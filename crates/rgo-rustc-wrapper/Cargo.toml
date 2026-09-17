@@ -10,7 +10,11 @@ rust-version.workspace = true
 # Deliberately no clap / tokio / sqlite / tracing. Startup time is on the build's critical path.
 [dependencies]
 rgo-protocol.workspace = true
+serde.workspace = true
 serde_json.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+uds_windows.workspace = true
 
 [lints]
 workspace = true

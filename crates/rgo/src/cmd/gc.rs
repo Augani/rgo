@@ -1,37 +1,41 @@
-use std::time::SystemTime;
+use anyhow::{Result, bail};
+use rgo_core::ipc;
+use rgo_protocol::{Request, Response};
 
-use anyhow::Result;
-use rgo_core::{context, gc};
-
-use super::{env, human};
+use super::{daemon, human};
 
 pub fn run(dry_run: bool, aggressive: bool) -> Result<()> {
-    let e = env()?;
-    let contexts = context::list(&e.paths)?;
-    let plan = gc::plan(&gc::Inputs {
-        paths: &e.paths,
-        cfg: &e.cfg,
-        contexts: &contexts,
-        pinned: &[], // TODO(phase 2): pins from SQLite
-        now: SystemTime::now(),
-        aggressive,
-    });
-    if plan.skipped_live > 0 {
+    let e = super::env()?;
+    if !daemon::ensure_running(&e.paths) {
+        bail!("rgo daemon is unavailable; refusing to run coordinated GC");
+    }
+    let report = match ipc::request_with_timeout(
+        &e.paths.socket_path(),
+        Request::TriggerGc { dry_run, aggressive },
+        std::time::Duration::from_secs(30),
+    )? {
+        Response::Gc(report) => report,
+        Response::Error { code, message } => bail!("GC failed ({code}): {message}"),
+        other => bail!("unexpected daemon response: {other:?}"),
+    };
+    if report.skipped_live > 0 {
         println!(
             "{} context(s) skipped: built within the last {} min",
-            plan.skipped_live,
-            gc::LIVE_WINDOW.as_secs() / 60
+            report.skipped_live,
+            10
         );
     }
-    if plan.actions.is_empty() {
+    if report.skipped_leased > 0 {
+        println!("{} context(s) skipped: protected by active leases", report.skipped_leased);
+    }
+    if report.actions.is_empty() {
         println!(
             "nothing to reclaim (managed {}, target {})",
-            human(plan.managed_bytes),
-            human(plan.target_bytes)
+            human(report.managed_bytes),
+            human(report.target_bytes)
         );
         return Ok(());
     }
-    let reclaimed = gc::execute(&e.paths, &plan, dry_run)?;
     println!(
         "{} {}",
         if dry_run {
@@ -39,11 +43,7 @@ pub fn run(dry_run: bool, aggressive: bool) -> Result<()> {
         } else {
             "reclaimed"
         },
-        human(if dry_run {
-            plan.reclaim_bytes()
-        } else {
-            reclaimed
-        })
+        human(if dry_run { report.planned_bytes } else { report.reclaimed_bytes })
     );
     Ok(())
 }

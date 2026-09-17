@@ -1,9 +1,11 @@
 use anyhow::Result;
 use rgo_core::cargo_config;
 use rgo_core::config::volume_free_bytes;
+use rgo_core::ipc;
 use rgo_core::paths::cargo_home;
+use rgo_protocol::{Request, Response, PROTOCOL_VERSION};
 
-use super::{env, human};
+use super::{daemon, env, human};
 
 pub fn run() -> Result<()> {
     let e = env()?;
@@ -57,6 +59,14 @@ pub fn run() -> Result<()> {
         e.paths.builds_dir().is_dir(),
         format!("managed root exists: {}", e.paths.builds_dir().display()),
     );
+    let daemon_ok = daemon::ensure_running(&e.paths);
+    check(daemon_ok, format!("daemon responds with protocol v{PROTOCOL_VERSION}"));
+    if daemon_ok {
+        if let Ok(Response::Status(status)) = ipc::request_with_timeout(&e.paths.socket_path(), Request::QueryStatus, std::time::Duration::from_secs(10)) {
+            println!("info daemon pid {}: {} active lease(s), {} pinned context(s)", status.daemon_pid, status.active_leases, status.pinned_contexts);
+            println!("info last GC reclaimed {}", human(status.last_gc_reclaimed_bytes));
+        }
+    }
     let free = volume_free_bytes(&e.paths.root).unwrap_or(0);
     check(
         free >= e.cfg.min_free_space,
@@ -73,7 +83,6 @@ pub fn run() -> Result<()> {
     );
     // TODO(phase 1): per-toolchain `cargo --version` >= build-dir stabilization; fs reflink capability probe;
     //                service health; stray target/ scan via `rgo adopt`.
-    // TODO(phase 2): daemon reachable + protocol version.
 
     if problems == 0 {
         println!("all good");

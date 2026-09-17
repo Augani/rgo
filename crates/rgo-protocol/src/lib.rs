@@ -1,72 +1,57 @@
-//! Shared, I/O-free types. Anything written to disk or over IPC by more than one rgo
-//! binary is defined here so the wrapper, CLI and daemon can never disagree.
+//! Versioned, I/O-free types shared by the CLI, daemon, and rustc wrapper.
+//!
+//! The transport uses a four-byte big-endian length followed by one JSON payload. Keeping
+//! framing here as byte-buffer helpers means the wrapper can use the exact same wire format
+//! without depending on the daemon's database or runtime.
 
 use serde::{Deserialize, Serialize};
 
-/// Bump when any on-disk or on-wire shape here changes incompatibly.
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
+pub const MAX_FRAME_SIZE: usize = 1024 * 1024;
+pub const DEFAULT_LEASE_TTL_SECS: u32 = 30;
+pub const DEFAULT_HEARTBEAT_SECS: u32 = 10;
+pub const CLIENT_TIMEOUT_MILLIS: u64 = 150;
 
-/// File name of the sidecar rgo writes at the top level of a Cargo build-dir it manages.
-/// It is the only thing rgo ever writes inside `builds/<hash>/`.
 pub const SIDECAR_FILE: &str = ".rgo-context.json";
-
-/// Environment variable that turns every rgo binary into a pure passthrough.
 pub const BYPASS_ENV: &str = "RGO_BYPASS";
-
-/// Environment variable overriding the rgo storage root (default `~/.rgo`).
 pub const HOME_ENV: &str = "RGO_HOME";
+pub const LEASE_ENV: &str = "RGO_LEASE_ID";
 
-/// Attribution of a managed build-dir back to the workspace that produced it.
-/// Written by the rustc wrapper and the `rgo <cargo-cmd>` passthrough.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContextSidecar {
     pub version: u32,
-    /// Absolute path of the workspace root (parent of the root `Cargo.toml`).
     pub workspace_root: String,
-    /// Absolute path of the root manifest. If this file disappears the context is an orphan.
     pub manifest_path: String,
-    /// `rustc -vV` first line or rustup toolchain name, when known.
     pub toolchain: Option<String>,
-    /// Unix seconds.
     pub first_seen: u64,
-    /// Unix seconds. Refreshed at most once per day to avoid write churn.
     pub last_seen: u64,
 }
 
-/// IPC messages (Phase 2). Framed as length-prefixed JSON over a user-private
-/// Unix socket / named pipe. Both sides must send `Hello` first.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LeaseScope {
+    Workspace { workspace_root: String },
+    Context { build_dir: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Request {
-    Hello {
-        version: u32,
-        client: String,
-    },
-    AcquireContextLease {
-        build_dir: String,
-        pid: u32,
-        ttl_secs: u32,
-    },
-    Heartbeat {
-        lease_id: u64,
-    },
-    ReleaseLease {
-        lease_id: u64,
-    },
+    Hello { version: u32, client: String },
+    AcquireLease { scope: LeaseScope, pid: u32, ttl_secs: u32 },
+    BindLease { lease_id: u64, build_dir: String, workspace_root: Option<String> },
+    Heartbeat { lease_id: u64 },
+    ReleaseLease { lease_id: u64 },
     Touch {
         build_dir: String,
+        workspace_root: Option<String>,
+        physical_bytes: Option<u64>,
+        incremental_bytes: Option<u64>,
     },
     QueryStatus,
-    TriggerGc {
-        dry_run: bool,
-        aggressive: bool,
-    },
-    Pin {
-        build_dir: String,
-    },
-    Unpin {
-        build_dir: String,
-    },
+    TriggerGc { dry_run: bool, aggressive: bool },
+    Pin { build_dir: String },
+    Unpin { build_dir: String },
+    Clean { build_dir: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -76,7 +61,8 @@ pub enum Response {
     Lease { lease_id: u64, expires_in_secs: u32 },
     Ok,
     Status(StatusReport),
-    Error { message: String },
+    Gc(GcReport),
+    Error { code: String, message: String },
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -91,4 +77,108 @@ pub struct StatusReport {
     pub contexts: u64,
     pub orphaned_contexts: u64,
     pub active_leases: u64,
+    pub pinned_contexts: u64,
+    pub daemon_pid: u32,
+    pub last_gc_reclaimed_bytes: u64,
+    pub last_gc_at: u64,
+    pub last_gc_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct GcReport {
+    pub dry_run: bool,
+    pub managed_bytes: u64,
+    pub target_bytes: u64,
+    pub reclaimed_bytes: u64,
+    pub planned_bytes: u64,
+    pub skipped_live: u64,
+    pub skipped_leased: u64,
+    pub actions: Vec<GcAction>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GcAction {
+    pub tier: u8,
+    pub path: String,
+    pub bytes: u64,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FrameError {
+    Truncated,
+    Empty,
+    TooLarge(usize),
+    TrailingBytes,
+    InvalidJson(String),
+}
+
+impl std::fmt::Display for FrameError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Truncated => write!(f, "truncated frame"),
+            Self::Empty => write!(f, "empty frame"),
+            Self::TooLarge(n) => write!(f, "frame is too large: {n} bytes"),
+            Self::TrailingBytes => write!(f, "frame has trailing bytes"),
+            Self::InvalidJson(e) => write!(f, "invalid JSON: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for FrameError {}
+
+pub fn encode_frame<T: Serialize>(value: &T) -> Result<Vec<u8>, serde_json::Error> {
+    let payload = serde_json::to_vec(value)?;
+    let mut frame = Vec::with_capacity(4 + payload.len());
+    frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+    frame.extend_from_slice(&payload);
+    Ok(frame)
+}
+
+pub fn decode_frame<T: for<'de> Deserialize<'de>>(frame: &[u8]) -> Result<T, FrameError> {
+    if frame.len() < 4 {
+        return Err(FrameError::Truncated);
+    }
+    let len = u32::from_be_bytes([frame[0], frame[1], frame[2], frame[3]]) as usize;
+    if len == 0 {
+        return Err(FrameError::Empty);
+    }
+    if len > MAX_FRAME_SIZE {
+        return Err(FrameError::TooLarge(len));
+    }
+    if frame.len() < len + 4 {
+        return Err(FrameError::Truncated);
+    }
+    if frame.len() != len + 4 {
+        return Err(FrameError::TrailingBytes);
+    }
+    serde_json::from_slice(&frame[4..]).map_err(|e| FrameError::InvalidJson(e.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn frame_round_trips() {
+        let request = Request::QueryStatus;
+        let frame = encode_frame(&request).unwrap();
+        assert_eq!(decode_frame::<Request>(&frame).unwrap(), request);
+    }
+
+    #[test]
+    fn rejects_truncated_and_oversized_frames() {
+        assert_eq!(decode_frame::<Request>(&[0, 0, 0]).unwrap_err(), FrameError::Truncated);
+        let mut frame = (MAX_FRAME_SIZE as u32 + 1).to_be_bytes().to_vec();
+        frame.extend(std::iter::repeat_n(0, MAX_FRAME_SIZE + 1));
+        assert!(matches!(decode_frame::<Request>(&frame), Err(FrameError::TooLarge(_))));
+    }
+
+    #[test]
+    fn hello_is_versioned() {
+        let request = Request::Hello { version: PROTOCOL_VERSION, client: "test".into() };
+        let json = serde_json::to_string(&request).unwrap();
+        assert!(json.contains("hello"));
+        assert!(json.contains("version"));
+    }
 }

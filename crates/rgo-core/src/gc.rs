@@ -40,6 +40,8 @@ pub struct Plan {
     pub free_bytes: u64,
     /// Contexts that looked live (recent `.cargo-build-lock`) and were therefore never considered.
     pub skipped_live: usize,
+    /// Contexts protected by daemon leases and therefore never considered.
+    pub skipped_leased: usize,
 }
 
 impl Plan {
@@ -53,6 +55,7 @@ pub struct Inputs<'a> {
     pub cfg: &'a Resolved,
     pub contexts: &'a [BuildContext],
     pub pinned: &'a [PathBuf],
+    pub leased: &'a [PathBuf],
     pub now: SystemTime,
     pub aggressive: bool,
 }
@@ -73,16 +76,25 @@ pub fn plan(inp: &Inputs) -> Plan {
         .iter()
         .filter(|c| c.recently_locked(LIVE_WINDOW, inp.now))
         .count();
+    let skipped_leased = inp
+        .contexts
+        .iter()
+        .filter(|c| inp.leased.iter().any(|path| same_path(path, &c.dir)))
+        .count();
     let mut plan = Plan {
         actions: vec![],
         managed_bytes: managed,
         target_bytes: target,
         free_bytes: free,
         skipped_live,
+        skipped_leased,
     };
 
-    let eligible =
-        |c: &BuildContext| !inp.pinned.contains(&c.dir) && !c.recently_locked(LIVE_WINDOW, inp.now);
+    let eligible = |c: &BuildContext| {
+        !inp.pinned.iter().any(|path| same_path(path, &c.dir))
+            && !inp.leased.iter().any(|path| same_path(path, &c.dir))
+            && !c.recently_locked(LIVE_WINDOW, inp.now)
+    };
 
     // Tier 0 and 1 are always taken: they are garbage regardless of budget.
     for c in inp.contexts.iter().filter(|c| eligible(c) && c.is_orphan()) {
@@ -245,4 +257,73 @@ pub fn sweep_tmp(paths: &RgoPaths) -> Result<()> {
 
 fn trunc(d: Duration) -> Duration {
     Duration::from_secs(d.as_secs())
+}
+
+fn same_path(left: &Path, right: &Path) -> bool {
+    std::fs::canonicalize(left).unwrap_or_else(|_| left.to_path_buf())
+        == std::fs::canonicalize(right).unwrap_or_else(|_| right.to_path_buf())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{Cache, Gc, Resolved};
+    use rgo_protocol::ContextSidecar;
+    use crate::size::Usage;
+
+    #[test]
+    fn leased_contexts_are_excluded_from_pressure_gc() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = RgoPaths { root: root.path().join("rgo") };
+        paths.ensure_layout().unwrap();
+        let leased_dir = paths.builds_dir().join("aa/leased");
+        let reclaimable_dir = paths.builds_dir().join("bb/reclaimable");
+        let newest_dir = paths.builds_dir().join("cc/newest");
+        std::fs::create_dir_all(&leased_dir).unwrap();
+        std::fs::create_dir_all(&reclaimable_dir).unwrap();
+        std::fs::create_dir_all(&newest_dir).unwrap();
+        let manifest = root.path().join("Cargo.toml");
+        std::fs::write(&manifest, "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\n").unwrap();
+        let sidecar = || ContextSidecar {
+            version: rgo_protocol::PROTOCOL_VERSION,
+            workspace_root: root.path().display().to_string(),
+            manifest_path: manifest.display().to_string(),
+            toolchain: None,
+            first_seen: 0,
+            last_seen: 0,
+        };
+        let context = |dir: PathBuf, last_used: SystemTime| BuildContext {
+            dir,
+            sidecar: Some(sidecar()),
+            last_used,
+            usage: Usage { physical_bytes: 100, logical_bytes: 100, files: 1 },
+            incremental_usage: Usage::default(),
+        };
+        let now = SystemTime::now();
+        let contexts = vec![
+            context(leased_dir.clone(), now - Duration::from_secs(3600)),
+            context(reclaimable_dir.clone(), now - Duration::from_secs(3500)),
+            context(newest_dir, now - Duration::from_secs(3400)),
+        ];
+        let cfg = Resolved {
+            max_size: 1,
+            soft_watermark: 0,
+            min_free_space: 0,
+            gc: Gc::default(),
+            cache: Cache::default(),
+            volume_total: 1,
+        };
+        let plan = plan(&Inputs {
+            paths: &paths,
+            cfg: &cfg,
+            contexts: &contexts,
+            pinned: &[],
+            leased: &[leased_dir],
+            now,
+            aggressive: true,
+        });
+        assert_eq!(plan.skipped_leased, 1);
+        assert!(plan.actions.iter().all(|action| action.path != contexts[0].dir));
+        assert!(plan.actions.iter().any(|action| action.path == contexts[1].dir));
+    }
 }
