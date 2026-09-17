@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context as _, Result};
+use fs4::fs_std::FileExt;
 use rgo_protocol::{ContextSidecar, PROTOCOL_VERSION, SIDECAR_FILE};
 use tracing::debug;
 
@@ -58,6 +59,24 @@ impl BuildContext {
                 .unwrap_or(false)
         })
     }
+}
+
+/// Defense-in-depth liveness check used immediately before destructive operations. Cargo keeps
+/// one of these locks for the duration of a build; an unavailable lock file is treated as live.
+pub fn lock_files_for_safety(build_dir: &Path) -> bool {
+    lock_files(build_dir).any(|path| {
+        let Ok(file) = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+        else {
+            return true;
+        };
+        match file.try_lock_exclusive() {
+            Ok(true) => false,
+            Ok(false) | Err(_) => true,
+        }
+    })
 }
 
 pub fn list(paths: &RgoPaths) -> Result<Vec<BuildContext>> {

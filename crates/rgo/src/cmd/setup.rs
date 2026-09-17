@@ -1,8 +1,9 @@
 use anyhow::{Context, Result, bail};
 use rgo_core::cargo_config::{self, Desired};
 use rgo_core::paths::{RgoPaths, cargo_home};
+use rgo_core::service;
 
-pub fn run(undo: bool, dry_run: bool, _no_service: bool, no_wrapper: bool) -> Result<()> {
+pub fn run(undo: bool, dry_run: bool, no_service: bool, no_wrapper: bool) -> Result<()> {
     let paths = RgoPaths::discover()?;
     let cfg_path = cargo_home()?.join("config.toml");
     let current = cargo_config::read_or_empty(&cfg_path)?;
@@ -66,7 +67,57 @@ pub fn run(undo: bool, dry_run: bool, _no_service: bool, no_wrapper: bool) -> Re
     }
     if !undo && !dry_run {
         println!("managed build storage: {}", paths.builds_dir().display());
-        // TODO(phase 1, step 8): install launchd / systemd --user / schtasks service unless _no_service.
+    }
+
+    if no_service {
+        if dry_run {
+            println!("service: skipped (--no-service)");
+        }
+    } else {
+        let executable = std::env::current_exe().context("locating rgo executable")?;
+        if dry_run {
+            match service::render(&executable) {
+                Ok(rendered) => {
+                    if undo {
+                        println!(
+                            "would remove service {} ({})",
+                            rendered.label,
+                            rendered.path.display()
+                        );
+                    } else {
+                        println!(
+                            "would install service {} at {}",
+                            rendered.label,
+                            rendered.path.display()
+                        );
+                        print!("{}", rendered.contents);
+                    }
+                }
+                Err(error) => eprintln!("warning: service unavailable: {error:#}"),
+            }
+        } else if undo {
+            if let Err(error) = service::uninstall(&executable) {
+                eprintln!("warning: could not remove daemon service: {error:#}");
+                eprintln!(
+                    "remediation: remove the per-user rgo service with the platform service manager"
+                );
+            } else {
+                println!("removed daemon service");
+            }
+        } else {
+            paths.ensure_layout()?;
+            match service::install(&executable, &paths) {
+                Ok(rendered) => println!("installed daemon service {}", rendered.label),
+                Err(error) => {
+                    eprintln!("warning: could not install daemon service: {error:#}");
+                    eprintln!(
+                        "remediation: run `rgo setup` again after enabling your per-user service manager, or use `rgo setup --no-service`"
+                    );
+                }
+            }
+        }
+    }
+    if !undo && !dry_run {
         println!("next: run any `cargo build`; then `rgo status`.");
     }
     Ok(())

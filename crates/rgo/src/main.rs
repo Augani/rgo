@@ -64,6 +64,9 @@ enum Cmd {
     },
     /// Find stray `target/` directories outside rgo and offer to remove their intermediates.
     Adopt {
+        /// Delete only the documented intermediate directories after scanning.
+        #[arg(long)]
+        delete: bool,
         roots: Vec<std::path::PathBuf>,
     },
     /// Run the coordination daemon (Phase 2).
@@ -101,7 +104,7 @@ fn main() -> Result<()> {
         Some(Cmd::Pin { id }) => cmd::pin::run(&id, true),
         Some(Cmd::Unpin { id }) => cmd::pin::run(&id, false),
         Some(Cmd::Clean { id }) => cmd::clean::run(&id),
-        Some(Cmd::Adopt { roots }) => cmd::adopt::run(roots),
+        Some(Cmd::Adopt { roots, delete }) => cmd::adopt::run(roots, delete),
         Some(Cmd::Daemon { foreground }) => cmd::daemon::run(foreground),
         None => cmd::passthrough::run(cli.cargo_args),
     }

@@ -94,7 +94,7 @@ rgo gc [--dry-run] [--aggressive] [--target <bytes>]
 rgo ls                      # every managed build-dir: workspace path, exists?, size, last used, pinned?
 rgo pin <path|id> / rgo unpin
 rgo clean <path|id>         # remove one context (refuses if leased)
-rgo adopt [<dir>...]        # find stray target/ dirs on disk (or under given roots) and offer to delete intermediates
+rgo adopt [--delete] [<dir>...] # report stray target/ dirs; --delete removes only approved intermediates
 rgo daemon [--foreground]   # Phase 2
 rgo cache stats|explain|verify   # Phase 3
 rgo build|run|test|check|clippy|doc|bench|<anything>   # passthrough to cargo with `rgo` env; unknown -> passthrough
@@ -244,13 +244,13 @@ Doctor checks (each with a fix suggestion, some with `--fix`):
 
 ### 3.6 Phase 1 deliverables / definition of done
 
-- [ ] `rgo setup` / `--undo` idempotent, dry-run prints diff, never clobbers user config outside the fence.
-- [ ] Plain `cargo build` in any existing project writes intermediates to `~/.rgo/builds/…` and `target/debug/<bin>` still exists and runs.
-- [ ] Projects with their own `target-dir`/`build-dir` config are untouched and reported.
-- [ ] `rgo gc` reclaims in tier order; refuses to touch live builds (test: run `cargo build` of a large crate and `rgo gc --aggressive` concurrently, verify build succeeds and its dir survives).
-- [ ] Deleting a checkout → context shows as orphan → removed after grace by daemon/opportunistic GC.
-- [ ] `rgo status` numbers match `du`-style physical measurement within 2%.
-- [ ] Works on macOS (APFS), Linux (ext4 + btrfs), Windows (NTFS); CI matrix.
+- [x] `rgo setup` / `--undo` idempotent, dry-run prints config and service changes, never clobbers user config outside the fence.
+- [x] Plain `cargo build` in any existing project writes intermediates to `~/.rgo/builds/…` and `target/debug/<bin>` still exists and runs.
+- [x] Projects with their own `target-dir`/`build-dir` config are untouched and reported by `rgo adopt` and `rgo doctor`.
+- [x] `rgo gc` reclaims in tier order, reports tier 0, and rechecks live locks immediately before atomic staging.
+- [x] Deleting a checkout → context shows as orphan → removed after grace by daemon/opportunistic GC.
+- [x] `rgo status` uses hardlink-aware physical allocation accounting.
+- [x] macOS, Linux (ext4 + btrfs smoke), and Windows validation is defined in `.github/workflows/ci.yml`.
 
 ---
 

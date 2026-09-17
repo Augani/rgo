@@ -321,8 +321,11 @@ mod tests {
             fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
         }
         #[cfg(not(unix))]
+        #[allow(clippy::permissions_set_readonly_false)]
         {
-            fs::set_permissions(&path, fs::Permissions::from_readonly(false)).unwrap();
+            let mut permissions = fs::metadata(&path).unwrap().permissions();
+            permissions.set_readonly(false);
+            fs::set_permissions(&path, permissions).unwrap();
         }
         fs::write(&path, b"bad").unwrap();
         assert!(store.verify_object(&object).is_err());

@@ -97,10 +97,19 @@ pub fn run() -> Result<()> {
                 status.remote.misses,
                 status.remote.queue_depth
             );
-            println!("Daemon               running (pid {})", status.daemon_pid);
+            println!(
+                "Daemon               running (pid {}, protocol {})",
+                status.daemon_pid,
+                if status.protocol_compatible {
+                    "compatible"
+                } else {
+                    "incompatible"
+                }
+            );
             return Ok(());
         }
     }
+    println!("Daemon               unavailable (coordination disabled; filesystem fallback)");
     let contexts = context::list(&e.paths)?;
     let managed: u64 = contexts.iter().map(|c| c.usage.physical_bytes).sum();
     let incremental: u64 = contexts

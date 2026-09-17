@@ -2,7 +2,7 @@
 //! `execute` is the mechanism and enforces the safety rules regardless of policy.
 
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use tracing::{info, warn};
@@ -97,6 +97,7 @@ pub fn plan(inp: &Inputs) -> Plan {
     };
 
     // Tier 0 and 1 are always taken: they are garbage regardless of budget.
+    plan.actions.extend(temporary_actions(inp.paths, inp.now));
     for c in inp.contexts.iter().filter(|c| eligible(c) && c.is_orphan()) {
         if c.idle_for(inp.now) >= inp.cfg.gc.orphan_grace {
             let m = c
@@ -217,14 +218,25 @@ pub fn execute(paths: &RgoPaths, plan: &Plan, dry_run: bool) -> Result<u64> {
             Err(e) => warn!(path = %a.path.display(), %e, "skipped"),
         }
     }
-    sweep_tmp(paths)?;
     Ok(reclaimed)
 }
 
+/// Remove a path using rgo's atomic rename-before-delete rule.
+pub fn remove_atomically(paths: &RgoPaths, victim: &Path) -> Result<()> {
+    stage_and_remove(paths, victim)
+}
+
 fn stage_and_remove(paths: &RgoPaths, victim: &Path) -> Result<()> {
+    if is_live_managed_path(paths, victim) {
+        anyhow::bail!("live Cargo build lock detected near {}", victim.display());
+    }
     std::fs::create_dir_all(paths.tmp_dir())?;
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
     let staged = paths.tmp_dir().join(format!(
-        "gc-{}-{}",
+        "gc-{}-{nonce}-{}",
         std::process::id(),
         victim.file_name().and_then(|s| s.to_str()).unwrap_or("x")
     ));
@@ -235,6 +247,47 @@ fn stage_and_remove(paths: &RgoPaths, victim: &Path) -> Result<()> {
         std::fs::remove_file(&staged)
     }
     .with_context(|| format!("removing {}", staged.display()))
+}
+
+fn temporary_actions(paths: &RgoPaths, now: SystemTime) -> Vec<Action> {
+    let mut actions = Vec::new();
+    let cutoff = Duration::from_secs(3600);
+    for directory in [paths.tmp_dir(), paths.quarantine_dir()] {
+        let Ok(entries) = std::fs::read_dir(directory) else {
+            continue;
+        };
+        for entry in entries.filter_map(Result::ok) {
+            let path = entry.path();
+            let old = entry
+                .metadata()
+                .and_then(|metadata| metadata.modified())
+                .map(|modified| now.duration_since(modified).unwrap_or_default() > cutoff)
+                .unwrap_or(true);
+            if !old {
+                continue;
+            }
+            let mut scanner = crate::size::Scanner::new();
+            let bytes = scanner.measure(&path).physical_bytes;
+            actions.push(Action {
+                tier: Tier::Tmp,
+                path,
+                bytes,
+                reason: "abandoned temporary or quarantine entry".into(),
+            });
+        }
+    }
+    actions
+}
+
+fn is_live_managed_path(paths: &RgoPaths, victim: &Path) -> bool {
+    let Some(context) = paths
+        .managed_build_dirs()
+        .into_iter()
+        .find(|context| victim == context || victim.starts_with(context))
+    else {
+        return false;
+    };
+    crate::context::lock_files_for_safety(&context)
 }
 
 /// Tier 0: anything left in `tmp/` older than an hour is abandoned.
@@ -275,6 +328,107 @@ mod tests {
     use crate::config::{Cache, Gc, Resolved};
     use crate::size::Usage;
     use rgo_protocol::ContextSidecar;
+
+    fn test_cfg() -> Resolved {
+        Resolved {
+            max_size: 1,
+            soft_watermark: 0,
+            min_free_space: 0,
+            gc: Gc::default(),
+            cache: Cache::default(),
+            remote: crate::config::Remote::default(),
+            volume_total: 1,
+        }
+    }
+
+    #[test]
+    fn tier_zero_is_reported_and_execute_matches_the_plan() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = RgoPaths {
+            root: root.path().join("rgo"),
+        };
+        paths.ensure_layout().unwrap();
+        let stale = paths.tmp_dir().join("stale.tmp");
+        std::fs::write(&stale, b"temporary").unwrap();
+        let now = SystemTime::now() + Duration::from_secs(7200);
+        let cfg = test_cfg();
+        let plan = plan(&Inputs {
+            paths: &paths,
+            cfg: &cfg,
+            contexts: &[],
+            pinned: &[],
+            leased: &[],
+            now,
+            aggressive: false,
+        });
+        assert_eq!(plan.actions.len(), 1);
+        assert_eq!(plan.actions[0].tier, Tier::Tmp);
+        assert!(plan.reclaim_bytes() >= 9);
+        let planned = plan.reclaim_bytes();
+        let reclaimed = execute(&paths, &plan, false).unwrap();
+        assert_eq!(reclaimed, planned);
+        assert!(!stale.exists());
+    }
+
+    #[test]
+    fn tiers_are_ordered_and_stale_incremental_state_is_selected_before_contexts() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = RgoPaths {
+            root: root.path().join("rgo"),
+        };
+        paths.ensure_layout().unwrap();
+        let context_dir = paths.builds_dir().join("aa/context");
+        let incremental = context_dir.join("debug/incremental");
+        std::fs::create_dir_all(&incremental).unwrap();
+        std::fs::write(incremental.join("old"), b"old state").unwrap();
+        let manifest = root.path().join("Cargo.toml");
+        std::fs::write(&manifest, "[package]\nname='x'\nversion='0.1.0'\n").unwrap();
+        let now = SystemTime::now();
+        let context = BuildContext {
+            dir: context_dir,
+            sidecar: Some(ContextSidecar {
+                version: rgo_protocol::PROTOCOL_VERSION,
+                workspace_root: root.path().display().to_string(),
+                manifest_path: manifest.display().to_string(),
+                toolchain: None,
+                first_seen: 0,
+                last_seen: 0,
+            }),
+            last_used: now - Duration::from_secs(3600),
+            usage: Usage {
+                physical_bytes: 100,
+                logical_bytes: 100,
+                files: 1,
+            },
+            incremental_usage: Usage {
+                physical_bytes: 9,
+                logical_bytes: 9,
+                files: 1,
+            },
+        };
+        let mut cfg = test_cfg();
+        cfg.gc.incremental_retention = Duration::from_secs(1);
+        cfg.gc.context_retention = Duration::from_secs(7200);
+        let plan = plan(&Inputs {
+            paths: &paths,
+            cfg: &cfg,
+            contexts: &[context],
+            pinned: &[],
+            leased: &[],
+            now,
+            aggressive: false,
+        });
+        assert!(
+            plan.actions
+                .iter()
+                .any(|action| action.tier == Tier::StaleIncremental)
+        );
+        assert!(
+            plan.actions
+                .windows(2)
+                .all(|pair| pair[0].tier <= pair[1].tier)
+        );
+    }
 
     #[test]
     fn leased_contexts_are_excluded_from_pressure_gc() {

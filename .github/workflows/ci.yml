@@ -1,0 +1,70 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: ${{ matrix.os }} / ${{ matrix.toolchain }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14, windows-latest]
+        toolchain: [stable, beta, '1.85.0']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.toolchain }}
+          components: rustfmt, clippy
+      - name: Build workspace
+        run: cargo build --workspace
+      - name: Test workspace
+        run: cargo test --workspace
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Diff check
+        run: git diff --check
+
+  btrfs-smoke:
+    name: Linux btrfs smoke
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install btrfs tools
+        run: sudo apt-get update && sudo apt-get install -y btrfs-progs
+      - name: Create filesystem image
+        shell: bash
+        run: |
+          set -euo pipefail
+          image="$RUNNER_TEMP/rgo-btrfs.img"
+          truncate -s 2G "$image"
+          if ! sudo mkfs.btrfs -f "$image"; then
+            echo "btrfs is unavailable on this runner; skipping smoke test"
+            exit 0
+          fi
+          mountpoint="$RUNNER_TEMP/rgo-btrfs"
+          mkdir -p "$mountpoint"
+          sudo mount -o loop "$image" "$mountpoint" || {
+            echo "loopback mount unavailable on this runner; skipping smoke test"
+            exit 0
+          }
+          sudo chown "$USER:$USER" "$mountpoint"
+          echo "RGO_BTRFS_ROOT=$mountpoint" >> "$GITHUB_ENV"
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Run storage tests on btrfs when mounted
+        shell: bash
+        run: |
+          if [[ -n "${RGO_BTRFS_ROOT:-}" ]]; then
+            RGO_HOME="$RGO_BTRFS_ROOT/.rgo" CARGO_HOME="$RGO_BTRFS_ROOT/.cargo" cargo test --workspace
+          else
+            echo "btrfs smoke test skipped"
+          fi

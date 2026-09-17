@@ -668,6 +668,7 @@ dependencies = [
  "predicates",
  "rgo-cas",
  "rgo-core",
+ "rgo-materialize",
  "rgo-protocol",
  "rgo-testkit",
  "serde_json",

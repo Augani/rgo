@@ -8,6 +8,7 @@
 //! - `cargo_config` — fenced edits to `$CARGO_HOME/config.toml` for `rgo setup`
 //! - `gc`       — tiered reclamation policy + safety mechanism
 
+pub mod adopt;
 pub mod cargo_config;
 pub mod config;
 pub mod context;
@@ -16,6 +17,7 @@ pub mod db;
 pub mod gc;
 pub mod ipc;
 pub mod paths;
+pub mod service;
 pub mod size;
 
 pub use rgo_protocol as protocol;

@@ -15,6 +15,7 @@ path = "src/main.rs"
 rgo-core.workspace = true
 rgo-protocol.workspace = true
 rgo-cas.workspace = true
+rgo-materialize.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 serde_json.workspace = true
