@@ -18,7 +18,9 @@ pub fn run(id: &str) -> Result<()> {
     }
     let response = ipc::request_with_timeout(
         &e.paths.socket_path(),
-        Request::Clean { build_dir: c.dir.to_string_lossy().into_owned() },
+        Request::Clean {
+            build_dir: c.dir.to_string_lossy().into_owned(),
+        },
         std::time::Duration::from_secs(30),
     )?;
     let n = match response {

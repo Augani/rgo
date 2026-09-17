@@ -11,15 +11,21 @@
 use std::ffi::OsString;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, ExitStatus, Stdio};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::thread;
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use rgo_protocol::{BYPASS_ENV, CLIENT_TIMEOUT_MILLIS, ContextSidecar, DEFAULT_HEARTBEAT_SECS,
-    DEFAULT_LEASE_TTL_SECS, HOME_ENV, LEASE_ENV, LeaseScope, PROTOCOL_VERSION, Request, Response,
-    SIDECAR_FILE, decode_frame, encode_frame, MAX_FRAME_SIZE};
+use rgo_cas::{MANIFEST_VERSION, Manifest, ManifestOutput, ObjectRef, Store};
+use rgo_key::{AllowedRoots, BypassReason, Candidate, Classification, classify};
+use rgo_materialize::materialize;
+use rgo_protocol::{
+    BYPASS_ENV, CLIENT_TIMEOUT_MILLIS, CacheEvent, CacheManifest, CacheObject, CacheOutput,
+    ContextSidecar, DEFAULT_HEARTBEAT_SECS, DEFAULT_LEASE_TTL_SECS, HOME_ENV, LEASE_ENV,
+    LeaseScope, MAX_FRAME_SIZE, PROTOCOL_VERSION, Request, Response, SIDECAR_FILE, decode_frame,
+    encode_frame,
+};
 
 #[cfg(unix)]
 type PlatformStream = std::os::unix::net::UnixStream;
@@ -34,7 +40,7 @@ fn main() {
     };
     let args: Vec<OsString> = args.collect();
 
-    let mut lease_id = None;
+    let mut context_lease_id = None;
     if std::env::var_os(BYPASS_ENV).is_none() {
         if let Some(build_dir) = attribute(&args) {
             let workspace_root = workspace_root();
@@ -47,28 +53,525 @@ fn main() {
                     })
                     .is_ok();
                     if !bound {
-                        lease_id = acquire_context_lease(&build_dir);
+                        context_lease_id = acquire_context_lease(&build_dir);
+                    } else {
+                        context_lease_id = Some(id);
                     }
                 }
-            } else if let Ok(Response::Lease { lease_id: id, .. }) = request(Request::AcquireLease {
-                scope: LeaseScope::Context { build_dir: build_dir.to_string_lossy().into_owned() },
-                pid: std::process::id(),
-                ttl_secs: DEFAULT_LEASE_TTL_SECS,
-            }) {
-                lease_id = Some(id);
+            } else if let Ok(Response::Lease { lease_id: id, .. }) =
+                request(Request::AcquireLease {
+                    scope: LeaseScope::Context {
+                        build_dir: build_dir.to_string_lossy().into_owned(),
+                    },
+                    pid: std::process::id(),
+                    ttl_secs: DEFAULT_LEASE_TTL_SECS,
+                })
+            {
+                context_lease_id = Some(id);
             }
         }
     }
+
+    if std::env::var_os(BYPASS_ENV).is_some() {
+        finish_passthrough(rustc, &args, context_lease_id);
+    }
+
+    let Some(_build_dir) = attribute(&args) else {
+        finish_passthrough(rustc, &args, context_lease_id);
+    };
+    let Some(candidate) = classify_invocation(Path::new(&rustc), &args) else {
+        finish_passthrough(rustc, &args, context_lease_id);
+    };
+    if configured_inner_wrapper().is_some() {
+        record_event(
+            None,
+            "bypass",
+            0,
+            Some(BypassReason::InnerWrapper.to_string()),
+        );
+        finish_passthrough(rustc, &args, context_lease_id);
+    }
+
+    let Some(home) = rgo_home() else {
+        finish_passthrough(rustc, &args, context_lease_id);
+    };
+    let store = match Store::new(home.join("cas"), home.join("quarantine")) {
+        Ok(store) => store,
+        Err(_error) => finish_passthrough(rustc, &args, context_lease_id),
+    };
+    let cache_response = request(Request::CacheLookup {
+        key: candidate.key.to_string(),
+        pid: std::process::id(),
+        ttl_secs: DEFAULT_LEASE_TTL_SECS,
+    });
+    match cache_response {
+        Ok(Response::CacheHit { manifest, lease_id }) => {
+            if materialize_hit(&store, &candidate, &manifest).is_ok() {
+                replay_output(&store, manifest.stdout.as_ref(), true);
+                replay_output(&store, manifest.stderr.as_ref(), false);
+                record_event(Some(candidate.key.to_string()), "hit", 0, None);
+                if let Some(id) = lease_id {
+                    let _ = request(Request::ReleaseLease { lease_id: id });
+                }
+                finish_success(context_lease_id);
+            }
+            if let Some(id) = lease_id {
+                let _ = request(Request::ReleaseLease { lease_id: id });
+            }
+            let _ = request(Request::RecordCacheEvent {
+                event: CacheEvent {
+                    key: Some(candidate.key.to_string()),
+                    outcome: "miss".into(),
+                    bytes: 0,
+                    reason: Some("materialization_failed".into()),
+                },
+            });
+        }
+        Ok(Response::CacheMiss { reason }) if reason != "cache_disabled" => {
+            let result = run_captured(&rustc, &args, context_lease_id, false);
+            if result.status.success() {
+                match publish_result(&store, &candidate, &result) {
+                    Ok(manifest) => {
+                        let _ = request(Request::CachePublish {
+                            manifest: wire_manifest(&manifest),
+                        });
+                    }
+                    Err(_error) => {}
+                }
+                record_event(
+                    Some(candidate.key.to_string()),
+                    "miss",
+                    result.stdout.len() as u64 + result.stderr.len() as u64,
+                    None,
+                );
+            }
+            exit_with_status(result.status);
+        }
+        Ok(Response::CacheMiss { reason }) => {
+            record_event(None, "bypass", 0, Some(reason));
+        }
+        Ok(Response::Error { message, .. }) => {
+            record_event(None, "bypass", 0, Some(message));
+        }
+        _ => {}
+    }
+    finish_passthrough(rustc, &args, context_lease_id);
+}
+
+fn finish_passthrough(rustc: OsString, args: &[OsString], lease_id: Option<u64>) -> ! {
     if let Some(lease_id) = lease_id {
-        run_supervised(rustc, &args, lease_id);
+        run_supervised(rustc, args, lease_id);
     } else {
-        exec(rustc, &args);
+        exec(rustc, args);
+    }
+}
+
+fn finish_success(lease_id: Option<u64>) -> ! {
+    if let Some(lease_id) = lease_id {
+        let _ = request(Request::ReleaseLease { lease_id });
+    }
+    std::process::exit(0);
+}
+
+fn rgo_home() -> Option<PathBuf> {
+    std::env::var_os(HOME_ENV).map(PathBuf::from).or_else(|| {
+        std::env::var_os("HOME")
+            .or_else(|| std::env::var_os("USERPROFILE"))
+            .map(|path| PathBuf::from(path).join(".rgo"))
+    })
+}
+
+fn classify_invocation(rustc: &Path, args: &[OsString]) -> Option<Candidate> {
+    let home = rgo_home()?;
+    let cargo_home = std::env::var_os("CARGO_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|path| PathBuf::from(path).join(".cargo")))?;
+    let env = std::env::vars_os().collect::<Vec<_>>();
+    match classify(
+        rustc,
+        args,
+        &env,
+        &AllowedRoots {
+            build_root: home.join("builds"),
+            source_roots: vec![
+                cargo_home.join("registry").join("src"),
+                cargo_home.join("git").join("checkouts"),
+            ],
+        },
+    ) {
+        Classification::Cacheable(candidate) => Some(candidate),
+        Classification::Bypass(reason) => {
+            record_event(None, "bypass", 0, Some(reason.to_string()));
+            None
+        }
+    }
+}
+
+fn configured_inner_wrapper() -> Option<OsString> {
+    std::env::var_os("RGO_INNER_RUSTC_WRAPPER").or_else(|| {
+        rgo_home()
+            .and_then(|home| std::fs::read_to_string(home.join("state/inner-wrapper")).ok())
+            .map(|value| OsString::from(value.trim()))
+            .filter(|value| !value.is_empty())
+    })
+}
+
+fn materialize_hit(
+    store: &Store,
+    candidate: &Candidate,
+    manifest: &CacheManifest,
+) -> Result<(), String> {
+    if manifest.key != candidate.key.as_str() {
+        return Err("cache manifest key mismatch".into());
+    }
+    let mut used = vec![false; candidate.outputs.len()];
+    for output in &manifest.outputs {
+        let Some((index, spec)) = candidate
+            .outputs
+            .iter()
+            .enumerate()
+            .find(|(index, spec)| !used[*index] && spec.kind == output.kind)
+        else {
+            return Err(format!(
+                "manifest output kind has no target: {}",
+                output.kind
+            ));
+        };
+        used[index] = true;
+        let destination = if spec.path.is_dir() {
+            spec.path.join(&output.name)
+        } else {
+            spec.path.clone()
+        };
+        let object = ObjectRef {
+            digest: output.object.digest.clone(),
+            size: output.object.size,
+            mode: output.object.mode,
+        };
+        store
+            .verify_object(&object)
+            .map_err(|error| error.to_string())?;
+        materialize(
+            &store.object_path(&object.digest),
+            &destination,
+            object.mode,
+            true,
+        )
+        .map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
+fn replay_output(store: &Store, object: Option<&CacheObject>, stdout: bool) {
+    let Some(object) = object else { return };
+    let native = ObjectRef {
+        digest: object.digest.clone(),
+        size: object.size,
+        mode: object.mode,
+    };
+    let Ok(bytes) = store.read_object(&native) else {
+        return;
+    };
+    if stdout {
+        let _ = std::io::stdout().write_all(&bytes);
+        let _ = std::io::stdout().flush();
+    } else {
+        let _ = std::io::stderr().write_all(&bytes);
+        let _ = std::io::stderr().flush();
+    }
+}
+
+struct Captured {
+    status: ExitStatus,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    started_at: SystemTime,
+}
+
+fn run_captured(
+    rustc: &OsString,
+    args: &[OsString],
+    lease_id: Option<u64>,
+    inner: bool,
+) -> Captured {
+    let started_at = SystemTime::now();
+    let mut command = if inner {
+        let wrapper = configured_inner_wrapper().unwrap_or_else(|| OsString::from(rustc));
+        let mut command = Command::new(wrapper);
+        command.arg(rustc);
+        command.args(args);
+        command
+    } else {
+        let mut command = Command::new(rustc);
+        command.args(args);
+        command
+    };
+    let mut child = match command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(error) => {
+            eprintln!(
+                "rgo-rustc-wrapper: failed to run {}: {error}",
+                rustc.to_string_lossy()
+            );
+            return Captured {
+                status: exit_status(127),
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+                started_at,
+            };
+        }
+    };
+    let mut stdout = child.stdout.take().expect("stdout was piped");
+    let mut stderr = child.stderr.take().expect("stderr was piped");
+    let stdout_thread = thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = stdout.read_to_end(&mut bytes);
+        bytes
+    });
+    let stderr_thread = thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = stderr.read_to_end(&mut bytes);
+        bytes
+    });
+    let (stop, heartbeat) = lease_id
+        .map(|lease_id| {
+            let (stop, stop_thread) = mpsc::channel();
+            let heartbeat = thread::spawn(move || {
+                loop {
+                    match stop_thread
+                        .recv_timeout(Duration::from_secs(u64::from(DEFAULT_HEARTBEAT_SECS)))
+                    {
+                        Ok(()) | Err(RecvTimeoutError::Disconnected) => break,
+                        Err(RecvTimeoutError::Timeout) => {
+                            if request(Request::Heartbeat { lease_id }).is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
+            });
+            (stop, heartbeat)
+        })
+        .unzip();
+    let status = child.wait().unwrap_or_else(|_| exit_status(127));
+    if let Some(stop) = stop {
+        let _ = stop.send(());
+    }
+    if let Some(heartbeat) = heartbeat {
+        let _ = heartbeat.join();
+    }
+    let stdout_bytes = stdout_thread.join().unwrap_or_default();
+    let stderr_bytes = stderr_thread.join().unwrap_or_default();
+    let _ = std::io::stdout().write_all(&stdout_bytes);
+    let _ = std::io::stdout().flush();
+    let _ = std::io::stderr().write_all(&stderr_bytes);
+    let _ = std::io::stderr().flush();
+    if let Some(lease_id) = lease_id {
+        let _ = request(Request::ReleaseLease { lease_id });
+    }
+    Captured {
+        status,
+        stdout: stdout_bytes,
+        stderr: stderr_bytes,
+        started_at,
+    }
+}
+
+fn publish_result(
+    store: &Store,
+    candidate: &Candidate,
+    result: &Captured,
+) -> anyhow::Result<Manifest> {
+    let outputs = collect_outputs(candidate, result.started_at)?;
+    if outputs.is_empty() {
+        anyhow::bail!("eligible rustc invocation produced no cacheable outputs");
+    }
+    let output_refs = outputs
+        .into_iter()
+        .map(|(kind, path)| {
+            let mode = file_mode(&path);
+            let object = store.put_file(&path, mode)?;
+            Ok(ManifestOutput {
+                kind,
+                name: path
+                    .file_name()
+                    .and_then(|v| v.to_str())
+                    .unwrap_or("output")
+                    .into(),
+                object,
+            })
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let stdout = (!result.stdout.is_empty())
+        .then(|| store.put_bytes(&result.stdout, 0o644))
+        .transpose()?;
+    let stderr = (!result.stderr.is_empty())
+        .then(|| store.put_bytes(&result.stderr, 0o644))
+        .transpose()?;
+    let manifest = Manifest {
+        version: MANIFEST_VERSION,
+        key: candidate.key.to_string(),
+        outputs: output_refs,
+        stdout,
+        stderr,
+        created_at: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs(),
+    };
+    store.write_manifest(&manifest)?;
+    Ok(manifest)
+}
+
+fn collect_outputs(
+    candidate: &Candidate,
+    started_at: SystemTime,
+) -> anyhow::Result<Vec<(String, PathBuf)>> {
+    let mut outputs = Vec::new();
+    for spec in &candidate.outputs {
+        if spec.path.is_file() {
+            outputs.push((spec.kind.clone(), spec.path.clone()));
+            continue;
+        }
+        if !spec.path.is_dir() {
+            continue;
+        }
+        for entry in std::fs::read_dir(&spec.path)? {
+            let path = entry?.path();
+            if !path.is_file() || !is_output_for_kind(&path, &spec.kind) {
+                continue;
+            }
+            let modified = std::fs::metadata(&path)?.modified().unwrap_or(UNIX_EPOCH);
+            if modified >= started_at {
+                outputs.push((spec.kind.clone(), path));
+            }
+        }
+    }
+    outputs.sort_by(|left, right| left.1.cmp(&right.1));
+    outputs.dedup_by(|left, right| left.1 == right.1);
+    Ok(outputs)
+}
+
+fn is_output_for_kind(path: &Path, kind: &str) -> bool {
+    match kind {
+        "dep-info" => path.extension().and_then(|v| v.to_str()) == Some("d"),
+        "metadata" => path.extension().and_then(|v| v.to_str()) == Some("rmeta"),
+        "link" => matches!(
+            path.extension().and_then(|v| v.to_str()),
+            Some("rlib" | "rmeta" | "so" | "dylib")
+        ),
+        _ => false,
+    }
+}
+
+fn file_mode(path: &Path) -> u32 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path)
+            .map(|m| m.permissions().mode())
+            .unwrap_or(0o644)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        0o644
+    }
+}
+
+fn wire_manifest(manifest: &Manifest) -> CacheManifest {
+    CacheManifest {
+        version: manifest.version,
+        key: manifest.key.clone(),
+        outputs: manifest
+            .outputs
+            .iter()
+            .map(|output| CacheOutput {
+                kind: output.kind.clone(),
+                name: output.name.clone(),
+                object: CacheObject {
+                    digest: output.object.digest.clone(),
+                    size: output.object.size,
+                    mode: output.object.mode,
+                },
+            })
+            .collect(),
+        stdout: manifest.stdout.as_ref().map(|object| CacheObject {
+            digest: object.digest.clone(),
+            size: object.size,
+            mode: object.mode,
+        }),
+        stderr: manifest.stderr.as_ref().map(|object| CacheObject {
+            digest: object.digest.clone(),
+            size: object.size,
+            mode: object.mode,
+        }),
+        created_at: manifest.created_at,
+    }
+}
+
+fn record_event(key: Option<String>, outcome: &str, bytes: u64, reason: Option<String>) {
+    let Some(home) = rgo_home() else { return };
+    let path = home.join("state/cache-events.log");
+    let event = CacheEvent {
+        key,
+        outcome: outcome.into(),
+        bytes,
+        reason,
+    };
+    let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    else {
+        return;
+    };
+    if let Ok(bytes) = serde_json::to_vec(&event) {
+        let _ = file.write_all(&bytes);
+        let _ = file.write_all(b"\n");
+    }
+}
+
+fn exit_status(code: i32) -> ExitStatus {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        ExitStatus::from_raw(code)
+    }
+    #[cfg(not(unix))]
+    {
+        std::process::Command::new("cmd")
+            .args(["/C", "exit", &code.to_string()])
+            .status()
+            .unwrap()
+    }
+}
+
+fn exit_with_status(status: ExitStatus) -> ! {
+    std::process::exit(exit_code(status));
+}
+
+fn compiler_command(rustc: &OsString, args: &[OsString]) -> Command {
+    if let Some(wrapper) = configured_inner_wrapper() {
+        let mut command = Command::new(wrapper);
+        command.arg(rustc).args(args);
+        command
+    } else {
+        let mut command = Command::new(rustc);
+        command.args(args);
+        command
     }
 }
 
 fn acquire_context_lease(build_dir: &Path) -> Option<u64> {
     match request(Request::AcquireLease {
-        scope: LeaseScope::Context { build_dir: build_dir.to_string_lossy().into_owned() },
+        scope: LeaseScope::Context {
+            build_dir: build_dir.to_string_lossy().into_owned(),
+        },
         pid: std::process::id(),
         ttl_secs: DEFAULT_LEASE_TTL_SECS,
     }) {
@@ -117,21 +620,38 @@ fn attribute(args: &[OsString]) -> Option<PathBuf> {
 fn workspace_root() -> Option<String> {
     let manifest = std::env::var_os("RGO_MANIFEST_PATH")
         .map(PathBuf::from)
-        .or_else(|| std::env::var_os("CARGO_MANIFEST_DIR").map(|p| PathBuf::from(p).join("Cargo.toml")))?;
+        .or_else(|| {
+            std::env::var_os("CARGO_MANIFEST_DIR").map(|p| PathBuf::from(p).join("Cargo.toml"))
+        })?;
     manifest.parent().map(|p| p.to_string_lossy().into_owned())
 }
 
 fn request(message: Request) -> Result<Response, String> {
     let home = std::env::var_os(HOME_ENV)
         .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")).map(PathBuf::from).map(|p| p.join(".rgo")))
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .or_else(|| std::env::var_os("USERPROFILE"))
+                .map(PathBuf::from)
+                .map(|p| p.join(".rgo"))
+        })
         .ok_or_else(|| "cannot determine RGO_HOME".to_owned())?;
     let socket = home.join("state").join("daemon.sock");
     let mut stream = PlatformStream::connect(socket).map_err(|e| e.to_string())?;
     let timeout = Some(Duration::from_millis(CLIENT_TIMEOUT_MILLIS));
-    stream.set_read_timeout(timeout).map_err(|e| e.to_string())?;
-    stream.set_write_timeout(timeout).map_err(|e| e.to_string())?;
-    write_frame(&mut stream, &Request::Hello { version: PROTOCOL_VERSION, client: "rustc-wrapper".into() })?;
+    stream
+        .set_read_timeout(timeout)
+        .map_err(|e| e.to_string())?;
+    stream
+        .set_write_timeout(timeout)
+        .map_err(|e| e.to_string())?;
+    write_frame(
+        &mut stream,
+        &Request::Hello {
+            version: PROTOCOL_VERSION,
+            client: "rustc-wrapper".into(),
+        },
+    )?;
     match read_message::<Response>(&mut stream)? {
         Response::Hello { version } if version == PROTOCOL_VERSION => {}
         Response::Hello { version } => return Err(format!("protocol mismatch: {version}")),
@@ -148,7 +668,9 @@ fn write_frame<T: serde::Serialize>(stream: &mut PlatformStream, value: &T) -> R
     stream.flush().map_err(|e| e.to_string())
 }
 
-fn read_message<T: for<'de> serde::Deserialize<'de>>(stream: &mut PlatformStream) -> Result<T, String> {
+fn read_message<T: for<'de> serde::Deserialize<'de>>(
+    stream: &mut PlatformStream,
+) -> Result<T, String> {
     let mut header = [0u8; 4];
     stream.read_exact(&mut header).map_err(|e| e.to_string())?;
     let len = u32::from_be_bytes(header) as usize;
@@ -157,7 +679,9 @@ fn read_message<T: for<'de> serde::Deserialize<'de>>(stream: &mut PlatformStream
     }
     let mut frame = vec![0u8; len + 4];
     frame[..4].copy_from_slice(&header);
-    stream.read_exact(&mut frame[4..]).map_err(|e| e.to_string())?;
+    stream
+        .read_exact(&mut frame[4..])
+        .map_err(|e| e.to_string())?;
     decode_frame(&frame).map_err(|e| e.to_string())
 }
 
@@ -173,14 +697,17 @@ fn run_supervised(rustc: OsString, args: &[OsString], lease_id: u64) -> ! {
             }
         }
     });
-    let status = Command::new(&rustc).args(args).status();
+    let status = compiler_command(&rustc, args).status();
     let _ = stop.send(());
     let _ = heartbeat.join();
     let _ = request(Request::ReleaseLease { lease_id });
     match status {
         Ok(status) => std::process::exit(exit_code(status)),
         Err(error) => {
-            eprintln!("rgo-rustc-wrapper: failed to run {}: {error}", rustc.to_string_lossy());
+            eprintln!(
+                "rgo-rustc-wrapper: failed to run {}: {error}",
+                rustc.to_string_lossy()
+            );
             std::process::exit(127);
         }
     }
@@ -225,7 +752,7 @@ fn find_managed_build_dir(out_dir: &Path) -> Option<PathBuf> {
 #[cfg(unix)]
 fn exec(rustc: OsString, args: &[OsString]) -> ! {
     use std::os::unix::process::CommandExt;
-    let err = Command::new(&rustc).args(args).exec();
+    let err = compiler_command(&rustc, args).exec();
     eprintln!(
         "rgo-rustc-wrapper: failed to exec {}: {err}",
         rustc.to_string_lossy()
@@ -246,7 +773,7 @@ fn exit_code(s: std::process::ExitStatus) -> i32 {
 
 #[cfg(not(unix))]
 fn exec(rustc: OsString, args: &[OsString]) -> ! {
-    match Command::new(&rustc).args(args).status() {
+    match compiler_command(&rustc, args).status() {
         Ok(s) => std::process::exit(s.code().unwrap_or(1)),
         Err(err) => {
             eprintln!(

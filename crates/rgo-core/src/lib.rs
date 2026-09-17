@@ -11,9 +11,9 @@
 pub mod cargo_config;
 pub mod config;
 pub mod context;
-pub mod gc;
-pub mod db;
 pub mod daemon;
+pub mod db;
+pub mod gc;
 pub mod ipc;
 pub mod paths;
 pub mod size;

@@ -3,7 +3,7 @@ use rgo_core::cargo_config;
 use rgo_core::config::volume_free_bytes;
 use rgo_core::ipc;
 use rgo_core::paths::cargo_home;
-use rgo_protocol::{Request, Response, PROTOCOL_VERSION};
+use rgo_protocol::{PROTOCOL_VERSION, Request, Response};
 
 use super::{daemon, env, human};
 
@@ -35,9 +35,8 @@ pub fn run() -> Result<()> {
         format!("no global build.target-dir ({:?})", insp.target_dir),
     );
     if let Some(w) = &insp.rustc_wrapper {
-        println!(
-            "info build.rustc-wrapper = {w:?} (rgo composes with it in Phase 3; unaffected today)"
-        );
+        println!("info build.rustc-wrapper = {w:?}");
+        println!("info wrapper chain = rgo-rustc-wrapper -> {w}");
     }
     for var in [
         "CARGO_TARGET_DIR",
@@ -60,11 +59,36 @@ pub fn run() -> Result<()> {
         format!("managed root exists: {}", e.paths.builds_dir().display()),
     );
     let daemon_ok = daemon::ensure_running(&e.paths);
-    check(daemon_ok, format!("daemon responds with protocol v{PROTOCOL_VERSION}"));
+    check(
+        daemon_ok,
+        format!("daemon responds with protocol v{PROTOCOL_VERSION}"),
+    );
     if daemon_ok {
-        if let Ok(Response::Status(status)) = ipc::request_with_timeout(&e.paths.socket_path(), Request::QueryStatus, std::time::Duration::from_secs(10)) {
-            println!("info daemon pid {}: {} active lease(s), {} pinned context(s)", status.daemon_pid, status.active_leases, status.pinned_contexts);
-            println!("info last GC reclaimed {}", human(status.last_gc_reclaimed_bytes));
+        if let Ok(Response::Status(status)) = ipc::request_with_timeout(
+            &e.paths.socket_path(),
+            Request::QueryStatus,
+            std::time::Duration::from_secs(10),
+        ) {
+            println!(
+                "info daemon pid {}: {} active lease(s), {} pinned context(s)",
+                status.daemon_pid, status.active_leases, status.pinned_contexts
+            );
+            println!(
+                "info last GC reclaimed {}",
+                human(status.last_gc_reclaimed_bytes)
+            );
+            println!(
+                "info cache {}: {} hit(s), {} miss(es), {} bypass(es), {} CAS",
+                if status.cache.enabled {
+                    "enabled"
+                } else {
+                    "disabled"
+                },
+                status.cache.hits,
+                status.cache.misses,
+                status.cache.bypasses,
+                human(status.cache.cas_bytes)
+            );
         }
     }
     let free = volume_free_bytes(&e.paths.root).unwrap_or(0);

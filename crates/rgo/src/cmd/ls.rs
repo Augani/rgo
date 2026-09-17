@@ -33,8 +33,16 @@ pub fn run() -> Result<()> {
             human(c.usage.physical_bytes),
             human(c.incremental_usage.physical_bytes),
             idle,
-            if pinned.iter().any(|p| same_path(p, &c.dir)) { "PIN" } else { "" },
-            if leased.iter().any(|p| same_path(p, &c.dir)) { "LIVE" } else { "" },
+            if pinned.iter().any(|p| same_path(p, &c.dir)) {
+                "PIN"
+            } else {
+                ""
+            },
+            if leased.iter().any(|p| same_path(p, &c.dir)) {
+                "LIVE"
+            } else {
+                ""
+            },
             ws
         );
     }

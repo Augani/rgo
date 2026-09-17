@@ -20,6 +20,11 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// Inspect and verify the opt-in compiler-result cache.
+    Cache {
+        #[command(subcommand)]
+        command: cmd::cache::Command,
+    },
     /// One-time machine setup: config fence in $CARGO_HOME/config.toml, ~/.rgo layout, background service.
     Setup {
         #[arg(long)]
@@ -79,6 +84,7 @@ fn main() -> Result<()> {
 
     let cli = Cli::parse();
     match cli.cmd {
+        Some(Cmd::Cache { command }) => cmd::cache::run(command),
         Some(Cmd::Setup {
             undo,
             dry_run,

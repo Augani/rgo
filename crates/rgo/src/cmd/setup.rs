@@ -56,6 +56,15 @@ pub fn run(undo: bool, dry_run: bool, _no_service: bool, no_wrapper: bool) -> Re
 
     if !undo && !dry_run {
         paths.ensure_layout()?;
+        if let Some(inner) = insp.rustc_wrapper.as_deref() {
+            std::fs::write(paths.state_dir().join("inner-wrapper"), inner)?;
+        } else {
+            let _ = std::fs::remove_file(paths.state_dir().join("inner-wrapper"));
+        }
+    } else if undo && !dry_run {
+        let _ = std::fs::remove_file(paths.state_dir().join("inner-wrapper"));
+    }
+    if !undo && !dry_run {
         println!("managed build storage: {}", paths.builds_dir().display());
         // TODO(phase 1, step 8): install launchd / systemd --user / schtasks service unless _no_service.
         println!("next: run any `cargo build`; then `rgo status`.");

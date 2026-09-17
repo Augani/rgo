@@ -11,7 +11,10 @@ pub fn run(dry_run: bool, aggressive: bool) -> Result<()> {
     }
     let report = match ipc::request_with_timeout(
         &e.paths.socket_path(),
-        Request::TriggerGc { dry_run, aggressive },
+        Request::TriggerGc {
+            dry_run,
+            aggressive,
+        },
         std::time::Duration::from_secs(30),
     )? {
         Response::Gc(report) => report,
@@ -21,12 +24,14 @@ pub fn run(dry_run: bool, aggressive: bool) -> Result<()> {
     if report.skipped_live > 0 {
         println!(
             "{} context(s) skipped: built within the last {} min",
-            report.skipped_live,
-            10
+            report.skipped_live, 10
         );
     }
     if report.skipped_leased > 0 {
-        println!("{} context(s) skipped: protected by active leases", report.skipped_leased);
+        println!(
+            "{} context(s) skipped: protected by active leases",
+            report.skipped_leased
+        );
     }
     if report.actions.is_empty() {
         println!(
@@ -43,7 +48,11 @@ pub fn run(dry_run: bool, aggressive: bool) -> Result<()> {
         } else {
             "reclaimed"
         },
-        human(if dry_run { report.planned_bytes } else { report.reclaimed_bytes })
+        human(if dry_run {
+            report.planned_bytes
+        } else {
+            report.reclaimed_bytes
+        })
     );
     Ok(())
 }

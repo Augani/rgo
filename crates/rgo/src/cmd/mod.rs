@@ -1,4 +1,5 @@
 pub mod adopt;
+pub mod cache;
 pub mod clean;
 pub mod daemon;
 pub mod doctor;

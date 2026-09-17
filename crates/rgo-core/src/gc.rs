@@ -229,7 +229,12 @@ fn stage_and_remove(paths: &RgoPaths, victim: &Path) -> Result<()> {
         victim.file_name().and_then(|s| s.to_str()).unwrap_or("x")
     ));
     std::fs::rename(victim, &staged).with_context(|| format!("staging {}", victim.display()))?;
-    std::fs::remove_dir_all(&staged).with_context(|| format!("removing {}", staged.display()))
+    if staged.is_dir() {
+        std::fs::remove_dir_all(&staged)
+    } else {
+        std::fs::remove_file(&staged)
+    }
+    .with_context(|| format!("removing {}", staged.display()))
 }
 
 /// Tier 0: anything left in `tmp/` older than an hour is abandoned.
@@ -268,13 +273,15 @@ fn same_path(left: &Path, right: &Path) -> bool {
 mod tests {
     use super::*;
     use crate::config::{Cache, Gc, Resolved};
-    use rgo_protocol::ContextSidecar;
     use crate::size::Usage;
+    use rgo_protocol::ContextSidecar;
 
     #[test]
     fn leased_contexts_are_excluded_from_pressure_gc() {
         let root = tempfile::tempdir().unwrap();
-        let paths = RgoPaths { root: root.path().join("rgo") };
+        let paths = RgoPaths {
+            root: root.path().join("rgo"),
+        };
         paths.ensure_layout().unwrap();
         let leased_dir = paths.builds_dir().join("aa/leased");
         let reclaimable_dir = paths.builds_dir().join("bb/reclaimable");
@@ -283,7 +290,11 @@ mod tests {
         std::fs::create_dir_all(&reclaimable_dir).unwrap();
         std::fs::create_dir_all(&newest_dir).unwrap();
         let manifest = root.path().join("Cargo.toml");
-        std::fs::write(&manifest, "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\n").unwrap();
+        std::fs::write(
+            &manifest,
+            "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
         let sidecar = || ContextSidecar {
             version: rgo_protocol::PROTOCOL_VERSION,
             workspace_root: root.path().display().to_string(),
@@ -296,7 +307,11 @@ mod tests {
             dir,
             sidecar: Some(sidecar()),
             last_used,
-            usage: Usage { physical_bytes: 100, logical_bytes: 100, files: 1 },
+            usage: Usage {
+                physical_bytes: 100,
+                logical_bytes: 100,
+                files: 1,
+            },
             incremental_usage: Usage::default(),
         };
         let now = SystemTime::now();
@@ -323,7 +338,15 @@ mod tests {
             aggressive: true,
         });
         assert_eq!(plan.skipped_leased, 1);
-        assert!(plan.actions.iter().all(|action| action.path != contexts[0].dir));
-        assert!(plan.actions.iter().any(|action| action.path == contexts[1].dir));
+        assert!(
+            plan.actions
+                .iter()
+                .all(|action| action.path != contexts[0].dir)
+        );
+        assert!(
+            plan.actions
+                .iter()
+                .any(|action| action.path == contexts[1].dir)
+        );
     }
 }

@@ -55,7 +55,11 @@ pub fn ensure_running(paths: &RgoPaths) -> bool {
 }
 
 fn daemon_responds(paths: &RgoPaths) -> bool {
-    match ipc::request_with_timeout(&paths.socket_path(), Request::QueryStatus, Duration::from_secs(2)) {
+    match ipc::request_with_timeout(
+        &paths.socket_path(),
+        Request::QueryStatus,
+        Duration::from_secs(2),
+    ) {
         Ok(Response::Status(_)) => true,
         Ok(other) => {
             tracing::debug!(response = ?other, "daemon health check returned unexpected response");

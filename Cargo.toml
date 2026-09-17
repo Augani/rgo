@@ -13,6 +13,9 @@ rust-version = "1.85"
 rgo-core = { path = "crates/rgo-core" }
 rgo-protocol = { path = "crates/rgo-protocol" }
 rgo-testkit = { path = "crates/rgo-testkit" }
+rgo-key = { path = "crates/rgo-key" }
+rgo-cas = { path = "crates/rgo-cas" }
+rgo-materialize = { path = "crates/rgo-materialize" }
 
 anyhow = "1"
 thiserror = "2"
@@ -24,7 +27,7 @@ clap = { version = "4", features = ["derive"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 rusqlite = { version = "0.37", features = ["bundled"] }
-blake3 = "1"
+blake3 = { version = "1", default-features = false, features = ["std", "pure"] }
 humantime = "2"
 bytesize = "2"
 directories = "6"

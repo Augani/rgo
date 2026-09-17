@@ -9,7 +9,11 @@ rust-version.workspace = true
 
 # Deliberately no clap / tokio / sqlite / tracing. Startup time is on the build's critical path.
 [dependencies]
+anyhow.workspace = true
 rgo-protocol.workspace = true
+rgo-key.workspace = true
+rgo-cas.workspace = true
+rgo-materialize.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 

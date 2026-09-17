@@ -2,8 +2,8 @@ use std::time::SystemTime;
 
 use anyhow::Result;
 use rgo_core::config::volume_free_bytes;
-use rgo_core::{context, gc};
 use rgo_core::ipc;
+use rgo_core::{context, gc};
 use rgo_protocol::{Request, Response};
 
 use super::{daemon, env, human};
@@ -11,18 +11,65 @@ use super::{daemon, env, human};
 pub fn run() -> Result<()> {
     let e = env()?;
     if daemon::ensure_running(&e.paths) {
-        if let Ok(Response::Status(status)) = ipc::request_with_timeout(&e.paths.socket_path(), Request::QueryStatus, std::time::Duration::from_secs(10)) {
-            println!("Managed storage      {:>10}   ({} contexts, {} orphaned)", human(status.managed_bytes), status.contexts, status.orphaned_contexts);
-            println!("  incremental state  {:>10}", human(status.incremental_bytes));
-            println!("Soft GC watermark    {:>10}", human(status.soft_watermark_bytes));
-            println!("Hard limit           {:>10}", human(status.hard_limit_bytes));
-            println!("Volume free          {:>10}   (reserve {})", human(status.volume_free_bytes), human(status.min_free_bytes));
-            println!("Reclaimable now      {:>10}", human(status.reclaimable_bytes));
-            println!("Active leases        {:>10}   pinned {}", status.active_leases, status.pinned_contexts);
-            println!("Last GC              {:>10}", human(status.last_gc_reclaimed_bytes));
+        if let Ok(Response::Status(status)) = ipc::request_with_timeout(
+            &e.paths.socket_path(),
+            Request::QueryStatus,
+            std::time::Duration::from_secs(10),
+        ) {
+            println!(
+                "Managed storage      {:>10}   ({} contexts, {} orphaned)",
+                human(status.managed_bytes),
+                status.contexts,
+                status.orphaned_contexts
+            );
+            println!(
+                "  incremental state  {:>10}",
+                human(status.incremental_bytes)
+            );
+            println!(
+                "Soft GC watermark    {:>10}",
+                human(status.soft_watermark_bytes)
+            );
+            println!(
+                "Hard limit           {:>10}",
+                human(status.hard_limit_bytes)
+            );
+            println!(
+                "Volume free          {:>10}   (reserve {})",
+                human(status.volume_free_bytes),
+                human(status.min_free_bytes)
+            );
+            println!(
+                "Reclaimable now      {:>10}",
+                human(status.reclaimable_bytes)
+            );
+            println!(
+                "Active leases        {:>10}   pinned {}",
+                status.active_leases, status.pinned_contexts
+            );
+            println!(
+                "Last GC              {:>10}",
+                human(status.last_gc_reclaimed_bytes)
+            );
             if let Some(error) = status.last_gc_error {
                 println!("Last GC error        {error}");
             }
+            println!(
+                "Cache                {}   {} hits, {} misses, {} bypasses",
+                if status.cache.enabled {
+                    "enabled"
+                } else {
+                    "disabled"
+                },
+                status.cache.hits,
+                status.cache.misses,
+                status.cache.bypasses
+            );
+            println!(
+                "Physical CAS         {:>10}   ({} manifests)",
+                human(status.cache.cas_bytes),
+                status.cache.manifests
+            );
             println!("Daemon               running (pid {})", status.daemon_pid);
             return Ok(());
         }

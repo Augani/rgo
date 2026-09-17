@@ -45,7 +45,11 @@ fn daemon_coordinates_builds_and_pins_contexts() {
         .args(["build", "--offline"])
         .output()
         .unwrap();
-    assert!(build.status.success(), "{}", String::from_utf8_lossy(&build.stderr));
+    assert!(
+        build.status.success(),
+        "{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
     let plain_project = sb.simple_bin("plain-cargo-project").unwrap();
     let plain_build = sb
         .cargo()
@@ -67,8 +71,14 @@ fn daemon_coordinates_builds_and_pins_contexts() {
         status_text,
         String::from_utf8_lossy(&status.stderr)
     );
-    assert!(status_text.contains("Daemon               running"), "{status_text}");
-    assert!(status_text.contains("Active leases        "), "{status_text}");
+    assert!(
+        status_text.contains("Daemon               running"),
+        "{status_text}"
+    );
+    assert!(
+        status_text.contains("Active leases        "),
+        "{status_text}"
+    );
 
     let ls = sb.cmd(cargo_bin("rgo")).arg("ls").output().unwrap();
     let id = String::from_utf8_lossy(&ls.stdout)
@@ -77,13 +87,29 @@ fn daemon_coordinates_builds_and_pins_contexts() {
         .and_then(|line| line.split_whitespace().next())
         .expect("one context")
         .to_owned();
-    let pin = sb.cmd(cargo_bin("rgo")).args(["pin", &id]).output().unwrap();
-    assert!(pin.status.success(), "{}", String::from_utf8_lossy(&pin.stderr));
+    let pin = sb
+        .cmd(cargo_bin("rgo"))
+        .args(["pin", &id])
+        .output()
+        .unwrap();
+    assert!(
+        pin.status.success(),
+        "{}",
+        String::from_utf8_lossy(&pin.stderr)
+    );
     let pinned_ls = sb.cmd(cargo_bin("rgo")).arg("ls").output().unwrap();
     assert!(String::from_utf8_lossy(&pinned_ls.stdout).contains("PIN"));
 
-    let unpin = sb.cmd(cargo_bin("rgo")).args(["unpin", &id]).output().unwrap();
-    assert!(unpin.status.success(), "{}", String::from_utf8_lossy(&unpin.stderr));
+    let unpin = sb
+        .cmd(cargo_bin("rgo"))
+        .args(["unpin", &id])
+        .output()
+        .unwrap();
+    assert!(
+        unpin.status.success(),
+        "{}",
+        String::from_utf8_lossy(&unpin.stderr)
+    );
 
     daemon.kill().unwrap();
     let _ = daemon.wait();

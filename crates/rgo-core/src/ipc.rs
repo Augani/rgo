@@ -9,8 +9,10 @@ use std::path::Path;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use rgo_protocol::{CLIENT_TIMEOUT_MILLIS, MAX_FRAME_SIZE, PROTOCOL_VERSION, Request, Response,
-    decode_frame, encode_frame};
+use rgo_protocol::{
+    CLIENT_TIMEOUT_MILLIS, MAX_FRAME_SIZE, PROTOCOL_VERSION, Request, Response, decode_frame,
+    encode_frame,
+};
 
 #[cfg(unix)]
 mod platform {
@@ -83,7 +85,9 @@ impl Write for Connection {
 
 impl Listener {
     pub fn bind(path: &Path) -> Result<Self> {
-        Ok(Self(platform::bind(path).with_context(|| format!("binding {}", path.display()))?))
+        Ok(Self(
+            platform::bind(path).with_context(|| format!("binding {}", path.display()))?,
+        ))
     }
 
     pub fn accept(&self) -> io::Result<Connection> {
@@ -97,7 +101,8 @@ impl Listener {
 }
 
 pub fn connect(path: &Path, timeout: Duration) -> Result<Connection> {
-    let stream = platform::connect(path).with_context(|| format!("connecting to {}", path.display()))?;
+    let stream =
+        platform::connect(path).with_context(|| format!("connecting to {}", path.display()))?;
     stream.set_read_timeout(Some(timeout))?;
     stream.set_write_timeout(Some(timeout))?;
     Ok(Connection { stream })
@@ -109,13 +114,18 @@ pub fn request(path: &Path, message: Request) -> Result<Response> {
 
 pub fn request_with_timeout(path: &Path, message: Request, timeout: Duration) -> Result<Response> {
     let mut connection = connect(path, timeout)?;
-    write_message(&mut connection, &Request::Hello {
-        version: PROTOCOL_VERSION,
-        client: client_name(),
-    })?;
+    write_message(
+        &mut connection,
+        &Request::Hello {
+            version: PROTOCOL_VERSION,
+            client: client_name(),
+        },
+    )?;
     match read_message::<Response>(&mut connection)? {
         Response::Hello { version } if version == PROTOCOL_VERSION => {}
-        Response::Hello { version } => bail!("daemon protocol mismatch: server={version}, client={PROTOCOL_VERSION}"),
+        Response::Hello { version } => {
+            bail!("daemon protocol mismatch: server={version}, client={PROTOCOL_VERSION}")
+        }
         Response::Error { code, message } => bail!("daemon handshake failed ({code}): {message}"),
         other => bail!("invalid daemon handshake response: {other:?}"),
     }
@@ -136,7 +146,9 @@ pub fn write_message<T: serde::Serialize>(connection: &mut Connection, message: 
 
 fn read_frame(connection: &mut Connection) -> Result<Vec<u8>> {
     let mut header = [0u8; 4];
-    connection.read_exact(&mut header).context("reading IPC frame length")?;
+    connection
+        .read_exact(&mut header)
+        .context("reading IPC frame length")?;
     let len = u32::from_be_bytes(header) as usize;
     if len == 0 {
         bail!("empty IPC frame");
@@ -147,7 +159,9 @@ fn read_frame(connection: &mut Connection) -> Result<Vec<u8>> {
     let mut frame = Vec::with_capacity(len + 4);
     frame.extend_from_slice(&header);
     frame.resize(len + 4, 0);
-    connection.read_exact(&mut frame[4..]).context("reading IPC frame payload")?;
+    connection
+        .read_exact(&mut frame[4..])
+        .context("reading IPC frame payload")?;
     Ok(frame)
 }
 

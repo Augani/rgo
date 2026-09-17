@@ -3,15 +3,17 @@
 //! even when the rustc wrapper is not installed.
 
 use std::ffi::OsString;
-use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::process::Command;
+use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::thread;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use rgo_core::ipc;
-use rgo_protocol::{BYPASS_ENV, DEFAULT_HEARTBEAT_SECS, DEFAULT_LEASE_TTL_SECS, LEASE_ENV,
-    LeaseScope, Request, Response};
+use rgo_protocol::{
+    BYPASS_ENV, DEFAULT_HEARTBEAT_SECS, DEFAULT_LEASE_TTL_SECS, LEASE_ENV, LeaseScope, Request,
+    Response,
+};
 
 use super::{daemon, env};
 
@@ -109,7 +111,9 @@ impl LeaseGuard {
         let socket_thread = socket.clone();
         let thread = thread::spawn(move || {
             loop {
-                match stop_thread.recv_timeout(Duration::from_secs(u64::from(DEFAULT_HEARTBEAT_SECS))) {
+                match stop_thread
+                    .recv_timeout(Duration::from_secs(u64::from(DEFAULT_HEARTBEAT_SECS)))
+                {
                     Ok(()) | Err(RecvTimeoutError::Disconnected) => break,
                     Err(RecvTimeoutError::Timeout) => {
                         let _ = ipc::request(&socket_thread, Request::Heartbeat { lease_id: id });
@@ -117,7 +121,12 @@ impl LeaseGuard {
                 }
             }
         });
-        Self { socket, id, stop: Some(stop), thread: Some(thread) }
+        Self {
+            socket,
+            id,
+            stop: Some(stop),
+            thread: Some(thread),
+        }
     }
 }
 
