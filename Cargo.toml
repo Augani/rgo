@@ -1,0 +1,47 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/augustusotu/rgo"
+rust-version = "1.85"
+
+[workspace.dependencies]
+rgo-core = { path = "crates/rgo-core" }
+rgo-protocol = { path = "crates/rgo-protocol" }
+rgo-testkit = { path = "crates/rgo-testkit" }
+
+anyhow = "1"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.9"
+toml_edit = "0.23"
+clap = { version = "4", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+rusqlite = { version = "0.37", features = ["bundled"] }
+blake3 = "1"
+humantime = "2"
+bytesize = "2"
+directories = "6"
+walkdir = "2"
+fs4 = "0.13"
+sysinfo = "0.37"
+tempfile = "3"
+assert_cmd = "2"
+predicates = "3"
+
+[workspace.lints.rust]
+unsafe_code = "warn"
+
+[workspace.lints.clippy]
+all = "warn"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

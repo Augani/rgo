@@ -1,0 +1,30 @@
+[package]
+name = "rgo-core"
+description = "rgo library: config, storage paths, physical size accounting, contexts, GC, leases"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rgo-protocol.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+toml_edit.workspace = true
+tracing.workspace = true
+humantime.workspace = true
+bytesize.workspace = true
+directories.workspace = true
+walkdir.workspace = true
+fs4.workspace = true
+sysinfo.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

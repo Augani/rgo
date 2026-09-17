@@ -1,0 +1,16 @@
+[package]
+name = "rgo-testkit"
+description = "Sandboxed HOME/CARGO_HOME/RGO_HOME environments and fixture crates for rgo integration tests"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,16 @@
+[package]
+name = "rgo-rustc-wrapper"
+description = "Minimal rustc wrapper for rgo. Must stay tiny: it runs on every compiler invocation."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+# Deliberately no clap / tokio / sqlite / tracing. Startup time is on the build's critical path.
+[dependencies]
+rgo-protocol.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true

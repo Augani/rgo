@@ -1,0 +1,14 @@
+[package]
+name = "rgo-protocol"
+description = "Versioned, I/O-free message and sidecar types shared by rgo binaries"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+serde.workspace = true
+
+[lints]
+workspace = true
