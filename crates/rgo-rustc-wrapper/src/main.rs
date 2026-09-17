@@ -179,11 +179,31 @@ fn acquire_cache_role(candidate: &Candidate) -> Option<CacheRole> {
                     ttl_secs: DEFAULT_LEASE_TTL_SECS,
                 };
             }
+            Response::CacheRemotePending {
+                retry_after_millis, ..
+            } => {
+                if std::time::Instant::now() >= deadline {
+                    record_event(
+                        Some(key.clone()),
+                        "timeout",
+                        0,
+                        Some("remote_fetch_timeout".into()),
+                    );
+                    return None;
+                }
+                thread::sleep(Duration::from_millis(retry_after_millis.min(100)));
+                message = Request::CacheWait {
+                    key: key.clone(),
+                    pid: std::process::id(),
+                    ttl_secs: DEFAULT_LEASE_TTL_SECS,
+                };
+            }
             Response::CacheMiss { reason } => {
                 record_event(None, "bypass", 0, Some(reason));
                 return None;
             }
             Response::CacheFailed { reason }
+            | Response::CacheRemoteFailed { reason, .. }
             | Response::Error {
                 message: reason, ..
             } => {

@@ -326,6 +326,7 @@ mod tests {
             min_free_space: 0,
             gc: Gc::default(),
             cache: Cache::default(),
+            remote: crate::config::Remote::default(),
             volume_total: 1,
         };
         let plan = plan(&Inputs {

@@ -9,13 +9,15 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
-use rgo_protocol::{CacheEvent, CacheManifest, CacheStatsReport, LeaseScope, PROTOCOL_VERSION};
+use rgo_protocol::{
+    CacheEvent, CacheManifest, CacheStatsReport, LeaseScope, PROTOCOL_VERSION, RemoteStatusReport,
+};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 
 use crate::context;
 use crate::paths::RgoPaths;
 
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 
 #[derive(Debug, Clone, Default)]
 pub struct DbStats {
@@ -34,6 +36,13 @@ pub struct LastGc {
 pub enum CacheBuildDecision {
     Producer { lease_id: u64, expires_in_secs: u32 },
     Wait { expires_in_secs: u32 },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RemoteFetchDecision {
+    Started { lease_id: u64 },
+    Wait,
+    Build(CacheBuildDecision),
 }
 
 #[derive(Debug, Clone, Default)]
@@ -198,6 +207,44 @@ impl StateDb {
                 takeovers INTEGER NOT NULL DEFAULT 0
             );
             INSERT OR IGNORE INTO single_flight_stats(id) VALUES (1);
+            CREATE TABLE IF NOT EXISTS remote_meta (
+                id INTEGER PRIMARY KEY CHECK(id = 1),
+                endpoint TEXT NOT NULL DEFAULT '',
+                namespace TEXT NOT NULL DEFAULT '',
+                config_fingerprint TEXT NOT NULL DEFAULT '',
+                last_probe INTEGER NOT NULL DEFAULT 0,
+                healthy INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT
+            );
+            INSERT OR IGNORE INTO remote_meta(id) VALUES (1);
+            CREATE TABLE IF NOT EXISTS remote_jobs (
+                job_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                key TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                digest TEXT,
+                status TEXT NOT NULL DEFAULT 'PENDING',
+                attempts INTEGER NOT NULL DEFAULT 0,
+                next_attempt_at INTEGER NOT NULL DEFAULT 0,
+                bytes INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                UNIQUE(key, kind, digest)
+            );
+            CREATE INDEX IF NOT EXISTS remote_jobs_ready ON remote_jobs(status, next_attempt_at);
+            CREATE TABLE IF NOT EXISTS remote_counters (
+                id INTEGER PRIMARY KEY CHECK(id = 1),
+                hits INTEGER NOT NULL DEFAULT 0,
+                misses INTEGER NOT NULL DEFAULT 0,
+                authentication_failures INTEGER NOT NULL DEFAULT 0,
+                corruptions INTEGER NOT NULL DEFAULT 0,
+                uploads INTEGER NOT NULL DEFAULT 0,
+                downloads INTEGER NOT NULL DEFAULT 0,
+                upload_bytes INTEGER NOT NULL DEFAULT 0,
+                download_bytes INTEGER NOT NULL DEFAULT 0,
+                retries INTEGER NOT NULL DEFAULT 0
+            );
+            INSERT OR IGNORE INTO remote_counters(id) VALUES (1);
             ",
         )?;
         let current: Option<i64> = connection
@@ -345,11 +392,13 @@ impl StateDb {
             "UPDATE cache_builds
              SET state = 'FAILED', owner_lease_id = NULL, expires_at = ?1,
                  heartbeat_at = ?1, error = 'daemon_restart'
-             WHERE state IN ('BUILDING', 'COMMITTING')",
+             WHERE state IN ('BUILDING', 'COMMITTING', 'REMOTE_FETCHING')",
             params![now],
         )?;
-        self.connection
-            .execute("DELETE FROM leases WHERE scope = 'cache_build'", [])?;
+        self.connection.execute(
+            "DELETE FROM leases WHERE scope IN ('cache_build', 'cache_remote')",
+            [],
+        )?;
         Ok(())
     }
 
@@ -427,12 +476,120 @@ impl StateDb {
         })
     }
 
+    /// Reserve a key for the daemon's remote fetch worker. The reservation is kept in the same
+    /// single-flight table as local producers so waiters never issue network requests themselves.
+    pub fn acquire_remote_fetch(
+        &self,
+        key: &str,
+        pid: u32,
+        ttl_secs: u32,
+    ) -> Result<RemoteFetchDecision> {
+        self.expire_leases()?;
+        let now = unix_now();
+        let ttl = u64::from(ttl_secs.max(1));
+        let transaction = self.connection.unchecked_transaction()?;
+        let existing: Option<(String, Option<i64>, i64)> = transaction
+            .query_row(
+                "SELECT state, owner_lease_id, expires_at FROM cache_builds WHERE key = ?1",
+                params![key],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        if let Some((state, Some(owner), expires)) = &existing {
+            let active: i64 = transaction.query_row(
+                "SELECT COUNT(*) FROM leases WHERE lease_id = ?1 AND expires_at > ?2",
+                params![owner, now],
+                |row| row.get(0),
+            )?;
+            if *expires as u64 > now && active != 0 {
+                let decision = if state == "REMOTE_FETCHING" {
+                    RemoteFetchDecision::Wait
+                } else {
+                    RemoteFetchDecision::Build(CacheBuildDecision::Wait {
+                        expires_in_secs: (*expires as u64).saturating_sub(now) as u32,
+                    })
+                };
+                transaction.commit()?;
+                return Ok(decision);
+            }
+        }
+        let expires = now.saturating_add(ttl);
+        transaction.execute(
+            "INSERT INTO leases(scope, owner_pid, created_at, heartbeat_at, expires_at)
+             VALUES('cache_remote', ?1, ?2, ?2, ?3)",
+            params![i64::from(pid), now, expires],
+        )?;
+        let lease_id = transaction.last_insert_rowid() as u64;
+        transaction.execute(
+            "INSERT INTO cache_builds(key, state, owner_lease_id, started_at, heartbeat_at, expires_at, error)
+             VALUES(?1, 'REMOTE_FETCHING', ?2, ?3, ?3, ?4, NULL)
+             ON CONFLICT(key) DO UPDATE SET state='REMOTE_FETCHING', owner_lease_id=?2,
+               started_at=?3, heartbeat_at=?3, expires_at=?4, error=NULL",
+            params![key, lease_id as i64, now, expires],
+        )?;
+        transaction.commit()?;
+        Ok(RemoteFetchDecision::Started { lease_id })
+    }
+
+    pub fn finish_remote_fetch(
+        &self,
+        key: &str,
+        lease_id: u64,
+        manifest_path: &Path,
+    ) -> Result<bool> {
+        let transaction = self.connection.unchecked_transaction()?;
+        let changed = transaction.execute(
+            "UPDATE cache_builds SET state='READY', owner_lease_id=NULL, manifest_path=?1,
+             heartbeat_at=?2, expires_at=?2, error=NULL
+             WHERE key=?3 AND state='REMOTE_FETCHING' AND owner_lease_id=?4",
+            params![
+                manifest_path.to_string_lossy(),
+                unix_now(),
+                key,
+                lease_id as i64
+            ],
+        )?;
+        transaction.execute(
+            "DELETE FROM leases WHERE lease_id=?1 AND scope='cache_remote'",
+            params![lease_id as i64],
+        )?;
+        transaction.commit()?;
+        Ok(changed != 0)
+    }
+
+    /// Make a failed remote fetch immediately available to the normal local producer path.
+    pub fn remote_fetch_fallback(&self, key: &str, lease_id: u64, reason: &str) -> Result<()> {
+        let transaction = self.connection.unchecked_transaction()?;
+        transaction.execute(
+            "UPDATE cache_builds SET state='BUILDING', owner_lease_id=NULL, expires_at=?1,
+             heartbeat_at=?1, error=?2 WHERE key=?3 AND state='REMOTE_FETCHING' AND owner_lease_id=?4",
+            params![unix_now(), reason, key, lease_id as i64],
+        )?;
+        transaction.execute(
+            "DELETE FROM leases WHERE lease_id=?1 AND scope='cache_remote'",
+            params![lease_id as i64],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
     pub fn record_single_flight_timeout(&self) -> Result<()> {
         self.connection.execute(
             "UPDATE single_flight_stats SET timeouts = timeouts + 1 WHERE id = 1",
             [],
         )?;
         Ok(())
+    }
+
+    pub fn remote_fetch_active(&self, key: &str) -> Result<bool> {
+        let now = unix_now();
+        Ok(self.connection.query_row(
+            "SELECT COUNT(*) FROM cache_builds b JOIN leases l ON l.lease_id = b.owner_lease_id
+             WHERE b.key = ?1 AND b.state = 'REMOTE_FETCHING' AND l.scope = 'cache_remote'
+               AND l.expires_at > ?2",
+            params![key, now],
+            |row| row.get::<_, i64>(0),
+        )? != 0)
     }
 
     pub fn prune_failed_cache_builds(&self, retention: Duration) -> Result<usize> {
@@ -693,7 +850,179 @@ impl StateDb {
             single_flight_timeouts: flight.timeouts,
             single_flight_takeovers: flight.takeovers,
             active_builds: flight.active_builds,
+            remote: self.remote_status(false, None, None)?,
         })
+    }
+
+    pub fn remote_status(
+        &self,
+        enabled: bool,
+        endpoint: Option<&str>,
+        namespace: Option<&str>,
+    ) -> Result<RemoteStatusReport> {
+        let meta = self.connection.query_row(
+            "SELECT healthy, last_error FROM remote_meta WHERE id = 1",
+            [],
+            |row| Ok((row.get::<_, i64>(0)?, row.get(1)?)),
+        )?;
+        let values: (u64, u64, u64, u64, u64, u64, u64, u64, u64) = self.connection.query_row(
+            "SELECT hits, misses, authentication_failures, corruptions, uploads, downloads,
+                    upload_bytes, download_bytes, retries FROM remote_counters WHERE id = 1",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)? as u64,
+                    row.get::<_, i64>(1)? as u64,
+                    row.get::<_, i64>(2)? as u64,
+                    row.get::<_, i64>(3)? as u64,
+                    row.get::<_, i64>(4)? as u64,
+                    row.get::<_, i64>(5)? as u64,
+                    row.get::<_, i64>(6)? as u64,
+                    row.get::<_, i64>(7)? as u64,
+                    row.get::<_, i64>(8)? as u64,
+                ))
+            },
+        )?;
+        let queue_depth = self.connection.query_row(
+            "SELECT COUNT(*) FROM remote_jobs WHERE status IN ('PENDING', 'RETRY')",
+            [],
+            |row| row.get::<_, i64>(0),
+        )? as u64;
+        Ok(RemoteStatusReport {
+            enabled,
+            configured: endpoint.is_some_and(|value| !value.is_empty())
+                && namespace.is_some_and(|value| !value.is_empty()),
+            healthy: enabled && meta.0 != 0,
+            endpoint: endpoint.map(str::to_owned),
+            namespace: namespace.map(str::to_owned),
+            protocol_compatible: enabled && meta.0 != 0,
+            queue_depth,
+            hits: values.0,
+            misses: values.1,
+            authentication_failures: values.2,
+            corruptions: values.3,
+            uploads: values.4,
+            downloads: values.5,
+            upload_bytes: values.6,
+            download_bytes: values.7,
+            retries: values.8,
+            last_error: meta.1,
+        })
+    }
+
+    pub fn set_remote_config(
+        &self,
+        endpoint: &str,
+        namespace: &str,
+        fingerprint: &str,
+    ) -> Result<()> {
+        self.connection.execute(
+            "UPDATE remote_meta SET endpoint = ?1, namespace = ?2, config_fingerprint = ?3 WHERE id = 1",
+            params![endpoint, namespace, fingerprint],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_remote_probe(&self, healthy: bool, error: Option<&str>) -> Result<()> {
+        self.connection.execute(
+            "UPDATE remote_meta SET last_probe = ?1, healthy = ?2, last_error = ?3 WHERE id = 1",
+            params![unix_now(), i64::from(healthy), error],
+        )?;
+        Ok(())
+    }
+
+    pub fn record_remote_counter(&self, counter: &str, bytes: u64) -> Result<()> {
+        let column = match counter {
+            "hit" => "hits",
+            "miss" => "misses",
+            "authentication_failure" => "authentication_failures",
+            "corruption" => "corruptions",
+            "upload" => "uploads",
+            "download" => "downloads",
+            "retry" => "retries",
+            _ => bail!("unknown remote counter {counter}"),
+        };
+        self.connection.execute(
+            &format!("UPDATE remote_counters SET {column} = {column} + 1 WHERE id = 1"),
+            [],
+        )?;
+        if counter == "upload" {
+            self.connection.execute(
+                "UPDATE remote_counters SET upload_bytes = upload_bytes + ?1 WHERE id = 1",
+                params![bytes as i64],
+            )?;
+        } else if counter == "download" {
+            self.connection.execute(
+                "UPDATE remote_counters SET download_bytes = download_bytes + ?1 WHERE id = 1",
+                params![bytes as i64],
+            )?;
+        }
+        Ok(())
+    }
+
+    pub fn queue_remote_job(&self, key: &str, kind: &str, digest: Option<&str>) -> Result<()> {
+        let now = unix_now();
+        self.connection.execute(
+            "INSERT INTO remote_jobs(key, kind, digest, status, created_at, updated_at)
+             VALUES(?1, ?2, ?3, 'PENDING', ?4, ?4)
+             ON CONFLICT(key, kind, digest) DO UPDATE SET status = 'PENDING', updated_at = ?4",
+            params![key, kind, digest, now],
+        )?;
+        Ok(())
+    }
+
+    pub fn finish_remote_job(&self, key: &str, error: Option<&str>) -> Result<()> {
+        self.connection.execute(
+            "UPDATE remote_jobs SET status = ?1, attempts = attempts + 1, last_error = ?2,
+             updated_at = ?3 WHERE key = ?4 AND status IN ('PENDING', 'RETRY', 'RUNNING')",
+            params![
+                if error.is_some() { "FAILED" } else { "DONE" },
+                error,
+                unix_now(),
+                key
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn next_remote_job(&self) -> Result<Option<String>> {
+        self.connection
+            .query_row(
+                "SELECT key FROM remote_jobs
+                 WHERE status IN ('PENDING', 'RETRY') AND next_attempt_at <= ?1
+                 ORDER BY job_id LIMIT 1",
+                params![unix_now()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn claim_remote_job(&self, key: &str) -> Result<bool> {
+        Ok(self.connection.execute(
+            "UPDATE remote_jobs SET status='RUNNING', updated_at=?1
+             WHERE key=?2 AND status IN ('PENDING', 'RETRY') AND next_attempt_at <= ?1",
+            params![unix_now(), key],
+        )? != 0)
+    }
+
+    pub fn retry_remote_job(&self, key: &str, error: &str) -> Result<()> {
+        self.connection.execute(
+            "UPDATE remote_jobs SET status = CASE WHEN attempts >= 7 THEN 'FAILED' ELSE 'RETRY' END,
+             attempts = attempts + 1,
+             next_attempt_at = ?1 + (1 << MIN(attempts, 6)), last_error = ?2, updated_at = ?1
+             WHERE key = ?3 AND status IN ('PENDING', 'RETRY', 'RUNNING')",
+            params![unix_now(), error, key],
+        )?;
+        self.record_remote_counter("retry", 0)
+    }
+
+    pub fn recover_remote_jobs(&self) -> Result<()> {
+        self.connection.execute(
+            "UPDATE remote_jobs SET status='RETRY', next_attempt_at=?1 WHERE status='RUNNING'",
+            params![unix_now()],
+        )?;
+        Ok(())
     }
 
     pub fn record_cache_event(&self, event: &CacheEvent) -> Result<()> {
@@ -779,7 +1108,7 @@ impl StateDb {
         if let Some((state, reason)) = self
             .connection
             .query_row(
-                "SELECT state, error FROM cache_builds WHERE key = ?1 AND state IN ('BUILDING', 'COMMITTING', 'FAILED')",
+                "SELECT state, error FROM cache_builds WHERE key = ?1 AND state IN ('BUILDING', 'COMMITTING', 'REMOTE_FETCHING', 'FAILED')",
                 params![key],
                 |row| Ok((row.get::<_, String>(0)?, row.get(1)?)),
             )
@@ -1016,5 +1345,24 @@ mod tests {
             db.acquire_cache_build("key", 2, 30, true).unwrap(),
             CacheBuildDecision::Producer { .. }
         ));
+    }
+
+    #[test]
+    fn remote_jobs_are_claimed_and_recovered() {
+        let root = tempdir().unwrap();
+        let paths = RgoPaths {
+            root: root.path().join("rgo"),
+        };
+        paths.ensure_layout().unwrap();
+        let db = StateDb::open(&paths).unwrap();
+        db.set_remote_config("https://cache.example", "stable", "fingerprint")
+            .unwrap();
+        db.queue_remote_job("key", "manifest", None).unwrap();
+        assert_eq!(db.next_remote_job().unwrap().as_deref(), Some("key"));
+        assert!(db.claim_remote_job("key").unwrap());
+        db.recover_remote_jobs().unwrap();
+        assert_eq!(db.next_remote_job().unwrap().as_deref(), Some("key"));
+        let status = db.remote_status(true, Some("https://cache.example"), Some("stable"));
+        assert_eq!(status.unwrap().queue_depth, 1);
     }
 }

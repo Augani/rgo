@@ -10,6 +10,8 @@ rust-version.workspace = true
 [dependencies]
 rgo-protocol.workspace = true
 rgo-cas.workspace = true
+rgo-remote.workspace = true
+blake3.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
 serde.workspace = true

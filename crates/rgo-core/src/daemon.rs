@@ -16,11 +16,12 @@ use rgo_protocol::{
 
 use crate::config::{Resolved, volume_free_bytes};
 use crate::context;
-use crate::db::{CacheBuildDecision, StateDb};
+use crate::db::{CacheBuildDecision, RemoteFetchDecision, StateDb};
 use crate::gc::{self, Inputs};
 use crate::ipc::{self, Connection, Listener};
 use crate::paths::RgoPaths;
 use rgo_cas::{MANIFEST_VERSION, Manifest, ManifestOutput, ObjectRef, Store};
+use rgo_remote::{Client as RemoteClient, Config as RemoteConfig, Fetch as RemoteFetch};
 
 const POLL_INTERVAL: Duration = Duration::from_secs(30);
 
@@ -32,10 +33,53 @@ struct State {
     cas: Store,
     operation_lock: Arc<Mutex<()>>,
     pid: u32,
+    remote: Option<RemoteClient>,
+    remote_error: Arc<Mutex<Option<String>>>,
 }
 
 struct InstanceLock {
     _file: File,
+}
+
+fn configured_remote(
+    cfg: &Resolved,
+    remote_error: &Arc<Mutex<Option<String>>>,
+) -> Option<RemoteClient> {
+    if !cfg.cache.enabled || !cfg.remote.enabled {
+        return None;
+    }
+    let token = match std::env::var(&cfg.remote.token_env) {
+        Ok(token) if !token.is_empty() => token,
+        Ok(_) => {
+            *remote_error.lock().unwrap() = Some("remote token is empty".into());
+            return None;
+        }
+        Err(_) => {
+            *remote_error.lock().unwrap() = Some(format!(
+                "remote token environment variable {} is not set",
+                cfg.remote.token_env
+            ));
+            return None;
+        }
+    };
+    let config = RemoteConfig {
+        endpoint: cfg.remote.endpoint.clone(),
+        namespace: cfg.remote.namespace.clone(),
+        token,
+        timeout: cfg.remote.timeout,
+        max_object_size: match cfg.remote.max_object_size {
+            crate::config::Size::Bytes(value) => value,
+            crate::config::Size::Auto => 2 * (1 << 30),
+        },
+        allow_insecure_loopback: cfg.remote.allow_insecure_loopback,
+    };
+    match RemoteClient::new(config) {
+        Ok(client) => Some(client),
+        Err(error) => {
+            *remote_error.lock().unwrap() = Some(error.to_string());
+            None
+        }
+    }
 }
 
 pub fn run(paths: RgoPaths, cfg: Resolved) -> Result<()> {
@@ -61,9 +105,19 @@ pub fn run(paths: RgoPaths, cfg: Resolved) -> Result<()> {
     let cas = Store::new(paths.cas_dir(), paths.quarantine_dir())?;
     let mut db = StateDb::open(&paths)?;
     db.recover_cache_builds()?;
+    db.recover_remote_jobs()?;
     db.reconcile(&paths)?;
     reconcile_cache(&mut db, &cas)?;
     drain_cache_events(&paths, &db)?;
+    let remote_error = Arc::new(Mutex::new(None));
+    let remote = configured_remote(&cfg, &remote_error);
+    if remote.is_some() {
+        let fingerprint =
+            blake3::hash(format!("{}:{}", cfg.remote.namespace, cfg.remote.endpoint).as_bytes())
+                .to_hex()
+                .to_string();
+        db.set_remote_config(&cfg.remote.endpoint, &cfg.remote.namespace, &fingerprint)?;
+    }
     let db = Arc::new(Mutex::new(db));
     let listener = Listener::bind(&paths.socket_path())?;
     let state = State {
@@ -73,6 +127,8 @@ pub fn run(paths: RgoPaths, cfg: Resolved) -> Result<()> {
         cas,
         operation_lock: Arc::new(Mutex::new(())),
         pid: std::process::id(),
+        remote,
+        remote_error,
     };
 
     tracing::info!(socket = %paths.socket_path().display(), "rgo daemon listening");
@@ -315,6 +371,30 @@ fn handle_request_result(state: &State, request: Request) -> Result<Response> {
                     lease_id: Some(lease_id),
                 });
             }
+            if state.remote.is_some() {
+                let decision = {
+                    let db = state.db.lock().unwrap();
+                    db.acquire_remote_fetch(&key, pid, ttl_secs)?
+                };
+                return match decision {
+                    RemoteFetchDecision::Started { lease_id } => {
+                        let worker_state = state.clone();
+                        let worker_key = key.clone();
+                        thread::spawn(move || {
+                            remote_fetch_worker(&worker_state, &worker_key, lease_id)
+                        });
+                        Ok(Response::CacheRemotePending {
+                            key,
+                            retry_after_millis: 100,
+                        })
+                    }
+                    RemoteFetchDecision::Wait => Ok(Response::CacheRemotePending {
+                        key,
+                        retry_after_millis: 100,
+                    }),
+                    RemoteFetchDecision::Build(decision) => Ok(cache_build_response(key, decision)),
+                };
+            }
             let db = state.db.lock().unwrap();
             match db.acquire_cache_build(&key, pid, ttl_secs, true)? {
                 CacheBuildDecision::Producer {
@@ -352,6 +432,13 @@ fn handle_request_result(state: &State, request: Request) -> Result<Response> {
                 });
             }
             let db = state.db.lock().unwrap();
+            db.expire_leases()?;
+            if state.remote.is_some() && db.remote_fetch_active(&key)? {
+                return Ok(Response::CacheRemotePending {
+                    key,
+                    retry_after_millis: 100,
+                });
+            }
             match db.acquire_cache_build(&key, pid, ttl_secs, false)? {
                 CacheBuildDecision::Producer {
                     lease_id,
@@ -398,6 +485,14 @@ fn handle_request_result(state: &State, request: Request) -> Result<Response> {
             )?;
             let accepted =
                 db.finish_cache_commit(&key, lease_id, &state.cas.manifest_path(&manifest.key))?;
+            if accepted && state.remote.is_some() && state.cfg.remote.upload {
+                db.queue_remote_job(&manifest.key, "manifest", None)?;
+                if db.claim_remote_job(&manifest.key)? {
+                    let worker_state = state.clone();
+                    let worker_key = manifest.key.clone();
+                    thread::spawn(move || remote_upload_worker(&worker_state, &worker_key));
+                }
+            }
             Ok(Response::CacheCommitted { accepted })
         }
         Request::CacheFail {
@@ -433,10 +528,50 @@ fn handle_request_result(state: &State, request: Request) -> Result<Response> {
         Request::QueryCacheStats => {
             let db = state.db.lock().unwrap();
             drain_cache_events(&state.paths, &db)?;
-            Ok(Response::CacheStats(db.cache_stats(
-                state.cfg.cache.enabled,
-                state.cas.object_bytes()?,
-            )?))
+            let mut report = db.cache_stats(state.cfg.cache.enabled, state.cas.object_bytes()?)?;
+            report.remote = remote_status_from_db(state, &db)?;
+            Ok(Response::CacheStats(report))
+        }
+        Request::QueryRemoteStatus => Ok(Response::RemoteStatus(remote_status(state)?)),
+        Request::ProbeRemote => {
+            let Some(remote) = &state.remote else {
+                return Ok(Response::RemoteProbe(rgo_protocol::RemoteProbeReport {
+                    ok: false,
+                    namespace: (!state.cfg.remote.namespace.is_empty())
+                        .then(|| state.cfg.remote.namespace.clone()),
+                    message: state
+                        .remote_error
+                        .lock()
+                        .unwrap()
+                        .clone()
+                        .unwrap_or_else(|| "remote CAS is disabled".into()),
+                }));
+            };
+            match remote.probe() {
+                Ok(()) => {
+                    *state.remote_error.lock().unwrap() = None;
+                    state.db.lock().unwrap().set_remote_probe(true, None)?;
+                    Ok(Response::RemoteProbe(rgo_protocol::RemoteProbeReport {
+                        ok: true,
+                        namespace: Some(remote.namespace().into()),
+                        message: "remote endpoint is reachable".into(),
+                    }))
+                }
+                Err(error) => {
+                    let message = error.to_string();
+                    *state.remote_error.lock().unwrap() = Some(message.clone());
+                    state
+                        .db
+                        .lock()
+                        .unwrap()
+                        .set_remote_probe(false, Some(&message))?;
+                    Ok(Response::RemoteProbe(rgo_protocol::RemoteProbeReport {
+                        ok: false,
+                        namespace: Some(remote.namespace().into()),
+                        message,
+                    }))
+                }
+            }
         }
         Request::ExplainCache { key } => {
             let db = state.db.lock().unwrap();
@@ -487,8 +622,11 @@ fn status_report(state: &State) -> Result<StatusReport> {
     });
     let cache = {
         let db = state.db.lock().unwrap();
-        db.cache_stats(state.cfg.cache.enabled, state.cas.object_bytes()?)?
+        let mut report = db.cache_stats(state.cfg.cache.enabled, state.cas.object_bytes()?)?;
+        report.remote = remote_status_from_db(state, &db)?;
+        report
     };
+    let remote = cache.remote.clone();
     Ok(StatusReport {
         managed_bytes: contexts.iter().map(|c| c.usage.physical_bytes).sum(),
         incremental_bytes: contexts
@@ -510,7 +648,241 @@ fn status_report(state: &State) -> Result<StatusReport> {
         last_gc_error: last_gc.error,
         cache,
         protocol_compatible: true,
+        remote,
     })
+}
+
+fn cache_build_response(key: String, decision: CacheBuildDecision) -> Response {
+    match decision {
+        CacheBuildDecision::Producer {
+            lease_id,
+            expires_in_secs,
+        } => Response::CacheProducer {
+            key,
+            lease_id,
+            expires_in_secs,
+        },
+        CacheBuildDecision::Wait { expires_in_secs } => Response::CacheWait {
+            key,
+            retry_after_millis: 100,
+            expires_in_secs,
+        },
+    }
+}
+
+fn remote_status(state: &State) -> Result<rgo_protocol::RemoteStatusReport> {
+    let db = state.db.lock().unwrap();
+    remote_status_from_db(state, &db)
+}
+
+fn remote_status_from_db(state: &State, db: &StateDb) -> Result<rgo_protocol::RemoteStatusReport> {
+    let mut report = db.remote_status(
+        state.cfg.cache.enabled && state.cfg.remote.enabled,
+        (!state.cfg.remote.endpoint.is_empty())
+            .then(|| redact_endpoint(&state.cfg.remote.endpoint))
+            .as_deref(),
+        (!state.cfg.remote.namespace.is_empty()).then_some(state.cfg.remote.namespace.as_str()),
+    )?;
+    if let Some(error) = state.remote_error.lock().unwrap().clone() {
+        report.healthy = false;
+        report.protocol_compatible = false;
+        report.last_error = Some(error);
+    }
+    Ok(report)
+}
+
+fn redact_endpoint(endpoint: &str) -> String {
+    let Some((scheme, rest)) = endpoint.split_once("://") else {
+        return "<invalid endpoint>".into();
+    };
+    let Some(at) = rest.find('@') else {
+        return rest.split(['?', '#']).next().map_or_else(
+            || endpoint.to_owned(),
+            |authority| format!("{scheme}://{authority}"),
+        );
+    };
+    let authority = rest[at + 1..].split(['?', '#']).next().unwrap_or_default();
+    format!("{scheme}://<redacted>@{authority}")
+}
+
+fn remote_fetch_worker(state: &State, key: &str, lease_id: u64) {
+    let result = remote_fetch_worker_result(state, key, lease_id);
+    if let Err(error) = result {
+        tracing::debug!(key, %error, "remote cache fetch fell back to local compilation");
+    }
+}
+
+fn remote_fetch_worker_result(state: &State, key: &str, lease_id: u64) -> Result<()> {
+    let Some(remote) = &state.remote else {
+        return Ok(());
+    };
+    let fetched = match remote.get_manifest(key) {
+        Ok(value) => value,
+        Err(error) => {
+            let message = error.to_string();
+            let db = state.db.lock().unwrap();
+            db.record_remote_counter(
+                if matches!(error.kind, rgo_remote::RemoteErrorKind::Authentication) {
+                    "authentication_failure"
+                } else {
+                    "miss"
+                },
+                0,
+            )?;
+            db.remote_fetch_fallback(key, lease_id, &message)?;
+            *state.remote_error.lock().unwrap() = Some(message);
+            return Ok(());
+        }
+    };
+    let RemoteFetch::Hit(manifest_bytes) = fetched else {
+        let db = state.db.lock().unwrap();
+        db.record_remote_counter("miss", 0)?;
+        db.remote_fetch_fallback(key, lease_id, "remote_manifest_missing")?;
+        return Ok(());
+    };
+    let manifest: Manifest = match serde_json::from_slice::<Manifest>(&manifest_bytes) {
+        Ok(manifest) if manifest.version == MANIFEST_VERSION && manifest.key == key => manifest,
+        _ => {
+            let db = state.db.lock().unwrap();
+            db.record_remote_counter("corruption", 0)?;
+            db.remote_fetch_fallback(key, lease_id, "invalid_remote_manifest")?;
+            return Ok(());
+        }
+    };
+    if manifest
+        .outputs
+        .iter()
+        .any(|output| !safe_output_name(&output.name) || !valid_object_ref(&output.object))
+        || manifest
+            .stdout
+            .as_ref()
+            .is_some_and(|object| !valid_object_ref(object))
+        || manifest
+            .stderr
+            .as_ref()
+            .is_some_and(|object| !valid_object_ref(object))
+    {
+        let db = state.db.lock().unwrap();
+        db.record_remote_counter("corruption", 0)?;
+        db.remote_fetch_fallback(key, lease_id, "unsafe_remote_output_name")?;
+        return Ok(());
+    }
+    for object in manifest
+        .outputs
+        .iter()
+        .map(|output| &output.object)
+        .chain(manifest.stdout.iter())
+        .chain(manifest.stderr.iter())
+    {
+        let bytes = match remote.get_object(&object.digest) {
+            Ok(RemoteFetch::Hit(bytes)) => bytes,
+            Ok(RemoteFetch::Miss) => {
+                let db = state.db.lock().unwrap();
+                db.record_remote_counter("miss", 0)?;
+                db.remote_fetch_fallback(key, lease_id, "remote_object_missing")?;
+                return Ok(());
+            }
+            Err(error) => {
+                let message = error.to_string();
+                let db = state.db.lock().unwrap();
+                db.record_remote_counter("corruption", 0)?;
+                db.remote_fetch_fallback(key, lease_id, &message)?;
+                return Ok(());
+            }
+        };
+        if bytes.len() as u64 != object.size
+            || blake3::hash(&bytes).to_hex().to_string() != object.digest
+        {
+            let db = state.db.lock().unwrap();
+            db.record_remote_counter("corruption", bytes.len() as u64)?;
+            db.remote_fetch_fallback(key, lease_id, "remote_object_digest_mismatch")?;
+            return Ok(());
+        }
+        state.cas.put_bytes(&bytes, object.mode)?;
+        state
+            .db
+            .lock()
+            .unwrap()
+            .record_remote_counter("download", bytes.len() as u64)?;
+    }
+    state.cas.write_manifest(&manifest)?;
+    let wire = wire_manifest(&manifest);
+    let db = state.db.lock().unwrap();
+    db.record_cache_manifest(&wire, &state.cas.manifest_path(key))?;
+    db.record_remote_counter("hit", manifest_bytes.len() as u64)?;
+    db.record_remote_counter("download", manifest_bytes.len() as u64)?;
+    db.finish_remote_fetch(key, lease_id, &state.cas.manifest_path(key))?;
+    Ok(())
+}
+
+fn remote_upload_worker(state: &State, key: &str) {
+    if let Err(error) = remote_upload_worker_result(state, key) {
+        let message = error.to_string();
+        if let Ok(db) = state.db.lock() {
+            let terminal =
+                error
+                    .downcast_ref::<rgo_remote::RemoteError>()
+                    .is_some_and(|remote_error| {
+                        matches!(
+                            remote_error.kind,
+                            rgo_remote::RemoteErrorKind::Authentication
+                                | rgo_remote::RemoteErrorKind::Conflict
+                                | rgo_remote::RemoteErrorKind::InvalidResponse
+                                | rgo_remote::RemoteErrorKind::Unsupported
+                        )
+                    });
+            let _ = if terminal {
+                db.finish_remote_job(key, Some(&message))
+            } else {
+                db.retry_remote_job(key, &message)
+            };
+        }
+        tracing::debug!(key, error = %message, "remote cache upload deferred");
+    }
+}
+
+fn remote_upload_worker_result(state: &State, key: &str) -> Result<()> {
+    let Some(remote) = &state.remote else {
+        return Ok(());
+    };
+    let manifest = state
+        .cas
+        .read_manifest(key)?
+        .context("manifest disappeared before remote upload")?;
+    let mut objects = Vec::new();
+    objects.extend(manifest.outputs.iter().map(|output| &output.object));
+    objects.extend(manifest.stdout.iter());
+    objects.extend(manifest.stderr.iter());
+    for object in objects {
+        let bytes = state.cas.read_object(object)?;
+        remote
+            .put_object(&object.digest, &bytes)
+            .map_err(|error| anyhow::anyhow!(error))?;
+        state
+            .db
+            .lock()
+            .unwrap()
+            .record_remote_counter("upload", bytes.len() as u64)?;
+    }
+    let manifest_bytes = serde_json::to_vec(&manifest)?;
+    remote
+        .put_manifest(key, &manifest_bytes)
+        .map_err(|error| anyhow::anyhow!(error))?;
+    let db = state.db.lock().unwrap();
+    db.record_remote_counter("upload", manifest_bytes.len() as u64)?;
+    db.finish_remote_job(key, None)?;
+    Ok(())
+}
+
+fn safe_output_name(name: &str) -> bool {
+    let path = Path::new(name);
+    !name.is_empty() && !path.is_absolute() && !name.contains("..") && !name.contains(['/', '\\'])
+}
+
+fn valid_object_ref(object: &ObjectRef) -> bool {
+    object.digest.len() == 64
+        && object.digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+        && object.mode <= 0o177777
 }
 
 fn run_gc(state: &State, dry_run: bool, aggressive: bool) -> Result<GcReport> {
@@ -624,14 +996,34 @@ fn append_unreferenced_cas(
 }
 
 fn maintenance(state: &State) -> Result<()> {
-    let _operation = state.operation_lock.lock().unwrap();
-    let contexts = context::list(&state.paths)?;
-    let mut db = state.db.lock().unwrap();
-    db.expire_leases()?;
-    db.prune_failed_cache_builds(Duration::from_secs(7 * 86_400))?;
-    db.reconcile_contexts(&contexts)?;
-    reconcile_cache(&mut db, &state.cas)?;
-    drain_cache_events(&state.paths, &db)?;
+    {
+        let _operation = state.operation_lock.lock().unwrap();
+        let contexts = context::list(&state.paths)?;
+        let mut db = state.db.lock().unwrap();
+        db.expire_leases()?;
+        db.prune_failed_cache_builds(Duration::from_secs(7 * 86_400))?;
+        db.reconcile_contexts(&contexts)?;
+        reconcile_cache(&mut db, &state.cas)?;
+        drain_cache_events(&state.paths, &db)?;
+    }
+    process_remote_jobs(state)?;
+    Ok(())
+}
+
+fn process_remote_jobs(state: &State) -> Result<()> {
+    if state.remote.is_none() || !state.cfg.remote.upload {
+        return Ok(());
+    }
+    let key = {
+        let db = state.db.lock().unwrap();
+        db.next_remote_job()?
+    };
+    let Some(key) = key else { return Ok(()) };
+    let claimed = state.db.lock().unwrap().claim_remote_job(&key)?;
+    if claimed {
+        let worker_state = state.clone();
+        thread::spawn(move || remote_upload_worker(&worker_state, &key));
+    }
     Ok(())
 }
 

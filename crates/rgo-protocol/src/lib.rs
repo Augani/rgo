@@ -6,7 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u32 = 4;
+pub const PROTOCOL_VERSION: u32 = 5;
 pub const MAX_FRAME_SIZE: usize = 1024 * 1024;
 pub const DEFAULT_LEASE_TTL_SECS: u32 = 30;
 pub const DEFAULT_HEARTBEAT_SECS: u32 = 10;
@@ -114,9 +114,12 @@ pub enum Request {
         key: String,
     },
     VerifyCache,
+    QueryRemoteStatus,
+    ProbeRemote,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(clippy::large_enum_variant)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Response {
     Hello {
@@ -146,6 +149,14 @@ pub enum Response {
         retry_after_millis: u64,
         expires_in_secs: u32,
     },
+    CacheRemotePending {
+        key: String,
+        retry_after_millis: u64,
+    },
+    CacheRemoteFailed {
+        key: String,
+        reason: String,
+    },
     CacheReady {
         manifest: CacheManifest,
         lease_id: Option<u64>,
@@ -159,6 +170,9 @@ pub enum Response {
     CacheStats(CacheStatsReport),
     CacheExplanation(CacheExplanation),
     CacheVerify(CacheVerifyReport),
+    RemoteStatus(RemoteStatusReport),
+    RemoteProbe(RemoteProbeReport),
+    RemoteError(RemoteErrorReport),
     Error {
         code: String,
         message: String,
@@ -213,6 +227,7 @@ pub struct CacheStatsReport {
     pub single_flight_timeouts: u64,
     pub single_flight_takeovers: u64,
     pub active_builds: u64,
+    pub remote: RemoteStatusReport,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -250,6 +265,43 @@ pub struct StatusReport {
     pub last_gc_error: Option<String>,
     pub cache: CacheStatsReport,
     pub protocol_compatible: bool,
+    pub remote: RemoteStatusReport,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteStatusReport {
+    pub enabled: bool,
+    pub configured: bool,
+    pub healthy: bool,
+    pub endpoint: Option<String>,
+    pub namespace: Option<String>,
+    pub protocol_compatible: bool,
+    pub queue_depth: u64,
+    pub hits: u64,
+    pub misses: u64,
+    pub authentication_failures: u64,
+    pub corruptions: u64,
+    pub uploads: u64,
+    pub downloads: u64,
+    pub upload_bytes: u64,
+    pub download_bytes: u64,
+    pub retries: u64,
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteProbeReport {
+    pub ok: bool,
+    pub namespace: Option<String>,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteErrorReport {
+    pub code: String,
+    pub status: Option<u16>,
+    pub retryable: bool,
+    pub message: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -393,6 +445,25 @@ mod tests {
         assert!(matches!(
             decode_frame::<Response>(&frame).unwrap(),
             Response::CacheWait { .. }
+        ));
+    }
+
+    #[test]
+    fn remote_messages_round_trip_with_structured_status() {
+        let request = Request::ProbeRemote;
+        let frame = encode_frame(&request).unwrap();
+        assert_eq!(decode_frame::<Request>(&frame).unwrap(), request);
+        let response = Response::RemoteStatus(RemoteStatusReport {
+            enabled: true,
+            configured: true,
+            healthy: true,
+            namespace: Some("toolchain-target".into()),
+            ..Default::default()
+        });
+        let frame = encode_frame(&response).unwrap();
+        assert!(matches!(
+            decode_frame::<Response>(&frame).unwrap(),
+            Response::RemoteStatus(_)
         ));
     }
 }

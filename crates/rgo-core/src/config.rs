@@ -13,6 +13,7 @@ pub struct Config {
     pub storage: Storage,
     pub gc: Gc,
     pub cache: Cache,
+    pub remote: Remote,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -50,6 +51,22 @@ pub struct Cache {
     pub single_flight_timeout: Duration,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Remote {
+    /// Remote CAS is opt-in and is ignored when `cache.enabled` is false.
+    pub enabled: bool,
+    pub endpoint: String,
+    pub namespace: String,
+    pub token_env: String,
+    #[serde(with = "humantime_serde")]
+    pub timeout: Duration,
+    pub max_object_size: Size,
+    pub upload: bool,
+    /// Only intended for an in-process loopback test server. Production endpoints must use TLS.
+    pub allow_insecure_loopback: bool,
+}
+
 impl Default for Cache {
     fn default() -> Self {
         Self {
@@ -58,6 +75,21 @@ impl Default for Cache {
             single_flight_timeout: Duration::from_secs(
                 rgo_protocol::DEFAULT_SINGLE_FLIGHT_TIMEOUT_SECS as u64,
             ),
+        }
+    }
+}
+
+impl Default for Remote {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            endpoint: String::new(),
+            namespace: String::new(),
+            token_env: "RGO_REMOTE_TOKEN".into(),
+            timeout: Duration::from_secs(5),
+            max_object_size: Size::Bytes(2 * (1 << 30)),
+            upload: true,
+            allow_insecure_loopback: false,
         }
     }
 }
@@ -123,6 +155,7 @@ pub struct Resolved {
     pub min_free_space: u64,
     pub gc: Gc,
     pub cache: Cache,
+    pub remote: Remote,
     pub volume_total: u64,
 }
 
@@ -158,6 +191,7 @@ impl Config {
             min_free_space,
             gc: self.gc.clone(),
             cache: self.cache.clone(),
+            remote: self.remote.clone(),
             volume_total,
         })
     }
@@ -212,6 +246,8 @@ mod tests {
         assert_eq!(c.storage.max_size, Size::Auto);
         assert_eq!(c.gc.orphan_grace, Duration::from_secs(3600));
         assert!(!c.cache.enabled);
+        assert!(!c.remote.enabled);
+        assert_eq!(c.remote.token_env, "RGO_REMOTE_TOKEN");
         assert!(!c.cache.remap_workspace_paths);
         assert_eq!(
             c.cache.single_flight_timeout,
@@ -231,6 +267,9 @@ mod tests {
             [cache]
             remap_workspace_paths = true
             single_flight_timeout = "7s"
+            [remote]
+            timeout = "2s"
+            max_object_size = "4MiB"
             "#,
         )
         .unwrap();
@@ -239,6 +278,8 @@ mod tests {
         assert_eq!(c.gc.incremental_retention, Duration::from_secs(3 * 86400));
         assert!(c.cache.remap_workspace_paths);
         assert_eq!(c.cache.single_flight_timeout, Duration::from_secs(7));
+        assert_eq!(c.remote.timeout, Duration::from_secs(2));
+        assert_eq!(c.remote.max_object_size, Size::Bytes(4 * 1024 * 1024));
     }
 
     #[test]

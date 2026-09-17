@@ -73,8 +73,7 @@ impl Store {
             mode,
         };
         let path = self.object_path(&digest);
-        if path.is_file() {
-            self.verify_object(&object)?;
+        if path.is_file() && self.verify_object(&object).is_ok() {
             return Ok(object);
         }
         let parent = path.parent().context("object path has no parent")?;

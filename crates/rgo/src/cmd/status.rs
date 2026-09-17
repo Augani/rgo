@@ -86,6 +86,17 @@ pub fn run() -> Result<()> {
                     "disabled"
                 }
             );
+            println!(
+                "Remote CAS           {}   {} hit(s), {} miss(es), queue {}",
+                if status.remote.enabled {
+                    "enabled"
+                } else {
+                    "disabled"
+                },
+                status.remote.hits,
+                status.remote.misses,
+                status.remote.queue_depth
+            );
             println!("Daemon               running (pid {})", status.daemon_pid);
             return Ok(());
         }

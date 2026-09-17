@@ -69,6 +69,27 @@ pub fn run() -> Result<()> {
         e.paths.builds_dir().is_dir(),
         format!("managed root exists: {}", e.paths.builds_dir().display()),
     );
+    if e.cfg.remote.enabled {
+        check(
+            e.cfg.cache.enabled,
+            "remote CAS requires cache.enabled = true".into(),
+        );
+        check(
+            !e.cfg.remote.endpoint.is_empty(),
+            "remote endpoint is configured".into(),
+        );
+        check(
+            !e.cfg.remote.namespace.is_empty(),
+            "remote namespace is configured".into(),
+        );
+        check(
+            std::env::var_os(&e.cfg.remote.token_env).is_some_and(|token| !token.is_empty()),
+            format!(
+                "remote token is available through {}",
+                e.cfg.remote.token_env
+            ),
+        );
+    }
     let daemon_ok = daemon::ensure_running(&e.paths);
     check(
         daemon_ok,
@@ -116,6 +137,21 @@ pub fn run() -> Result<()> {
                     "disabled"
                 }
             );
+            println!(
+                "info remote CAS: {} (healthy {}, queue {}, {} upload(s), {} download(s))",
+                if status.remote.enabled {
+                    "enabled"
+                } else {
+                    "disabled"
+                },
+                status.remote.healthy,
+                status.remote.queue_depth,
+                status.remote.uploads,
+                status.remote.downloads
+            );
+            if let Some(error) = status.remote.last_error {
+                println!("info remote last error: {error}");
+            }
         }
     }
     let free = volume_free_bytes(&e.paths.root).unwrap_or(0);
