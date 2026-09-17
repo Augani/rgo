@@ -401,18 +401,166 @@ Cargo in a sandboxed `$HOME` (see `crates/rgo/tests/relocate.rs`).
 
 1. ~~**Scaffold**: workspace, 5 crates, `rgo --help`.~~ done
 2. ~~`rgo-core::config` + machine-aware defaults + size parsing (+ unit tests).~~ done
-3. ~~`rgo setup` / `--undo` / `--dry-run` with fenced config editing.~~ done (service install pending)
-4. ~~`rgo-core::size` physical, hardlink-aware measurement.~~ done (Windows allocation size TODO)
+3. ~~`rgo setup` / `--undo` / `--dry-run` with fenced config editing and service installation.~~ done
+4. ~~`rgo-core::size` physical, hardlink-aware measurement.~~ done
 5. ~~Sidecar protocol + wrapper Phase 1 behaviour.~~ done
-6. ~~`rgo ls`, `rgo status`~~ done; `rgo doctor` — basic checks done, toolchain/fs/service checks TODO
-7. `rgo gc` tiers 0–4 — implemented with `.cargo-build-lock` live detection; needs unit tests for
-   `gc::plan` with synthetic contexts and a concurrent-build torture test. `rgo adopt` — stub.
-8. Service installers (launchd plist, systemd user unit, schtasks) + `rgo gc --auto`.
-9. CI matrix (macOS/Linux/Windows), `cargo dist`/release binaries, Homebrew tap.
+6. ~~`rgo ls`, `rgo status`, and `rgo doctor` toolchain/filesystem/service checks.~~ done
+7. ~~`rgo gc` tiers 0–4, synthetic policy tests, concurrent-build torture test, and `rgo adopt`.~~ done
+8. ~~Service installers (launchd plist, systemd user unit, schtasks).~~ done; `rgo gc --auto` remains pending.
+9. ~~CI matrix (macOS/Linux/Windows, including btrfs smoke).~~ done; release packaging and Homebrew tap remain pending.
 10. Release v0.1 (Phase 1). Dogfood on your own machine.
-11. Daemon + leases + SQLite (Phase 2) → v0.2.
-12. Wrapper classifier + key + CAS behind `cache.enabled=false` (Phase 3) → v0.3, flip default after gates.
-13. Phase 4 items → v0.4+.
+11. ~~Daemon + leases + SQLite (Phase 2).~~ implemented; release validation remains.
+12. ~~Wrapper classifier + key + CAS behind `cache.enabled=false` (Phase 3).~~ implemented; differential correctness gates remain before enabling by default.
+13. Single-flight and opt-in workspace path remapping are implemented; wrapper-composition validation and the full Phase 4 compatibility corpus remain.
+14. Optional remote CAS is implemented behind opt-in configuration; interoperability and failure-injection validation remain.
+
+### Detailed remaining-work checklist
+
+Work in this order. Items marked **release-blocking** must be complete before the named release or default is changed.
+
+#### A. Finish and release Phase 1 — bounded storage (`v0.1`, release-blocking)
+
+- [ ] Implement `rgo gc --auto` for unattended/opportunistic invocation.
+  - Exit quickly and successfully when `[gc].auto = false` or no trigger condition is met.
+  - Trigger only when managed bytes exceed the soft watermark or free space is below the reserve.
+  - Coordinate through the daemon when available; if coordination is unavailable, do not run unsafe GC.
+  - Produce quiet, stable output suitable for cron/service use and a useful non-zero exit on configuration errors.
+  - Add tests for disabled, no-pressure, soft-watermark, free-space-pressure, and daemon-unavailable cases.
+- [ ] Implement the documented `rgo gc --target <bytes>` override.
+  - Reuse the existing size parser and reject malformed or impossible targets clearly.
+  - Preserve tier ordering, pins, leases, live-lock checks, and rename-before-delete safety.
+  - Report requested, planned, and actually reclaimed bytes in dry-run and real modes.
+- [ ] Complete setup lifecycle hardening.
+  - Write Cargo configuration atomically and preserve permissions.
+  - Verify `setup`, repeated `setup`, `--dry-run`, `--undo`, and repeated `--undo` against empty and existing `[build]` tables.
+  - Verify setup never changes content outside the managed fence.
+  - Verify service installation failure leaves build relocation usable and prints an actionable fallback.
+- [ ] Complete precedence and compatibility coverage.
+  - Test project `build-dir`, project `target-dir`, `CARGO_BUILD_BUILD_DIR`, `CARGO_TARGET_DIR`, and `--target-dir` overrides with real Cargo.
+  - Test `RGO_BYPASS=1` for both the CLI passthrough and rustc wrapper, including removal of inherited `RGO_*` coordination variables.
+  - Test unknown Cargo subcommands, `+toolchain`, non-UTF-8 arguments where supported, signals, stdio, and exact exit-code propagation.
+- [ ] Expand `rgo adopt` safety coverage.
+  - Cover nested workspaces, custom profiles, cross-target output, symlinks, unreadable paths, and builds that become live between scan and deletion.
+  - Confirm final binaries, examples, docs, package output, and user-created files are never selected.
+  - Add an explicit confirmation UX if interactive deletion is introduced; non-interactive deletion must remain narrowly scoped.
+- [ ] Dogfood storage behavior on representative large projects.
+  - Record physical bytes before and after setup, after repeated debug/release builds, and after deleting checkouts.
+  - Confirm checkout `target/` directories retain requested final outputs while intermediates remain bounded centrally.
+  - Exercise a storage root on another volume and document the copy-versus-hardlink performance trade-off.
+- [ ] Finish release packaging.
+  - Add reproducible release binaries, checksums, and `cargo-dist` or equivalent automation.
+  - Add Homebrew installation and upgrade validation.
+  - Verify `rgo` and `rgo-rustc-wrapper` are always installed beside each other.
+  - Publish installation, upgrade, uninstall, bypass, and recovery instructions.
+
+**Phase 1 done when:** a fresh install followed by plain Cargo usage bounds intermediate storage automatically; overrides and bypass remain reliable; GC cannot remove active or pinned state; and release artifacts work on macOS, Linux, and Windows.
+
+#### B. Production-harden Phase 2 — daemon and leases (`v0.2`, release-blocking)
+
+- [ ] Complete daemon failure and recovery testing.
+  - Kill the daemon during lease acquisition, heartbeat, GC planning, GC staging, cache publication, and status queries.
+  - Verify expired leases are reclaimed and clients continue building without rgo-caused failures.
+  - Verify stale PID files, stale sockets, concurrent startup, and protocol-version mismatches recover cleanly.
+- [ ] Strengthen IPC platform guarantees.
+  - Verify Unix socket ownership and `0600` access on macOS/Linux.
+  - Verify the Windows named-pipe DACL restricts access to the current user.
+  - Bound frame size, connection duration, request latency, and malformed-client resource consumption.
+- [ ] Complete SQLite recovery coverage.
+  - Inject truncation and corruption into the DB, WAL, and SHM files at multiple transaction points.
+  - Rebuild contexts, pins where recoverable, cache manifests, and accounting from filesystem truth.
+  - Verify corrupt DB quarantine is atomic, clearly reported, and never blocks ordinary Cargo builds.
+- [ ] Complete the specified concurrency torture suite.
+  - Run at least 20 parallel builds across five worktrees while aggressive GC loops.
+  - Randomly kill clients and the daemon and vary lease/heartbeat timing.
+  - Assert zero live-context deletion, zero leaked leases after TTL, no deadlocks, and no rgo-attributable build failures.
+- [ ] Validate maintenance behavior under sustained pressure.
+  - Test periodic rescans, free-space watchdog behavior, GC serialization, and cache-admission suspension.
+  - Ensure maintenance work is low priority and does not materially delay compiler invocations.
+
+**Phase 2 done when:** coordination failures degrade to safe uncached builds, the DB is demonstrably rebuildable, and concurrent builds plus GC survive fault injection on every supported OS.
+
+#### C. Prove Phase 3 cache correctness before enabling it by default (`v0.3`, release-blocking)
+
+- [ ] Build the differential compatibility corpus.
+  - Cover at least 50 popular registry crates across three toolchains and all three supported operating systems.
+  - Include features, custom profiles, cross compilation, path/git dependencies, multiple registries, clippy, rustdoc, tests, benches, and examples.
+  - Compare cold and cache-hit exit status, stdout/stderr bytes, diagnostics, `.rlib`/`.rmeta` bytes, executable behavior, and no-op rebuild behavior.
+- [ ] Audit and lock down artifact-key completeness.
+  - Verify compiler identity caching invalidates on rustc binary replacement.
+  - Verify all order-sensitive arguments remain ordered and only proven order-insensitive arguments are normalized.
+  - Verify source, `--extern`, target, crate metadata, codegen, cfg, relevant Cargo environment, and build-script input identities participate correctly.
+  - Add regression vectors for every discovered incorrect-equivalence risk and version the key schema when behavior changes.
+- [ ] Harden cacheability classification.
+  - Add table-driven accept/bypass tests for every crate type, emit mode, `-Z` flag, incremental mode, native input, external path, symlink, `OUT_DIR`, and unsupported invocation.
+  - Ensure ambiguity always produces a named bypass reason and ordinary compilation.
+  - Verify no semantic changes are made merely to improve hit rate.
+- [ ] Complete CAS integrity and crash-safety testing.
+  - Inject bit flips, truncation, wrong modes, missing objects, manifest/object disagreement, interrupted writes, and concurrent identical producers.
+  - Verify corruption always quarantines and misses; it must never materialize bad output or report false success.
+  - Verify immutable object permissions and atomic publication on APFS, ext4, btrfs, XFS where available, and NTFS.
+- [ ] Complete materialization validation.
+  - Test clonefile/reflink, safe hardlink, copy fallback, cross-volume operation, permission preservation, and partial destination failure.
+  - Ensure consumers cannot mutate CAS objects through a hardlink.
+  - Measure physical rather than logical bytes for reflinked and hardlinked data.
+- [ ] Finish cache observability.
+  - Make `rgo cache explain` report stable hit, miss, bypass, timeout, takeover, corruption, and remote-fallback reasons without exposing sensitive values.
+  - Verify stats survive daemon restarts and DB reconstruction where intended.
+  - Add per-class hit-rate and bytes-avoided measurements needed to judge whether caching pays for its overhead.
+- [ ] Establish performance gates.
+  - Benchmark wrapper startup, hashing, daemon round trips, cold misses, hits, and no-cache bypasses.
+  - Cache compiler identity and other safe metadata so ordinary builds do not invoke `rustc -vV` repeatedly.
+  - Define acceptable overhead for cache-disabled and fully bypassed builds and fail benchmarks on meaningful regressions.
+
+**Phase 3 done when:** the differential corpus has zero known incorrect hits, corruption only causes misses, cache-disabled overhead is acceptable, and the default can be enabled without weakening Cargo compatibility.
+
+#### D. Complete Phase 4 — composition and broader reuse (`v0.4+`)
+
+- [ ] Implement and validate existing-wrapper composition.
+  - Define exact Cargo configuration and process chains for no wrapper, `sccache`, and unknown wrappers.
+  - Preserve and restore pre-existing configuration across setup/undo without editing unrelated user content.
+  - Let rgo yield for classes handled by `sccache`; conservatively disconnect or bypass unknown chains.
+  - Add real-Cargo integration tests proving argument order, environment, diagnostics, exit codes, and no recursive wrapper invocation.
+- [ ] Finish single-flight fault coverage.
+  - Test producer death in `BUILDING` and `COMMITTING`, waiter timeout, lease takeover, daemon restart, failed compiler output, and publication failure.
+  - Confirm waiters always have a bounded fallback to compiling independently and there is never a global lock.
+- [ ] Validate opt-in workspace path remapping.
+  - Compare equivalent and divergent Git worktrees and ensure only equivalent inputs share keys.
+  - Test `file!()`, panic locations, diagnostics, debug info, debugger source lookup, generated code, and user-provided remap flags.
+  - Detect conflicts rather than stacking unsafe remaps; keep absolute paths in identity whenever equivalence is not proven.
+- [ ] Validate widened cache classes independently.
+  - Proc macros: host identity, loading behavior, and no unproven build-script inputs.
+  - Build-script consumers: complete and strict `OUT_DIR` digesting, symlink policy, and native-input exclusion.
+  - Metadata-only binaries/checks: output mapping and Cargo message compatibility.
+- [ ] Add repository/worktree grouping for UX without sharing mutable build roots.
+  - Use Git common-directory identity only for status grouping and cache/path-remap policy.
+  - Handle non-Git workspaces, moved repositories, nested workspaces, and deleted worktrees.
+
+**Phase 4 done when:** wrapper composition is reversible and tested, single-flight survives producer failures, and cross-worktree reuse cannot alter observable source-path semantics without explicit opt-in.
+
+#### E. Validate optional remote CAS (`v0.5+`, never required for local correctness)
+
+- [ ] Specify and version the provider-neutral HTTP protocol, namespace format, authentication behavior, and compatibility policy.
+- [ ] Add interoperability tests against at least two independent server implementations or fixtures.
+- [ ] Verify every downloaded object and manifest before local publication; malformed or oversized responses must fail closed to a local miss.
+- [ ] Test timeouts, TLS failures, authentication failures, partial downloads/uploads, retries, duplicate uploads, offline operation, and server corruption.
+- [ ] Ensure credentials never enter logs, object names, cache explanations, diagnostics, or persisted configuration unintentionally.
+- [ ] Bound upload queues and temporary download storage under disk pressure; local GC and ordinary builds must continue when remote service is unavailable.
+- [ ] Document opt-in enablement, namespace isolation, retention expectations, privacy implications, and complete disablement.
+
+**Remote CAS done when:** disconnecting or corrupting the remote service can only reduce hit rate; it cannot break a correct local build or poison the local CAS.
+
+#### F. Cross-cutting quality and release gates
+
+- [ ] Run CI on stable, beta, nightly, and the oldest supported Rust version across macOS, Linux GNU, Windows MSVC, and supported cross targets.
+- [ ] Add ext4, btrfs, APFS, and NTFS coverage for accounting, locking, rename, materialization, and disk-pressure behavior; add XFS when CI permits.
+- [ ] Add ENOSPC, permission-denied, clock-jump, atomic-rename-failure, unreadable-tree, and process-crash fault injection.
+- [ ] Add security review coverage for path traversal, symlink races, unsafe archive/object names, socket/pipe access, untrusted manifests, and secret redaction.
+- [ ] Define on-disk, DB, protocol, sidecar, manifest, and cache-key schema compatibility and migration policies before the first stable release.
+- [ ] Ensure `cargo build`, `cargo clippy --all-targets`, `cargo test`, formatting, and the real-Cargo fixture corpus are mandatory CI gates.
+- [ ] Produce end-user benchmarks showing storage growth versus plain Cargo across many projects/worktrees, GC effectiveness, cache reuse, and added build latency.
+- [ ] Document known incompatibilities and immediate recovery: `RGO_BYPASS=1`, project-level opt-out, daemon stop, `rgo setup --undo`, DB rebuild, and CAS quarantine.
+
+**Production-safe acceptance:** all invariants in `doc.md` hold; managed storage remains within documented transient headroom; active/pinned data is never collected; all cache uncertainty bypasses; corruption degrades to rebuilding; and users can install rgo, keep using plain Cargo, create/delete many worktrees, and stop thinking about accumulated target directories.
 
 ---
 

@@ -18,12 +18,14 @@ pub fn run(undo: bool, dry_run: bool, no_service: bool, no_wrapper: bool) -> Res
                 cfg_path.display()
             );
         }
-        let wrapper = if no_wrapper || insp.rustc_workspace_wrapper_outside_fence.is_some() {
-            if let Some(w) = &insp.rustc_workspace_wrapper_outside_fence {
-                eprintln!(
-                    "note: keeping your existing build.rustc-workspace-wrapper = {w:?}; context attribution will use `rgo <cmd>` only"
-                );
-            }
+        let wrapper_conflict =
+            insp.rustc_wrapper.is_some() || insp.rustc_workspace_wrapper_outside_fence.is_some();
+        if wrapper_conflict {
+            eprintln!(
+                "note: keeping existing Cargo compiler wrapper configuration; context attribution will use `rgo <cmd>` and the rgo cache will remain disconnected"
+            );
+        }
+        let wrapper = if no_wrapper || wrapper_conflict {
             None
         } else {
             Some(wrapper_path()?)
@@ -32,7 +34,8 @@ pub fn run(undo: bool, dry_run: bool, no_service: bool, no_wrapper: bool) -> Res
             &current,
             &Desired {
                 build_dir: paths.build_dir_template(),
-                rustc_workspace_wrapper: wrapper,
+                rustc_wrapper: wrapper,
+                rustc_workspace_wrapper: None,
             },
         )?
     };

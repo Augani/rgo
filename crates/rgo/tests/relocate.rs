@@ -22,6 +22,10 @@ fn plain_cargo_build_is_relocated_and_binary_still_uplifted() {
     );
     let cfg = std::fs::read_to_string(sb.cargo_home.join("config.toml")).unwrap();
     assert!(cfg.contains("build-dir"), "config was not written:\n{cfg}");
+    assert!(
+        cfg.contains("rustc-wrapper") && !cfg.contains("rustc-workspace-wrapper"),
+        "all compiler invocations must pass through rgo so dependency caching is reachable:\n{cfg}"
+    );
 
     let proj = sb.simple_bin("hello").unwrap();
     let build = sb

@@ -19,6 +19,8 @@ pub const FENCE_END: &str = "# <<< rgo managed <<<";
 pub struct Desired {
     pub build_dir: String,
     /// `None` = leave the user's wrapper setting alone.
+    pub rustc_wrapper: Option<String>,
+    /// `None` = leave the user's wrapper setting alone.
     pub rustc_workspace_wrapper: Option<String>,
 }
 
@@ -58,6 +60,9 @@ pub fn apply(text: &str, desired: &Desired) -> Result<String> {
     let mut block = DocumentMut::new();
     block["build"] = toml_edit::table();
     block["build"]["build-dir"] = value(&desired.build_dir);
+    if let Some(w) = &desired.rustc_wrapper {
+        block["build"]["rustc-wrapper"] = value(w);
+    }
     if let Some(w) = &desired.rustc_workspace_wrapper {
         block["build"]["rustc-workspace-wrapper"] = value(w);
     }
@@ -92,7 +97,7 @@ pub fn remove(text: &str) -> Result<String> {
     let mut doc: DocumentMut = outside.parse().context("parsing cargo config")?;
     if inside.is_none() {
         if let Some(b) = doc.get_mut("build").and_then(Item::as_table_mut) {
-            for k in ["build-dir", "rustc-workspace-wrapper"] {
+            for k in ["build-dir", "rustc-wrapper", "rustc-workspace-wrapper"] {
                 if b.get(k).and_then(Item::as_str).is_some_and(looks_like_ours) {
                     b.remove(k);
                 }
@@ -140,6 +145,7 @@ mod tests {
     fn desired() -> Desired {
         Desired {
             build_dir: "/home/u/.rgo/builds/{workspace-path-hash}".into(),
+            rustc_wrapper: Some("/home/u/bin/rgo-rustc-wrapper".into()),
             rustc_workspace_wrapper: None,
         }
     }

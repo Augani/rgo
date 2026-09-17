@@ -49,17 +49,17 @@ pub fn run() -> Result<()> {
     );
     if let Some(w) = &insp.rustc_wrapper {
         println!("info build.rustc-wrapper = {w:?}");
-        let delegation = std::path::Path::new(w)
-            .file_stem()
-            .and_then(|name| name.to_str())
-            .is_some_and(|name| name.eq_ignore_ascii_case("sccache"));
-        println!(
-            "info wrapper chain = rgo-rustc-wrapper -> {w} ({})",
-            if delegation {
-                "sccache overlap delegated; remapped workspace classes remain eligible"
-            } else {
-                "unknown inner wrapper; rgo cache bypasses conservatively"
-            }
+        check(
+            false,
+            "existing build.rustc-wrapper takes precedence; rgo dependency caching is disconnected; remediation: remove it and run `rgo setup`, or keep it and use rgo for storage management only".into(),
+        );
+    }
+    if let Some(w) = &insp.rustc_workspace_wrapper_outside_fence {
+        check(
+            false,
+            format!(
+                "existing build.rustc-workspace-wrapper = {w:?} prevents safe rgo wrapper installation; remediation: remove it and run `rgo setup`, or keep it and use rgo for storage management only"
+            ),
         );
     }
     for var in [

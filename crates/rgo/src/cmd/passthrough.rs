@@ -51,11 +51,19 @@ pub fn run(args: Vec<OsString>) -> Result<()> {
 
     let mut command = Command::new(&cargo);
     command.args(&args);
-    if let Some(manifest) = manifest {
-        command.env("RGO_MANIFEST_PATH", manifest);
-    }
-    if let Some(lease) = &lease {
-        command.env(LEASE_ENV, lease.id.to_string());
+    if std::env::var_os(BYPASS_ENV).is_some() {
+        for (key, _) in std::env::vars_os() {
+            if key.to_string_lossy().starts_with("RGO_") {
+                command.env_remove(key);
+            }
+        }
+    } else {
+        if let Some(manifest) = manifest {
+            command.env("RGO_MANIFEST_PATH", manifest);
+        }
+        if let Some(lease) = &lease {
+            command.env(LEASE_ENV, lease.id.to_string());
+        }
     }
     let status = command
         .status()

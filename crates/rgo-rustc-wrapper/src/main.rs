@@ -777,6 +777,11 @@ fn acquire_context_lease(build_dir: &Path) -> Option<u64> {
 fn attribute(args: &[OsString]) -> Option<PathBuf> {
     let out_dir = arg_value(args, "--out-dir")?;
     let build_dir = find_managed_build_dir(Path::new(&out_dir))?;
+    if std::env::var_os("CARGO_PRIMARY_PACKAGE").is_none()
+        && std::env::var_os("RGO_MANIFEST_PATH").is_none()
+    {
+        return Some(build_dir);
+    }
     let manifest_dir = std::env::var_os("CARGO_MANIFEST_DIR")?;
     // CARGO_MANIFEST_DIR is the *package*; RGO_MANIFEST_PATH (set by `rgo <cmd>`) is the workspace root.
     let manifest_path = std::env::var_os("RGO_MANIFEST_PATH")
