@@ -36,7 +36,18 @@ pub fn run() -> Result<()> {
     );
     if let Some(w) = &insp.rustc_wrapper {
         println!("info build.rustc-wrapper = {w:?}");
-        println!("info wrapper chain = rgo-rustc-wrapper -> {w}");
+        let delegation = std::path::Path::new(w)
+            .file_stem()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.eq_ignore_ascii_case("sccache"));
+        println!(
+            "info wrapper chain = rgo-rustc-wrapper -> {w} ({})",
+            if delegation {
+                "sccache overlap delegated; remapped workspace classes remain eligible"
+            } else {
+                "unknown inner wrapper; rgo cache bypasses conservatively"
+            }
+        );
     }
     for var in [
         "CARGO_TARGET_DIR",
@@ -88,6 +99,22 @@ pub fn run() -> Result<()> {
                 status.cache.misses,
                 status.cache.bypasses,
                 human(status.cache.cas_bytes)
+            );
+            println!(
+                "info single-flight: {} active, {} producer(s), {} waiter(s), {} timeout(s), {} takeover(s)",
+                status.cache.active_builds,
+                status.cache.single_flight_producers,
+                status.cache.single_flight_waiters,
+                status.cache.single_flight_timeouts,
+                status.cache.single_flight_takeovers
+            );
+            println!(
+                "info workspace path remapping: {}",
+                if e.cfg.cache.remap_workspace_paths {
+                    "enabled (opt-in semantic change)"
+                } else {
+                    "disabled"
+                }
             );
         }
     }

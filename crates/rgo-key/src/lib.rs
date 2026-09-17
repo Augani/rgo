@@ -13,7 +13,8 @@ use std::process::Command;
 use blake3::Hasher;
 use serde::{Deserialize, Serialize};
 
-pub const CACHE_SCHEMA_VERSION: u32 = 1;
+pub const CACHE_SCHEMA_VERSION: u32 = 2;
+pub const WORKSPACE_REMAP_PREFIX: &str = "/rgo/workspace";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -34,6 +35,10 @@ pub enum BypassReason {
     CompilerIdentity,
     InnerWrapper,
     MissingCacheState,
+    RemapConflict,
+    UnsafeWorkspacePath,
+    UnsupportedWorkspaceSource,
+    InvalidOutDir,
 }
 
 impl std::fmt::Display for BypassReason {
@@ -55,6 +60,10 @@ impl std::fmt::Display for BypassReason {
             Self::CompilerIdentity => "compiler_identity",
             Self::InnerWrapper => "inner_wrapper",
             Self::MissingCacheState => "missing_cache_state",
+            Self::RemapConflict => "remap_conflict",
+            Self::UnsafeWorkspacePath => "unsafe_workspace_path",
+            Self::UnsupportedWorkspaceSource => "unsupported_workspace_source",
+            Self::InvalidOutDir => "invalid_out_dir",
         };
         f.write_str(value)
     }
@@ -64,6 +73,15 @@ impl std::fmt::Display for BypassReason {
 pub struct AllowedRoots {
     pub build_root: PathBuf,
     pub source_roots: Vec<PathBuf>,
+    pub workspace_roots: Vec<PathBuf>,
+    pub remap_workspace_paths: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SourceKind {
+    Registry,
+    Git,
+    Workspace,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -75,15 +93,19 @@ pub struct OutputSpec {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Candidate {
     pub key: ArtifactKey,
+    pub source_kind: SourceKind,
     pub source_root: PathBuf,
     pub source_digest: String,
     pub outputs: Vec<OutputSpec>,
     pub normalized_args: Vec<String>,
+    pub compiler_args: Vec<OsString>,
+    pub remap_path_prefix: Option<(String, String)>,
+    pub out_dir_digest: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Classification {
-    Cacheable(Candidate),
+    Cacheable(Box<Candidate>),
     Bypass(BypassReason),
 }
 
@@ -115,11 +137,7 @@ pub fn classify(
     roots: &AllowedRoots,
 ) -> Classification {
     let crate_types = comma_values(args, "--crate-type");
-    if crate_types.is_empty()
-        || crate_types
-            .iter()
-            .any(|v| !matches!(v.as_str(), "lib" | "rlib"))
-    {
+    if crate_types.is_empty() {
         return Classification::Bypass(BypassReason::UnsupportedCrateType);
     }
     let emits = comma_values(args, "--emit");
@@ -141,9 +159,42 @@ pub fn classify(
     let Ok(source) = fs::canonicalize(&source) else {
         return Classification::Bypass(BypassReason::MissingSource);
     };
-    let Some(source_root) = package_root(&source, roots) else {
+    let Some((source_root, source_kind)) = package_root(&source, roots) else {
         return Classification::Bypass(BypassReason::SourceOutsideCache);
     };
+
+    let has_link = emits.iter().any(|value| {
+        value
+            .split_once('=')
+            .map_or(value.as_str(), |(kind, _)| kind)
+            == "link"
+    });
+    let is_workspace = source_kind == SourceKind::Workspace;
+    let is_bin = crate_types.iter().any(|value| value == "bin");
+    let is_proc_macro = crate_types.iter().any(|value| value == "proc-macro");
+    let supported_type = crate_types
+        .iter()
+        .all(|value| matches!(value.as_str(), "lib" | "rlib"))
+        || (is_proc_macro
+            && crate_types.len() == 1
+            && !crate_types.iter().any(|value| value != "proc-macro"))
+        || (is_bin
+            && crate_types.len() == 1
+            && !has_link
+            && emits.iter().all(|value| {
+                value
+                    .split_once('=')
+                    .map_or(value.as_str(), |(kind, _)| kind)
+                    == "metadata"
+                    || value.starts_with("dep-info")
+            }));
+    if !supported_type {
+        return Classification::Bypass(if is_workspace {
+            BypassReason::UnsupportedWorkspaceSource
+        } else {
+            BypassReason::UnsupportedCrateType
+        });
+    }
 
     let mut extern_paths = BTreeMap::new();
     let mut i = 0;
@@ -193,39 +244,100 @@ pub fn classify(
         i += 1;
     }
 
-    if env.iter().any(|(k, _)| k == "OUT_DIR") {
-        return Classification::Bypass(BypassReason::BuildScriptOutput);
-    }
+    let out_dir = env
+        .iter()
+        .find(|(key, _)| key == "OUT_DIR")
+        .map(|(_, value)| PathBuf::from(value));
+    let out_dir_digest = if let Some(out_dir) = &out_dir {
+        if !path_under(out_dir, &roots.build_root) {
+            return Classification::Bypass(BypassReason::BuildScriptOutput);
+        }
+        match digest_tree_strict(out_dir) {
+            Ok(digest) => Some(digest),
+            Err(_) => return Classification::Bypass(BypassReason::InvalidOutDir),
+        }
+    } else {
+        None
+    };
+
+    let existing_remap = remap_path_prefixes(args);
+    let remap_path_prefix = if is_workspace {
+        match existing_remap
+            .iter()
+            .find(|(from, _)| path_under(&source_root, Path::new(from)))
+        {
+            Some((from, to)) if path_under(&source_root, Path::new(from)) => {
+                Some((from.clone(), to.clone()))
+            }
+            Some(_) => return Classification::Bypass(BypassReason::RemapConflict),
+            None if roots.remap_workspace_paths => Some((
+                source_root.to_string_lossy().into_owned(),
+                WORKSPACE_REMAP_PREFIX.to_owned(),
+            )),
+            None => None,
+        }
+    } else {
+        None
+    };
 
     let source_digest = match digest_tree(&source_root) {
         Ok(digest) => digest,
         Err(_) => return Classification::Bypass(BypassReason::SourceOutsideCache),
     };
-    let normalized_args = normalize_args(args, roots, &source_root);
-    let env_digest = relevant_environment(env);
+    let mut compiler_args = args.to_vec();
+    if let Some((from, to)) = &remap_path_prefix {
+        if !existing_remap
+            .iter()
+            .any(|entry| entry == &(from.clone(), to.clone()))
+        {
+            compiler_args.push(format!("--remap-path-prefix={from}={to}").into());
+        }
+    }
+    let normalized_args = normalize_args(
+        &compiler_args,
+        roots,
+        &source_root,
+        source_kind,
+        remap_path_prefix.as_ref(),
+        out_dir.as_deref(),
+    );
+    let env_digest = relevant_environment(
+        env,
+        out_dir_digest.as_deref(),
+        source_kind,
+        &source_root,
+        remap_path_prefix.as_ref(),
+    );
     let compiler_identity = match compiler_identity(rustc) {
         Ok(identity) => identity,
         Err(_) => return Classification::Bypass(BypassReason::CompilerIdentity),
     };
-    let key = make_key(
-        &compiler_identity,
-        &normalized_args,
-        &source_digest,
-        &extern_paths,
-        &env_digest,
-        args,
-    );
-    let outputs = output_specs(args);
+    let key = make_key(KeyInputs {
+        compiler_identity: &compiler_identity,
+        normalized_args: &normalized_args,
+        source_digest: &source_digest,
+        extern_paths: &extern_paths,
+        env_digest: &env_digest,
+        args: &compiler_args,
+        source_kind,
+        remap_path_prefix: remap_path_prefix.as_ref(),
+        out_dir_digest: out_dir_digest.as_deref(),
+    });
+    let outputs = output_specs(&compiler_args);
     if outputs.is_empty() {
         return Classification::Bypass(BypassReason::MissingOutputDirectory);
     }
-    Classification::Cacheable(Candidate {
+    Classification::Cacheable(Box::new(Candidate {
         key,
+        source_kind,
         source_root,
         source_digest,
         outputs,
         normalized_args,
-    })
+        compiler_args,
+        remap_path_prefix,
+        out_dir_digest,
+    }))
 }
 
 pub fn digest_tree(root: &Path) -> std::io::Result<String> {
@@ -241,6 +353,18 @@ pub fn digest_tree(root: &Path) -> std::io::Result<String> {
     Ok(hasher.finalize().to_hex().to_string())
 }
 
+fn digest_tree_strict(root: &Path) -> std::io::Result<String> {
+    let mut files = Vec::new();
+    collect_files_strict(root, root, &mut files)?;
+    files.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut hasher = Hasher::new();
+    for (relative, path) in files {
+        hash_field(&mut hasher, relative.to_string_lossy().as_bytes());
+        hash_field(&mut hasher, &fs::read(path)?);
+    }
+    Ok(hasher.finalize().to_hex().to_string())
+}
+
 pub fn compiler_identity(rustc: &Path) -> std::io::Result<String> {
     let output = Command::new(rustc).arg("-vV").output()?;
     if !output.status.success() {
@@ -249,34 +373,61 @@ pub fn compiler_identity(rustc: &Path) -> std::io::Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
-fn make_key(
-    compiler_identity: &str,
-    normalized_args: &[String],
-    source_digest: &str,
-    extern_paths: &BTreeMap<String, String>,
-    env_digest: &[(String, String)],
-    args: &[OsString],
-) -> ArtifactKey {
+struct KeyInputs<'a> {
+    compiler_identity: &'a str,
+    normalized_args: &'a [String],
+    source_digest: &'a str,
+    extern_paths: &'a BTreeMap<String, String>,
+    env_digest: &'a [(String, String)],
+    args: &'a [OsString],
+    source_kind: SourceKind,
+    remap_path_prefix: Option<&'a (String, String)>,
+    out_dir_digest: Option<&'a str>,
+}
+
+fn make_key(input: KeyInputs<'_>) -> ArtifactKey {
     let mut hasher = Hasher::new();
     hash_field(
         &mut hasher,
         format!("rgo-cache-v{CACHE_SCHEMA_VERSION}").as_bytes(),
     );
-    hash_field(&mut hasher, compiler_identity.as_bytes());
-    for arg in normalized_args {
+    hash_field(&mut hasher, input.compiler_identity.as_bytes());
+    for arg in input.normalized_args {
         hash_field(&mut hasher, arg.as_bytes());
     }
-    hash_field(&mut hasher, source_digest.as_bytes());
-    for (name, digest) in extern_paths {
+    hash_field(&mut hasher, input.source_digest.as_bytes());
+    hash_field(
+        &mut hasher,
+        format!("source-kind:{:?}", input.source_kind).as_bytes(),
+    );
+    for (name, digest) in input.extern_paths {
         hash_field(&mut hasher, name.as_bytes());
         hash_field(&mut hasher, digest.as_bytes());
     }
-    for (name, value_digest) in env_digest {
+    for (name, value_digest) in input.env_digest {
         hash_field(&mut hasher, name.as_bytes());
         hash_field(&mut hasher, value_digest.as_bytes());
     }
-    if let Some(target) = target_triple(args) {
+    if let Some(target) = target_triple(input.args) {
         hash_field(&mut hasher, target.as_bytes());
+    }
+    if let Some((from, to)) = input.remap_path_prefix {
+        hash_field(&mut hasher, b"remap-from");
+        if input.source_kind == SourceKind::Workspace {
+            // The source side is intentionally omitted for workspace members: the compiler
+            // receives the real checkout root, but the generated artifact contains `to`.
+            hash_field(&mut hasher, b"workspace-root");
+        } else {
+            hash_field(&mut hasher, from.as_bytes());
+        }
+        hash_field(&mut hasher, b"remap-to");
+        hash_field(&mut hasher, to.as_bytes());
+    } else {
+        hash_field(&mut hasher, b"remap-disabled");
+    }
+    if let Some(digest) = input.out_dir_digest {
+        hash_field(&mut hasher, b"out-dir");
+        hash_field(&mut hasher, digest.as_bytes());
     }
     ArtifactKey(hasher.finalize().to_hex().to_string())
 }
@@ -307,23 +458,85 @@ fn collect_files(
     Ok(())
 }
 
-fn package_root(source: &Path, roots: &AllowedRoots) -> Option<PathBuf> {
-    let allowed = roots.source_roots.iter().any(|root| {
+fn collect_files_strict(
+    root: &Path,
+    current: &Path,
+    out: &mut Vec<(PathBuf, PathBuf)>,
+) -> std::io::Result<()> {
+    for entry in fs::read_dir(current)? {
+        let entry = entry?;
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(&path)?;
+        if metadata.file_type().is_symlink() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "symlinks are not cacheable",
+            ));
+        }
+        if metadata.is_dir() {
+            collect_files_strict(root, &path, out)?;
+        } else if metadata.is_file() {
+            out.push((path.strip_prefix(root).unwrap_or(&path).to_path_buf(), path));
+        }
+    }
+    Ok(())
+}
+
+fn package_root(source: &Path, roots: &AllowedRoots) -> Option<(PathBuf, SourceKind)> {
+    let source_kind = if roots.workspace_roots.iter().any(|root| {
         source.starts_with(root)
             || fs::canonicalize(root)
                 .map(|canonical| source.starts_with(canonical))
                 .unwrap_or(false)
-    });
-    if !allowed {
+    }) {
+        SourceKind::Workspace
+    } else if roots.source_roots.iter().any(|root| {
+        source.starts_with(root)
+            || fs::canonicalize(root)
+                .map(|canonical| source.starts_with(canonical))
+                .unwrap_or(false)
+    }) {
+        if source
+            .components()
+            .any(|component| component.as_os_str() == "checkouts")
+        {
+            SourceKind::Git
+        } else {
+            SourceKind::Registry
+        }
+    } else {
         return None;
-    }
+    };
     let mut current = source.parent()?;
     loop {
         if current.join("Cargo.toml").is_file() {
-            return Some(current.to_path_buf());
+            return Some((current.to_path_buf(), source_kind));
         }
         current = current.parent()?;
     }
+}
+
+fn remap_path_prefixes(args: &[OsString]) -> Vec<(String, String)> {
+    let mut result = Vec::new();
+    let mut index = 0;
+    while index < args.len() {
+        let value = args[index].to_string_lossy();
+        let mapping = if value == "--remap-path-prefix" {
+            args.get(index + 1)
+                .map(|value| value.to_string_lossy().into_owned())
+        } else {
+            value
+                .strip_prefix("--remap-path-prefix=")
+                .map(str::to_owned)
+        };
+        if let Some(mapping) = mapping {
+            if let Some((from, to)) = mapping.split_once('=') {
+                result.push((from.to_owned(), to.to_owned()));
+            }
+        }
+        index += if value == "--remap-path-prefix" { 2 } else { 1 };
+    }
+    result
 }
 
 fn source_argument(args: &[OsString]) -> Option<OsString> {
@@ -370,46 +583,73 @@ fn record_extern(value: &str, roots: &AllowedRoots, output: &mut BTreeMap<String
 }
 
 fn path_under(path: &Path, root: &Path) -> bool {
-    path.starts_with(root)
-        || fs::canonicalize(root)
-            .map(|canonical| path.starts_with(canonical))
-            .unwrap_or(false)
+    if path.starts_with(root) {
+        return true;
+    }
+    let canonical_path = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let canonical_root = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    canonical_path.starts_with(canonical_root)
 }
 
 fn is_sysroot_path(path: &Path) -> bool {
     path.components().any(|c| c.as_os_str() == "rustlib")
 }
 
-fn normalize_args(args: &[OsString], roots: &AllowedRoots, source_root: &Path) -> Vec<String> {
+fn normalize_args(
+    args: &[OsString],
+    roots: &AllowedRoots,
+    source_root: &Path,
+    source_kind: SourceKind,
+    remap_path_prefix: Option<&(String, String)>,
+    out_dir: Option<&Path>,
+) -> Vec<String> {
     args.iter()
         .map(|arg| {
             let mut value = arg.to_string_lossy().into_owned();
             let build = roots.build_root.to_string_lossy();
             let source = source_root.to_string_lossy();
             value = normalize_path_token(&value, build.as_ref(), "<BUILD_DIR>");
-            normalize_path_token(&value, source.as_ref(), "<SOURCE_ROOT>")
+            if source_kind != SourceKind::Workspace || remap_path_prefix.is_some() {
+                value = normalize_path_token(&value, source.as_ref(), "<SOURCE_ROOT>");
+            }
+            if let Some(out_dir) = out_dir {
+                value = normalize_path_token(&value, &out_dir.to_string_lossy(), "<OUT_DIR>");
+            }
+            value
         })
         .collect()
 }
 
 fn normalize_path_token(value: &str, root: &str, replacement: &str) -> String {
-    if value == root
-        || value
-            .strip_prefix(root)
-            .is_some_and(|rest| rest.starts_with('/') || rest.starts_with('\\'))
-    {
-        return replacement.to_owned();
+    let mut roots = vec![root.to_owned()];
+    if let Some(without_private) = root.strip_prefix("/private/") {
+        roots.push(format!("/{without_private}"));
     }
-    if let Some(index) = value.find(root) {
-        let prefix = &value[..index];
-        if prefix.ends_with('=') || prefix.ends_with(':') {
-            return format!("{prefix}{replacement}");
+    for root in roots {
+        if value == root
+            || value
+                .strip_prefix(&root)
+                .is_some_and(|rest| rest.starts_with('/') || rest.starts_with('\\'))
+        {
+            return replacement.to_owned();
+        }
+        if let Some(index) = value.find(&root) {
+            let prefix = &value[..index];
+            if prefix.ends_with('=') || prefix.ends_with(':') {
+                return format!("{prefix}{replacement}");
+            }
         }
     }
     value.to_owned()
 }
 
-fn relevant_environment(env: &[(OsString, OsString)]) -> Vec<(String, String)> {
+fn relevant_environment(
+    env: &[(OsString, OsString)],
+    out_dir_digest: Option<&str>,
+    source_kind: SourceKind,
+    source_root: &Path,
+    remap_path_prefix: Option<&(String, String)>,
+) -> Vec<(String, String)> {
     let mut values = env
         .iter()
         .filter_map(|(key, value)| {
@@ -420,15 +660,25 @@ fn relevant_environment(env: &[(OsString, OsString)]) -> Vec<(String, String)> {
                 || key == "CARGO_MANIFEST_DIR"
                 || key == "RUSTUP_TOOLCHAIN";
             relevant.then(|| {
+                let value = if key == "CARGO_MANIFEST_DIR"
+                    && source_kind == SourceKind::Workspace
+                    && remap_path_prefix.is_some()
+                    && path_under(Path::new(&value), source_root)
+                {
+                    WORKSPACE_REMAP_PREFIX.to_owned()
+                } else {
+                    value.to_string_lossy().into_owned()
+                };
                 (
                     key.into_owned(),
-                    blake3::hash(value.to_string_lossy().as_bytes())
-                        .to_hex()
-                        .to_string(),
+                    blake3::hash(value.as_bytes()).to_hex().to_string(),
                 )
             })
         })
         .collect::<Vec<_>>();
+    if let Some(digest) = out_dir_digest {
+        values.push(("OUT_DIR_CONTENTS".into(), digest.into()));
+    }
     values.sort();
     values
 }
@@ -525,11 +775,135 @@ mod tests {
             &AllowedRoots {
                 build_root: root.clone(),
                 source_roots: vec![root.parent().unwrap().to_path_buf()],
+                workspace_roots: Vec::new(),
+                remap_workspace_paths: false,
             },
         );
         assert_eq!(
             result,
             Classification::Bypass(BypassReason::UnsupportedCrateType)
         );
+    }
+
+    #[test]
+    fn workspace_remapping_makes_equivalent_worktrees_share_a_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first/member");
+        let second = dir.path().join("second/member");
+        for root in [&first, &second] {
+            fs::create_dir_all(root.join("src")).unwrap();
+            fs::write(root.join("Cargo.toml"), "[package]\nname='member'\n").unwrap();
+            fs::write(root.join("src/lib.rs"), "pub fn value() -> u32 { 1 }\n").unwrap();
+        }
+        let args = |root: &Path, build: &Path| {
+            vec![
+                "--crate-name".into(),
+                "member".into(),
+                "--crate-type=lib".into(),
+                "--emit=metadata".into(),
+                "--out-dir".into(),
+                build.as_os_str().to_owned(),
+                root.join("src/lib.rs").into_os_string(),
+            ]
+        };
+        let env = |root: &Path| {
+            vec![(
+                OsString::from("CARGO_MANIFEST_DIR"),
+                root.as_os_str().to_owned(),
+            )]
+        };
+        let classify_with = |root: &Path, remap| {
+            classify(
+                Path::new("rustc"),
+                &args(root, &dir.path().join("build")),
+                &env(root),
+                &AllowedRoots {
+                    build_root: dir.path().join("build"),
+                    source_roots: Vec::new(),
+                    workspace_roots: vec![root.parent().unwrap().to_path_buf()],
+                    remap_workspace_paths: remap,
+                },
+            )
+        };
+        let first_without = match classify_with(&first, false) {
+            Classification::Cacheable(candidate) => candidate,
+            other => panic!("expected cacheable candidate, got {other:?}"),
+        };
+        let second_without = match classify_with(&second, false) {
+            Classification::Cacheable(candidate) => candidate,
+            other => panic!("expected cacheable candidate, got {other:?}"),
+        };
+        assert_ne!(first_without.key, second_without.key);
+
+        let first_with = match classify_with(&first, true) {
+            Classification::Cacheable(candidate) => candidate,
+            other => panic!("expected cacheable candidate, got {other:?}"),
+        };
+        let second_with = match classify_with(&second, true) {
+            Classification::Cacheable(candidate) => candidate,
+            other => panic!("expected cacheable candidate, got {other:?}"),
+        };
+        assert_eq!(first_with.key, second_with.key);
+        assert!(
+            first_with
+                .compiler_args
+                .iter()
+                .any(|arg| arg.to_string_lossy().contains("--remap-path-prefix="))
+        );
+    }
+
+    #[test]
+    fn widened_workspace_classes_require_safe_inputs() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("workspace/member");
+        let build = dir.path().join("build");
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::create_dir_all(&build).unwrap();
+        fs::write(root.join("Cargo.toml"), "[package]\nname='member'\n").unwrap();
+        let source = root.join("src/lib.rs");
+        fs::write(&source, "pub fn value() -> u32 { 1 }\n").unwrap();
+        let roots = AllowedRoots {
+            build_root: build.clone(),
+            source_roots: Vec::new(),
+            workspace_roots: vec![root.parent().unwrap().to_path_buf()],
+            remap_workspace_paths: false,
+        };
+        let classify_type = |crate_type: &str, emit: &str, env: &[(OsString, OsString)]| {
+            classify(
+                Path::new("rustc"),
+                &[
+                    "--crate-name".into(),
+                    "member".into(),
+                    format!("--crate-type={crate_type}").into(),
+                    format!("--emit={emit}").into(),
+                    "--out-dir".into(),
+                    build.as_os_str().to_owned(),
+                    source.as_os_str().to_owned(),
+                ],
+                env,
+                &roots,
+            )
+        };
+        assert!(matches!(
+            classify_type("bin", "metadata", &[]),
+            Classification::Cacheable(_)
+        ));
+        assert!(matches!(
+            classify_type("proc-macro", "metadata,link", &[]),
+            Classification::Cacheable(_)
+        ));
+
+        let out_dir = build.join("out");
+        fs::create_dir_all(&out_dir).unwrap();
+        fs::write(
+            out_dir.join("generated.rs"),
+            "pub const GENERATED: u8 = 1;\n",
+        )
+        .unwrap();
+        let env = vec![(OsString::from("OUT_DIR"), out_dir.into_os_string())];
+        assert!(matches!(
+            classify_type("lib", "metadata", &env),
+            Classification::Cacheable(_)
+        ));
     }
 }

@@ -6,10 +6,11 @@
 
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
 pub const MAX_FRAME_SIZE: usize = 1024 * 1024;
 pub const DEFAULT_LEASE_TTL_SECS: u32 = 30;
 pub const DEFAULT_HEARTBEAT_SECS: u32 = 10;
+pub const DEFAULT_SINGLE_FLIGHT_TIMEOUT_SECS: u32 = 30;
 pub const CLIENT_TIMEOUT_MILLIS: u64 = 150;
 
 pub const SIDECAR_FILE: &str = ".rgo-context.json";
@@ -82,6 +83,26 @@ pub enum Request {
         pid: u32,
         ttl_secs: u32,
     },
+    CacheAcquire {
+        key: String,
+        pid: u32,
+        ttl_secs: u32,
+    },
+    CacheWait {
+        key: String,
+        pid: u32,
+        ttl_secs: u32,
+    },
+    CacheCommit {
+        key: String,
+        lease_id: u64,
+        manifest: CacheManifest,
+    },
+    CacheFail {
+        key: String,
+        lease_id: u64,
+        reason: String,
+    },
     CachePublish {
         manifest: CacheManifest,
     },
@@ -114,6 +135,26 @@ pub enum Response {
     },
     CacheMiss {
         reason: String,
+    },
+    CacheProducer {
+        key: String,
+        lease_id: u64,
+        expires_in_secs: u32,
+    },
+    CacheWait {
+        key: String,
+        retry_after_millis: u64,
+        expires_in_secs: u32,
+    },
+    CacheReady {
+        manifest: CacheManifest,
+        lease_id: Option<u64>,
+    },
+    CacheFailed {
+        reason: String,
+    },
+    CacheCommitted {
+        accepted: bool,
     },
     CacheStats(CacheStatsReport),
     CacheExplanation(CacheExplanation),
@@ -167,6 +208,11 @@ pub struct CacheStatsReport {
     pub bypasses: u64,
     pub last_verify_at: u64,
     pub last_verify_error: Option<String>,
+    pub single_flight_producers: u64,
+    pub single_flight_waiters: u64,
+    pub single_flight_timeouts: u64,
+    pub single_flight_takeovers: u64,
+    pub active_builds: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -327,5 +373,26 @@ mod tests {
         };
         let json = serde_json::to_string(&response).unwrap();
         assert!(json.contains("cache_miss"));
+    }
+
+    #[test]
+    fn single_flight_messages_round_trip() {
+        let request = Request::CacheAcquire {
+            key: "key".into(),
+            pid: 42,
+            ttl_secs: DEFAULT_LEASE_TTL_SECS,
+        };
+        let frame = encode_frame(&request).unwrap();
+        assert_eq!(decode_frame::<Request>(&frame).unwrap(), request);
+        let response = Response::CacheWait {
+            key: "key".into(),
+            retry_after_millis: 100,
+            expires_in_secs: DEFAULT_LEASE_TTL_SECS,
+        };
+        let frame = encode_frame(&response).unwrap();
+        assert!(matches!(
+            decode_frame::<Response>(&frame).unwrap(),
+            Response::CacheWait { .. }
+        ));
     }
 }

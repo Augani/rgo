@@ -38,11 +38,28 @@ pub struct Gc {
     pub auto: bool,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Cache {
     /// Phase 3. Off until differential testing gates pass.
     pub enabled: bool,
+    /// Phase 4. Remapping changes observable source paths, so it is opt-in.
+    pub remap_workspace_paths: bool,
+    /// Maximum time a cache waiter spends waiting for another compiler.
+    #[serde(with = "humantime_serde")]
+    pub single_flight_timeout: Duration,
+}
+
+impl Default for Cache {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            remap_workspace_paths: false,
+            single_flight_timeout: Duration::from_secs(
+                rgo_protocol::DEFAULT_SINGLE_FLIGHT_TIMEOUT_SECS as u64,
+            ),
+        }
+    }
 }
 
 impl Default for Storage {
@@ -195,6 +212,11 @@ mod tests {
         assert_eq!(c.storage.max_size, Size::Auto);
         assert_eq!(c.gc.orphan_grace, Duration::from_secs(3600));
         assert!(!c.cache.enabled);
+        assert!(!c.cache.remap_workspace_paths);
+        assert_eq!(
+            c.cache.single_flight_timeout,
+            Duration::from_secs(rgo_protocol::DEFAULT_SINGLE_FLIGHT_TIMEOUT_SECS as u64)
+        );
     }
 
     #[test]
@@ -206,12 +228,17 @@ mod tests {
             min_free_space = "auto"
             [gc]
             incremental_retention = "3d"
+            [cache]
+            remap_workspace_paths = true
+            single_flight_timeout = "7s"
             "#,
         )
         .unwrap();
         assert_eq!(c.storage.max_size, Size::Bytes(60_000_000_000));
         assert_eq!(c.storage.min_free_space, Size::Auto);
         assert_eq!(c.gc.incremental_retention, Duration::from_secs(3 * 86400));
+        assert!(c.cache.remap_workspace_paths);
+        assert_eq!(c.cache.single_flight_timeout, Duration::from_secs(7));
     }
 
     #[test]

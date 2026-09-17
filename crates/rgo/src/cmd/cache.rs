@@ -54,6 +54,10 @@ fn stats(e: &super::Env) -> Result<()> {
     println!("Cache hits           {}", report.hits);
     println!("Cache misses         {}", report.misses);
     println!("Cache bypasses       {}", report.bypasses);
+    println!("Single-flight active {}", report.active_builds);
+    println!("Single-flight waits  {}", report.single_flight_waiters);
+    println!("Single-flight timeouts {}", report.single_flight_timeouts);
+    println!("Single-flight takeovers {}", report.single_flight_takeovers);
     if let Some(error) = report.last_verify_error {
         println!("Last verify error    {error}");
     }

@@ -15,7 +15,7 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use crate::context;
 use crate::paths::RgoPaths;
 
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 
 #[derive(Debug, Clone, Default)]
 pub struct DbStats {
@@ -28,6 +28,21 @@ pub struct LastGc {
     pub reclaimed_bytes: u64,
     pub finished_at: u64,
     pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CacheBuildDecision {
+    Producer { lease_id: u64, expires_in_secs: u32 },
+    Wait { expires_in_secs: u32 },
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct SingleFlightStats {
+    pub producers: u64,
+    pub waiters: u64,
+    pub timeouts: u64,
+    pub takeovers: u64,
+    pub active_builds: u64,
 }
 
 pub struct StateDb {
@@ -164,6 +179,25 @@ impl StateDb {
                 quarantined INTEGER NOT NULL,
                 error TEXT
             );
+            CREATE TABLE IF NOT EXISTS cache_builds (
+                key TEXT PRIMARY KEY NOT NULL,
+                state TEXT NOT NULL,
+                owner_lease_id INTEGER,
+                started_at INTEGER NOT NULL,
+                heartbeat_at INTEGER NOT NULL,
+                expires_at INTEGER NOT NULL,
+                manifest_path TEXT,
+                error TEXT
+            );
+            CREATE INDEX IF NOT EXISTS cache_builds_state ON cache_builds(state);
+            CREATE TABLE IF NOT EXISTS single_flight_stats (
+                id INTEGER PRIMARY KEY CHECK(id = 1),
+                producers INTEGER NOT NULL DEFAULT 0,
+                waiters INTEGER NOT NULL DEFAULT 0,
+                timeouts INTEGER NOT NULL DEFAULT 0,
+                takeovers INTEGER NOT NULL DEFAULT 0
+            );
+            INSERT OR IGNORE INTO single_flight_stats(id) VALUES (1);
             ",
         )?;
         let current: Option<i64> = connection
@@ -182,8 +216,8 @@ impl StateDb {
                     "unsupported rgo database schema {version}, expected at most {SCHEMA_VERSION}"
                 );
             }
-            // Version 1 had all Phase 2 tables. Phase 3 tables are additive and are created
-            // above, so advancing the marker is a safe migration.
+            // Phase 3 and Phase 4 tables are additive, so advancing the marker is a safe
+            // migration for databases created by earlier versions.
         }
         connection.execute(
             "INSERT OR REPLACE INTO schema_meta(key, value) VALUES ('schema_version', ?1)",
@@ -303,6 +337,185 @@ impl StateDb {
         Ok((self.connection.last_insert_rowid() as u64, ttl_secs.max(1)))
     }
 
+    /// Ephemeral producer ownership must never survive a daemon restart. A manifest already
+    /// published in CAS remains usable; an in-progress row is simply made retryable.
+    pub fn recover_cache_builds(&self) -> Result<()> {
+        let now = unix_now();
+        self.connection.execute(
+            "UPDATE cache_builds
+             SET state = 'FAILED', owner_lease_id = NULL, expires_at = ?1,
+                 heartbeat_at = ?1, error = 'daemon_restart'
+             WHERE state IN ('BUILDING', 'COMMITTING')",
+            params![now],
+        )?;
+        self.connection
+            .execute("DELETE FROM leases WHERE scope = 'cache_build'", [])?;
+        Ok(())
+    }
+
+    pub fn acquire_cache_build(
+        &self,
+        key: &str,
+        pid: u32,
+        ttl_secs: u32,
+        register_waiter: bool,
+    ) -> Result<CacheBuildDecision> {
+        self.expire_leases()?;
+        let now = unix_now();
+        let ttl = u64::from(ttl_secs.max(1));
+        let transaction = self.connection.unchecked_transaction()?;
+        let existing: Option<(String, Option<i64>, i64)> = transaction
+            .query_row(
+                "SELECT state, owner_lease_id, expires_at FROM cache_builds WHERE key = ?1",
+                params![key],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        let active = if let Some((_, Some(owner), expires)) = &existing {
+            let lease_active: i64 = transaction.query_row(
+                "SELECT COUNT(*) FROM leases WHERE lease_id = ?1 AND expires_at > ?2",
+                params![owner, now],
+                |row| row.get(0),
+            )?;
+            *expires as u64 > now && lease_active > 0
+        } else {
+            false
+        };
+        if active {
+            if register_waiter {
+                transaction.execute(
+                    "UPDATE single_flight_stats SET waiters = waiters + 1 WHERE id = 1",
+                    [],
+                )?;
+            }
+            transaction.commit()?;
+            let expires = existing
+                .map(|(_, _, expires)| expires as u64)
+                .unwrap_or(now);
+            return Ok(CacheBuildDecision::Wait {
+                expires_in_secs: expires.saturating_sub(now).min(u64::from(u32::MAX)) as u32,
+            });
+        }
+
+        let stale_owner = existing
+            .as_ref()
+            .is_some_and(|(_, owner, _)| owner.is_some() && !active);
+        let expires = now.saturating_add(ttl);
+        transaction.execute(
+            "INSERT INTO leases(scope, owner_pid, created_at, heartbeat_at, expires_at)
+             VALUES('cache_build', ?1, ?2, ?2, ?3)",
+            params![i64::from(pid), now, expires],
+        )?;
+        let lease_id = transaction.last_insert_rowid() as u64;
+        transaction.execute(
+            "INSERT INTO cache_builds(key, state, owner_lease_id, started_at, heartbeat_at, expires_at, error)
+             VALUES(?1, 'BUILDING', ?2, ?3, ?3, ?4, NULL)
+             ON CONFLICT(key) DO UPDATE SET
+               state = 'BUILDING', owner_lease_id = excluded.owner_lease_id,
+               started_at = excluded.started_at, heartbeat_at = excluded.heartbeat_at,
+               expires_at = excluded.expires_at, error = NULL",
+            params![key, lease_id as i64, now, expires],
+        )?;
+        transaction.execute(
+            "UPDATE single_flight_stats SET producers = producers + 1, takeovers = takeovers + ?1 WHERE id = 1",
+            params![if stale_owner { 1i64 } else { 0i64 }],
+        )?;
+        transaction.commit()?;
+        Ok(CacheBuildDecision::Producer {
+            lease_id,
+            expires_in_secs: ttl as u32,
+        })
+    }
+
+    pub fn record_single_flight_timeout(&self) -> Result<()> {
+        self.connection.execute(
+            "UPDATE single_flight_stats SET timeouts = timeouts + 1 WHERE id = 1",
+            [],
+        )?;
+        Ok(())
+    }
+
+    pub fn prune_failed_cache_builds(&self, retention: Duration) -> Result<usize> {
+        let cutoff = unix_now().saturating_sub(retention.as_secs());
+        Ok(self.connection.execute(
+            "DELETE FROM cache_builds
+             WHERE state = 'FAILED' AND owner_lease_id IS NULL AND expires_at < ?1",
+            params![cutoff],
+        )?)
+    }
+
+    pub fn begin_cache_commit(&self, key: &str, lease_id: u64) -> Result<bool> {
+        let changed = self.connection.execute(
+            "UPDATE cache_builds SET state = 'COMMITTING', heartbeat_at = ?1
+             WHERE key = ?2 AND state = 'BUILDING' AND owner_lease_id = ?3
+               AND EXISTS(SELECT 1 FROM leases WHERE lease_id = ?3 AND expires_at > ?1)",
+            params![unix_now(), key, lease_id as i64],
+        )?;
+        Ok(changed != 0)
+    }
+
+    pub fn finish_cache_commit(
+        &self,
+        key: &str,
+        lease_id: u64,
+        manifest_path: &Path,
+    ) -> Result<bool> {
+        let transaction = self.connection.unchecked_transaction()?;
+        let changed = transaction.execute(
+            "UPDATE cache_builds SET state = 'READY', owner_lease_id = NULL,
+                 manifest_path = ?1, expires_at = ?2, heartbeat_at = ?2, error = NULL
+             WHERE key = ?3 AND state = 'COMMITTING' AND owner_lease_id = ?4",
+            params![
+                manifest_path.to_string_lossy(),
+                unix_now(),
+                key,
+                lease_id as i64
+            ],
+        )?;
+        transaction.execute(
+            "DELETE FROM leases WHERE lease_id = ?1",
+            params![lease_id as i64],
+        )?;
+        transaction.commit()?;
+        Ok(changed != 0)
+    }
+
+    pub fn fail_cache_build(&self, key: &str, lease_id: u64, reason: &str) -> Result<bool> {
+        let transaction = self.connection.unchecked_transaction()?;
+        let changed = transaction.execute(
+            "UPDATE cache_builds SET state = 'FAILED', owner_lease_id = NULL,
+                 expires_at = ?1, heartbeat_at = ?1, error = ?2
+             WHERE key = ?3 AND owner_lease_id = ?4",
+            params![unix_now(), reason, key, lease_id as i64],
+        )?;
+        transaction.execute(
+            "DELETE FROM leases WHERE lease_id = ?1",
+            params![lease_id as i64],
+        )?;
+        transaction.commit()?;
+        Ok(changed != 0)
+    }
+
+    pub fn single_flight_stats(&self) -> Result<SingleFlightStats> {
+        let (producers, waiters, timeouts, takeovers): (u64, u64, u64, u64) = self.connection.query_row(
+            "SELECT producers, waiters, timeouts, takeovers FROM single_flight_stats WHERE id = 1",
+            [],
+            |row| Ok((row.get::<_, i64>(0)? as u64, row.get::<_, i64>(1)? as u64, row.get::<_, i64>(2)? as u64, row.get::<_, i64>(3)? as u64)),
+        )?;
+        let active_builds = self.connection.query_row(
+            "SELECT COUNT(*) FROM cache_builds WHERE state IN ('BUILDING', 'COMMITTING') AND expires_at > ?1",
+            params![unix_now()],
+            |row| row.get::<_, i64>(0),
+        )? as u64;
+        Ok(SingleFlightStats {
+            producers,
+            waiters,
+            timeouts,
+            takeovers,
+            active_builds,
+        })
+    }
+
     pub fn bind(
         &self,
         lease_id: u64,
@@ -386,7 +599,7 @@ impl StateDb {
 
     pub fn active_cache_keys(&self) -> Result<Vec<String>> {
         let mut statement = self.connection.prepare(
-            "SELECT workspace_root FROM leases WHERE scope = 'cache' AND expires_at > ?1 AND workspace_root IS NOT NULL",
+            "SELECT workspace_root FROM leases WHERE scope IN ('cache', 'cache_build') AND expires_at > ?1 AND workspace_root IS NOT NULL",
         )?;
         statement
             .query_map(params![unix_now()], |row| row.get(0))?
@@ -464,6 +677,7 @@ impl StateDb {
             [],
             |row| Ok((row.get::<_, i64>(0)? as u64, row.get(1)?)),
         ).optional()?.unwrap_or_default();
+        let flight = self.single_flight_stats()?;
         Ok(CacheStatsReport {
             enabled,
             manifests,
@@ -474,6 +688,11 @@ impl StateDb {
             bypasses,
             last_verify_at,
             last_verify_error,
+            single_flight_producers: flight.producers,
+            single_flight_waiters: flight.waiters,
+            single_flight_timeouts: flight.timeouts,
+            single_flight_takeovers: flight.takeovers,
+            active_builds: flight.active_builds,
         })
     }
 
@@ -493,6 +712,9 @@ impl StateDb {
                 &format!("UPDATE cache_entries SET {column} = {column} + 1, last_used = ?1 WHERE key = ?2"),
                 params![now, key],
             )?;
+        }
+        if event.outcome == "timeout" {
+            self.record_single_flight_timeout()?;
         }
         Ok(())
     }
@@ -554,6 +776,22 @@ impl StateDb {
     }
 
     pub fn cache_explanation(&self, key: &str) -> Result<rgo_protocol::CacheExplanation> {
+        if let Some((state, reason)) = self
+            .connection
+            .query_row(
+                "SELECT state, error FROM cache_builds WHERE key = ?1 AND state IN ('BUILDING', 'COMMITTING', 'FAILED')",
+                params![key],
+                |row| Ok((row.get::<_, String>(0)?, row.get(1)?)),
+            )
+            .optional()?
+        {
+            return Ok(rgo_protocol::CacheExplanation {
+                key: key.into(),
+                state: state.to_lowercase(),
+                reason,
+                outputs: Vec::new(),
+            });
+        }
         let entry = self
             .connection
             .query_row(
@@ -725,5 +963,58 @@ mod tests {
                     .to_string_lossy()
                     .starts_with("meta.sqlite.corrupt-"))
         );
+    }
+
+    #[test]
+    fn single_flight_has_one_producer_and_reclaims_expired_owner() {
+        let root = tempdir().unwrap();
+        let paths = RgoPaths {
+            root: root.path().join("rgo"),
+        };
+        paths.ensure_layout().unwrap();
+        let db = StateDb::open(&paths).unwrap();
+        let first = db.acquire_cache_build("key", 1, 30, true).unwrap();
+        let lease = match first {
+            CacheBuildDecision::Producer { lease_id, .. } => lease_id,
+            other => panic!("expected producer, got {other:?}"),
+        };
+        assert!(matches!(
+            db.acquire_cache_build("key", 2, 30, true).unwrap(),
+            CacheBuildDecision::Wait { .. }
+        ));
+        db.connection
+            .execute(
+                "UPDATE leases SET expires_at = 0 WHERE lease_id = ?1",
+                params![lease as i64],
+            )
+            .unwrap();
+        assert!(matches!(
+            db.acquire_cache_build("key", 3, 30, true).unwrap(),
+            CacheBuildDecision::Producer { .. }
+        ));
+        let stats = db.single_flight_stats().unwrap();
+        assert_eq!(stats.producers, 2);
+        assert_eq!(stats.waiters, 1);
+        assert_eq!(stats.takeovers, 1);
+    }
+
+    #[test]
+    fn restart_recovery_does_not_leave_an_active_build() {
+        let root = tempdir().unwrap();
+        let paths = RgoPaths {
+            root: root.path().join("rgo"),
+        };
+        paths.ensure_layout().unwrap();
+        let db = StateDb::open(&paths).unwrap();
+        assert!(matches!(
+            db.acquire_cache_build("key", 1, 30, true).unwrap(),
+            CacheBuildDecision::Producer { .. }
+        ));
+        db.recover_cache_builds().unwrap();
+        assert_eq!(db.single_flight_stats().unwrap().active_builds, 0);
+        assert!(matches!(
+            db.acquire_cache_build("key", 2, 30, true).unwrap(),
+            CacheBuildDecision::Producer { .. }
+        ));
     }
 }

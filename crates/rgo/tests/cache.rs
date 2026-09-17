@@ -55,6 +55,7 @@ if [ "$1" = "-vV" ]; then
   exit 0
 fi
 printf 'compile\n' >> "$FAKE_RUSTC_LOG"
+if [ -n "$FAKE_RUSTC_SLEEP" ]; then sleep "$FAKE_RUSTC_SLEEP"; fi
 out=
 name=demo
 while [ "$#" -gt 0 ]; do
@@ -75,7 +76,7 @@ printf 'dep:%s\n' "$name" > "$out/$name.d"
 
         let mut daemon = start_daemon(&sb);
         let wrapper = cargo_bin("rgo-rustc-wrapper");
-        let invoke = |context: &str| {
+        let command_for = |context: &str, sleep: Option<&str>| {
             let out_dir = sb
                 .rgo_home
                 .join("builds/aa")
@@ -96,8 +97,25 @@ printf 'dep:%s\n' "$name" > "$out/$name.d"
                     out_dir.as_os_str(),
                     source.as_os_str(),
                 ]);
-            command.output().unwrap()
+            if let Some(sleep) = sleep {
+                command.env("FAKE_RUSTC_SLEEP", sleep);
+            }
+            command
         };
+
+        let first_child = command_for("flight-first", Some("1")).spawn().unwrap();
+        let second_child = command_for("flight-second", Some("1")).spawn().unwrap();
+        let first = first_child.wait_with_output().unwrap();
+        let second = second_child.wait_with_output().unwrap();
+        assert!(first.status.success());
+        assert!(second.status.success());
+        assert_eq!(
+            fs::read_to_string(&log).unwrap().lines().count(),
+            1,
+            "concurrent identical keys should have one producer"
+        );
+
+        let invoke = |context: &str| command_for(context, None).output().unwrap();
 
         let first = invoke("first");
         assert!(

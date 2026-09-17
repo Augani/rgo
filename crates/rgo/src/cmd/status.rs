@@ -70,6 +70,22 @@ pub fn run() -> Result<()> {
                 human(status.cache.cas_bytes),
                 status.cache.manifests
             );
+            println!(
+                "Single-flight        {} active, {} producer(s), {} waiter(s), {} timeout(s), {} takeover(s)",
+                status.cache.active_builds,
+                status.cache.single_flight_producers,
+                status.cache.single_flight_waiters,
+                status.cache.single_flight_timeouts,
+                status.cache.single_flight_takeovers
+            );
+            println!(
+                "Workspace remap      {}",
+                if e.cfg.cache.remap_workspace_paths {
+                    "enabled"
+                } else {
+                    "disabled"
+                }
+            );
             println!("Daemon               running (pid {})", status.daemon_pid);
             return Ok(());
         }

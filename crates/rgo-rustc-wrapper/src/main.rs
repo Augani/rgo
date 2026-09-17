@@ -82,7 +82,10 @@ fn main() {
     let Some(candidate) = classify_invocation(Path::new(&rustc), &args) else {
         finish_passthrough(rustc, &args, context_lease_id);
     };
-    if configured_inner_wrapper().is_some() {
+    if let Some(inner) = configured_inner_wrapper()
+        && (!is_sccache(Path::new(&inner))
+            || candidate.source_kind != rgo_key::SourceKind::Workspace)
+    {
         record_event(
             None,
             "bypass",
@@ -99,13 +102,8 @@ fn main() {
         Ok(store) => store,
         Err(_error) => finish_passthrough(rustc, &args, context_lease_id),
     };
-    let cache_response = request(Request::CacheLookup {
-        key: candidate.key.to_string(),
-        pid: std::process::id(),
-        ttl_secs: DEFAULT_LEASE_TTL_SECS,
-    });
-    match cache_response {
-        Ok(Response::CacheHit { manifest, lease_id }) => {
+    match acquire_cache_role(&candidate) {
+        Some(CacheRole::Ready { manifest, lease_id }) => {
             if materialize_hit(&store, &candidate, &manifest).is_ok() {
                 replay_output(&store, manifest.stdout.as_ref(), true);
                 replay_output(&store, manifest.stderr.as_ref(), false);
@@ -118,44 +116,135 @@ fn main() {
             if let Some(id) = lease_id {
                 let _ = request(Request::ReleaseLease { lease_id: id });
             }
-            let _ = request(Request::RecordCacheEvent {
-                event: CacheEvent {
-                    key: Some(candidate.key.to_string()),
-                    outcome: "miss".into(),
-                    bytes: 0,
-                    reason: Some("materialization_failed".into()),
-                },
+            record_event(
+                Some(candidate.key.to_string()),
+                "miss",
+                0,
+                Some("materialization_failed".into()),
+            );
+            run_cache_producer(rustc, &candidate, &store, context_lease_id, None);
+        }
+        Some(CacheRole::Producer { lease_id }) => {
+            run_cache_producer(rustc, &candidate, &store, context_lease_id, Some(lease_id));
+        }
+        None => finish_passthrough(rustc, &args, context_lease_id),
+    }
+}
+
+enum CacheRole {
+    Producer {
+        lease_id: u64,
+    },
+    Ready {
+        manifest: CacheManifest,
+        lease_id: Option<u64>,
+    },
+}
+
+fn acquire_cache_role(candidate: &Candidate) -> Option<CacheRole> {
+    let key = candidate.key.to_string();
+    let timeout = cache_wait_timeout();
+    let deadline = std::time::Instant::now() + timeout;
+    let mut message = Request::CacheAcquire {
+        key: key.clone(),
+        pid: std::process::id(),
+        ttl_secs: DEFAULT_LEASE_TTL_SECS,
+    };
+    loop {
+        let response = request(message).ok()?;
+        match response {
+            Response::CacheProducer { lease_id, .. } => {
+                return Some(CacheRole::Producer { lease_id });
+            }
+            Response::CacheReady { manifest, lease_id }
+            | Response::CacheHit { manifest, lease_id } => {
+                return Some(CacheRole::Ready { manifest, lease_id });
+            }
+            Response::CacheWait {
+                retry_after_millis, ..
+            } => {
+                if std::time::Instant::now() >= deadline {
+                    record_event(
+                        Some(key.clone()),
+                        "timeout",
+                        0,
+                        Some("single_flight_timeout".into()),
+                    );
+                    return None;
+                }
+                thread::sleep(Duration::from_millis(retry_after_millis.min(100)));
+                message = Request::CacheWait {
+                    key: key.clone(),
+                    pid: std::process::id(),
+                    ttl_secs: DEFAULT_LEASE_TTL_SECS,
+                };
+            }
+            Response::CacheMiss { reason } => {
+                record_event(None, "bypass", 0, Some(reason));
+                return None;
+            }
+            Response::CacheFailed { reason }
+            | Response::Error {
+                message: reason, ..
+            } => {
+                record_event(Some(key), "bypass", 0, Some(reason));
+                return None;
+            }
+            _ => return None,
+        }
+    }
+}
+
+fn run_cache_producer(
+    rustc: OsString,
+    candidate: &Candidate,
+    store: &Store,
+    context_lease_id: Option<u64>,
+    cache_lease_id: Option<u64>,
+) -> ! {
+    let result = run_captured_with_leases(
+        &rustc,
+        &candidate.compiler_args,
+        context_lease_id,
+        cache_lease_id,
+        configured_inner_wrapper().is_some()
+            && candidate.source_kind != rgo_key::SourceKind::Workspace,
+    );
+    if let Some(lease_id) = cache_lease_id {
+        if result.status.success() {
+            match publish_result(store, candidate, &result) {
+                Ok(manifest) => {
+                    let _ = request(Request::CacheCommit {
+                        key: candidate.key.to_string(),
+                        lease_id,
+                        manifest: wire_manifest(&manifest),
+                    });
+                }
+                Err(error) => {
+                    let _ = request(Request::CacheFail {
+                        key: candidate.key.to_string(),
+                        lease_id,
+                        reason: format!("publish: {error:#}"),
+                    });
+                }
+            }
+        } else {
+            let _ = request(Request::CacheFail {
+                key: candidate.key.to_string(),
+                lease_id,
+                reason: "compiler_failed".into(),
             });
         }
-        Ok(Response::CacheMiss { reason }) if reason != "cache_disabled" => {
-            let result = run_captured(&rustc, &args, context_lease_id, false);
-            if result.status.success() {
-                match publish_result(&store, &candidate, &result) {
-                    Ok(manifest) => {
-                        let _ = request(Request::CachePublish {
-                            manifest: wire_manifest(&manifest),
-                        });
-                    }
-                    Err(_error) => {}
-                }
-                record_event(
-                    Some(candidate.key.to_string()),
-                    "miss",
-                    result.stdout.len() as u64 + result.stderr.len() as u64,
-                    None,
-                );
-            }
-            exit_with_status(result.status);
-        }
-        Ok(Response::CacheMiss { reason }) => {
-            record_event(None, "bypass", 0, Some(reason));
-        }
-        Ok(Response::Error { message, .. }) => {
-            record_event(None, "bypass", 0, Some(message));
-        }
-        _ => {}
     }
-    finish_passthrough(rustc, &args, context_lease_id);
+    if result.status.success() {
+        record_event(
+            Some(candidate.key.to_string()),
+            "miss",
+            result.stdout.len() as u64 + result.stderr.len() as u64,
+            None,
+        );
+    }
+    exit_with_status(result.status);
 }
 
 fn finish_passthrough(rustc: OsString, args: &[OsString], lease_id: Option<u64>) -> ! {
@@ -197,14 +286,88 @@ fn classify_invocation(rustc: &Path, args: &[OsString]) -> Option<Candidate> {
                 cargo_home.join("registry").join("src"),
                 cargo_home.join("git").join("checkouts"),
             ],
+            workspace_roots: workspace_root().into_iter().map(PathBuf::from).collect(),
+            remap_workspace_paths: remap_workspace_paths_enabled(),
         },
     ) {
-        Classification::Cacheable(candidate) => Some(candidate),
+        Classification::Cacheable(candidate) => Some(*candidate),
         Classification::Bypass(reason) => {
             record_event(None, "bypass", 0, Some(reason.to_string()));
             None
         }
     }
+}
+
+fn remap_workspace_paths_enabled() -> bool {
+    let Some(home) = rgo_home() else { return false };
+    let Ok(text) = std::fs::read_to_string(home.join("config.toml")) else {
+        return false;
+    };
+    let mut in_cache = false;
+    for line in text.lines() {
+        let line = line.split('#').next().unwrap_or_default().trim();
+        if line.starts_with('[') {
+            in_cache = line == "[cache]";
+            continue;
+        }
+        if in_cache
+            && line.split_once('=').is_some_and(|(key, value)| {
+                key.trim() == "remap_workspace_paths" && value.trim() == "true"
+            })
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn cache_wait_timeout() -> Duration {
+    let Some(home) = rgo_home() else {
+        return Duration::from_secs(rgo_protocol::DEFAULT_SINGLE_FLIGHT_TIMEOUT_SECS as u64);
+    };
+    let Ok(text) = std::fs::read_to_string(home.join("config.toml")) else {
+        return Duration::from_secs(rgo_protocol::DEFAULT_SINGLE_FLIGHT_TIMEOUT_SECS as u64);
+    };
+    let mut in_cache = false;
+    for line in text.lines() {
+        let line = line.split('#').next().unwrap_or_default().trim();
+        if line.starts_with('[') {
+            in_cache = line == "[cache]";
+            continue;
+        }
+        if in_cache && line.starts_with("single_flight_timeout") {
+            if let Some(value) = line.split('=').nth(1) {
+                let value = value.trim().trim_matches('"');
+                if let Some(duration) = parse_wait_duration(value) {
+                    return duration;
+                }
+            }
+        }
+    }
+    Duration::from_secs(rgo_protocol::DEFAULT_SINGLE_FLIGHT_TIMEOUT_SECS as u64)
+}
+
+fn parse_wait_duration(value: &str) -> Option<Duration> {
+    let (number, multiplier) = if let Some(value) = value.strip_suffix("ms") {
+        (value, 0.001)
+    } else if let Some(value) = value.strip_suffix('s') {
+        (value, 1.0)
+    } else if let Some(value) = value.strip_suffix('m') {
+        (value, 60.0)
+    } else if let Some(value) = value.strip_suffix('h') {
+        (value, 3600.0)
+    } else {
+        (value, 1.0)
+    };
+    let seconds = number.trim().parse::<f64>().ok()? * multiplier;
+    (seconds >= 0.0).then(|| Duration::from_secs_f64(seconds))
+}
+
+fn is_sccache(wrapper: &Path) -> bool {
+    wrapper
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.eq_ignore_ascii_case("sccache"))
 }
 
 fn configured_inner_wrapper() -> Option<OsString> {
@@ -288,10 +451,11 @@ struct Captured {
     started_at: SystemTime,
 }
 
-fn run_captured(
+fn run_captured_with_leases(
     rustc: &OsString,
     args: &[OsString],
-    lease_id: Option<u64>,
+    context_lease_id: Option<u64>,
+    cache_lease_id: Option<u64>,
     inner: bool,
 ) -> Captured {
     let started_at = SystemTime::now();
@@ -337,26 +501,36 @@ fn run_captured(
         let _ = stderr.read_to_end(&mut bytes);
         bytes
     });
-    let (stop, heartbeat) = lease_id
-        .map(|lease_id| {
-            let (stop, stop_thread) = mpsc::channel();
-            let heartbeat = thread::spawn(move || {
-                loop {
-                    match stop_thread
-                        .recv_timeout(Duration::from_secs(u64::from(DEFAULT_HEARTBEAT_SECS)))
-                    {
-                        Ok(()) | Err(RecvTimeoutError::Disconnected) => break,
-                        Err(RecvTimeoutError::Timeout) => {
-                            if request(Request::Heartbeat { lease_id }).is_err() {
-                                break;
+    let lease_ids = [context_lease_id, cache_lease_id]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    let (stop, heartbeat) = if lease_ids.is_empty() {
+        (None, None)
+    } else {
+        let (stop, stop_thread) = mpsc::channel();
+        let heartbeat = thread::spawn(move || {
+            loop {
+                match stop_thread
+                    .recv_timeout(Duration::from_secs(u64::from(DEFAULT_HEARTBEAT_SECS)))
+                {
+                    Ok(()) | Err(RecvTimeoutError::Disconnected) => break,
+                    Err(RecvTimeoutError::Timeout) => {
+                        for lease_id in &lease_ids {
+                            if request(Request::Heartbeat {
+                                lease_id: *lease_id,
+                            })
+                            .is_err()
+                            {
+                                return;
                             }
                         }
                     }
                 }
-            });
-            (stop, heartbeat)
-        })
-        .unzip();
+            }
+        });
+        (Some(stop), Some(heartbeat))
+    };
     let status = child.wait().unwrap_or_else(|_| exit_status(127));
     if let Some(stop) = stop {
         let _ = stop.send(());
@@ -370,7 +544,7 @@ fn run_captured(
     let _ = std::io::stdout().flush();
     let _ = std::io::stderr().write_all(&stderr_bytes);
     let _ = std::io::stderr().flush();
-    if let Some(lease_id) = lease_id {
+    if let Some(lease_id) = context_lease_id {
         let _ = request(Request::ReleaseLease { lease_id });
     }
     Captured {

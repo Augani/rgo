@@ -16,7 +16,7 @@ use rgo_protocol::{
 
 use crate::config::{Resolved, volume_free_bytes};
 use crate::context;
-use crate::db::StateDb;
+use crate::db::{CacheBuildDecision, StateDb};
 use crate::gc::{self, Inputs};
 use crate::ipc::{self, Connection, Listener};
 use crate::paths::RgoPaths;
@@ -60,6 +60,7 @@ pub fn run(paths: RgoPaths, cfg: Resolved) -> Result<()> {
 
     let cas = Store::new(paths.cas_dir(), paths.quarantine_dir())?;
     let mut db = StateDb::open(&paths)?;
+    db.recover_cache_builds()?;
     db.reconcile(&paths)?;
     reconcile_cache(&mut db, &cas)?;
     drain_cache_events(&paths, &db)?;
@@ -295,6 +296,119 @@ fn handle_request_result(state: &State, request: Request) -> Result<Response> {
                 }),
             }
         }
+        Request::CacheAcquire { key, pid, ttl_secs } => {
+            if !state.cfg.cache.enabled {
+                return Ok(Response::CacheMiss {
+                    reason: "cache_disabled".into(),
+                });
+            }
+            let _operation = state.operation_lock.lock().unwrap();
+            if let Ok(Some(manifest)) = state.cas.read_manifest(&key) {
+                let db = state.db.lock().unwrap();
+                let (lease_id, _) = db.acquire(
+                    &rgo_protocol::LeaseScope::Cache { key: key.clone() },
+                    pid,
+                    ttl_secs,
+                )?;
+                return Ok(Response::CacheReady {
+                    manifest: wire_manifest(&manifest),
+                    lease_id: Some(lease_id),
+                });
+            }
+            let db = state.db.lock().unwrap();
+            match db.acquire_cache_build(&key, pid, ttl_secs, true)? {
+                CacheBuildDecision::Producer {
+                    lease_id,
+                    expires_in_secs,
+                } => Ok(Response::CacheProducer {
+                    key,
+                    lease_id,
+                    expires_in_secs,
+                }),
+                CacheBuildDecision::Wait { expires_in_secs } => Ok(Response::CacheWait {
+                    key,
+                    retry_after_millis: 100,
+                    expires_in_secs,
+                }),
+            }
+        }
+        Request::CacheWait { key, pid, ttl_secs } => {
+            if !state.cfg.cache.enabled {
+                return Ok(Response::CacheMiss {
+                    reason: "cache_disabled".into(),
+                });
+            }
+            let _operation = state.operation_lock.lock().unwrap();
+            if let Ok(Some(manifest)) = state.cas.read_manifest(&key) {
+                let db = state.db.lock().unwrap();
+                let (lease_id, _) = db.acquire(
+                    &rgo_protocol::LeaseScope::Cache { key: key.clone() },
+                    pid,
+                    ttl_secs,
+                )?;
+                return Ok(Response::CacheReady {
+                    manifest: wire_manifest(&manifest),
+                    lease_id: Some(lease_id),
+                });
+            }
+            let db = state.db.lock().unwrap();
+            match db.acquire_cache_build(&key, pid, ttl_secs, false)? {
+                CacheBuildDecision::Producer {
+                    lease_id,
+                    expires_in_secs,
+                } => Ok(Response::CacheProducer {
+                    key,
+                    lease_id,
+                    expires_in_secs,
+                }),
+                CacheBuildDecision::Wait { expires_in_secs } => Ok(Response::CacheWait {
+                    key,
+                    retry_after_millis: 100,
+                    expires_in_secs,
+                }),
+            }
+        }
+        Request::CacheCommit {
+            key,
+            lease_id,
+            manifest,
+        } => {
+            if !state.cfg.cache.enabled {
+                return Ok(Response::CacheCommitted { accepted: false });
+            }
+            let _operation = state.operation_lock.lock().unwrap();
+            let manifest = native_manifest(&manifest)?;
+            if manifest.key != key {
+                let db = state.db.lock().unwrap();
+                db.release(lease_id)?;
+                return Ok(Response::CacheCommitted { accepted: false });
+            }
+            let db = state.db.lock().unwrap();
+            if !db.begin_cache_commit(&key, lease_id)? {
+                db.release(lease_id)?;
+                return Ok(Response::CacheCommitted { accepted: false });
+            }
+            if let Err(error) = state.cas.write_manifest(&manifest) {
+                db.fail_cache_build(&key, lease_id, &format!("publish: {error:#}"))?;
+                return Err(error);
+            }
+            db.record_cache_manifest(
+                &wire_manifest(&manifest),
+                &state.cas.manifest_path(&manifest.key),
+            )?;
+            let accepted =
+                db.finish_cache_commit(&key, lease_id, &state.cas.manifest_path(&manifest.key))?;
+            Ok(Response::CacheCommitted { accepted })
+        }
+        Request::CacheFail {
+            key,
+            lease_id,
+            reason,
+        } => {
+            let db = state.db.lock().unwrap();
+            db.fail_cache_build(&key, lease_id, &reason)?;
+            Ok(Response::Ok)
+        }
         Request::CachePublish { manifest } => {
             if !state.cfg.cache.enabled {
                 return Ok(Response::CacheMiss {
@@ -354,6 +468,7 @@ fn status_report(state: &State) -> Result<StatusReport> {
     let contexts = context::list(&state.paths)?;
     let mut db = state.db.lock().unwrap();
     db.expire_leases()?;
+    db.prune_failed_cache_builds(Duration::from_secs(7 * 86_400))?;
     db.reconcile_contexts(&contexts)?;
     drain_cache_events(&state.paths, &db)?;
     let pinned = db.pinned_paths()?;
@@ -513,6 +628,7 @@ fn maintenance(state: &State) -> Result<()> {
     let contexts = context::list(&state.paths)?;
     let mut db = state.db.lock().unwrap();
     db.expire_leases()?;
+    db.prune_failed_cache_builds(Duration::from_secs(7 * 86_400))?;
     db.reconcile_contexts(&contexts)?;
     reconcile_cache(&mut db, &state.cas)?;
     drain_cache_events(&state.paths, &db)?;
