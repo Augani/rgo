@@ -1,0 +1,84 @@
+name: Release
+
+# Reproducible release binaries + checksums for every tag. Equivalent automation to
+# cargo-dist without the extra tool: each archive always contains `rgo` and
+# `rgo-rustc-wrapper` side by side because `rgo setup` requires the wrapper next to the CLI.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: macos-aarch64, os: macos-14, target: aarch64-apple-darwin, ext: "" }
+          - { name: macos-x86_64, os: macos-13, target: x86_64-apple-darwin, ext: "" }
+          - { name: linux-x86_64, os: ubuntu-latest, target: x86_64-unknown-linux-gnu, ext: "" }
+          - { name: windows-x86_64, os: windows-latest, target: x86_64-pc-windows-msvc, ext: ".exe" }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+      - name: Build release binaries
+        run: cargo build --release --locked --target ${{ matrix.target }} -p rgo -p rgo-rustc-wrapper
+      - name: Package archive
+        shell: bash
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          name="rgo-${TAG}-${{ matrix.target }}"
+          stage="$RUNNER_TEMP/$name"
+          mkdir -p "$stage"
+          bin_dir="target/${{ matrix.target }}/release"
+          cp "$bin_dir/rgo${{ matrix.ext }}" "$bin_dir/rgo-rustc-wrapper${{ matrix.ext }}" "$stage/"
+          cp README.md doc.md LICENSE-MIT LICENSE-APACHE "$stage/"
+          mkdir -p artifacts
+          if [ "${{ matrix.os }}" = "windows-latest" ]; then
+            powershell -NoProfile -Command "Compress-Archive -Path '$stage' -DestinationPath 'artifacts/$name.zip'"
+          else
+            tar -C "$RUNNER_TEMP" -czf "artifacts/$name.tar.gz" "$name"
+          fi
+      - name: Checksum
+        shell: bash
+        run: |
+          cd artifacts
+          shasum -a 256 * > "SHA256SUMS-${{ matrix.target }}.txt"
+          cat "SHA256SUMS-${{ matrix.target }}.txt"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.name }}
+          path: artifacts/
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+      - name: Merge checksums
+        run: |
+          cat dist/SHA256SUMS-*.txt > dist/SHA256SUMS.txt
+          rm dist/SHA256SUMS-*.txt
+          sort -o dist/SHA256SUMS.txt dist/SHA256SUMS.txt
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release create "${{ github.ref_name }}" dist/* --title "rgo ${{ github.ref_name }}" --generate-notes --verify-tag
