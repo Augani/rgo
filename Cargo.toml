@@ -35,7 +35,7 @@ directories = "6"
 walkdir = "2"
 fs4 = "0.13"
 sysinfo = "0.37"
-uds_windows = "1.2"
+interprocess = { version = "2.4.4", default-features = false }
 ureq = { version = "3.4", default-features = false, features = ["rustls"] }
 tempfile = "3"
 assert_cmd = "2"

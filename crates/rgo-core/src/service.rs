@@ -48,17 +48,27 @@ pub fn render(executable: &Path) -> Result<RenderedService> {
             .join("LaunchAgents")
             .join(format!("{MAC_LABEL}.plist"));
         let logs = RgoPaths::discover()?.logs_dir();
+        let environment = std::env::var_os("RGO_HOME")
+            .map(|value| {
+                format!(
+                    "  <key>EnvironmentVariables</key><dict><key>RGO_HOME</key><string>{}</string></dict>\n",
+                    xml_escape(&value.to_string_lossy())
+                )
+            })
+            .unwrap_or_default();
         let contents = format!(
             "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
 <!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n\
 <plist version=\"1.0\">\n<dict>\n\
   <key>Label</key><string>{MAC_LABEL}</string>\n\
   <key>ProgramArguments</key>\n  <array><string>{}</string><string>daemon</string><string>--foreground</string></array>\n\
+{}\
   <key>RunAtLoad</key><true/>\n  <key>KeepAlive</key><true/>\n\
   <key>StandardOutPath</key><string>{}</string>\n\
   <key>StandardErrorPath</key><string>{}</string>\n\
 </dict>\n</plist>\n",
             xml_escape(&executable.display().to_string()),
+            environment,
             xml_escape(&logs.join("daemon.stdout.log").display().to_string()),
             xml_escape(&logs.join("daemon.stderr.log").display().to_string()),
         );
@@ -78,9 +88,18 @@ pub fn render(executable: &Path) -> Result<RenderedService> {
             .map(PathBuf::from)
             .unwrap_or_else(|| home.join(".config"));
         let path = config.join("systemd").join("user").join(LINUX_UNIT);
+        let environment = std::env::var_os("RGO_HOME")
+            .map(|value| {
+                format!(
+                    "Environment=RGO_HOME={}\n",
+                    systemd_escape(&value.to_string_lossy())
+                )
+            })
+            .unwrap_or_default();
         let contents = format!(
-            "[Unit]\nDescription=rgo build storage daemon\nAfter=default.target\n\n[Service]\nExecStart={} daemon --foreground\nRestart=on-failure\nRestartSec=2\n\n[Install]\nWantedBy=default.target\n",
-            systemd_escape(&executable.display().to_string())
+            "[Unit]\nDescription=rgo build storage daemon\nAfter=default.target\n\n[Service]\nExecStart={} daemon --foreground\n{}Restart=on-failure\nRestartSec=2\n\n[Install]\nWantedBy=default.target\n",
+            systemd_escape(&executable.display().to_string()),
+            environment
         );
         Ok(RenderedService {
             path,
@@ -226,6 +245,15 @@ pub fn status(executable: &Path) -> Result<ServiceStatus> {
     }
     #[cfg(target_os = "linux")]
     {
+        if Command::new("systemctl").arg("--version").output().is_err() {
+            return Ok(ServiceStatus {
+                supported: false,
+                installed: false,
+                running: false,
+                location: rendered.path,
+                detail: "systemd user manager unavailable; install systemd or run `rgo setup --no-service`".into(),
+            });
+        }
         let running = command("systemctl", ["--user", "is-active", "--quiet", LINUX_UNIT]).is_ok();
         Ok(ServiceStatus {
             supported: true,
@@ -265,9 +293,13 @@ pub fn status(executable: &Path) -> Result<ServiceStatus> {
 fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     let parent = path.parent().context("service path has no parent")?;
     let temp = parent.join(format!(
-        ".{}.{}.tmp",
+        ".{}.{}-{}.tmp",
         path.file_name().unwrap_or_default().to_string_lossy(),
-        std::process::id()
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
     ));
     std::fs::write(&temp, bytes)?;
     #[cfg(unix)]

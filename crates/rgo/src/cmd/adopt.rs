@@ -22,6 +22,13 @@ pub fn run(roots: Vec<PathBuf>, delete: bool) -> Result<()> {
             "ies"
         }
     );
+    for skipped in &report.skipped {
+        println!(
+            "\nSkipped: {}\n  reason: {}",
+            skipped.path.display(),
+            skipped.reason
+        );
+    }
     for candidate in &report.candidates {
         println!("\nTarget: {}", candidate.target_dir.display());
         if let Some(project) = &candidate.project_root {

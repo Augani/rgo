@@ -125,6 +125,7 @@ pub fn run() -> Result<()> {
         leased: &[],
         now: SystemTime::now(),
         aggressive: true,
+        target_bytes: None,
     });
     let free = volume_free_bytes(&e.paths.root).unwrap_or(0);
 

@@ -69,14 +69,17 @@ pub fn apply(text: &str, desired: &Desired) -> Result<String> {
     // Cargo merges duplicate `[build]` tables across files but NOT within one file, so if
     // the user already has `[build]`, we must add keys to it rather than emit a second table.
     let mut doc: DocumentMut = outside.parse().context("parsing cargo config")?;
-    let merged = if doc.get("build").is_some_and(Item::is_table) {
+    if doc.get("build").is_some_and(Item::is_table) {
+        let mut managed_keys = vec!["build-dir"];
         for (k, v) in block["build"].as_table().unwrap().iter() {
             doc["build"][k] = v.clone();
+            if k != "build-dir" {
+                managed_keys.push(k);
+            }
         }
-        return Ok(doc.to_string());
-    } else {
-        block.to_string()
-    };
+        return Ok(fence_existing_build_keys(&doc.to_string(), &managed_keys));
+    }
+    let merged = block.to_string();
     let mut out = outside.trim_end().to_owned();
     if !out.is_empty() {
         out.push_str("\n\n");
@@ -88,6 +91,62 @@ pub fn apply(text: &str, desired: &Desired) -> Result<String> {
     out.push_str(FENCE_END);
     out.push('\n');
     Ok(out)
+}
+
+fn fence_existing_build_keys(text: &str, keys: &[&str]) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    let Some(build_start) = lines.iter().position(|line| line.trim() == "[build]") else {
+        return text.to_owned();
+    };
+    let build_end = lines
+        .iter()
+        .enumerate()
+        .skip(build_start + 1)
+        .find(|(_, line)| line.trim_start().starts_with('['))
+        .map(|(index, _)| index)
+        .unwrap_or(lines.len());
+    let is_managed = |line: &str| {
+        let trimmed = line.trim_start();
+        keys.iter().any(|key| {
+            trimmed.starts_with(&format!("{key} =")) || trimmed.starts_with(&format!("{key}="))
+        })
+    };
+    let managed_lines: Vec<&str> = lines[build_start + 1..build_end]
+        .iter()
+        .copied()
+        .filter(|line| is_managed(line))
+        .collect();
+    if managed_lines.is_empty() {
+        return text.to_owned();
+    }
+    let mut output = String::new();
+    for (index, line) in lines.iter().enumerate() {
+        if index == build_end {
+            output.push_str(FENCE_START);
+            output.push('\n');
+            for managed in &managed_lines {
+                output.push_str(managed);
+                output.push('\n');
+            }
+            output.push_str(FENCE_END);
+            output.push('\n');
+        }
+        if index < build_start + 1 || index >= build_end || !is_managed(line) {
+            output.push_str(line);
+            output.push('\n');
+        }
+    }
+    if build_end == lines.len() {
+        output.push_str(FENCE_START);
+        output.push('\n');
+        for managed in &managed_lines {
+            output.push_str(managed);
+            output.push('\n');
+        }
+        output.push_str(FENCE_END);
+        output.push('\n');
+    }
+    output
 }
 
 /// Returns the file contents with the fence removed. Keys that `apply` merged into a
@@ -109,6 +168,21 @@ pub fn remove(text: &str) -> Result<String> {
         return Ok(doc.to_string());
     }
     Ok(outside.trim_end().to_owned() + "\n")
+}
+
+/// Restore a wrapper that setup temporarily moved behind the rgo wrapper.
+///
+/// The caller supplies the value captured before `apply`; this keeps undo reversible without
+/// touching unrelated Cargo configuration.
+pub fn restore_rustc_wrapper(text: &str, wrapper: &str) -> Result<String> {
+    let mut doc: DocumentMut = text.parse().context("parsing cargo config")?;
+    if doc.get("build").is_some_and(Item::is_table) {
+        doc["build"]["rustc-wrapper"] = value(wrapper);
+    } else {
+        doc["build"] = toml_edit::table();
+        doc["build"]["rustc-wrapper"] = value(wrapper);
+    }
+    Ok(doc.to_string())
 }
 
 fn looks_like_ours(v: &str) -> bool {
@@ -167,6 +241,7 @@ mod tests {
         let a = apply(user, &desired()).unwrap();
         assert!(a.contains("retry = 5 # keep me"));
         assert!(a.contains("jobs = 4"));
+        assert!(a.contains(FENCE_START) && a.contains(FENCE_END));
         assert_eq!(
             a.matches("[build]").count(),
             1,
@@ -174,6 +249,15 @@ mod tests {
         );
         let r = remove(&a).unwrap();
         assert!(r.contains("jobs = 4") && !r.contains("build-dir"));
+    }
+
+    #[test]
+    fn existing_build_keys_are_fenced_without_swallowing_interleaved_user_keys() {
+        let user = "[build]\njobs = 4\nbuild-dir = \"/old\"\nnet = \"keep\"\n";
+        let applied = apply(user, &desired()).unwrap();
+        let removed = remove(&applied).unwrap();
+        assert!(removed.contains("jobs = 4"));
+        assert!(removed.contains("net = \"keep\""));
     }
 
     #[test]

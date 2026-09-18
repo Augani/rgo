@@ -17,8 +17,7 @@ rgo-materialize.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 
-[target.'cfg(windows)'.dependencies]
-uds_windows.workspace = true
+interprocess.workspace = true
 
 [lints]
 workspace = true

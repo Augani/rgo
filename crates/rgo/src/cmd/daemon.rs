@@ -54,6 +54,12 @@ pub fn ensure_running(paths: &RgoPaths) -> bool {
     false
 }
 
+/// Read-only health probe used by `rgo doctor`. Unlike `ensure_running`, this never starts a
+/// daemon or mutates the user's coordination state.
+pub fn is_available(paths: &RgoPaths) -> bool {
+    daemon_responds(paths)
+}
+
 fn daemon_responds(paths: &RgoPaths) -> bool {
     match ipc::request_with_timeout(
         &paths.socket_path(),

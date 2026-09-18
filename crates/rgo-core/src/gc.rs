@@ -10,6 +10,7 @@ use tracing::{info, warn};
 use crate::config::{Resolved, volume_free_bytes};
 use crate::context::{BuildContext, incremental_dirs};
 use crate::paths::RgoPaths;
+use crate::size::Scanner;
 
 /// Contexts whose `.cargo-lock` changed within this window are assumed live (Phase 1 heuristic;
 /// Phase 2 replaces this with daemon leases).
@@ -58,6 +59,7 @@ pub struct Inputs<'a> {
     pub leased: &'a [PathBuf],
     pub now: SystemTime,
     pub aggressive: bool,
+    pub target_bytes: Option<u64>,
 }
 
 pub fn plan(inp: &Inputs) -> Plan {
@@ -65,7 +67,9 @@ pub fn plan(inp: &Inputs) -> Plan {
     let free = volume_free_bytes(&inp.paths.root).unwrap_or(u64::MAX);
     let free_deficit = inp.cfg.min_free_space.saturating_sub(free);
     let over_soft = managed.saturating_sub(inp.cfg.soft_watermark);
-    let target = if over_soft > 0 || inp.aggressive {
+    let target = if let Some(target) = inp.target_bytes {
+        target.min(managed)
+    } else if over_soft > 0 || inp.aggressive {
         (inp.cfg.soft_watermark as f64 * 0.9) as u64
     } else {
         managed
@@ -132,18 +136,22 @@ pub fn plan(inp: &Inputs) -> Plan {
         if c.idle_for(inp.now) >= inp.cfg.gc.incremental_retention
             && c.incremental_usage.physical_bytes > 0
         {
+            let mut scanner = Scanner::new();
+            let mut incremental_bytes = 0;
             for d in incremental_dirs(&c.dir) {
+                let bytes = scanner.measure(&d).physical_bytes;
+                incremental_bytes += bytes;
                 plan.actions.push(Action {
                     tier: Tier::StaleIncremental,
                     path: d,
-                    bytes: 0,
+                    bytes,
                     reason: format!(
                         "incremental state idle for {}",
                         humantime::format_duration(trunc(c.idle_for(inp.now)))
                     ),
                 });
             }
-            needed = needed.saturating_sub(c.incremental_usage.physical_bytes);
+            needed = needed.saturating_sub(incremental_bytes);
         }
     }
 
@@ -153,6 +161,15 @@ pub fn plan(inp: &Inputs) -> Plan {
             break;
         }
         if c.idle_for(inp.now) >= inp.cfg.gc.context_retention {
+            let nested_bytes = plan
+                .actions
+                .iter()
+                .filter(|action| action.path.starts_with(&c.dir))
+                .map(|action| action.bytes)
+                .sum::<u64>();
+            plan.actions
+                .retain(|action| !action.path.starts_with(&c.dir));
+            needed = needed.saturating_add(nested_bytes);
             plan.actions.push(Action {
                 tier: Tier::StaleContext,
                 path: c.dir.clone(),
@@ -168,7 +185,12 @@ pub fn plan(inp: &Inputs) -> Plan {
 
     // Tier 4: only under real pressure. LRU regardless of age, but keep the most recent
     // context per workspace so an active project never loses everything.
-    if needed > 0 && (free_deficit > 0 || inp.aggressive || managed > inp.cfg.max_size) {
+    if needed > 0
+        && (free_deficit > 0
+            || inp.aggressive
+            || inp.target_bytes.is_some()
+            || managed > inp.cfg.max_size)
+    {
         let mut keep_latest: std::collections::HashMap<String, &BuildContext> = Default::default();
         for c in &by_age {
             let ws = c
@@ -280,14 +302,22 @@ fn temporary_actions(paths: &RgoPaths, now: SystemTime) -> Vec<Action> {
 }
 
 fn is_live_managed_path(paths: &RgoPaths, victim: &Path) -> bool {
-    let Some(context) = paths
+    if let Some(context) = paths
         .managed_build_dirs()
         .into_iter()
         .find(|context| victim == context || victim.starts_with(context))
-    else {
-        return false;
-    };
-    crate::context::lock_files_for_safety(&context)
+        && crate::context::lock_files_for_safety(&context)
+    {
+        return true;
+    }
+
+    // Adopted legacy targets are outside `RgoPaths::builds_dir()`, but they have the same
+    // Cargo profile lock convention. Re-check the owning `target/` immediately before rename
+    // so a build that started after planning cannot be removed by `rgo adopt --delete`.
+    victim.ancestors().any(|ancestor| {
+        ancestor.file_name().is_some_and(|name| name == "target")
+            && crate::context::lock_files_for_safety(ancestor)
+    })
 }
 
 /// Tier 0: anything left in `tmp/` older than an hour is abandoned.
@@ -349,7 +379,9 @@ mod tests {
         };
         paths.ensure_layout().unwrap();
         let stale = paths.tmp_dir().join("stale.tmp");
+        let quarantined = paths.quarantine_dir().join("corrupt-object");
         std::fs::write(&stale, b"temporary").unwrap();
+        std::fs::write(&quarantined, b"quarantine").unwrap();
         let now = SystemTime::now() + Duration::from_secs(7200);
         let cfg = test_cfg();
         let plan = plan(&Inputs {
@@ -360,14 +392,16 @@ mod tests {
             leased: &[],
             now,
             aggressive: false,
+            target_bytes: None,
         });
-        assert_eq!(plan.actions.len(), 1);
-        assert_eq!(plan.actions[0].tier, Tier::Tmp);
-        assert!(plan.reclaim_bytes() >= 9);
+        assert_eq!(plan.actions.len(), 2);
+        assert!(plan.actions.iter().all(|action| action.tier == Tier::Tmp));
+        assert!(plan.reclaim_bytes() >= 19);
         let planned = plan.reclaim_bytes();
         let reclaimed = execute(&paths, &plan, false).unwrap();
         assert_eq!(reclaimed, planned);
         assert!(!stale.exists());
+        assert!(!quarantined.exists());
     }
 
     #[test]
@@ -417,6 +451,7 @@ mod tests {
             leased: &[],
             now,
             aggressive: false,
+            target_bytes: None,
         });
         assert!(
             plan.actions
@@ -491,6 +526,7 @@ mod tests {
             leased: &[leased_dir],
             now,
             aggressive: true,
+            target_bytes: None,
         });
         assert_eq!(plan.skipped_leased, 1);
         assert!(
@@ -503,5 +539,201 @@ mod tests {
                 .iter()
                 .any(|action| action.path == contexts[1].dir)
         );
+    }
+
+    #[test]
+    fn orphan_contexts_are_selected_before_stale_contexts() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = RgoPaths {
+            root: root.path().join("rgo"),
+        };
+        paths.ensure_layout().unwrap();
+        let orphan_dir = paths.builds_dir().join("aa/orphan");
+        let stale_dir = paths.builds_dir().join("bb/stale");
+        std::fs::create_dir_all(&orphan_dir).unwrap();
+        std::fs::create_dir_all(&stale_dir).unwrap();
+        let missing = root.path().join("gone/Cargo.toml");
+        let present = root.path().join("present/Cargo.toml");
+        std::fs::create_dir_all(present.parent().unwrap()).unwrap();
+        std::fs::write(&present, "[package]\nname='present'\nversion='0.1.0'\n").unwrap();
+        let now = SystemTime::now();
+        let context = |dir: PathBuf, manifest: PathBuf| BuildContext {
+            dir,
+            sidecar: Some(ContextSidecar {
+                version: rgo_protocol::PROTOCOL_VERSION,
+                workspace_root: root.path().display().to_string(),
+                manifest_path: manifest.display().to_string(),
+                toolchain: None,
+                first_seen: 0,
+                last_seen: 0,
+            }),
+            last_used: now - Duration::from_secs(7200),
+            usage: Usage {
+                physical_bytes: 50,
+                logical_bytes: 50,
+                files: 1,
+            },
+            incremental_usage: Usage::default(),
+        };
+        let contexts = vec![
+            context(orphan_dir.clone(), missing),
+            context(stale_dir, present),
+        ];
+        let mut cfg = test_cfg();
+        cfg.gc.orphan_grace = Duration::from_secs(1);
+        cfg.gc.context_retention = Duration::from_secs(1);
+        let plan = plan(&Inputs {
+            paths: &paths,
+            cfg: &cfg,
+            contexts: &contexts,
+            pinned: &[],
+            leased: &[],
+            now,
+            aggressive: true,
+            target_bytes: Some(0),
+        });
+        assert_eq!(plan.actions[0].tier, Tier::Orphan);
+        assert!(
+            plan.actions
+                .iter()
+                .any(|action| action.tier == Tier::StaleContext)
+        );
+    }
+
+    #[test]
+    fn pins_and_recent_locks_are_protected_from_pressure_eviction() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = RgoPaths {
+            root: root.path().join("rgo"),
+        };
+        paths.ensure_layout().unwrap();
+        let pinned_dir = paths.builds_dir().join("aa/pinned");
+        let locked_dir = paths.builds_dir().join("bb/locked");
+        let reclaimable_dir = paths.builds_dir().join("cc/reclaimable");
+        let newest_dir = paths.builds_dir().join("dd/newest");
+        for dir in [&pinned_dir, &locked_dir, &reclaimable_dir, &newest_dir] {
+            std::fs::create_dir_all(dir.join("debug")).unwrap();
+        }
+        let lock_path = locked_dir.join("debug/.cargo-build-lock");
+        std::fs::write(&lock_path, b"live").unwrap();
+        let root_manifest = root.path().join("Cargo.toml");
+        std::fs::write(&root_manifest, "[package]\nname='x'\nversion='0.1.0'\n").unwrap();
+        let now = SystemTime::now();
+        let context = |dir: PathBuf, workspace: &str| BuildContext {
+            dir,
+            sidecar: Some(ContextSidecar {
+                version: rgo_protocol::PROTOCOL_VERSION,
+                workspace_root: workspace.into(),
+                manifest_path: root_manifest.display().to_string(),
+                toolchain: None,
+                first_seen: 0,
+                last_seen: 0,
+            }),
+            last_used: now - Duration::from_secs(7200),
+            usage: Usage {
+                physical_bytes: 100,
+                logical_bytes: 100,
+                files: 1,
+            },
+            incremental_usage: Usage::default(),
+        };
+        let contexts = vec![
+            context(pinned_dir.clone(), "/pinned"),
+            context(locked_dir.clone(), "/locked"),
+            context(reclaimable_dir.clone(), "/shared"),
+            context(newest_dir, "/shared"),
+        ];
+        let mut cfg = test_cfg();
+        cfg.gc.context_retention = Duration::from_secs(1);
+        let plan = plan(&Inputs {
+            paths: &paths,
+            cfg: &cfg,
+            contexts: &contexts,
+            pinned: std::slice::from_ref(&pinned_dir),
+            leased: &[],
+            now,
+            aggressive: true,
+            target_bytes: Some(0),
+        });
+        assert!(
+            plan.actions
+                .iter()
+                .all(|action| action.path != pinned_dir && action.path != locked_dir)
+        );
+        assert!(
+            plan.actions
+                .iter()
+                .any(|action| action.path == reclaimable_dir)
+        );
+    }
+
+    #[test]
+    fn liveness_is_rechecked_before_staging_a_deletion() {
+        use fs4::fs_std::FileExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let paths = RgoPaths {
+            root: root.path().join("rgo"),
+        };
+        paths.ensure_layout().unwrap();
+        let context_dir = paths.builds_dir().join("aa/race");
+        std::fs::create_dir_all(&context_dir).unwrap();
+        let now = SystemTime::now();
+        let context = BuildContext {
+            dir: context_dir.clone(),
+            sidecar: None,
+            last_used: now - Duration::from_secs(7200),
+            usage: Usage {
+                physical_bytes: 10,
+                logical_bytes: 10,
+                files: 1,
+            },
+            incremental_usage: Usage::default(),
+        };
+        let mut cfg = test_cfg();
+        cfg.gc.context_retention = Duration::from_secs(1);
+        let plan = plan(&Inputs {
+            paths: &paths,
+            cfg: &cfg,
+            contexts: &[context],
+            pinned: &[],
+            leased: &[],
+            now,
+            aggressive: true,
+            target_bytes: Some(0),
+        });
+        let lock_path = context_dir.join("debug/.cargo-build-lock");
+        std::fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
+        std::fs::write(&lock_path, b"live").unwrap();
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .unwrap();
+        lock.lock_exclusive().unwrap();
+        assert_eq!(execute(&paths, &plan, false).unwrap(), 0);
+        assert!(context_dir.exists());
+    }
+
+    #[test]
+    fn legacy_target_liveness_is_rechecked_before_adopted_deletion() {
+        use fs4::fs_std::FileExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let paths = RgoPaths {
+            root: root.path().join("rgo"),
+        };
+        paths.ensure_layout().unwrap();
+        let target = root.path().join("project/target/debug");
+        let deps = target.join("deps");
+        std::fs::create_dir_all(&deps).unwrap();
+        std::fs::write(deps.join("libfixture.rlib"), b"live").unwrap();
+        let lock_path = target.join(".cargo-build-lock");
+        let lock = std::fs::File::create(&lock_path).unwrap();
+        lock.lock_exclusive().unwrap();
+
+        let error = remove_atomically(&paths, &deps).unwrap_err();
+        assert!(error.to_string().contains("live Cargo build lock"));
+        assert!(deps.exists());
     }
 }

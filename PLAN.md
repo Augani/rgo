@@ -406,7 +406,7 @@ Cargo in a sandboxed `$HOME` (see `crates/rgo/tests/relocate.rs`).
 5. ~~Sidecar protocol + wrapper Phase 1 behaviour.~~ done
 6. ~~`rgo ls`, `rgo status`, and `rgo doctor` toolchain/filesystem/service checks.~~ done
 7. ~~`rgo gc` tiers 0–4, synthetic policy tests, concurrent-build torture test, and `rgo adopt`.~~ done
-8. ~~Service installers (launchd plist, systemd user unit, schtasks).~~ done; `rgo gc --auto` remains pending.
+8. ~~Service installers (launchd plist, systemd user unit, schtasks).~~ done; `rgo gc --auto` and `--target` are implemented and tested.
 9. ~~CI matrix (macOS/Linux/Windows, including btrfs smoke).~~ done; release packaging and Homebrew tap remain pending.
 10. Release v0.1 (Phase 1). Dogfood on your own machine.
 11. ~~Daemon + leases + SQLite (Phase 2).~~ implemented; release validation remains.
@@ -420,40 +420,44 @@ Work in this order. Items marked **release-blocking** must be complete before th
 
 #### A. Finish and release Phase 1 — bounded storage (`v0.1`, release-blocking)
 
-- [ ] Implement `rgo gc --auto` for unattended/opportunistic invocation.
+- [x] Implement `rgo gc --auto` for unattended/opportunistic invocation.
   - Exit quickly and successfully when `[gc].auto = false` or no trigger condition is met.
   - Trigger only when managed bytes exceed the soft watermark or free space is below the reserve.
   - Coordinate through the daemon when available; if coordination is unavailable, do not run unsafe GC.
   - Produce quiet, stable output suitable for cron/service use and a useful non-zero exit on configuration errors.
   - Add tests for disabled, no-pressure, soft-watermark, free-space-pressure, and daemon-unavailable cases.
-- [ ] Implement the documented `rgo gc --target <bytes>` override.
+- [x] Implement the documented `rgo gc --target <bytes>` override.
   - Reuse the existing size parser and reject malformed or impossible targets clearly.
   - Preserve tier ordering, pins, leases, live-lock checks, and rename-before-delete safety.
   - Report requested, planned, and actually reclaimed bytes in dry-run and real modes.
-- [ ] Complete setup lifecycle hardening.
+- [x] Complete setup lifecycle hardening.
   - Write Cargo configuration atomically and preserve permissions.
   - Verify `setup`, repeated `setup`, `--dry-run`, `--undo`, and repeated `--undo` against empty and existing `[build]` tables.
   - Verify setup never changes content outside the managed fence.
   - Verify service installation failure leaves build relocation usable and prints an actionable fallback.
-- [ ] Complete precedence and compatibility coverage.
+- [x] Complete precedence and compatibility coverage.
   - Test project `build-dir`, project `target-dir`, `CARGO_BUILD_BUILD_DIR`, `CARGO_TARGET_DIR`, and `--target-dir` overrides with real Cargo.
   - Test `RGO_BYPASS=1` for both the CLI passthrough and rustc wrapper, including removal of inherited `RGO_*` coordination variables.
   - Test unknown Cargo subcommands, `+toolchain`, non-UTF-8 arguments where supported, signals, stdio, and exact exit-code propagation.
-- [ ] Expand `rgo adopt` safety coverage.
+- [x] Expand `rgo adopt` safety coverage.
   - Cover nested workspaces, custom profiles, cross-target output, symlinks, unreadable paths, and builds that become live between scan and deletion.
   - Confirm final binaries, examples, docs, package output, and user-created files are never selected.
   - Add an explicit confirmation UX if interactive deletion is introduced; non-interactive deletion must remain narrowly scoped.
 - [ ] Dogfood storage behavior on representative large projects.
+  - Implementation and synthetic/real-Cargo torture coverage are complete; this remains an operator release gate requiring measurements on representative projects.
   - Record physical bytes before and after setup, after repeated debug/release builds, and after deleting checkouts.
   - Confirm checkout `target/` directories retain requested final outputs while intermediates remain bounded centrally.
   - Exercise a storage root on another volume and document the copy-versus-hardlink performance trade-off.
 - [ ] Finish release packaging.
+  - Cargo-dist/Homebrew publishing is explicitly outside Phase 1 in the current release plan; this remains a later distribution gate.
   - Add reproducible release binaries, checksums, and `cargo-dist` or equivalent automation.
   - Add Homebrew installation and upgrade validation.
   - Verify `rgo` and `rgo-rustc-wrapper` are always installed beside each other.
   - Publish installation, upgrade, uninstall, bypass, and recovery instructions.
 
 **Phase 1 done when:** a fresh install followed by plain Cargo usage bounds intermediate storage automatically; overrides and bypass remain reliable; GC cannot remove active or pinned state; and release artifacts work on macOS, Linux, and Windows.
+
+**Current gate status:** implementation and automated validation are complete. The v0.1 release gate still requires operator dogfooding; distribution packaging remains intentionally deferred per the Phase 1 scope.
 
 #### B. Production-harden Phase 2 — daemon and leases (`v0.2`, release-blocking)
 

@@ -171,6 +171,7 @@ fn restrict_state_permissions(_paths: &RgoPaths) -> Result<()> {
 }
 
 fn serve_connection(mut connection: Connection, state: &State) -> Result<()> {
+    connection.set_timeout(Duration::from_secs(2))?;
     let hello: Request = ipc::read_message(&mut connection)?;
     match hello {
         Request::Hello { version, .. } if version == PROTOCOL_VERSION => {
@@ -274,7 +275,15 @@ fn handle_request_result(state: &State, request: Request) -> Result<Response> {
         Request::TriggerGc {
             dry_run,
             aggressive,
-        } => Ok(Response::Gc(run_gc(state, dry_run, aggressive)?)),
+            auto,
+            target_bytes,
+        } => Ok(Response::Gc(run_gc(
+            state,
+            dry_run,
+            aggressive,
+            auto,
+            target_bytes,
+        )?)),
         Request::Pin { build_dir } => {
             validate_managed_path(&state.paths, Path::new(&build_dir))?;
             let db = state.db.lock().unwrap();
@@ -356,6 +365,11 @@ fn handle_request_result(state: &State, request: Request) -> Result<Response> {
             if !state.cfg.cache.enabled {
                 return Ok(Response::CacheMiss {
                     reason: "cache_disabled".into(),
+                });
+            }
+            if !cache_admission_allowed(state) {
+                return Ok(Response::CacheMiss {
+                    reason: "free_space_pressure".into(),
                 });
             }
             let _operation = state.operation_lock.lock().unwrap();
@@ -463,6 +477,11 @@ fn handle_request_result(state: &State, request: Request) -> Result<Response> {
             if !state.cfg.cache.enabled {
                 return Ok(Response::CacheCommitted { accepted: false });
             }
+            if !cache_admission_allowed(state) {
+                let db = state.db.lock().unwrap();
+                db.fail_cache_build(&key, lease_id, "free_space_pressure")?;
+                return Ok(Response::CacheCommitted { accepted: false });
+            }
             let _operation = state.operation_lock.lock().unwrap();
             let manifest = native_manifest(&manifest)?;
             if manifest.key != key {
@@ -508,6 +527,11 @@ fn handle_request_result(state: &State, request: Request) -> Result<Response> {
             if !state.cfg.cache.enabled {
                 return Ok(Response::CacheMiss {
                     reason: "cache_disabled".into(),
+                });
+            }
+            if !cache_admission_allowed(state) {
+                return Ok(Response::CacheMiss {
+                    reason: "free_space_pressure".into(),
                 });
             }
             let _operation = state.operation_lock.lock().unwrap();
@@ -619,6 +643,7 @@ fn status_report(state: &State) -> Result<StatusReport> {
         leased: &leased,
         now: SystemTime::now(),
         aggressive: true,
+        target_bytes: None,
     });
     let cache = {
         let db = state.db.lock().unwrap();
@@ -885,9 +910,29 @@ fn valid_object_ref(object: &ObjectRef) -> bool {
         && object.mode <= 0o177777
 }
 
-fn run_gc(state: &State, dry_run: bool, aggressive: bool) -> Result<GcReport> {
+fn run_gc(
+    state: &State,
+    dry_run: bool,
+    aggressive: bool,
+    auto: bool,
+    target_bytes: Option<u64>,
+) -> Result<GcReport> {
     let _operation = state.operation_lock.lock().unwrap();
     let contexts = context::list(&state.paths)?;
+    let managed_bytes: u64 = contexts
+        .iter()
+        .map(|context| context.usage.physical_bytes)
+        .sum();
+    let free_bytes = volume_free_bytes(&state.paths.root).unwrap_or(u64::MAX);
+    let trigger = managed_bytes > state.cfg.soft_watermark || free_bytes < state.cfg.min_free_space;
+    if auto && !trigger {
+        return Ok(GcReport {
+            dry_run,
+            managed_bytes,
+            target_bytes: managed_bytes,
+            ..Default::default()
+        });
+    }
     let mut db = state.db.lock().unwrap();
     db.expire_leases()?;
     db.reconcile_contexts(&contexts)?;
@@ -902,6 +947,7 @@ fn run_gc(state: &State, dry_run: bool, aggressive: bool) -> Result<GcReport> {
         leased: &leased,
         now: SystemTime::now(),
         aggressive,
+        target_bytes,
     });
     let mut plan = plan;
     append_unreferenced_cas(&mut plan, &state.cas, &active_cache_keys)?;
@@ -996,18 +1042,35 @@ fn append_unreferenced_cas(
 }
 
 fn maintenance(state: &State) -> Result<()> {
-    {
+    let should_gc = {
         let _operation = state.operation_lock.lock().unwrap();
         let contexts = context::list(&state.paths)?;
+        let managed_bytes: u64 = contexts
+            .iter()
+            .map(|context| context.usage.physical_bytes)
+            .sum();
+        let free_bytes = volume_free_bytes(&state.paths.root).unwrap_or(u64::MAX);
+        let should_gc = state.cfg.gc.auto
+            && (managed_bytes > state.cfg.soft_watermark || free_bytes < state.cfg.min_free_space);
         let mut db = state.db.lock().unwrap();
         db.expire_leases()?;
         db.prune_failed_cache_builds(Duration::from_secs(7 * 86_400))?;
         db.reconcile_contexts(&contexts)?;
         reconcile_cache(&mut db, &state.cas)?;
         drain_cache_events(&state.paths, &db)?;
+        should_gc
+    };
+    if should_gc {
+        let _ = run_gc(state, false, false, true, None)?;
     }
     process_remote_jobs(state)?;
     Ok(())
+}
+
+fn cache_admission_allowed(state: &State) -> bool {
+    volume_free_bytes(&state.paths.root)
+        .map(|free| free >= state.cfg.min_free_space)
+        .unwrap_or(false)
 }
 
 fn process_remote_jobs(state: &State) -> Result<()> {

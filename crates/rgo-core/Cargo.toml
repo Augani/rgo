@@ -26,12 +26,10 @@ walkdir.workspace = true
 fs4.workspace = true
 sysinfo.workspace = true
 rusqlite.workspace = true
+interprocess.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
-
-[target.'cfg(windows)'.dependencies]
-uds_windows.workspace = true
 
 [lints]
 workspace = true

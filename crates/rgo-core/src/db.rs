@@ -76,16 +76,33 @@ impl StateDb {
         match Self::open_initialized(&paths.db_file()) {
             Ok(db) => Ok(db),
             Err(first_error) => {
+                let stamp = unix_now();
                 let corrupt = paths
                     .state_dir()
-                    .join(format!("meta.sqlite.corrupt-{}", unix_now()));
-                if paths.db_file().exists() {
-                    std::fs::rename(paths.db_file(), &corrupt).with_context(|| {
-                        format!(
-                            "moving corrupt database to {} after: {first_error:#}",
-                            corrupt.display()
-                        )
-                    })?;
+                    .join(format!("meta.sqlite.corrupt-{stamp}"));
+                for (source, destination) in [
+                    (paths.db_file(), corrupt.clone()),
+                    (
+                        paths.state_dir().join("meta.sqlite-wal"),
+                        paths
+                            .state_dir()
+                            .join(format!("meta.sqlite-wal.corrupt-{stamp}")),
+                    ),
+                    (
+                        paths.state_dir().join("meta.sqlite-shm"),
+                        paths
+                            .state_dir()
+                            .join(format!("meta.sqlite-shm.corrupt-{stamp}")),
+                    ),
+                ] {
+                    if source.exists() {
+                        std::fs::rename(&source, &destination).with_context(|| {
+                            format!(
+                                "moving corrupt database artifact to {} after: {first_error:#}",
+                                destination.display()
+                            )
+                        })?;
+                    }
                 }
                 let db = Self::open_initialized(&paths.db_file())
                     .context("rebuilding SQLite metadata database")?;
@@ -1364,5 +1381,94 @@ mod tests {
         assert_eq!(db.next_remote_job().unwrap().as_deref(), Some("key"));
         let status = db.remote_status(true, Some("https://cache.example"), Some("stable"));
         assert_eq!(status.unwrap().queue_depth, 1);
+    }
+
+    #[test]
+    fn concurrent_writers_survive_wal_busy_contention() {
+        use std::sync::{Arc, Barrier};
+
+        let root = tempdir().unwrap();
+        let paths = RgoPaths {
+            root: root.path().join("rgo"),
+        };
+        paths.ensure_layout().unwrap();
+        let paths = Arc::new(paths);
+        let barrier = Arc::new(Barrier::new(8));
+        let mut workers = Vec::new();
+        for index in 0..8 {
+            let paths = Arc::clone(&paths);
+            let barrier = Arc::clone(&barrier);
+            workers.push(std::thread::spawn(move || {
+                let db = StateDb::open(&paths).unwrap();
+                barrier.wait();
+                for round in 0..20 {
+                    db.touch(
+                        &paths
+                            .builds_dir()
+                            .join(format!("aa/context-{index}-{round}")),
+                        None,
+                        Some((index + round + 1) as u64),
+                        None,
+                    )
+                    .unwrap();
+                }
+            }));
+        }
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        let db = StateDb::open(&paths).unwrap();
+        assert_eq!(db.stats().unwrap().active_leases, 0);
+        assert!(
+            db.connection
+                .query_row::<i64, _, _>("SELECT COUNT(*) FROM access_summary", [], |row| row.get(0))
+                .unwrap()
+                >= 160
+        );
+    }
+
+    #[test]
+    fn damaged_wal_and_shm_are_recoverable_without_blocking_reopen() {
+        let root = tempdir().unwrap();
+        let paths = RgoPaths {
+            root: root.path().join("rgo"),
+        };
+        paths.ensure_layout().unwrap();
+        drop(StateDb::open(&paths).unwrap());
+
+        let raw = Connection::open(paths.db_file()).unwrap();
+        raw.pragma_update(None, "journal_mode", "WAL").unwrap();
+        raw.pragma_update(None, "wal_autocheckpoint", 1_000_000_i64)
+            .unwrap();
+        let transaction = raw.unchecked_transaction().unwrap();
+        for index in 0..500 {
+            transaction
+                .execute(
+                    "INSERT OR REPLACE INTO access_summary(build_dir, touch_count, last_touched)
+                     VALUES(?1, ?2, ?2)",
+                    params![format!("/tmp/recovery-{index}"), index as i64],
+                )
+                .unwrap();
+        }
+        transaction.commit().unwrap();
+        let wal = paths.state_dir().join("meta.sqlite-wal");
+        let shm = paths.state_dir().join("meta.sqlite-shm");
+        assert!(wal.is_file());
+        assert!(shm.is_file());
+        std::fs::write(&wal, vec![0_u8; 32]).unwrap();
+        std::fs::write(&shm, vec![0_u8; 32]).unwrap();
+        drop(raw);
+
+        let reopened = StateDb::open(&paths).unwrap();
+        assert!(
+            reopened
+                .connection
+                .query_row::<String, _, _>(
+                    "SELECT value FROM schema_meta WHERE key = 'schema_version'",
+                    [],
+                    |row| row.get(0),
+                )
+                .is_ok()
+        );
     }
 }

@@ -156,6 +156,12 @@ pub fn classify(
         return Classification::Bypass(BypassReason::MissingSource);
     };
     let source = PathBuf::from(source);
+    if fs::symlink_metadata(&source)
+        .map(|metadata| metadata.file_type().is_symlink())
+        .unwrap_or(false)
+    {
+        return Classification::Bypass(BypassReason::UnsafePath);
+    }
     let Ok(source) = fs::canonicalize(&source) else {
         return Classification::Bypass(BypassReason::MissingSource);
     };
@@ -205,22 +211,16 @@ pub fn classify(
         }
         if arg == "-C" {
             if let Some(value) = args.get(i + 1).map(|v| v.to_string_lossy().into_owned()) {
-                if value.starts_with("incremental=") {
-                    return Classification::Bypass(BypassReason::Incremental);
-                }
-                if value == "save-temps" || value.starts_with("save-temps=") {
-                    return Classification::Bypass(BypassReason::SaveTemps);
+                if let Some(reason) = unsafe_codegen_option(&value) {
+                    return Classification::Bypass(reason);
                 }
             }
             i += 2;
             continue;
         }
         if let Some(value) = arg.strip_prefix("-C") {
-            if value == "incremental" || value.starts_with("incremental=") {
-                return Classification::Bypass(BypassReason::Incremental);
-            }
-            if value == "save-temps" || value.starts_with("save-temps=") {
-                return Classification::Bypass(BypassReason::SaveTemps);
+            if let Some(reason) = unsafe_codegen_option(value) {
+                return Classification::Bypass(reason);
             }
         }
         if arg == "--extern" {
@@ -238,8 +238,31 @@ pub fn classify(
                 return Classification::Bypass(BypassReason::ExternalExtern);
             }
         }
-        if arg == "-l" || arg.starts_with("-l") || arg == "-L" || arg.starts_with("-Lnative=") {
+        if arg == "-l"
+            || arg.starts_with("-l")
+            || arg.starts_with("-Lnative=")
+            || arg.starts_with("-Clinker=")
+            || arg.starts_with("-Clink-arg=")
+            || arg.starts_with("-Clink-self-contained")
+        {
             return Classification::Bypass(BypassReason::NativeInput);
+        }
+        if arg == "-L" {
+            let Some(value) = args.get(i + 1).map(|v| v.to_string_lossy().into_owned()) else {
+                return Classification::Bypass(BypassReason::NativeInput);
+            };
+            let path = value
+                .split_once('=')
+                .map_or(value.as_str(), |(_, path)| path);
+            if value.starts_with("native=") {
+                return Classification::Bypass(BypassReason::NativeInput);
+            }
+            if !path_under(Path::new(path), &roots.build_root) && !is_sysroot_path(Path::new(path))
+            {
+                return Classification::Bypass(BypassReason::ExternalExtern);
+            }
+            i += 2;
+            continue;
         }
         i += 1;
     }
@@ -262,14 +285,18 @@ pub fn classify(
 
     let existing_remap = remap_path_prefixes(args);
     let remap_path_prefix = if is_workspace {
-        match existing_remap
+        let covering = existing_remap
             .iter()
-            .find(|(from, _)| path_under(&source_root, Path::new(from)))
-        {
-            Some((from, to)) if path_under(&source_root, Path::new(from)) => {
-                Some((from.clone(), to.clone()))
-            }
-            Some(_) => return Classification::Bypass(BypassReason::RemapConflict),
+            .filter(|(from, _)| path_under(&source_root, Path::new(from)))
+            .collect::<Vec<_>>();
+        if covering.len() > 1 {
+            return Classification::Bypass(BypassReason::RemapConflict);
+        }
+        if covering.is_empty() && !existing_remap.is_empty() && roots.remap_workspace_paths {
+            return Classification::Bypass(BypassReason::RemapConflict);
+        }
+        match covering.first() {
+            Some((from, to)) => Some(((*from).clone(), (*to).clone())),
             None if roots.remap_workspace_paths => Some((
                 source_root.to_string_lossy().into_owned(),
                 WORKSPACE_REMAP_PREFIX.to_owned(),
@@ -280,7 +307,7 @@ pub fn classify(
         None
     };
 
-    let source_digest = match digest_tree(&source_root) {
+    let source_digest = match digest_tree_strict(&source_root) {
         Ok(digest) => digest,
         Err(_) => return Classification::Bypass(BypassReason::SourceOutsideCache),
     };
@@ -363,6 +390,18 @@ fn digest_tree_strict(root: &Path) -> std::io::Result<String> {
         hash_field(&mut hasher, &fs::read(path)?);
     }
     Ok(hasher.finalize().to_hex().to_string())
+}
+
+fn unsafe_codegen_option(value: &str) -> Option<BypassReason> {
+    let option = value.split_once('=').map_or(value, |(name, _)| name);
+    match option {
+        "incremental" => Some(BypassReason::Incremental),
+        "save-temps" => Some(BypassReason::SaveTemps),
+        "linker" | "link-arg" | "link-args" | "link-self-contained" => {
+            Some(BypassReason::NativeInput)
+        }
+        _ => None,
+    }
 }
 
 pub fn compiler_identity(rustc: &Path) -> std::io::Result<String> {
@@ -905,5 +944,134 @@ mod tests {
             classify_type("lib", "metadata", &env),
             Classification::Cacheable(_)
         ));
+    }
+
+    #[test]
+    fn classifier_has_stable_reasons_for_unsafe_inputs() {
+        let (_dir, root, source) = fixture();
+        let build = root.join("build");
+        fs::create_dir_all(&build).unwrap();
+        let roots = AllowedRoots {
+            build_root: build.clone(),
+            source_roots: vec![root.parent().unwrap().to_path_buf()],
+            workspace_roots: Vec::new(),
+            remap_workspace_paths: false,
+        };
+        let base = || {
+            vec![
+                "--crate-name".into(),
+                "demo".into(),
+                "--crate-type=lib".into(),
+                "--emit=metadata,link".into(),
+                "--out-dir".into(),
+                build.as_os_str().to_owned(),
+                source.as_os_str().to_owned(),
+            ]
+        };
+        let cases = [
+            (vec!["--crate-type=bin"], BypassReason::UnsupportedCrateType),
+            (vec!["--emit=asm"], BypassReason::UnsupportedEmit),
+            (vec!["-C", "incremental=cache"], BypassReason::Incremental),
+            (vec!["-C", "save-temps"], BypassReason::SaveTemps),
+            (vec!["-Zunstable-options"], BypassReason::UnstableFlag),
+            (vec!["-lfoo"], BypassReason::NativeInput),
+            (vec!["-C", "link-arg=-nostdlib"], BypassReason::NativeInput),
+            (vec!["-L", "native=cache"], BypassReason::NativeInput),
+            (vec!["-L", "/outside"], BypassReason::ExternalExtern),
+            (
+                vec!["--extern=other=/outside/libother.rlib"],
+                BypassReason::ExternalExtern,
+            ),
+        ];
+        for (extra, expected) in cases {
+            let mut args = base();
+            for value in extra {
+                args.push(value.into());
+            }
+            assert_eq!(
+                classify(Path::new("rustc"), &args, &[], &roots),
+                Classification::Bypass(expected)
+            );
+        }
+
+        let outside = tempfile::tempdir().unwrap();
+        let out_dir = outside.path().join("out");
+        fs::create_dir_all(&out_dir).unwrap();
+        let env = vec![(OsString::from("OUT_DIR"), out_dir.into_os_string())];
+        assert_eq!(
+            classify(Path::new("rustc"), &base(), &env, &roots),
+            Classification::Bypass(BypassReason::BuildScriptOutput)
+        );
+
+        #[cfg(unix)]
+        {
+            let link = root.join("symlink.rs");
+            std::os::unix::fs::symlink(&source, &link).unwrap();
+            let mut args = base();
+            *args.last_mut().unwrap() = link.into_os_string();
+            assert_eq!(
+                classify(Path::new("rustc"), &args, &[], &roots),
+                Classification::Bypass(BypassReason::UnsafePath)
+            );
+        }
+    }
+
+    #[test]
+    fn user_remap_is_honored_and_conflicts_are_bypassed() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("workspace");
+        let member = workspace.join("member");
+        let build = dir.path().join("build");
+        fs::create_dir_all(member.join("src")).unwrap();
+        fs::create_dir_all(&build).unwrap();
+        fs::write(member.join("Cargo.toml"), "[package]\nname='member'\n").unwrap();
+        let source = member.join("src/lib.rs");
+        fs::write(&source, "pub fn value() {}\n").unwrap();
+        let roots = AllowedRoots {
+            build_root: build.clone(),
+            source_roots: Vec::new(),
+            workspace_roots: vec![workspace.clone()],
+            remap_workspace_paths: true,
+        };
+        let base = vec![
+            "--crate-name".into(),
+            "member".into(),
+            "--crate-type=lib".into(),
+            "--emit=metadata".into(),
+            "--out-dir".into(),
+            build.as_os_str().to_owned(),
+            source.as_os_str().to_owned(),
+        ];
+        let mut explicit = base.clone();
+        explicit.push(
+            format!(
+                "--remap-path-prefix={}=/custom/workspace",
+                workspace.display()
+            )
+            .into(),
+        );
+        let candidate = match classify(Path::new("rustc"), &explicit, &[], &roots) {
+            Classification::Cacheable(candidate) => candidate,
+            other => panic!("expected explicit remap to be accepted: {other:?}"),
+        };
+        assert_eq!(
+            candidate.remap_path_prefix,
+            Some((workspace.display().to_string(), "/custom/workspace".into()))
+        );
+        assert_eq!(
+            candidate
+                .compiler_args
+                .iter()
+                .filter(|arg| arg.to_string_lossy().starts_with("--remap-path-prefix="))
+                .count(),
+            1
+        );
+
+        let mut unrelated = base.clone();
+        unrelated.push("--remap-path-prefix=/unrelated=/other".into());
+        assert_eq!(
+            classify(Path::new("rustc"), &unrelated, &[], &roots),
+            Classification::Bypass(BypassReason::RemapConflict)
+        );
     }
 }

@@ -24,6 +24,80 @@ fn setup_dry_run_includes_the_platform_service_without_mutating_the_sandbox() {
     assert!(output.contains("<string>daemon</string>"), "{output}");
     assert!(output.contains("<string>--foreground</string>"), "{output}");
     assert!(!sandbox.cargo_home.join("config.toml").exists());
+
+    let undo = sandbox
+        .cmd(cargo_bin("rgo"))
+        .args(["setup", "--undo", "--dry-run"])
+        .output()
+        .unwrap();
+    assert!(
+        undo.status.success(),
+        "{}",
+        String::from_utf8_lossy(&undo.stderr)
+    );
+    assert!(String::from_utf8_lossy(&undo.stdout).contains("would remove service"));
+    assert!(!sandbox.cargo_home.join("config.toml").exists());
+}
+
+#[test]
+fn automatic_gc_can_be_disabled_without_starting_coordination() {
+    ensure_workspace_bins_built().unwrap();
+    let sandbox = Sandbox::new().unwrap();
+    std::fs::write(sandbox.rgo_home.join("config.toml"), "[gc]\nauto = false\n").unwrap();
+    let result = sandbox
+        .cmd(cargo_bin("rgo"))
+        .args(["gc", "--auto"])
+        .output()
+        .unwrap();
+    assert!(result.status.success());
+    assert!(result.stdout.is_empty());
+    assert!(!sandbox.rgo_home.join("state/daemon.sock").exists());
+}
+
+#[test]
+fn automatic_gc_without_pressure_is_quiet_and_does_not_start_a_daemon() {
+    ensure_workspace_bins_built().unwrap();
+    let sandbox = Sandbox::new().unwrap();
+    let result = sandbox
+        .cmd(cargo_bin("rgo"))
+        .args(["gc", "--auto"])
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(result.stdout.is_empty());
+    assert!(!sandbox.rgo_home.join("state/daemon.sock").exists());
+}
+
+#[test]
+fn doctor_is_read_only_for_daemon_state() {
+    ensure_workspace_bins_built().unwrap();
+    let sandbox = Sandbox::new().unwrap();
+    let result = sandbox
+        .cmd(cargo_bin("rgo"))
+        .arg("doctor")
+        .output()
+        .unwrap();
+    assert!(result.status.success());
+    assert!(!sandbox.rgo_home.join("state/daemon.sock").exists());
+    assert!(!sandbox.rgo_home.join("state/daemon.pid").exists());
+}
+
+#[test]
+fn gc_target_rejects_non_concrete_sizes_before_startup() {
+    ensure_workspace_bins_built().unwrap();
+    let sandbox = Sandbox::new().unwrap();
+    let result = sandbox
+        .cmd(cargo_bin("rgo"))
+        .args(["gc", "--target", "not-a-size"])
+        .output()
+        .unwrap();
+    assert!(!result.status.success());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("invalid size"));
+    assert!(!sandbox.rgo_home.join("state/daemon.sock").exists());
 }
 
 #[test]

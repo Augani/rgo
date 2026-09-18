@@ -48,6 +48,12 @@ enum Cmd {
         dry_run: bool,
         #[arg(long)]
         aggressive: bool,
+        /// Run only when the configured automatic-GC trigger is active.
+        #[arg(long)]
+        auto: bool,
+        /// Reclaim until managed storage is at or below this size.
+        #[arg(long)]
+        target: Option<String>,
     },
     /// List managed build contexts.
     Ls,
@@ -99,7 +105,9 @@ fn main() -> Result<()> {
         Some(Cmd::Gc {
             dry_run,
             aggressive,
-        }) => cmd::gc::run(dry_run, aggressive),
+            auto,
+            target,
+        }) => cmd::gc::run(dry_run, aggressive, auto, target),
         Some(Cmd::Ls) => cmd::ls::run(),
         Some(Cmd::Pin { id }) => cmd::pin::run(&id, true),
         Some(Cmd::Unpin { id }) => cmd::pin::run(&id, false),

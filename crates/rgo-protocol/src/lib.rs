@@ -68,6 +68,8 @@ pub enum Request {
     TriggerGc {
         dry_run: bool,
         aggressive: bool,
+        auto: bool,
+        target_bytes: Option<u64>,
     },
     Pin {
         build_dir: String,

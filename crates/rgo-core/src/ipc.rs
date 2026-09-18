@@ -17,17 +17,19 @@ use rgo_protocol::{
 #[cfg(unix)]
 mod platform {
     use std::io;
-    use std::os::unix::net::{UnixListener, UnixStream};
     use std::path::Path;
 
-    pub type Listener = UnixListener;
-    pub type Stream = UnixStream;
+    use interprocess::local_socket::{GenericFilePath, ListenerOptions, prelude::*};
+
+    pub type Listener = interprocess::local_socket::Listener;
+    pub type Stream = interprocess::local_socket::Stream;
 
     pub fn bind(path: &Path) -> io::Result<Listener> {
         if path.exists() {
             let _ = std::fs::remove_file(path);
         }
-        let listener = UnixListener::bind(path)?;
+        let name = path.to_fs_name::<GenericFilePath>()?;
+        let listener = ListenerOptions::new().name(name).create_sync()?;
         let mut permissions = std::fs::metadata(path)?.permissions();
         use std::os::unix::fs::PermissionsExt;
         permissions.set_mode(0o600);
@@ -36,28 +38,38 @@ mod platform {
     }
 
     pub fn connect(path: &Path) -> io::Result<Stream> {
-        UnixStream::connect(path)
+        let name = path.to_fs_name::<GenericFilePath>()?;
+        interprocess::local_socket::ConnectOptions::new()
+            .name(name)
+            .connect_sync()
     }
 }
 
 #[cfg(windows)]
 mod platform {
+    use interprocess::local_socket::{
+        ConnectOptions, GenericNamespaced, ListenerOptions, prelude::*,
+    };
     use std::io;
     use std::path::Path;
-    use uds_windows::{UnixListener, UnixStream};
 
-    pub type Listener = UnixListener;
-    pub type Stream = UnixStream;
+    pub type Listener = interprocess::local_socket::Listener;
+    pub type Stream = interprocess::local_socket::Stream;
 
     pub fn bind(path: &Path) -> io::Result<Listener> {
-        if path.exists() {
-            let _ = std::fs::remove_file(path);
-        }
-        UnixListener::bind(path)
+        let name = path
+            .to_string_lossy()
+            .into_owned()
+            .to_ns_name::<GenericNamespaced>()?;
+        ListenerOptions::new().name(name).create_sync()
     }
 
     pub fn connect(path: &Path) -> io::Result<Stream> {
-        UnixStream::connect(path)
+        let name = path
+            .to_string_lossy()
+            .into_owned()
+            .to_ns_name::<GenericNamespaced>()?;
+        ConnectOptions::new().name(name).connect_sync()
     }
 }
 
@@ -65,6 +77,16 @@ pub struct Listener(platform::Listener);
 
 pub struct Connection {
     stream: platform::Stream,
+}
+
+impl Connection {
+    /// Bound daemon-side resource usage for clients that connect and then stop sending bytes.
+    pub fn set_timeout(&self, timeout: Duration) -> io::Result<()> {
+        use interprocess::local_socket::traits::Stream as _;
+        self.stream.set_recv_timeout(Some(timeout))?;
+        self.stream.set_send_timeout(Some(timeout))?;
+        Ok(())
+    }
 }
 
 impl Read for Connection {
@@ -91,20 +113,28 @@ impl Listener {
     }
 
     pub fn accept(&self) -> io::Result<Connection> {
-        let (stream, _) = self.0.accept()?;
+        use interprocess::local_socket::traits::Listener as _;
+        let stream = self.0.accept()?;
         Ok(Connection { stream })
     }
 
     pub fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()> {
-        self.0.set_nonblocking(nonblocking)
+        use interprocess::local_socket::traits::Listener as _;
+        self.0.set_nonblocking(
+            interprocess::local_socket::ListenerNonblockingMode::from_bool(
+                nonblocking,
+                nonblocking,
+            ),
+        )
     }
 }
 
 pub fn connect(path: &Path, timeout: Duration) -> Result<Connection> {
     let stream =
         platform::connect(path).with_context(|| format!("connecting to {}", path.display()))?;
-    stream.set_read_timeout(Some(timeout))?;
-    stream.set_write_timeout(Some(timeout))?;
+    use interprocess::local_socket::traits::Stream as _;
+    stream.set_recv_timeout(Some(timeout))?;
+    stream.set_send_timeout(Some(timeout))?;
     Ok(Connection { stream })
 }
 

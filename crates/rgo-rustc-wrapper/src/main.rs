@@ -27,10 +27,44 @@ use rgo_protocol::{
     encode_frame,
 };
 
-#[cfg(unix)]
-type PlatformStream = std::os::unix::net::UnixStream;
-#[cfg(windows)]
-type PlatformStream = uds_windows::UnixStream;
+mod platform {
+    use std::io;
+    use std::path::Path;
+    use std::time::Duration;
+
+    use interprocess::local_socket::{ConnectOptions, prelude::*};
+
+    pub type Stream = interprocess::local_socket::Stream;
+
+    #[cfg(unix)]
+    pub fn connect(path: &Path, timeout: Duration) -> io::Result<Stream> {
+        use interprocess::local_socket::GenericFilePath;
+        let name = path.to_fs_name::<GenericFilePath>()?;
+        let stream = ConnectOptions::new().name(name).connect_sync()?;
+        set_timeout(&stream, timeout)?;
+        Ok(stream)
+    }
+
+    #[cfg(windows)]
+    pub fn connect(path: &Path, timeout: Duration) -> io::Result<Stream> {
+        use interprocess::local_socket::GenericNamespaced;
+        let name = path
+            .to_string_lossy()
+            .into_owned()
+            .to_ns_name::<GenericNamespaced>()?;
+        let stream = ConnectOptions::new().name(name).connect_sync()?;
+        set_timeout(&stream, timeout)?;
+        Ok(stream)
+    }
+
+    fn set_timeout(stream: &Stream, timeout: Duration) -> io::Result<()> {
+        use interprocess::local_socket::traits::Stream as _;
+        stream.set_recv_timeout(Some(timeout))?;
+        stream.set_send_timeout(Some(timeout))
+    }
+}
+
+type PlatformStream = platform::Stream;
 
 fn main() {
     let mut args = std::env::args_os().skip(1);
@@ -391,12 +425,35 @@ fn is_sccache(wrapper: &Path) -> bool {
 }
 
 fn configured_inner_wrapper() -> Option<OsString> {
-    std::env::var_os("RGO_INNER_RUSTC_WRAPPER").or_else(|| {
+    let configured = std::env::var_os("RGO_INNER_RUSTC_WRAPPER").or_else(|| {
         rgo_home()
             .and_then(|home| std::fs::read_to_string(home.join("state/inner-wrapper")).ok())
             .map(|value| OsString::from(value.trim()))
             .filter(|value| !value.is_empty())
-    })
+    })?;
+    let path = Path::new(&configured);
+    let is_self = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.eq_ignore_ascii_case("rgo-rustc-wrapper"));
+    let resolves_to_self = std::env::current_exe()
+        .ok()
+        .and_then(|current| {
+            let configured = if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                std::env::current_dir().ok()?.join(path)
+            };
+            Some((current, configured))
+        })
+        .is_some_and(|(current, configured)| {
+            std::fs::canonicalize(current).ok() == std::fs::canonicalize(configured).ok()
+        });
+    if is_self || resolves_to_self {
+        None
+    } else {
+        Some(configured)
+    }
 }
 
 fn materialize_hit(
@@ -836,13 +893,7 @@ fn request(message: Request) -> Result<Response, String> {
         })
         .ok_or_else(|| "cannot determine RGO_HOME".to_owned())?;
     let socket = home.join("state").join("daemon.sock");
-    let mut stream = PlatformStream::connect(socket).map_err(|e| e.to_string())?;
-    let timeout = Some(Duration::from_millis(CLIENT_TIMEOUT_MILLIS));
-    stream
-        .set_read_timeout(timeout)
-        .map_err(|e| e.to_string())?;
-    stream
-        .set_write_timeout(timeout)
+    let mut stream = platform::connect(&socket, Duration::from_millis(CLIENT_TIMEOUT_MILLIS))
         .map_err(|e| e.to_string())?;
     write_frame(
         &mut stream,
@@ -951,7 +1002,18 @@ fn find_managed_build_dir(out_dir: &Path) -> Option<PathBuf> {
 #[cfg(unix)]
 fn exec(rustc: OsString, args: &[OsString]) -> ! {
     use std::os::unix::process::CommandExt;
-    let err = compiler_command(&rustc, args).exec();
+    let bypass = std::env::var_os(BYPASS_ENV).is_some();
+    let mut command = if bypass {
+        let mut command = Command::new(&rustc);
+        command.args(args);
+        command
+    } else {
+        compiler_command(&rustc, args)
+    };
+    if bypass {
+        strip_rgo_environment(&mut command);
+    }
+    let err = command.exec();
     eprintln!(
         "rgo-rustc-wrapper: failed to exec {}: {err}",
         rustc.to_string_lossy()
@@ -972,7 +1034,18 @@ fn exit_code(s: std::process::ExitStatus) -> i32 {
 
 #[cfg(not(unix))]
 fn exec(rustc: OsString, args: &[OsString]) -> ! {
-    match compiler_command(&rustc, args).status() {
+    let bypass = std::env::var_os(BYPASS_ENV).is_some();
+    let mut command = if bypass {
+        let mut command = Command::new(&rustc);
+        command.args(args);
+        command
+    } else {
+        compiler_command(&rustc, args)
+    };
+    if bypass {
+        strip_rgo_environment(&mut command);
+    }
+    match command.status() {
         Ok(s) => std::process::exit(s.code().unwrap_or(1)),
         Err(err) => {
             eprintln!(
@@ -980,6 +1053,14 @@ fn exec(rustc: OsString, args: &[OsString]) -> ! {
                 rustc.to_string_lossy()
             );
             std::process::exit(127);
+        }
+    }
+}
+
+fn strip_rgo_environment(command: &mut Command) {
+    for (key, _) in std::env::vars_os() {
+        if key.to_string_lossy().starts_with("RGO_") {
+            command.env_remove(key);
         }
     }
 }

@@ -70,6 +70,24 @@ impl RgoPaths {
         ] {
             std::fs::create_dir_all(d).with_context(|| format!("creating {}", d.display()))?;
         }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for d in [
+                &self.root,
+                &self.state_dir(),
+                &self.state_dir().join("locks"),
+                &self.builds_dir(),
+                &self.tmp_dir(),
+                &self.quarantine_dir(),
+                &self.logs_dir(),
+            ] {
+                let mut permissions = std::fs::metadata(d)?.permissions();
+                permissions.set_mode(0o700);
+                std::fs::set_permissions(d, permissions)
+                    .with_context(|| format!("restricting {}", d.display()))?;
+            }
+        }
         Ok(())
     }
 

@@ -47,6 +47,26 @@ pub fn run() -> Result<()> {
             cfg_path.display()
         ),
     );
+    if insp.has_fence {
+        let inner = e
+            .paths
+            .state_dir()
+            .join("inner-wrapper")
+            .canonicalize()
+            .ok()
+            .and_then(|path| std::fs::read_to_string(path).ok())
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty());
+        let outer = std::env::current_exe()
+            .ok()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "rgo-rustc-wrapper".into());
+        println!(
+            "info wrapper chain: {} -> {}",
+            outer,
+            inner.as_deref().unwrap_or("rustc")
+        );
+    }
     if let Some(w) = &insp.rustc_wrapper {
         println!("info build.rustc-wrapper = {w:?}");
         check(
@@ -121,7 +141,7 @@ pub fn run() -> Result<()> {
             },
         );
     }
-    let daemon_ok = daemon::ensure_running(&e.paths);
+    let daemon_ok = daemon::is_available(&e.paths);
     check(
         daemon_ok,
         format!(
@@ -240,6 +260,13 @@ pub fn run() -> Result<()> {
                 candidates == 0,
                 format!(
                     "no reclaimable legacy target directories ({candidates} found; remediation: run `rgo adopt` then `rgo adopt --delete`)"
+                ),
+            );
+            check(
+                report.skipped.is_empty(),
+                format!(
+                    "legacy target scan read all paths ({} skipped; remediation: run `rgo adopt` with explicit readable roots)",
+                    report.skipped.len()
                 ),
             );
         }
