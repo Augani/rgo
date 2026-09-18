@@ -479,7 +479,8 @@ Work in this order. Items marked **release-blocking** must be complete before th
 #### C. Prove Phase 3 cache correctness before enabling it by default (`v0.3`, release-blocking)
 
 - [~] Build the differential compatibility corpus.
-  - A scaled-down real-Cargo corpus is in-tree: `real_cargo_git_dependency_hits_reproduce_cold_compiles` builds three chained git dependencies across three checkouts and asserts byte-identical rlibs for bypassed-cold, publishing, and cache-hit materialization, plus identical binary behavior.
+  - A scaled-down real-Cargo corpus is in-tree: `real_cargo_git_dependency_hits_reproduce_cold_compiles` builds five git dependencies (three chained libs, a build-script consumer, a proc-macro) across three checkouts and asserts byte-identical artifacts for path-free deps, publisher-verbatim bytes for all hit-materialized deps, and identical binary behavior.
+  - The corpus already caught two production bugs: shared-`--out-dir` scan poisoning (siblings' outputs entering a manifest → `materialization_failed`) and bare `--extern proc_macro` rejecting every real proc-macro compile. Both are fixed and covered.
   - The release gate remains scaling the corpus to ≥50 popular registry crates across three toolchains and all three supported operating systems — a CI-matrix-scale exercise.
   - Include features, custom profiles, cross compilation, path/git dependencies, multiple registries, clippy, rustdoc, tests, benches, and examples.
 - [x] Audit and lock down artifact-key completeness.

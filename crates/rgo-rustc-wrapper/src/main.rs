@@ -693,7 +693,10 @@ fn collect_outputs(
         }
         for entry in std::fs::read_dir(&spec.path)? {
             let path = entry?.path();
-            if !path.is_file() || !is_output_for_kind(&path, &spec.kind) {
+            if !path.is_file()
+                || !is_output_for_kind(&path, &spec.kind)
+                || !is_invocation_output(candidate, &path)
+            {
                 continue;
             }
             let modified = std::fs::metadata(&path)?.modified().unwrap_or(UNIX_EPOCH);
@@ -705,6 +708,21 @@ fn collect_outputs(
     outputs.sort_by(|left, right| left.1.cmp(&right.1));
     outputs.dedup_by(|left, right| left.1 == right.1);
     Ok(outputs)
+}
+
+/// `--out-dir` is shared by every crate in the graph, so a directory scan can only claim
+/// files whose stem names this invocation (`{lib?}{crate_name}{extra_filename}`). Anything
+/// else is a concurrently-built sibling's output and must not enter this crate's manifest.
+fn is_invocation_output(candidate: &Candidate, path: &Path) -> bool {
+    let Some(stem) = path.file_stem().and_then(|v| v.to_str()) else {
+        return false;
+    };
+    let base = format!(
+        "{}{}",
+        candidate.crate_name,
+        candidate.extra_filename.as_deref().unwrap_or("")
+    );
+    stem == base || stem == format!("lib{base}")
 }
 
 fn is_output_for_kind(path: &Path, kind: &str) -> bool {

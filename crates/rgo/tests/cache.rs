@@ -188,6 +188,63 @@ printf 'dep:%s\n' "$name" > "$out/$name.d"
         root
     }
 
+    /// Every managed build context under `builds/<shard>/<ctx>` — used to
+    /// attribute a new context to the build that just ran.
+    fn contexts(sb: &Sandbox) -> Vec<PathBuf> {
+        let mut dirs = Vec::new();
+        for shard in fs::read_dir(sb.rgo_home.join("builds"))
+            .into_iter()
+            .flatten()
+            .flatten()
+        {
+            for entry in fs::read_dir(shard.path()).into_iter().flatten().flatten() {
+                if entry.path().is_dir() {
+                    dirs.push(entry.path());
+                }
+            }
+        }
+        dirs
+    }
+
+    /// Loadable dependency artifacts under a context's `release/deps/`
+    /// (rlib/rmeta/shared-library outputs, dep-info excluded since it embeds
+    /// per-context paths by design).
+    fn dep_artifacts(context: &std::path::Path) -> Vec<(String, Vec<u8>)> {
+        let deps = context.join("release/deps");
+        let mut files: Vec<_> = fs::read_dir(&deps)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| {
+                p.is_file()
+                    && p.file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .starts_with("libdep_")
+                    && !p.extension().is_some_and(|ext| ext == "d")
+            })
+            .collect();
+        files.sort();
+        files
+            .into_iter()
+            .map(|p| {
+                (
+                    p.file_name().unwrap().to_string_lossy().into_owned(),
+                    fs::read(&p).unwrap(),
+                )
+            })
+            .collect()
+    }
+
+    /// The context dir created by the build that ran after `before` was taken.
+    fn new_context(sb: &Sandbox, before: &[PathBuf]) -> PathBuf {
+        contexts(sb)
+            .into_iter()
+            .find(|d| !before.contains(d))
+            .expect("build created no build context")
+    }
+
     fn workspace_command_for(
         sb: &Sandbox,
         fixture: &Fixture,
@@ -767,32 +824,63 @@ printf 'dep:%s\n' "$name" > "$out/$name.d"
                 .unwrap();
             assert!(status.success(), "git {args:?} failed in {}", dir.display());
         };
-        let dep_repo = |name: &str, deps: &str, body: &str| {
+        let dep_repo = |name: &str, manifest: &str, files: &[(&str, &str)]| {
             let dir = sb.projects.join(name);
             fs::create_dir_all(dir.join("src")).unwrap();
-            fs::write(
-                dir.join("Cargo.toml"),
-                format!(
-                    "[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\n{deps}"
-                ),
-            )
-            .unwrap();
-            fs::write(dir.join("src/lib.rs"), body).unwrap();
+            fs::write(dir.join("Cargo.toml"), manifest).unwrap();
+            for (path, body) in files {
+                fs::write(dir.join(path), body).unwrap();
+            }
             git(&dir, &["init", "-q"]);
             git(&dir, &["add", "-A"]);
             git(&dir, &["commit", "-qm", "init"]);
             format!("file://{}", dir.display())
         };
-        let url_a = dep_repo("dep_a", "", "pub fn a() -> u32 { 1 }\n");
+        let lib_manifest = |name: &str, deps: &str| {
+            format!(
+                "[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\n{deps}"
+            )
+        };
+        let url_a = dep_repo(
+            "dep_a",
+            &lib_manifest("dep_a", ""),
+            &[("src/lib.rs", "pub fn a() -> u32 { 1 }\n")],
+        );
         let url_b = dep_repo(
             "dep_b",
-            &format!("dep_a = {{ git = \"{url_a}\" }}\n"),
-            "pub fn b() -> u32 { dep_a::a() + 1 }\n",
+            &lib_manifest("dep_b", &format!("dep_a = {{ git = \"{url_a}\" }}\n")),
+            &[("src/lib.rs", "pub fn b() -> u32 { dep_a::a() + 1 }\n")],
         );
         let url_c = dep_repo(
             "dep_c",
-            &format!("dep_b = {{ git = \"{url_b}\" }}\n"),
-            "pub fn c() -> u32 { dep_b::b() + 1 }\n",
+            &lib_manifest("dep_c", &format!("dep_b = {{ git = \"{url_b}\" }}\n")),
+            &[("src/lib.rs", "pub fn c() -> u32 { dep_b::b() + 1 }\n")],
+        );
+        // Build-script consumer: its lib compile carries an OUT_DIR env whose
+        // contents are digested into the key — the widened class exercised
+        // end-to-end by real cargo.
+        let url_build = dep_repo(
+            "dep_build",
+            &lib_manifest("dep_build", ""),
+            &[
+                (
+                    "build.rs",
+                    "fn main() {\n  let out = std::env::var(\"OUT_DIR\").unwrap();\n  std::fs::write(std::path::Path::new(&out).join(\"generated.rs\"), \"pub fn g() -> u32 { 40 }\\n\").unwrap();\n}\n",
+                ),
+                (
+                    "src/lib.rs",
+                    "include!(concat!(env!(\"OUT_DIR\"), \"/generated.rs\"));\n",
+                ),
+            ],
+        );
+        // proc-macro crate: widened class compiled for the host toolchain.
+        let url_proc = dep_repo(
+            "dep_proc",
+            "[package]\nname = \"dep_proc\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[lib]\nproc-macro = true\n\n[dependencies]\n",
+            &[(
+                "src/lib.rs",
+                "extern crate proc_macro;\nuse proc_macro::TokenStream;\n\n#[proc_macro]\npub fn m(_input: TokenStream) -> TokenStream {\n    \"fn hi() -> u32 { 9 }\".parse().unwrap()\n}\n",
+            )],
         );
         let app = |name: &str| {
             let dir = sb.projects.join(name);
@@ -800,54 +888,16 @@ printf 'dep:%s\n' "$name" > "$out/$name.d"
             fs::write(
                 dir.join("Cargo.toml"),
                 format!(
-                    "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\ndep_c = {{ git = \"{url_c}\" }}\n"
+                    "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\ndep_c = {{ git = \"{url_c}\" }}\ndep_build = {{ git = \"{url_build}\" }}\ndep_proc = {{ git = \"{url_proc}\" }}\n"
                 ),
             )
             .unwrap();
             fs::write(
                 dir.join("src/main.rs"),
-                "fn main() { println!(\"answer={}\", dep_c::c()); }\n",
+                "dep_proc::m!();\nfn main() { println!(\"answer={}\", dep_c::c() + dep_build::g() + hi()); }\n",
             )
             .unwrap();
             dir
-        };
-        let contexts = |sb: &Sandbox| -> Vec<PathBuf> {
-            let mut dirs = Vec::new();
-            for shard in fs::read_dir(sb.rgo_home.join("builds"))
-                .into_iter()
-                .flatten()
-                .flatten()
-            {
-                for entry in fs::read_dir(shard.path()).into_iter().flatten().flatten() {
-                    if entry.path().is_dir() {
-                        dirs.push(entry.path());
-                    }
-                }
-            }
-            dirs
-        };
-        let dep_artifacts = |context: &std::path::Path| -> Vec<(String, Vec<u8>)> {
-            let deps = context.join("release/deps");
-            let mut files: Vec<_> = fs::read_dir(&deps)
-                .into_iter()
-                .flatten()
-                .flatten()
-                .map(|e| e.path())
-                .filter(|p| {
-                    let name = p.file_name().unwrap().to_string_lossy();
-                    name.starts_with("libdep_") && name.ends_with(".rlib")
-                })
-                .collect();
-            files.sort();
-            files
-                .into_iter()
-                .map(|p| {
-                    (
-                        p.file_name().unwrap().to_string_lossy().into_owned(),
-                        fs::read(&p).unwrap(),
-                    )
-                })
-                .collect()
         };
 
         // Cold reference: RGO_BYPASS compiles through the wrapper without
@@ -866,12 +916,22 @@ printf 'dep:%s\n' "$name" > "$out/$name.d"
             "cold build failed: {}",
             String::from_utf8_lossy(&cold.stderr)
         );
-        let ctx_a = contexts(&sb)
-            .into_iter()
-            .find(|d| !before.contains(d))
-            .expect("cold build created no build context");
+        let ctx_a = new_context(&sb, &before);
         let cold_artifacts = dep_artifacts(&ctx_a);
-        assert_eq!(cold_artifacts.len(), 3, "expected dep_a/dep_b/dep_c rlibs");
+        for expected in [
+            "libdep_a",
+            "libdep_b",
+            "libdep_c",
+            "libdep_build",
+            "libdep_proc",
+        ] {
+            assert!(
+                cold_artifacts
+                    .iter()
+                    .any(|(name, _)| name.starts_with(expected)),
+                "{expected} artifact missing: {cold_artifacts:?}"
+            );
+        }
 
         // Publisher: identical dependencies in a second checkout compile cold
         // and populate the CAS.
@@ -888,18 +948,35 @@ printf 'dep:%s\n' "$name" > "$out/$name.d"
             "publisher build failed: {}",
             String::from_utf8_lossy(&published.stderr)
         );
-        let ctx_b = contexts(&sb)
-            .into_iter()
-            .find(|d| !before.contains(d))
-            .expect("publisher created no build context");
+        let ctx_b = new_context(&sb, &before);
         let published_artifacts = dep_artifacts(&ctx_b);
+
+        // Path-free dependencies must be byte-identical across build contexts.
+        // Two classes are legitimately context-dependent and excluded here:
+        //   - dep_build embeds the per-context OUT_DIR path (include! of
+        //     generated code) — its key digests OUT_DIR *contents* instead.
+        //   - dep_proc's proc-macro dylib carries a linker-generated field
+        //     (Mach-O UUID / per-build hash) so dylib bytes are never
+        //     identical across compiles; a cache hit returns the producer's
+        //     verified bytes verbatim, which is the correct equivalence.
+        let path_free = |artifacts: &[(String, Vec<u8>)]| -> Vec<(String, Vec<u8>)> {
+            artifacts
+                .iter()
+                .filter(|(name, _)| {
+                    !name.starts_with("libdep_build") && !name.starts_with("libdep_proc")
+                })
+                .cloned()
+                .collect()
+        };
         assert_eq!(
-            cold_artifacts, published_artifacts,
+            path_free(&cold_artifacts),
+            path_free(&published_artifacts),
             "cold and published dependency artifacts diverged (nondeterminism or key drift)"
         );
 
-        // Consumer: a third checkout must serve every dependency from the CAS
-        // and produce identical bytes plus a working binary.
+        // Consumer: a third checkout must serve every dependency from the CAS —
+        // including the build-script consumer and the proc-macro — reproducing the
+        // publisher's exact bytes plus a working binary.
         let app_c = app("diff-c");
         let before = contexts(&sb);
         let hit = sb
@@ -913,10 +990,7 @@ printf 'dep:%s\n' "$name" > "$out/$name.d"
             "consumer build failed: {}",
             String::from_utf8_lossy(&hit.stderr)
         );
-        let ctx_c = contexts(&sb)
-            .into_iter()
-            .find(|d| !before.contains(d))
-            .expect("consumer created no build context");
+        let ctx_c = new_context(&sb, &before);
         assert_eq!(
             published_artifacts,
             dep_artifacts(&ctx_c),
@@ -924,15 +998,15 @@ printf 'dep:%s\n' "$name" > "$out/$name.d"
         );
         let hits = cache_events(&sb).matches("\"outcome\":\"hit\"").count();
         assert!(
-            hits >= 3,
-            "expected cache hits for dep_a, dep_b, dep_c; events: {}",
+            hits >= 5,
+            "expected cache hits for all five dependencies; events: {}",
             cache_events(&sb)
         );
         let binary = app_c.join("target/release/app");
         let run = sb.cmd(&binary).output().unwrap();
         assert_eq!(
             String::from_utf8_lossy(&run.stdout).trim(),
-            "answer=3",
+            "answer=52",
             "hit-built binary behaved differently"
         );
 

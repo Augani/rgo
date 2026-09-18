@@ -16,7 +16,7 @@ claim (schema version `rgo-cache-v2`).
 | normalized args | all rustc args after normalization | paths rewritten to roots-relative form; ordering preserved |
 | source digest | BLAKE3 over `(relpath, bytes)` for every file in the package source root, sorted | strict mode: any symlink fails the digest → bypass |
 | source kind | Registry / Git / Workspace | registry and git checkouts are immutable inputs; workspace members are handled separately |
-| extern inputs | `(name, file-content digest)` for every `--extern` | externs must resolve inside managed roots, else bypass |
+| extern inputs | `(name, file-content digest)` for every `--extern` | externs must resolve inside managed roots, else bypass; bare `--extern proc_macro` (no path) records `sysroot` — it is pinned by compiler identity |
 | env digest | `(name, BLAKE3(value))` for `CARGO_PKG_*`, `CARGO_CFG_*`, `CARGO_CRATE_NAME`, `CARGO_MANIFEST_DIR`, `RUSTUP_TOOLCHAIN` | plus `OUT_DIR_CONTENTS` digest when `OUT_DIR` is set |
 | target triple | `--target` value when present | cross builds never collide with host builds |
 | remap prefix | `(from, to)` of the applied `--remap-path-prefix` | workspace "from" is omitted so equivalent worktrees share one key |
@@ -67,6 +67,13 @@ a failure. Reasons are stable strings, recorded in `state/cache-events.log`.
 - Materialization order: APFS clonefile → same-volume hardlink → copy. All
   outputs are written only after verification; hit bytes are byte-identical
   to the producer's.
+- Output ownership: `--out-dir` is shared by every crate in the graph, so a
+  producer collecting outputs from a directory scan only claims files whose
+  stem names that invocation (`{lib?}{crate_name}{extra_filename}`).
+  Cargo compiles dependencies in parallel; without the stem filter a sibling
+  crate's outputs landing mid-scan enter the wrong manifest and poison hits
+  (observed: `materialization_failed` on `dep_a` because `dep_proc`'s `.d`
+  was captured as a second `dep-info` output).
 
 ## Observability
 
@@ -82,5 +89,9 @@ a failure. Reasons are stable strings, recorded in `state/cache-events.log`.
 - Non-deterministic rustc output (absolute paths, hashing order) outside the
   normalized/remapped set can produce correct-but-different bytes; covered by
   byte-equality tests on deterministic fixtures, and by remap for workspaces.
+  Measured on real cargo: build-script consumers embed their per-context
+  `OUT_DIR` path and proc-macro dylibs carry a linker-generated per-build
+  field, so cross-*compile* byte equality is only asserted for path-free
+  artifacts — hits still return the publisher's verified bytes verbatim.
 - A real-cargo differential corpus (compile vs. hit on a crate matrix) remains
   an operator gate before enabling by default, alongside perf measurement.

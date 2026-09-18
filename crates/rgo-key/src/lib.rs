@@ -96,6 +96,8 @@ pub struct Candidate {
     pub source_kind: SourceKind,
     pub source_root: PathBuf,
     pub source_digest: String,
+    pub crate_name: String,
+    pub extra_filename: Option<String>,
     pub outputs: Vec<OutputSpec>,
     pub normalized_args: Vec<String>,
     pub compiler_args: Vec<OsString>,
@@ -354,11 +356,24 @@ pub fn classify(
     if outputs.is_empty() {
         return Classification::Bypass(BypassReason::MissingOutputDirectory);
     }
+    let Some(crate_name) = arg_value(args, "--crate-name")
+        .map(|value| value.to_string_lossy().into_owned())
+        .or_else(|| {
+            source
+                .file_stem()
+                .map(|value| value.to_string_lossy().into_owned())
+        })
+    else {
+        return Classification::Bypass(BypassReason::MissingSource);
+    };
+    let extra_filename = codegen_value(args, "extra-filename");
     Classification::Cacheable(Box::new(Candidate {
         key,
         source_kind,
         source_root,
         source_digest,
+        crate_name,
+        extra_filename,
         outputs,
         normalized_args,
         compiler_args,
@@ -608,6 +623,12 @@ fn comma_values(args: &[OsString], flag: &str) -> Vec<String> {
 
 fn record_extern(value: &str, roots: &AllowedRoots, output: &mut BTreeMap<String, String>) -> bool {
     let Some((name, path)) = value.split_once('=') else {
+        // Cargo passes `--extern proc_macro` without a path for proc-macro crates; the
+        // crate resolves from the sysroot and is already pinned by compiler_identity.
+        if value == "proc_macro" {
+            output.insert(value.to_owned(), "sysroot".to_owned());
+            return true;
+        }
         return false;
     };
     let path = PathBuf::from(path);
@@ -764,6 +785,24 @@ fn arg_value(args: &[OsString], flag: &str) -> Option<OsString> {
         }
         if let Some(value) = value.strip_prefix(&format!("{flag}=")) {
             return Some(value.into());
+        }
+        i += 1;
+    }
+    None
+}
+
+fn codegen_value(args: &[OsString], name: &str) -> Option<String> {
+    let prefix = format!("{name}=");
+    let mut i = 0;
+    while i < args.len() {
+        let value = args[i].to_string_lossy();
+        if value == "-C" {
+            i += 1;
+            continue;
+        }
+        let option = value.strip_prefix("-C").unwrap_or(&value);
+        if let Some(rest) = option.strip_prefix(&prefix) {
+            return Some(rest.to_owned());
         }
         i += 1;
     }
@@ -944,6 +983,76 @@ mod tests {
             classify_type("lib", "metadata", &env),
             Classification::Cacheable(_)
         ));
+    }
+
+    #[test]
+    fn bare_proc_macro_extern_is_cacheable_and_names_the_invocation() {
+        let (_dir, root, source) = fixture();
+        let build = root.join("build");
+        fs::create_dir_all(&build).unwrap();
+        let roots = AllowedRoots {
+            build_root: build.clone(),
+            source_roots: vec![root.parent().unwrap().to_path_buf()],
+            workspace_roots: Vec::new(),
+            remap_workspace_paths: false,
+        };
+        let classify_with = |extra: &[&str]| {
+            let mut args = vec![
+                "--crate-name".into(),
+                "demo".into(),
+                "--crate-type=proc-macro".into(),
+                "--emit=dep-info,link".into(),
+                "-C".into(),
+                "extra-filename=-abc123".into(),
+                "--out-dir".into(),
+                build.as_os_str().to_owned(),
+                source.as_os_str().to_owned(),
+            ];
+            args.extend(extra.iter().map(OsString::from));
+            classify(Path::new("rustc"), &args, &[], &roots)
+        };
+        let candidate = match classify_with(&["--extern", "proc_macro"]) {
+            Classification::Cacheable(candidate) => candidate,
+            other => panic!("expected cacheable candidate, got {other:?}"),
+        };
+        assert_eq!(candidate.crate_name, "demo");
+        assert_eq!(candidate.extra_filename.as_deref(), Some("-abc123"));
+        assert!(matches!(
+            classify_with(&["--extern", "helper"]),
+            Classification::Bypass(BypassReason::ExternalExtern)
+        ));
+    }
+
+    #[test]
+    fn crate_name_falls_back_to_source_file_stem() {
+        let (_dir, root, source) = fixture();
+        let build = root.join("build");
+        fs::create_dir_all(&build).unwrap();
+        let roots = AllowedRoots {
+            build_root: build.clone(),
+            source_roots: vec![root.parent().unwrap().to_path_buf()],
+            workspace_roots: Vec::new(),
+            remap_workspace_paths: false,
+        };
+        let candidate = match classify(
+            Path::new("rustc"),
+            &[
+                "--crate-type=lib".into(),
+                "--emit=metadata,link".into(),
+                "-Cextra-filename=-deadbeef".into(),
+                "--out-dir".into(),
+                build.as_os_str().to_owned(),
+                source.as_os_str().to_owned(),
+            ],
+            &[],
+            &roots,
+        ) {
+            Classification::Cacheable(candidate) => candidate,
+            other => panic!("expected cacheable candidate, got {other:?}"),
+        };
+        // rustc's own default derives the crate name from the source file stem.
+        assert_eq!(candidate.crate_name, "lib");
+        assert_eq!(candidate.extra_filename.as_deref(), Some("-deadbeef"));
     }
 
     #[test]
