@@ -346,6 +346,30 @@ impl StateDb {
                 transaction.execute("DELETE FROM contexts WHERE build_dir = ?1", params![path])?;
             }
         }
+        // Pins are durable marker files inside build dirs; the table is a derived
+        // index rebuilt here so pins survive database loss, and a marker deleted
+        // out-of-band drops the pin.
+        let marked: HashSet<String> = contexts
+            .iter()
+            .filter(|c| context::is_pinned_dir(&c.dir))
+            .map(|c| normalize(&c.dir).to_string_lossy().into_owned())
+            .collect();
+        for path in &marked {
+            transaction.execute(
+                "INSERT OR IGNORE INTO pins(build_dir, created_at) VALUES(?1, ?2)",
+                params![path, unix_time(SystemTime::now())],
+            )?;
+        }
+        let mut statement = transaction.prepare("SELECT build_dir FROM pins")?;
+        let known_pins: Vec<String> = statement
+            .query_map([], |row| row.get(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(statement);
+        for path in known_pins {
+            if !marked.contains(&path) {
+                transaction.execute("DELETE FROM pins WHERE build_dir = ?1", params![path])?;
+            }
+        }
         transaction.commit()?;
         Ok(())
     }
@@ -1288,6 +1312,38 @@ mod tests {
         assert_eq!(db.stats().unwrap().pinned_contexts, 1);
         db.set_pin(Path::new("/tmp/build"), false).unwrap();
         assert_eq!(db.stats().unwrap().pinned_contexts, 0);
+    }
+
+    #[test]
+    fn reconcile_rebuilds_pins_from_markers() {
+        let root = tempdir().unwrap();
+        let paths = RgoPaths {
+            root: root.path().join("rgo"),
+        };
+        paths.ensure_layout().unwrap();
+        let pinned_dir = paths.builds_dir().join("ab").join("cdef");
+        let plain_dir = paths.builds_dir().join("ab").join("1234");
+        std::fs::create_dir_all(&pinned_dir).unwrap();
+        std::fs::create_dir_all(&plain_dir).unwrap();
+        context::write_pin_marker(&pinned_dir).unwrap();
+        let mut db = StateDb::open(&paths).unwrap();
+        db.reconcile(&paths).unwrap();
+        assert_eq!(
+            db.pinned_paths().unwrap(),
+            vec![std::fs::canonicalize(&pinned_dir).unwrap()],
+            "pin marker must rebuild the pins table"
+        );
+        // A marker removed out-of-band drops the pin on the next reconcile.
+        context::remove_pin_marker(&pinned_dir).unwrap();
+        db.reconcile(&paths).unwrap();
+        assert!(db.pinned_paths().unwrap().is_empty());
+        // And pins referencing deleted contexts are reaped.
+        context::write_pin_marker(&pinned_dir).unwrap();
+        db.reconcile(&paths).unwrap();
+        assert_eq!(db.pinned_paths().unwrap().len(), 1);
+        std::fs::remove_dir_all(&pinned_dir).unwrap();
+        db.reconcile(&paths).unwrap();
+        assert!(db.pinned_paths().unwrap().is_empty());
     }
 
     #[test]

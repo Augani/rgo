@@ -24,6 +24,57 @@ use rgo_cas::{MANIFEST_VERSION, Manifest, ManifestOutput, ObjectRef, Store};
 use rgo_remote::{Client as RemoteClient, Config as RemoteConfig, Fetch as RemoteFetch};
 
 const POLL_INTERVAL: Duration = Duration::from_secs(30);
+/// Bound on concurrent client connections; excess connections are refused so a flood
+/// of stalled or malformed clients cannot exhaust daemon threads or file descriptors.
+/// Clients see a dropped connection and fall back to ordinary cargo behavior.
+const MAX_CONNECTIONS: usize = 64;
+
+/// How often the daemon runs maintenance (lease expiry, reconciliation, automatic
+/// GC, remote-job dispatch). `RGO_DAEMON_POLL_SECS` overrides for tests/operations.
+fn poll_interval() -> Duration {
+    std::env::var("RGO_DAEMON_POLL_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|v| (1..=3600).contains(v))
+        .map(Duration::from_secs)
+        .unwrap_or(POLL_INTERVAL)
+}
+
+struct ConnectionPermit {
+    active: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl ConnectionPermit {
+    fn try_acquire(active: &Arc<std::sync::atomic::AtomicUsize>) -> Option<Self> {
+        use std::sync::atomic::Ordering;
+        let mut count = active.load(Ordering::Acquire);
+        loop {
+            if count >= MAX_CONNECTIONS {
+                return None;
+            }
+            match active.compare_exchange_weak(
+                count,
+                count + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    return Some(Self {
+                        active: active.clone(),
+                    });
+                }
+                Err(actual) => count = actual,
+            }
+        }
+    }
+}
+
+impl Drop for ConnectionPermit {
+    fn drop(&mut self) {
+        self.active
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
 
 #[derive(Clone)]
 struct State {
@@ -35,6 +86,7 @@ struct State {
     pid: u32,
     remote: Option<RemoteClient>,
     remote_error: Arc<Mutex<Option<String>>>,
+    connection_count: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 struct InstanceLock {
@@ -129,13 +181,14 @@ pub fn run(paths: RgoPaths, cfg: Resolved) -> Result<()> {
         pid: std::process::id(),
         remote,
         remote_error,
+        connection_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
     };
 
     tracing::info!(socket = %paths.socket_path().display(), "rgo daemon listening");
     let maintenance_state = state.clone();
     thread::spawn(move || {
         loop {
-            thread::sleep(POLL_INTERVAL);
+            thread::sleep(poll_interval());
             if let Err(error) = maintenance(&maintenance_state) {
                 tracing::warn!(%error, "daemon maintenance failed");
             }
@@ -145,7 +198,11 @@ pub fn run(paths: RgoPaths, cfg: Resolved) -> Result<()> {
         match listener.accept() {
             Ok(connection) => {
                 let state = state.clone();
+                let Some(permit) = ConnectionPermit::try_acquire(&state.connection_count) else {
+                    continue;
+                };
                 thread::spawn(move || {
+                    let _permit = permit;
                     if let Err(error) = serve_connection(connection, &state) {
                         tracing::debug!(%error, "daemon client disconnected with error");
                     }
@@ -285,14 +342,19 @@ fn handle_request_result(state: &State, request: Request) -> Result<Response> {
             target_bytes,
         )?)),
         Request::Pin { build_dir } => {
-            validate_managed_path(&state.paths, Path::new(&build_dir))?;
+            let path = Path::new(&build_dir);
+            validate_managed_path(&state.paths, path)?;
+            context::write_pin_marker(path)?;
             let db = state.db.lock().unwrap();
-            db.set_pin(Path::new(&build_dir), true)?;
+            db.set_pin(path, true)?;
             Ok(Response::Ok)
         }
         Request::Unpin { build_dir } => {
+            let path = Path::new(&build_dir);
+            validate_managed_path(&state.paths, path)?;
+            context::remove_pin_marker(path)?;
             let db = state.db.lock().unwrap();
-            db.set_pin(Path::new(&build_dir), false)?;
+            db.set_pin(path, false)?;
             Ok(Response::Ok)
         }
         Request::Clean { build_dir } => {

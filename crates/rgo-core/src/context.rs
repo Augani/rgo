@@ -1,6 +1,6 @@
 //! A "context" is one Cargo build-dir under `builds/`. rgo treats its contents as opaque
-//! except for the top-level sidecar it writes itself and the documented
-//! `<profile>/incremental/` sub-tier.
+//! except for the top-level files it writes itself (the `.rgo-context.json` sidecar and
+//! the `.rgo-pin` marker) and the documented `<profile>/incremental/` sub-tier.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -44,6 +44,14 @@ impl BuildContext {
             .is_some_and(|s| !Path::new(&s.manifest_path).exists())
     }
 
+    /// Whether the context carries the pin marker. The marker file inside the build
+    /// dir is the durable record of a pin; the SQLite `pins` table is a derived index
+    /// that `StateDb::reconcile_contexts` rebuilds from these markers so pins survive
+    /// database loss.
+    pub fn is_pinned(&self) -> bool {
+        is_pinned_dir(&self.dir)
+    }
+
     pub fn idle_for(&self, now: SystemTime) -> Duration {
         now.duration_since(self.last_used).unwrap_or_default()
     }
@@ -77,6 +85,30 @@ pub fn lock_files_for_safety(build_dir: &Path) -> bool {
             Ok(false) | Err(_) => true,
         }
     })
+}
+
+/// Marker file rgo writes at the top level of a managed build dir while the context
+/// is pinned. Removing it out-of-band drops the pin on the next reconcile.
+pub const PIN_MARKER: &str = ".rgo-pin";
+
+pub fn is_pinned_dir(dir: &Path) -> bool {
+    dir.join(PIN_MARKER).is_file()
+}
+
+pub fn write_pin_marker(dir: &Path) -> Result<()> {
+    let marker = dir.join(PIN_MARKER);
+    std::fs::File::create(&marker)
+        .with_context(|| format!("writing pin marker {}", marker.display()))?;
+    Ok(())
+}
+
+pub fn remove_pin_marker(dir: &Path) -> Result<()> {
+    let marker = dir.join(PIN_MARKER);
+    match std::fs::remove_file(&marker) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| format!("removing {}", marker.display())),
+    }
 }
 
 pub fn list(paths: &RgoPaths) -> Result<Vec<BuildContext>> {
