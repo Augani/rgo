@@ -111,6 +111,44 @@ pub fn remove_pin_marker(dir: &Path) -> Result<()> {
     }
 }
 
+/// Resolve the Git common directory a workspace shares with its linked
+/// worktrees, if it is a Git checkout. Reads `.git` and `commondir` files
+/// directly so no `git` binary is required. Returns `None` for non-Git
+/// workspaces and unreadable or deleted checkouts.
+pub fn git_common_dir(workspace_root: &Path) -> Option<PathBuf> {
+    let dotgit = workspace_root.join(".git");
+    let metadata = std::fs::metadata(&dotgit).ok()?;
+    let gitdir = if metadata.is_dir() {
+        dotgit
+    } else if metadata.is_file() {
+        // Linked worktrees and submodules keep a `.git` file containing
+        // `gitdir: <path>` instead of a directory.
+        let text = std::fs::read_to_string(&dotgit).ok()?;
+        let target = PathBuf::from(text.trim().strip_prefix("gitdir:")?.trim());
+        if target.is_absolute() {
+            target
+        } else {
+            workspace_root.join(target)
+        }
+    } else {
+        return None;
+    };
+    // A linked worktree's gitdir carries `commondir` pointing at the shared
+    // administrative directory (usually `../..`, i.e. `<repo>/.git`).
+    let common = match std::fs::read_to_string(gitdir.join("commondir")) {
+        Ok(text) => {
+            let target = PathBuf::from(text.trim());
+            if target.is_absolute() {
+                target
+            } else {
+                gitdir.join(target)
+            }
+        }
+        Err(_) => gitdir,
+    };
+    Some(std::fs::canonicalize(&common).unwrap_or(common))
+}
+
 pub fn list(paths: &RgoPaths) -> Result<Vec<BuildContext>> {
     let mut out = Vec::new();
     let mut scanner = Scanner::new();
@@ -269,5 +307,59 @@ mod tests {
         remove_pin_marker(&dir).unwrap();
         // Writing a marker for a missing directory fails loudly.
         assert!(write_pin_marker(&root.path().join("gone")).is_err());
+    }
+
+    #[test]
+    fn git_common_dir_resolves_checkouts_worktrees_and_non_git() {
+        let root = tempfile::tempdir().unwrap();
+        let canonical = |p: &Path| std::fs::canonicalize(p).unwrap();
+
+        // A plain checkout resolves to its own `.git` directory.
+        let main_ws = root.path().join("repo");
+        std::fs::create_dir_all(main_ws.join(".git")).unwrap();
+        assert_eq!(
+            git_common_dir(&main_ws).as_deref(),
+            Some(canonical(&main_ws.join(".git")).as_path())
+        );
+
+        // A linked worktree has a `.git` file pointing at its per-worktree
+        // gitdir, which carries `commondir` back to the shared admin dir.
+        let worktree = root.path().join("repo-wt2");
+        let wt_gitdir = main_ws.join(".git/worktrees/repo-wt2");
+        std::fs::create_dir_all(&wt_gitdir).unwrap();
+        std::fs::create_dir(&worktree).unwrap();
+        std::fs::write(
+            worktree.join(".git"),
+            format!("gitdir: {}\n", wt_gitdir.display()),
+        )
+        .unwrap();
+        std::fs::write(wt_gitdir.join("commondir"), "../..\n").unwrap();
+        assert_eq!(
+            git_common_dir(&worktree).as_deref(),
+            Some(canonical(&main_ws.join(".git")).as_path()),
+            "linked worktree must resolve to the same common dir as the main checkout"
+        );
+
+        // A submodule-style `.git` file with no `commondir` resolves to the
+        // gitdir itself.
+        let sub = root.path().join("sub");
+        let sub_gitdir = main_ws.join(".git/modules/sub");
+        std::fs::create_dir_all(&sub_gitdir).unwrap();
+        std::fs::create_dir(&sub).unwrap();
+        std::fs::write(
+            sub.join(".git"),
+            format!("gitdir: {}\n", sub_gitdir.display()),
+        )
+        .unwrap();
+        assert_eq!(
+            git_common_dir(&sub).as_deref(),
+            Some(canonical(&sub_gitdir).as_path())
+        );
+
+        // Non-Git workspaces and missing checkouts are ungrouped.
+        let plain = root.path().join("plain");
+        std::fs::create_dir(&plain).unwrap();
+        assert_eq!(git_common_dir(&plain), None);
+        assert_eq!(git_common_dir(&root.path().join("deleted")), None);
     }
 }

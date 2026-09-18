@@ -82,6 +82,75 @@ fn plain_cargo_build_is_relocated_and_binary_still_uplifted() {
 }
 
 #[test]
+fn worktrees_of_one_repo_group_under_a_header_in_ls() {
+    ensure_workspace_bins_built().unwrap();
+    let sb = Sandbox::new().unwrap();
+    assert!(
+        sb.cmd(cargo_bin("rgo"))
+            .args(["setup", "--no-service"])
+            .status()
+            .unwrap()
+            .success()
+    );
+
+    // Main checkout: a plain `.git` directory.
+    let main = sb.simple_bin("main-repo").unwrap();
+    std::fs::create_dir_all(main.join(".git/worktrees/linked")).unwrap();
+    std::fs::write(main.join(".git/worktrees/linked/commondir"), "../..\n").unwrap();
+
+    // Linked worktree: `.git` file pointing at its per-worktree gitdir.
+    let linked = sb.simple_bin("linked-wt").unwrap();
+    std::fs::write(
+        linked.join(".git"),
+        format!("gitdir: {}\n", main.join(".git/worktrees/linked").display()),
+    )
+    .unwrap();
+
+    // An unrelated solo project stays outside any group.
+    let solo = sb.simple_bin("solo").unwrap();
+    std::fs::create_dir(solo.join(".git")).unwrap();
+
+    for project in [&main, &linked, &solo] {
+        assert!(
+            sb.cargo()
+                .current_dir(project)
+                .args(["build", "--offline"])
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+
+    let ls = sb.cmd(cargo_bin("rgo")).arg("ls").output().unwrap();
+    assert!(ls.status.success());
+    let out = String::from_utf8_lossy(&ls.stdout);
+    let repo = std::fs::canonicalize(&main).unwrap();
+    let header = format!("── {} (2 contexts)", repo.display());
+    assert!(
+        out.contains(&header),
+        "expected worktree group header {header:?}:\n{out}"
+    );
+    assert!(
+        out.contains(main.to_str().unwrap()),
+        "main row missing:\n{out}"
+    );
+    assert!(
+        out.contains(linked.to_str().unwrap()),
+        "linked worktree row missing:\n{out}"
+    );
+    assert!(
+        out.contains(solo.to_str().unwrap()),
+        "solo row missing:\n{out}"
+    );
+    // The solo repo must not get a group header of its own.
+    assert_eq!(
+        out.matches("── ").count(),
+        1,
+        "expected exactly one group:\n{out}"
+    );
+}
+
+#[test]
 fn deleting_the_checkout_makes_the_context_an_orphan() {
     ensure_workspace_bins_built().unwrap();
     let sb = Sandbox::new().unwrap();

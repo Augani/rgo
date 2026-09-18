@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use anyhow::Result;
@@ -18,7 +20,26 @@ pub fn run() -> Result<()> {
         "{:<18} {:>10} {:>10} {:>10}  {:<3} {:<3} WORKSPACE",
         "ID", "SIZE", "INCR", "IDLE", "PIN", "USE"
     );
-    for c in contexts {
+
+    // Contexts whose workspaces share a Git common dir (linked worktrees of the
+    // same repository) are listed together under a repo header.
+    let keys: Vec<Option<PathBuf>> = contexts
+        .iter()
+        .map(|c| {
+            c.sidecar
+                .as_ref()
+                .and_then(|s| context::git_common_dir(Path::new(&s.workspace_root)))
+        })
+        .collect();
+    let mut clusters: HashMap<&PathBuf, Vec<usize>> = HashMap::new();
+    for (index, key) in keys.iter().enumerate() {
+        if let Some(key) = key {
+            clusters.entry(key).or_default().push(index);
+        }
+    }
+    clusters.retain(|_, members| members.len() > 1);
+
+    let print_row = |c: &context::BuildContext| {
         let ws = match &c.sidecar {
             Some(s) if c.is_orphan() => format!("{} (orphan)", s.workspace_root),
             Some(s) => s.workspace_root.clone(),
@@ -45,8 +66,35 @@ pub fn run() -> Result<()> {
             },
             ws
         );
+    };
+
+    let mut emitted = vec![false; contexts.len()];
+    for index in 0..contexts.len() {
+        if emitted[index] {
+            continue;
+        }
+        if let Some(key) = &keys[index] {
+            if let Some(members) = clusters.get(key) {
+                println!("── {} ({} contexts)", repo_label(key), members.len());
+                for &member in members {
+                    print_row(&contexts[member]);
+                    emitted[member] = true;
+                }
+                continue;
+            }
+        }
+        print_row(&contexts[index]);
+        emitted[index] = true;
     }
     Ok(())
+}
+
+/// `<repo>/.git` displays as `<repo>`; anything else shows the resolved path.
+fn repo_label(common: &Path) -> String {
+    match common.file_name() {
+        Some(name) if name == ".git" => common.parent().unwrap_or(common).display().to_string(),
+        _ => common.display().to_string(),
+    }
 }
 
 fn same_path(left: &std::path::Path, right: &std::path::Path) -> bool {

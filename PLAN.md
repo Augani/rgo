@@ -411,7 +411,7 @@ Cargo in a sandboxed `$HOME` (see `crates/rgo/tests/relocate.rs`).
 10. Release v0.1 (Phase 1). Dogfooding and release-artifact automation are done (see A); tagging and publishing remain operator actions.
 11. ~~Daemon + leases + SQLite (Phase 2).~~ implemented and hardened (see B).
 12. ~~Wrapper classifier + key + CAS behind `cache.enabled=false` (Phase 3).~~ implemented; a scaled-down real-Cargo differential corpus now exists, and the full 50-crate × 3-toolchain × 3-OS gate remains before enabling by default (see C).
-13. ~~Single-flight, wrapper composition, and opt-in workspace path remapping.~~ implemented and validated; only Git-common-dir status grouping remains for `v0.4+` (see D).
+13. ~~Single-flight, wrapper composition, opt-in workspace path remapping, and Git-common-dir status grouping.~~ implemented and validated (see D).
 14. ~~Optional remote CAS behind opt-in configuration.~~ implemented, protocol-specified, and failure-injection validated (see E).
 
 ### Detailed remaining-work checklist
@@ -511,8 +511,8 @@ Work in this order. Items marked **release-blocking** must be complete before th
   - `workspace_remap_shares_hits_across_equivalent_worktrees` proves identical checkouts miss without opt-in and hit with `remap_workspace_paths = true`; remap state participates in the key so remapped and un-remapped keys can never collide.
 - [x] Validate widened cache classes independently.
   - `widened_classes_proc_macro_and_metadata_only_bin_are_cacheable` covers proc-macro crates and metadata-only binaries; build-script `OUT_DIR` consumers stay digested-or-bypassed per the classifier tables.
-- [ ] Add repository/worktree grouping for UX without sharing mutable build roots.
-  - Remaining `v0.4+` UX work: group `rgo ls`/`rgo status` rows by Git common-directory identity; handle non-Git workspaces, moved repositories, nested workspaces, and deleted worktrees. Cache-level worktree sharing is already proven by the remap tests.
+- [x] Add repository/worktree grouping for UX without sharing mutable build roots.
+  - `rgo ls` groups contexts whose workspaces share a Git common directory under a repo header; `context::git_common_dir` resolves `.git`/`commondir` files without spawning `git`, and non-Git, submodule, moved, and deleted workspaces fall back to ungrouped rows. Mutable build roots stay per-checkout; only the listing is grouped.
 
 **Phase 4 done when:** wrapper composition is reversible and tested, single-flight survives producer failures, and cross-worktree reuse cannot alter observable source-path semantics without explicit opt-in.
 
