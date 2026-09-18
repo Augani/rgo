@@ -1151,6 +1151,236 @@ printf 'dep:%s\n' "$name" > "$out/$name.d"
                 "#[derive(serde::Serialize)]\nstruct S { v: u8 }\nfn main() { print!(\"{}\", serde_json::to_string(&S { v: 3 }).unwrap()); }\n",
                 "{\"v\":3}",
             ),
+            // Breadth tier toward the 50-crate gate: small pure-Rust libs.
+            (
+                "cfg-if",
+                "cfg-if = \"1\"",
+                "cfg_if::cfg_if! { if #[cfg(any(unix, windows))] { fn main() { print!(\"y\"); } } else { fn main() { print!(\"n\"); } } }\n",
+                "y",
+            ),
+            (
+                "scopeguard",
+                "scopeguard = \"1\"",
+                "fn main() { let _g = scopeguard::guard((), |_| print!(\"x\")); }\n",
+                "x",
+            ),
+            (
+                "bitflags",
+                "bitflags = \"2\"",
+                "bitflags::bitflags! { struct F: u8 { const A = 1; } }\nfn main() { print!(\"{}\", F::A.bits()); }\n",
+                "1",
+            ),
+            (
+                "once_cell",
+                "once_cell = \"1\"",
+                "static C: once_cell::sync::Lazy<u8> = once_cell::sync::Lazy::new(|| 7);\nfn main() { print!(\"{}\", *C); }\n",
+                "7",
+            ),
+            (
+                "pin-project-lite",
+                "pin-project-lite = \"0.2\"",
+                "pin_project_lite::pin_project! { struct P { v: u8 } }\nfn main() { let _ = P { v: 5 }; print!(\"5\"); }\n",
+                "5",
+            ),
+            (
+                "log",
+                "log = \"0.4\"",
+                "fn main() { print!(\"{}\", log::Level::Info); }\n",
+                "INFO",
+            ),
+            (
+                "aho-corasick",
+                "aho-corasick = \"1\"",
+                "fn main() { let ac = aho_corasick::AhoCorasick::new([\"ab\"]).unwrap(); print!(\"{}\", ac.is_match(\"xabz\")); }\n",
+                "true",
+            ),
+            (
+                "base64",
+                "base64 = \"0.22\"",
+                "use base64::Engine;\nfn main() { print!(\"{}\", base64::engine::general_purpose::STANDARD.encode(b\"hi\")); }\n",
+                "aGk=",
+            ),
+            (
+                "itertools",
+                "itertools = \"0.13\"",
+                "fn main() { print!(\"{}\", itertools::join([1, 2], \",\")); }\n",
+                "1,2",
+            ),
+            (
+                "slab",
+                "slab = \"0.4\"",
+                "fn main() { let mut s = slab::Slab::new(); let k = s.insert(9u8); print!(\"{}\", s[k]); }\n",
+                "9",
+            ),
+            (
+                "bytes",
+                "bytes = \"1\"",
+                "fn main() { print!(\"{}\", bytes::Bytes::from_static(b\"hi\").len()); }\n",
+                "2",
+            ),
+            (
+                "byteorder",
+                "byteorder = \"1\"",
+                "use byteorder::{ByteOrder, LittleEndian};\nfn main() { let mut b = [0u8; 2]; LittleEndian::write_u16(&mut b, 258); print!(\"{}\", b[0]); }\n",
+                "2",
+            ),
+            (
+                "unicode-normalization",
+                "unicode-normalization = \"0.1\"",
+                "use unicode_normalization::UnicodeNormalization;\nfn main() { print!(\"{}\", \"\\u{e9}\".nfd().count()); }\n",
+                "2",
+            ),
+            (
+                "unicode-segmentation",
+                "unicode-segmentation = \"1\"",
+                "use unicode_segmentation::UnicodeSegmentation;\nfn main() { print!(\"{}\", \"ab\".graphemes(true).count()); }\n",
+                "2",
+            ),
+            (
+                "ordered-float",
+                "ordered-float = \"4\"",
+                "fn main() { print!(\"{}\", ordered_float::OrderedFloat(2.5) > ordered_float::OrderedFloat(1.0)); }\n",
+                "true",
+            ),
+            (
+                "strsim",
+                "strsim = \"0.11\"",
+                "fn main() { print!(\"{}\", strsim::levenshtein(\"ab\", \"ac\")); }\n",
+                "1",
+            ),
+            (
+                "heck",
+                "heck = \"0.5\"",
+                "use heck::ToSnakeCase;\nfn main() { print!(\"{}\", \"FooBar\".to_snake_case()); }\n",
+                "foo_bar",
+            ),
+            (
+                "termcolor",
+                "termcolor = \"1\"",
+                "fn main() { print!(\"{:?}\", termcolor::Color::Red); }\n",
+                "Red",
+            ),
+            (
+                "lazy_static",
+                "lazy_static = \"1\"",
+                "lazy_static::lazy_static! { static ref N: u8 = 4; }\nfn main() { print!(\"{}\", *N); }\n",
+                "4",
+            ),
+            (
+                "linked-hash-map",
+                "linked-hash-map = \"0.5\"",
+                "fn main() { let mut m = linked_hash_map::LinkedHashMap::new(); m.insert(1, 2); print!(\"{}\", m[&1]); }\n",
+                "2",
+            ),
+            (
+                "getrandom",
+                "getrandom = \"0.3\"",
+                "fn main() { let mut b = [0u8; 1]; getrandom::fill(&mut b).unwrap(); print!(\"ok\"); }\n",
+                "ok",
+            ),
+            (
+                "indexmap",
+                "indexmap = \"2\"",
+                "fn main() { let mut m = indexmap::IndexMap::new(); m.insert(\"a\", 1); print!(\"{}\", *m.get_index(0).unwrap().0); }\n",
+                "a",
+            ),
+            (
+                "uuid",
+                "uuid = \"1\"",
+                "fn main() { print!(\"{}\", uuid::Uuid::nil()); }\n",
+                "00000000-0000-0000-0000-000000000000",
+            ),
+            (
+                "parking_lot",
+                "parking_lot = \"0.12\"",
+                "fn main() { let m = parking_lot::Mutex::new(3u8); print!(\"{}\", *m.lock()); }\n",
+                "3",
+            ),
+            // Build-script consumers and bigger real closures.
+            (
+                "libc",
+                "libc = \"0.2\"",
+                "fn main() { print!(\"{}\", libc::EXIT_SUCCESS); }\n",
+                "0",
+            ),
+            (
+                "num-traits",
+                "num-traits = \"0.2\"",
+                "fn main() { print!(\"{}\", num_traits::signum(-3)); }\n",
+                "-1",
+            ),
+            (
+                "chrono",
+                "chrono = \"0.4\"",
+                "use chrono::Datelike;\nfn main() { print!(\"{}\", chrono::NaiveDate::from_ymd_opt(2020, 1, 2).unwrap().day()); }\n",
+                "2",
+            ),
+            (
+                "flate2",
+                "flate2 = \"1\"",
+                "use std::io::Write;\nfn main() { let mut e = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::new(6)); e.write_all(b\"ab\").unwrap(); print!(\"{}\", e.finish().unwrap().len() > 0); }\n",
+                "true",
+            ),
+            (
+                "rand",
+                "rand = \"0.8\"",
+                "use rand::{Rng, SeedableRng};\nfn main() { let mut r = rand::rngs::StdRng::seed_from_u64(1); print!(\"{}\", r.gen_range(0u8..10) < 10); }\n",
+                "true",
+            ),
+            (
+                "tracing",
+                "tracing = \"0.1\"",
+                "fn main() { print!(\"{}\", tracing::Level::INFO.as_str()); }\n",
+                "INFO",
+            ),
+            (
+                "pin-project",
+                "pin-project = \"1\"",
+                "use pin_project::pin_project;\n#[pin_project]\nstruct P { v: u8 }\nfn main() { let _ = P { v: 5 }; print!(\"5\"); }\n",
+                "5",
+            ),
+            (
+                "async-trait",
+                "async-trait = \"0.1\"",
+                "#[async_trait::async_trait]\ntrait T { async fn f(&self) -> u8; }\nstruct S;\n#[async_trait::async_trait]\nimpl T for S { async fn f(&self) -> u8 { 3 } }\nfn main() { print!(\"ok\"); }\n",
+                "ok",
+            ),
+            (
+                "regex",
+                "regex = \"1\"",
+                "fn main() { print!(\"{}\", regex::Regex::new(r\"^\\d+$\").unwrap().is_match(\"123\")); }\n",
+                "true",
+            ),
+            (
+                "toml",
+                "toml = \"0.8\"",
+                "fn main() { print!(\"{}\", toml::from_str::<toml::Value>(\"a=1\").unwrap()[\"a\"].as_integer().unwrap()); }\n",
+                "1",
+            ),
+            (
+                "rayon",
+                "rayon = \"1\"",
+                "use rayon::prelude::*;\nfn main() { print!(\"{}\", (0u32..4).into_par_iter().sum::<u32>()); }\n",
+                "6",
+            ),
+            (
+                "futures",
+                "futures = \"0.3\"",
+                "fn main() { print!(\"{}\", futures::executor::block_on(async { 6u8 })); }\n",
+                "6",
+            ),
+            (
+                "tokio",
+                "tokio = { version = \"1\", features = [\"macros\", \"rt\"] }",
+                "#[tokio::main(flavor = \"current_thread\")]\nasync fn main() { let v = async { 5u8 }.await; print!(\"{v}\"); }\n",
+                "5",
+            ),
+            (
+                "clap",
+                "clap = { version = \"4\", features = [\"derive\"] }",
+                "use clap::Parser;\n#[derive(clap::Parser)]\nstruct A { #[arg(long)] n: u8 }\nfn main() { let a = A::parse_from([\"a\", \"--n\", \"3\"]); print!(\"{}\", a.n); }\n",
+                "3",
+            ),
         ];
         struct CorpusEntry {
             slug: String,
@@ -1188,6 +1418,7 @@ printf 'dep:%s\n' "$name" > "$out/$name.d"
         for toolchain in &toolchains {
             for entry in &crates {
                 let slug = format!("{toolchain}-{}", entry.slug).replace('.', "_");
+                eprintln!("corpus: {slug}");
                 let manifest = format!(
                     "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\n{}\n",
                     entry.deps
