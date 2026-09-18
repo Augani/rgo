@@ -683,6 +683,263 @@ printf 'dep:%s\n' "$name" > "$out/$name.d"
         let _ = daemon.wait();
     }
 
+    /// Performance gate: the bypassed wrapper must add only a small constant
+    /// overhead over invoking the compiler directly — no daemon round trips,
+    /// hashing, or classification work may run on the bypass path.
+    #[test]
+    fn bypassed_wrapper_overhead_stays_bounded() {
+        ensure_workspace_bins_built().unwrap();
+        let sb = Sandbox::new().unwrap();
+        let fixture = fixture(&sb);
+        const RUNS: u32 = 20;
+
+        let direct = (0..RUNS)
+            .map(|_| {
+                let started = std::time::Instant::now();
+                let status = Command::new(&fixture.fake_rustc)
+                    .arg("-vV")
+                    .env("FAKE_RUSTC_LOG", &fixture.log)
+                    .status()
+                    .unwrap();
+                assert!(status.success());
+                started.elapsed()
+            })
+            .collect::<Vec<_>>();
+        let wrapped = (0..RUNS)
+            .map(|_| {
+                let started = std::time::Instant::now();
+                let status = sb
+                    .cmd(cargo_bin("rgo-rustc-wrapper"))
+                    .env("RGO_BYPASS", "1")
+                    .env("FAKE_RUSTC_LOG", &fixture.log)
+                    .arg(&fixture.fake_rustc)
+                    .arg("-vV")
+                    .status()
+                    .unwrap();
+                assert!(status.success());
+                started.elapsed()
+            })
+            .collect::<Vec<_>>();
+        let avg = |runs: &[std::time::Duration]| {
+            runs.iter().sum::<std::time::Duration>() / runs.len() as u32
+        };
+        let (direct, wrapped) = (avg(&direct), avg(&wrapped));
+        assert!(
+            wrapped <= direct + Duration::from_millis(100),
+            "bypassed wrapper avg {wrapped:?} exceeds direct avg {direct:?} by >100ms"
+        );
+    }
+
+    /// Real-Cargo differential corpus (scaled-down): three chained git
+    /// dependencies compiled cold, cold-while-publishing, and via cache hits
+    /// must produce byte-identical artifacts, and the hit-produced binary
+    /// must behave identically.
+    #[test]
+    fn real_cargo_git_dependency_hits_reproduce_cold_compiles() {
+        ensure_workspace_bins_built().unwrap();
+        if Command::new("git").arg("--version").output().is_err() {
+            eprintln!("git unavailable; skipping real-cargo differential test");
+            return;
+        }
+        let sb = Sandbox::new().unwrap();
+        fixture(&sb); // enables [cache] in the sandbox config; fake rustc unused here
+        let setup = sb
+            .cmd(cargo_bin("rgo"))
+            .args(["setup", "--no-service"])
+            .output()
+            .unwrap();
+        assert!(
+            setup.status.success(),
+            "{}",
+            String::from_utf8_lossy(&setup.stderr)
+        );
+        let mut daemon = start_daemon(&sb);
+
+        let git = |dir: &std::path::Path, args: &[&str]| {
+            let status = Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .env("GIT_AUTHOR_NAME", "rgo")
+                .env("GIT_AUTHOR_EMAIL", "rgo@test")
+                .env("GIT_COMMITTER_NAME", "rgo")
+                .env("GIT_COMMITTER_EMAIL", "rgo@test")
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?} failed in {}", dir.display());
+        };
+        let dep_repo = |name: &str, deps: &str, body: &str| {
+            let dir = sb.projects.join(name);
+            fs::create_dir_all(dir.join("src")).unwrap();
+            fs::write(
+                dir.join("Cargo.toml"),
+                format!(
+                    "[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\n{deps}"
+                ),
+            )
+            .unwrap();
+            fs::write(dir.join("src/lib.rs"), body).unwrap();
+            git(&dir, &["init", "-q"]);
+            git(&dir, &["add", "-A"]);
+            git(&dir, &["commit", "-qm", "init"]);
+            format!("file://{}", dir.display())
+        };
+        let url_a = dep_repo("dep_a", "", "pub fn a() -> u32 { 1 }\n");
+        let url_b = dep_repo(
+            "dep_b",
+            &format!("dep_a = {{ git = \"{url_a}\" }}\n"),
+            "pub fn b() -> u32 { dep_a::a() + 1 }\n",
+        );
+        let url_c = dep_repo(
+            "dep_c",
+            &format!("dep_b = {{ git = \"{url_b}\" }}\n"),
+            "pub fn c() -> u32 { dep_b::b() + 1 }\n",
+        );
+        let app = |name: &str| {
+            let dir = sb.projects.join(name);
+            fs::create_dir_all(dir.join("src")).unwrap();
+            fs::write(
+                dir.join("Cargo.toml"),
+                format!(
+                    "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\ndep_c = {{ git = \"{url_c}\" }}\n"
+                ),
+            )
+            .unwrap();
+            fs::write(
+                dir.join("src/main.rs"),
+                "fn main() { println!(\"answer={}\", dep_c::c()); }\n",
+            )
+            .unwrap();
+            dir
+        };
+        let contexts = |sb: &Sandbox| -> Vec<PathBuf> {
+            let mut dirs = Vec::new();
+            for shard in fs::read_dir(sb.rgo_home.join("builds"))
+                .into_iter()
+                .flatten()
+                .flatten()
+            {
+                for entry in fs::read_dir(shard.path()).into_iter().flatten().flatten() {
+                    if entry.path().is_dir() {
+                        dirs.push(entry.path());
+                    }
+                }
+            }
+            dirs
+        };
+        let dep_artifacts = |context: &std::path::Path| -> Vec<(String, Vec<u8>)> {
+            let deps = context.join("release/deps");
+            let mut files: Vec<_> = fs::read_dir(&deps)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| {
+                    let name = p.file_name().unwrap().to_string_lossy();
+                    name.starts_with("libdep_") && name.ends_with(".rlib")
+                })
+                .collect();
+            files.sort();
+            files
+                .into_iter()
+                .map(|p| {
+                    (
+                        p.file_name().unwrap().to_string_lossy().into_owned(),
+                        fs::read(&p).unwrap(),
+                    )
+                })
+                .collect()
+        };
+
+        // Cold reference: RGO_BYPASS compiles through the wrapper without
+        // caching, still inside managed build-dirs.
+        let app_a = app("diff-a");
+        let before = contexts(&sb);
+        let cold = sb
+            .cargo()
+            .env("RGO_BYPASS", "1")
+            .current_dir(&app_a)
+            .args(["build", "--release"])
+            .output()
+            .unwrap();
+        assert!(
+            cold.status.success(),
+            "cold build failed: {}",
+            String::from_utf8_lossy(&cold.stderr)
+        );
+        let ctx_a = contexts(&sb)
+            .into_iter()
+            .find(|d| !before.contains(d))
+            .expect("cold build created no build context");
+        let cold_artifacts = dep_artifacts(&ctx_a);
+        assert_eq!(cold_artifacts.len(), 3, "expected dep_a/dep_b/dep_c rlibs");
+
+        // Publisher: identical dependencies in a second checkout compile cold
+        // and populate the CAS.
+        let app_b = app("diff-b");
+        let before = contexts(&sb);
+        let published = sb
+            .cargo()
+            .current_dir(&app_b)
+            .args(["build", "--release"])
+            .output()
+            .unwrap();
+        assert!(
+            published.status.success(),
+            "publisher build failed: {}",
+            String::from_utf8_lossy(&published.stderr)
+        );
+        let ctx_b = contexts(&sb)
+            .into_iter()
+            .find(|d| !before.contains(d))
+            .expect("publisher created no build context");
+        let published_artifacts = dep_artifacts(&ctx_b);
+        assert_eq!(
+            cold_artifacts, published_artifacts,
+            "cold and published dependency artifacts diverged (nondeterminism or key drift)"
+        );
+
+        // Consumer: a third checkout must serve every dependency from the CAS
+        // and produce identical bytes plus a working binary.
+        let app_c = app("diff-c");
+        let before = contexts(&sb);
+        let hit = sb
+            .cargo()
+            .current_dir(&app_c)
+            .args(["build", "--release"])
+            .output()
+            .unwrap();
+        assert!(
+            hit.status.success(),
+            "consumer build failed: {}",
+            String::from_utf8_lossy(&hit.stderr)
+        );
+        let ctx_c = contexts(&sb)
+            .into_iter()
+            .find(|d| !before.contains(d))
+            .expect("consumer created no build context");
+        assert_eq!(
+            published_artifacts,
+            dep_artifacts(&ctx_c),
+            "materialized hit outputs differ from the cold/published artifacts"
+        );
+        let hits = cache_events(&sb).matches("\"outcome\":\"hit\"").count();
+        assert!(
+            hits >= 3,
+            "expected cache hits for dep_a, dep_b, dep_c; events: {}",
+            cache_events(&sb)
+        );
+        let binary = app_c.join("target/release/app");
+        let run = sb.cmd(&binary).output().unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&run.stdout).trim(),
+            "answer=3",
+            "hit-built binary behaved differently"
+        );
+
+        daemon.kill().unwrap();
+        let _ = daemon.wait();
+    }
+
     #[test]
     fn widened_classes_proc_macro_and_metadata_only_bin_are_cacheable() {
         ensure_workspace_bins_built().unwrap();
