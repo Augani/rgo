@@ -1252,3 +1252,54 @@ fn native_object(object: &WireObject) -> ObjectRef {
         mode: object.mode,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn remote_output_names_reject_traversal_and_separators() {
+        for bad in [
+            "",
+            "/etc/passwd",
+            "../escape",
+            "a/../b",
+            "a/b",
+            "a\\b",
+            "C:\\Windows",
+            "..",
+        ] {
+            assert!(!safe_output_name(bad), "{bad} should be rejected");
+        }
+        for good in ["libfoo.rlib", "bar-1.0.d", ".hidden", "x"] {
+            assert!(safe_output_name(good), "{good} should be accepted");
+        }
+    }
+
+    #[test]
+    fn remote_object_refs_require_64_lower_hex_digests() {
+        let digest = "a".repeat(64);
+        assert!(valid_object_ref(&ObjectRef {
+            digest: digest.clone(),
+            size: 1,
+            mode: 0o444,
+        }));
+        let too_long = format!("{digest}a");
+        for bad in [&digest[..63], too_long.as_str(), "../ab", "zz"] {
+            let object = ObjectRef {
+                digest: bad.to_string(),
+                size: 1,
+                mode: 0o444,
+            };
+            assert!(!valid_object_ref(&object), "{bad} should be rejected");
+        }
+        let mut uppercase = ObjectRef {
+            digest: "A".repeat(64),
+            size: 1,
+            mode: 0o444,
+        };
+        assert!(valid_object_ref(&uppercase), "uppercase hex is valid hex");
+        uppercase.digest = "../".to_string() + &"a".repeat(61);
+        assert!(!valid_object_ref(&uppercase));
+    }
+}

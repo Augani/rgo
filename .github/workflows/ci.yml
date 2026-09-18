@@ -16,6 +16,16 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-14, windows-latest]
         toolchain: [stable, beta, '1.85.0']
+        include:
+          # Nightly is advisory-only: it catches upcoming toolchain regressions
+          # early without blocking merges on a moving target.
+          - os: ubuntu-latest
+            toolchain: nightly
+            experimental: true
+          - os: macos-14
+            toolchain: nightly
+            experimental: true
+    continue-on-error: ${{ matrix.experimental || false }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master

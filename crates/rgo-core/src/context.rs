@@ -228,3 +228,46 @@ fn last_used(dir: &Path, sidecar: Option<&ContextSidecar>) -> SystemTime {
     }
     best
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::size::Usage;
+
+    fn context_at(last_used: SystemTime) -> BuildContext {
+        BuildContext {
+            dir: PathBuf::from("/nonexistent"),
+            sidecar: None,
+            last_used,
+            usage: Usage::default(),
+            incremental_usage: Usage::default(),
+        }
+    }
+
+    #[test]
+    fn clock_jumps_backward_saturate_to_fresh_not_negative() {
+        // A clock that moved backwards must not make a context look older than it
+        // is: idle_for saturates at zero (treated as just-used, never collected).
+        let now = SystemTime::now();
+        let future = context_at(now + Duration::from_secs(86_400));
+        assert_eq!(future.idle_for(now), Duration::ZERO);
+        let present = context_at(now - Duration::from_secs(60));
+        assert_eq!(present.idle_for(now), Duration::from_secs(60));
+    }
+
+    #[test]
+    fn pin_marker_round_trips() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("ctx");
+        std::fs::create_dir(&dir).unwrap();
+        assert!(!is_pinned_dir(&dir));
+        write_pin_marker(&dir).unwrap();
+        assert!(is_pinned_dir(&dir));
+        remove_pin_marker(&dir).unwrap();
+        assert!(!is_pinned_dir(&dir));
+        // Removing a missing marker is idempotent.
+        remove_pin_marker(&dir).unwrap();
+        // Writing a marker for a missing directory fails loudly.
+        assert!(write_pin_marker(&root.path().join("gone")).is_err());
+    }
+}

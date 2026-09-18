@@ -379,6 +379,50 @@ printf 'dep:%s\n' "$name" > "$out/$name.d"
     }
 
     #[test]
+    fn unwritable_cas_degrades_to_plain_compiles() {
+        ensure_workspace_bins_built().unwrap();
+        let sb = Sandbox::new().unwrap();
+        let fixture = fixture(&sb);
+        let mut daemon = start_daemon(&sb);
+
+        // ENOSPC and EACCES reach the same write path: making the whole CAS tree
+        // read-only forces every object/manifest store to fail like a full disk.
+        let cas = sb.rgo_home.join("cas");
+        for entry in fs::read_dir(&cas).unwrap().flatten() {
+            fs::set_permissions(entry.path(), fs::Permissions::from_mode(0o555)).unwrap();
+        }
+        fs::set_permissions(&cas, fs::Permissions::from_mode(0o555)).unwrap();
+
+        let first = command_for(&sb, &fixture, "full-first", &[])
+            .output()
+            .unwrap();
+        assert!(
+            first.status.success(),
+            "compile must succeed even when publishing fails: {}",
+            String::from_utf8_lossy(&first.stderr)
+        );
+        assert_eq!(
+            fs::read(out_dir(&sb, "full-first").join("libdemo.rlib")).unwrap(),
+            b"rlib:demo\n"
+        );
+        let manifests = fs::read_dir(cas.join("manifests"))
+            .map(|entries| entries.flatten().count())
+            .unwrap_or(0);
+        assert_eq!(manifests, 0, "nothing may publish into a read-only CAS");
+
+        // A second invocation still misses and still compiles — never hits bad
+        // state and never fails the build.
+        let second = command_for(&sb, &fixture, "full-second", &[])
+            .output()
+            .unwrap();
+        assert!(second.status.success());
+        assert_eq!(compile_count(&fixture), 2);
+
+        daemon.kill().unwrap();
+        let _ = daemon.wait();
+    }
+
+    #[test]
     fn unsafe_invocations_always_compile_and_explain_the_bypass() {
         ensure_workspace_bins_built().unwrap();
         let sb = Sandbox::new().unwrap();
