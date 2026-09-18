@@ -230,34 +230,53 @@ printf 'dep:%s\n' "$name" > "$out/$name.d"
         artifacts_prefixed(context, "libdep_")
     }
 
-    /// `(name, bytes)` for every `{file_prefix}*` output under the context's
-    /// `release/deps`, sorted — dep-info `.d` files excluded (they embed paths).
-    fn artifacts_prefixed(context: &std::path::Path, file_prefix: &str) -> Vec<(String, Vec<u8>)> {
-        let deps = context.join("release/deps");
-        let mut files: Vec<_> = fs::read_dir(&deps)
+    /// Directories cargo may place unit artifacts in. Stable uses
+    /// `release/deps/`; newer nightlies use the per-unit layout
+    /// `release/build/<pkg>/<hash>/out/`. A one-level `build/<pkg>-<hash>/out/`
+    /// is a build-script OUT_DIR on every toolchain, so only the two-level
+    /// form is collected.
+    fn artifact_dirs(context: &std::path::Path) -> Vec<PathBuf> {
+        let release = context.join("release");
+        let mut dirs = vec![release.join("deps")];
+        for pkg in fs::read_dir(release.join("build"))
             .into_iter()
             .flatten()
             .flatten()
-            .map(|e| e.path())
-            .filter(|p| {
-                p.is_file()
-                    && p.file_name()
+        {
+            for unit in fs::read_dir(pkg.path()).into_iter().flatten().flatten() {
+                let out = unit.path().join("out");
+                if out.is_dir() {
+                    dirs.push(out);
+                }
+            }
+        }
+        dirs
+    }
+
+    /// `(name, bytes)` for every `{file_prefix}*` artifact in the context,
+    /// sorted — dep-info `.d` files excluded (they embed paths).
+    fn artifacts_prefixed(context: &std::path::Path, file_prefix: &str) -> Vec<(String, Vec<u8>)> {
+        let mut files = std::collections::BTreeMap::new();
+        for dir in artifact_dirs(context) {
+            for entry in fs::read_dir(&dir).into_iter().flatten().flatten() {
+                let p = entry.path();
+                if !p.is_file()
+                    || !p
+                        .file_name()
                         .unwrap()
                         .to_string_lossy()
                         .starts_with(file_prefix)
-                    && !p.extension().is_some_and(|ext| ext == "d")
-            })
-            .collect();
-        files.sort();
-        files
-            .into_iter()
-            .map(|p| {
-                (
+                    || p.extension().is_some_and(|ext| ext == "d")
+                {
+                    continue;
+                }
+                files.insert(
                     p.file_name().unwrap().to_string_lossy().into_owned(),
                     fs::read(&p).unwrap(),
-                )
-            })
-            .collect()
+                );
+            }
+        }
+        files.into_iter().collect()
     }
 
     /// The context dir created by the build that ran after `before` was taken.
@@ -1391,13 +1410,16 @@ printf 'dep:%s\n' "$name" > "$out/$name.d"
         let crates: Vec<CorpusEntry> = match std::env::var("RGO_CORPUS_CRATES") {
             Ok(list) => list
                 .split(',')
-                .filter_map(|entry| {
-                    entry.split_once('=').map(|(pkg, req)| CorpusEntry {
+                .map(|entry| {
+                    let (pkg, req) = entry.split_once('=').unwrap_or_else(|| {
+                        panic!("RGO_CORPUS_CRATES entry {entry:?} is not `pkg=version`")
+                    });
+                    CorpusEntry {
                         slug: pkg.to_owned(),
                         deps: format!("{pkg} = \"{req}\""),
                         main: "fn main() {}\n".to_owned(),
                         expected: None,
-                    })
+                    }
                 })
                 .collect(),
             Err(_) => defaults
@@ -1489,8 +1511,12 @@ printf 'dep:%s\n' "$name" > "$out/$name.d"
                         (v["outcome"] == "hit").then(|| v["key"].as_str().unwrap_or("").to_owned())
                     })
                     .collect();
-                let pub_deps = ctx_pub.join("release/deps");
-                let hit_deps = ctx_hit.join("release/deps");
+                let find_output = |ctx: &std::path::Path, name: &str| {
+                    artifact_dirs(ctx)
+                        .into_iter()
+                        .map(|dir| dir.join(name))
+                        .find(|p| p.is_file())
+                };
                 for key in &hit_keys {
                     let manifest: serde_json::Value = serde_json::from_str(
                         &std::fs::read_to_string(
@@ -1501,8 +1527,8 @@ printf 'dep:%s\n' "$name" > "$out/$name.d"
                     .unwrap();
                     for output in manifest["outputs"].as_array().unwrap() {
                         let name = output["name"].as_str().unwrap();
-                        let (p, h) = (pub_deps.join(name), hit_deps.join(name));
-                        if p.is_file() && h.is_file() {
+                        let (p, h) = (find_output(&ctx_pub, name), find_output(&ctx_hit, name));
+                        if let (Some(p), Some(h)) = (p, h) {
                             assert_eq!(
                                 std::fs::read(&p).unwrap(),
                                 std::fs::read(&h).unwrap(),

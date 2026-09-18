@@ -208,8 +208,17 @@ pub fn classify(
     let mut i = 0;
     while i < args.len() {
         let arg = args[i].to_string_lossy();
-        if arg == "-Z" || arg.starts_with("-Z") {
-            return Classification::Bypass(BypassReason::UnstableFlag);
+        if arg == "-Z" {
+            match args.get(i + 1).map(|v| v.to_string_lossy()) {
+                Some(value) if allowed_z_option(&value) => i += 2,
+                _ => return Classification::Bypass(BypassReason::UnstableFlag),
+            }
+            continue;
+        }
+        if let Some(value) = arg.strip_prefix("-Z") {
+            if !allowed_z_option(value) {
+                return Classification::Bypass(BypassReason::UnstableFlag);
+            }
         }
         if arg == "-C" {
             if let Some(value) = args.get(i + 1).map(|v| v.to_string_lossy().into_owned()) {
@@ -638,8 +647,22 @@ fn record_extern(value: &str, roots: &AllowedRoots, output: &mut BTreeMap<String
     let Ok(bytes) = fs::read(&path) else {
         return false;
     };
-    output.insert(name.to_owned(), blake3::hash(&bytes).to_hex().to_string());
+    // Newer cargo passes the same crate twice (`.rlib` and `.rmeta` externs);
+    // keying by name alone would silently drop one artifact's digest.
+    let label = path
+        .file_name()
+        .map(|file| format!("{name}={}", file.to_string_lossy()))
+        .unwrap_or_else(|| name.to_owned());
+    output.insert(label, blake3::hash(&bytes).to_hex().to_string());
     true
+}
+
+/// `-Z` options cargo passes by default on nightly toolchains. An allowlisted
+/// flag is normalized into the key like any other argument; every other `-Z`
+/// stays a bypass because unstable flags can alter codegen in ways the key
+/// cannot model.
+fn allowed_z_option(value: &str) -> bool {
+    matches!(value.split('=').next(), Some("embed-metadata"))
 }
 
 fn path_under(path: &Path, root: &Path) -> bool {
@@ -1021,6 +1044,95 @@ mod tests {
             classify_with(&["--extern", "helper"]),
             Classification::Bypass(BypassReason::ExternalExtern)
         ));
+    }
+
+    #[test]
+    fn allowlisted_z_option_is_keyed_and_others_still_bypass() {
+        let (_dir, root, source) = fixture();
+        let build = root.join("build");
+        fs::create_dir_all(&build).unwrap();
+        let roots = AllowedRoots {
+            build_root: build.clone(),
+            source_roots: vec![root.parent().unwrap().to_path_buf()],
+            workspace_roots: Vec::new(),
+            remap_workspace_paths: false,
+        };
+        let classify_with = |extra: &[&str]| {
+            let mut args = vec![
+                "--crate-name".into(),
+                "demo".into(),
+                "--crate-type=lib".into(),
+                "--emit=dep-info,metadata,link".into(),
+                "--out-dir".into(),
+                build.as_os_str().to_owned(),
+                source.as_os_str().to_owned(),
+            ];
+            args.extend(extra.iter().map(OsString::from));
+            classify(Path::new("rustc"), &args, &[], &roots)
+        };
+        // Nightly cargo passes `-Z embed-metadata=no` by default; it is keyed
+        // like any other argument rather than bypassing the cache.
+        let keyed = match classify_with(&["-Z", "embed-metadata=no"]) {
+            Classification::Cacheable(candidate) => candidate.key,
+            other => panic!("expected cacheable candidate, got {other:?}"),
+        };
+        let without_flag = match classify_with(&[]) {
+            Classification::Cacheable(candidate) => candidate.key,
+            other => panic!("expected cacheable candidate, got {other:?}"),
+        };
+        assert_ne!(keyed, without_flag);
+        assert!(matches!(
+            classify_with(&["-Zembed-metadata=no"]),
+            Classification::Cacheable(_)
+        ));
+        // Everything else under -Z remains unstable and bypassed.
+        for args in [vec!["-Z", "time-passes"], vec!["-Ztime-passes"]] {
+            assert!(matches!(
+                classify_with(&args),
+                Classification::Bypass(BypassReason::UnstableFlag)
+            ));
+        }
+    }
+
+    #[test]
+    fn duplicate_extern_names_keep_each_artifact_digest() {
+        let (_dir, root, source) = fixture();
+        let build = root.join("build");
+        fs::create_dir_all(&build).unwrap();
+        // Nightly cargo passes the same crate twice: once for its `.rlib` and
+        // once for its `.rmeta`.
+        let rlib = build.join("libdep-abc.rlib");
+        let rmeta = build.join("libdep-abc.rmeta");
+        fs::write(&rlib, b"rlib-v1").unwrap();
+        fs::write(&rmeta, b"rmeta").unwrap();
+        let roots = AllowedRoots {
+            build_root: build.clone(),
+            source_roots: vec![root.parent().unwrap().to_path_buf()],
+            workspace_roots: Vec::new(),
+            remap_workspace_paths: false,
+        };
+        let key_now = || {
+            let args: Vec<OsString> = vec![
+                "--crate-name".into(),
+                "demo".into(),
+                "--crate-type=lib".into(),
+                "--emit=dep-info,metadata,link".into(),
+                "--out-dir".into(),
+                build.as_os_str().to_owned(),
+                source.as_os_str().to_owned(),
+                "--extern".into(),
+                format!("dep={}", rlib.display()).into(),
+                "--extern".into(),
+                format!("dep={}", rmeta.display()).into(),
+            ];
+            match classify(Path::new("rustc"), &args, &[], &roots) {
+                Classification::Cacheable(candidate) => candidate.key,
+                other => panic!("expected cacheable candidate, got {other:?}"),
+            }
+        };
+        let before = key_now();
+        fs::write(&rlib, b"rlib-v2").unwrap();
+        assert_ne!(before, key_now());
     }
 
     #[test]

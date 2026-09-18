@@ -271,7 +271,7 @@ fn recently_locked(target: &Path) -> bool {
         .filter(|entry| {
             matches!(
                 entry.file_name().to_str(),
-                Some(".cargo-lock" | ".cargo-build-lock")
+                Some(".cargo-lock" | ".cargo-build-lock" | ".cargo-artifact-lock")
             )
         })
         .any(|entry| {

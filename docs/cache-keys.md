@@ -16,7 +16,7 @@ claim (schema version `rgo-cache-v2`).
 | normalized args | all rustc args after normalization | paths rewritten to roots-relative form; ordering preserved |
 | source digest | BLAKE3 over `(relpath, bytes)` for every file in the package source root, sorted | strict mode: any symlink fails the digest → bypass |
 | source kind | Registry / Git / Workspace | registry and git checkouts are immutable inputs; workspace members are handled separately |
-| extern inputs | `(name, file-content digest)` for every `--extern` | externs must resolve inside managed roots, else bypass; bare `--extern proc_macro` (no path) records `sysroot` — it is pinned by compiler identity |
+| extern inputs | `(name=file, file-content digest)` for every `--extern` | externs must resolve inside managed roots, else bypass; bare `--extern proc_macro` (no path) records `sysroot` — it is pinned by compiler identity. Newer cargo may pass the same crate twice (`.rlib` and `.rmeta` externs); each artifact's digest is keyed separately |
 | env digest | `(name, BLAKE3(value))` for `CARGO_PKG_*`, `CARGO_CFG_*`, `CARGO_CRATE_NAME`, `CARGO_MANIFEST_DIR`, `RUSTUP_TOOLCHAIN` | plus `OUT_DIR_CONTENTS` digest when `OUT_DIR` is set |
 | target triple | `--target` value when present | cross builds never collide with host builds |
 | remap prefix | `(from, to)` of the applied `--remap-path-prefix` | workspace "from" is omitted so equivalent worktrees share one key |
@@ -38,7 +38,8 @@ a failure. Reasons are stable strings, recorded in `state/cache-events.log`.
 | `bin`/`cdylib`/`staticlib`/`dylib` with `link` emit | `unsupported_crate_type` |
 | emit kinds outside the allowlist (asm, mir, llvm-ir, …) | `unsupported_emit` |
 | `-Cincremental`, `-Csave-temps` | `incremental`, `save_temps` |
-| any `-Z` flag | `unstable_flag` |
+| `-Z` flag not on the allowlist | `unstable_flag` |
+| `-Zembed-metadata` (nightly cargo default) | keyed like any other arg — allowlisted because cargo emits it on every nightly invocation |
 | `-l`, `-Lnative=`, `-Clinker=`, `-Clink-arg*`, `-Clink-self-contained` | `native_input` |
 | `-L` path outside build root / sysroot, or unresolvable `--extern` | `external_extern` |
 | `OUT_DIR` outside the managed build root | `build_script_output` |
@@ -64,6 +65,13 @@ Notes on invocation-derived key inputs:
 - The wrapper retries `CacheAcquire` for up to ~2s on transient IPC failures
   (parallel commit bursts can stall responses past the 150ms socket timeout)
   before recording `daemon_unreachable` and compiling normally.
+- Toolchain layout: stable cargo emits dep artifacts under `<profile>/deps/`;
+  nightly (cargo ≥1.100) uses the per-unit layout
+  `<profile>/build/<pkg>/<hash>/out/` with colocated `fingerprint/`. The wrapper
+  is layout-agnostic (it works from each invocation's `--out-dir`), and the
+  whole `build/` tree is already a documented intermediate, so relocation and
+  caching work on both layouts. Nightly also adds a `.cargo-artifact-lock`,
+  which the liveness heuristic watches alongside `.cargo-build-lock`.
 
 ## Integrity and recovery
 
