@@ -355,41 +355,18 @@ mod tests {
 
     #[test]
     fn authenticated_get_and_put_are_bounded_and_provider_neutral() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = thread::spawn(move || {
-            for index in 0..3 {
-                let (mut stream, _) = listener.accept().unwrap();
-                let mut request = Vec::new();
-                let mut buffer = [0_u8; 4096];
-                loop {
-                    let count = stream.read(&mut buffer).unwrap();
-                    if count == 0 {
-                        break;
-                    }
-                    request.extend_from_slice(&buffer[..count]);
-                    if request.windows(4).any(|window| window == b"\r\n\r\n") {
-                        break;
-                    }
-                }
-                let request_text = String::from_utf8_lossy(&request);
-                assert!(request_text.contains("authorization: Bearer test-token"));
-                let (status, body) = if index == 0 || index == 2 {
-                    ("200 OK", b"object".as_slice())
-                } else {
-                    ("409 Conflict", b"".as_slice())
-                };
-                write!(
-                    stream,
-                    "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                    body.len()
-                )
-                .unwrap();
-                stream.write_all(body).unwrap();
+        let mut index = 0usize;
+        let (endpoint, server) = serve_n(3, move |_| {
+            let current = index;
+            index += 1;
+            if current == 1 {
+                (409, Vec::new())
+            } else {
+                (200, b"object".to_vec())
             }
         });
         let client = Client::new(Config {
-            endpoint: format!("http://{address}"),
+            endpoint,
             namespace: "test".into(),
             token: "test-token".into(),
             timeout: Duration::from_secs(2),
@@ -403,7 +380,12 @@ mod tests {
             Fetch::Hit(b"object".to_vec())
         );
         assert_eq!(client.put_object(&digest, b"object").unwrap().status, 409);
-        server.join().unwrap();
+        let recorded = server.join().unwrap();
+        assert!(
+            recorded
+                .iter()
+                .all(|r| r.headers.contains("authorization: Bearer test-token"))
+        );
     }
 
     #[test]
@@ -429,5 +411,312 @@ mod tests {
         .unwrap();
         assert_eq!(client.get_manifest("key").unwrap(), Fetch::Miss);
         server.join().unwrap();
+    }
+
+    // ---- Shared fixtures for fault and interop coverage ----------------------
+
+    struct Recorded {
+        method: String,
+        path: String,
+        headers: String,
+        body: Vec<u8>,
+    }
+
+    fn read_request(stream: &mut std::net::TcpStream) -> Recorded {
+        let mut buf = Vec::new();
+        let mut tmp = [0_u8; 8192];
+        let headers_end = loop {
+            let count = stream.read(&mut tmp).unwrap();
+            if count == 0 {
+                break buf.len();
+            }
+            buf.extend_from_slice(&tmp[..count]);
+            if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                break pos + 4;
+            }
+        };
+        let headers = String::from_utf8_lossy(&buf[..headers_end]).into_owned();
+        let content_length = headers
+            .lines()
+            .find_map(|line| {
+                line.to_ascii_lowercase()
+                    .strip_prefix("content-length:")
+                    .and_then(|value| value.trim().parse::<usize>().ok())
+            })
+            .unwrap_or(0);
+        let mut body = buf[headers_end..].to_vec();
+        while body.len() < content_length {
+            match stream.read(&mut tmp) {
+                Ok(0) | Err(_) => break,
+                Ok(count) => body.extend_from_slice(&tmp[..count]),
+            }
+        }
+        body.truncate(content_length);
+        let mut request_line = headers
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .split_whitespace();
+        Recorded {
+            method: request_line.next().unwrap_or_default().into(),
+            path: request_line.next().unwrap_or_default().into(),
+            headers,
+            body,
+        }
+    }
+
+    fn write_response(stream: &mut std::net::TcpStream, status: u16, body: &[u8]) {
+        write!(
+            stream,
+            "HTTP/1.1 {status} R\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .unwrap();
+        stream.write_all(body).unwrap();
+    }
+
+    /// Serve `count` canned requests; returns the endpoint and a handle to the
+    /// recorded requests for assertions.
+    fn serve_n(
+        count: usize,
+        mut handler: impl FnMut(&Recorded) -> (u16, Vec<u8>) + Send + 'static,
+    ) -> (String, thread::JoinHandle<Vec<Recorded>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let handle = thread::spawn(move || {
+            let mut recorded = Vec::new();
+            for _ in 0..count {
+                let (mut stream, _) = listener.accept().unwrap();
+                let request = read_request(&mut stream);
+                let (status, body) = handler(&request);
+                write_response(&mut stream, status, &body);
+                recorded.push(request);
+            }
+            recorded
+        });
+        (format!("http://{address}"), handle)
+    }
+
+    fn test_config(endpoint: &str) -> Config {
+        Config {
+            endpoint: endpoint.into(),
+            namespace: "test".into(),
+            token: "test-token".into(),
+            timeout: Duration::from_secs(2),
+            max_object_size: 1024,
+            allow_insecure_loopback: true,
+        }
+    }
+
+    /// A second, independent implementation of the remote-CAS protocol: a
+    /// stateful in-memory CAS that returns 201 for new objects, 409 for
+    /// duplicates, and real GETs — exercising the client against semantics
+    /// rather than canned responses.
+    fn serve_cas(expected_requests: usize) -> (String, thread::JoinHandle<Vec<Recorded>>) {
+        use std::collections::HashMap;
+        use std::sync::{Arc, Mutex};
+        let store: Arc<Mutex<HashMap<String, Vec<u8>>>> = Arc::new(Mutex::new(HashMap::new()));
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let handle = thread::spawn(move || {
+            let mut recorded = Vec::new();
+            for _ in 0..expected_requests {
+                let (mut stream, _) = listener.accept().unwrap();
+                let request = read_request(&mut stream);
+                let mut store = store.lock().unwrap();
+                let (status, body) = match request.method.as_str() {
+                    "GET" => match store.get(&request.path) {
+                        Some(bytes) => (200, bytes.clone()),
+                        None => (404, Vec::new()),
+                    },
+                    "PUT" => {
+                        if store.contains_key(&request.path) {
+                            (409, Vec::new())
+                        } else {
+                            store.insert(request.path.clone(), request.body.clone());
+                            (201, Vec::new())
+                        }
+                    }
+                    _ => (405, Vec::new()),
+                };
+                drop(store);
+                write_response(&mut stream, status, &body);
+                recorded.push(request);
+            }
+            recorded
+        });
+        (format!("http://{address}"), handle)
+    }
+
+    #[test]
+    fn oversized_and_truncated_responses_fail_closed() {
+        // Body beyond max_object_size: bounded reader must error, never return a Hit.
+        let (endpoint, server) = serve_n(1, |_| (200, vec![b'x'; 2048]));
+        let client = Client::new(test_config(&endpoint)).unwrap();
+        let digest = blake3::hash(b"whatever").to_hex().to_string();
+        assert!(client.get_object(&digest).is_err());
+        server.join().unwrap();
+
+        // Content-Length lies (claims more than sent): must error, not return a
+        // partial Hit.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0_u8; 1024];
+            let _ = stream.read(&mut buf);
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 999\r\n\r\n")
+                .unwrap();
+            stream.write_all(b"short").unwrap();
+        });
+        let client = Client::new(test_config(&format!("http://{address}"))).unwrap();
+        let digest = blake3::hash(b"short").to_hex().to_string();
+        assert!(client.get_object(&digest).is_err());
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn digest_mismatch_auth_and_rate_limit_fail_closed() {
+        // Server returns a 200 with bytes that don't match the requested digest.
+        let (endpoint, server) = serve_n(1, |_| (200, b"forged".to_vec()));
+        let client = Client::new(test_config(&endpoint)).unwrap();
+        let digest = blake3::hash(b"genuine").to_hex().to_string();
+        let error = client.get_object(&digest).unwrap_err();
+        assert_eq!(error.kind, RemoteErrorKind::InvalidResponse);
+        server.join().unwrap();
+
+        let (endpoint, server) = serve_n(2, |_| (401, Vec::new()));
+        let client = Client::new(test_config(&endpoint)).unwrap();
+        assert_eq!(
+            client.get_manifest("k").unwrap_err().kind,
+            RemoteErrorKind::Authentication
+        );
+        assert_eq!(
+            client.put_manifest("k", b"m").unwrap_err().kind,
+            RemoteErrorKind::Authentication
+        );
+        server.join().unwrap();
+
+        let (endpoint, server) = serve_n(1, |_| (429, Vec::new()));
+        let client = Client::new(test_config(&endpoint)).unwrap();
+        assert_eq!(
+            client.get_manifest("k").unwrap_err().kind,
+            RemoteErrorKind::RateLimited
+        );
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn offline_timeout_and_tls_failures_are_transport_errors() {
+        // Nothing listening: connection refused is a bounded Transport error.
+        let client = Client::new(test_config("http://127.0.0.1:9")).unwrap();
+        assert_eq!(
+            client.get_manifest("k").unwrap_err().kind,
+            RemoteErrorKind::Transport
+        );
+
+        // A server that accepts but never responds must hit the global timeout.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let stalled = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            thread::sleep(Duration::from_secs(10));
+            drop(stream);
+        });
+        let client = Client::new(test_config(&format!("http://{address}"))).unwrap();
+        let started = std::time::Instant::now();
+        let error = client.get_manifest("k").unwrap_err();
+        assert_eq!(error.kind, RemoteErrorKind::Transport);
+        assert!(started.elapsed() < Duration::from_secs(8));
+        drop(stalled);
+
+        // HTTPS against a plaintext endpoint must fail at the transport layer —
+        // plaintext can never masquerade as a remote CAS.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0_u8; 512];
+            let _ = stream.read(&mut buf);
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                .unwrap();
+        });
+        let client = Client::new(Config {
+            endpoint: format!("https://{address}"),
+            ..test_config("")
+        })
+        .unwrap();
+        assert_eq!(
+            client.get_manifest("k").unwrap_err().kind,
+            RemoteErrorKind::Transport
+        );
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn second_implementation_interop_and_namespace_isolation() {
+        // Full object+manifest round trip against the independent CAS fixture:
+        // PUT -> 201, duplicate PUT -> 409 verified by GET, GET hits verified.
+        // Requests: put, put+get(409-verify), get, put, put+get(409-verify), get = 8.
+        let (endpoint, server) = serve_cas(8);
+        let client = Client::new(test_config(&endpoint)).unwrap();
+        let bytes = b"interoperable bytes".to_vec();
+        let digest = blake3::hash(&bytes).to_hex().to_string();
+        assert_eq!(client.put_object(&digest, &bytes).unwrap().status, 201);
+        assert_eq!(client.put_object(&digest, &bytes).unwrap().status, 409);
+        assert_eq!(
+            client.get_object(&digest).unwrap(),
+            Fetch::Hit(bytes.clone())
+        );
+        assert_eq!(client.put_manifest("key-1", b"{}").unwrap().status, 201);
+        assert_eq!(client.put_manifest("key-1", b"{}").unwrap().status, 409);
+        assert_eq!(
+            client.get_manifest("key-1").unwrap(),
+            Fetch::Hit(b"{}".to_vec())
+        );
+        let recorded = server.join().unwrap();
+        assert!(recorded.iter().all(|r| r.path.starts_with("/v1/test/")));
+        assert!(
+            recorded
+                .iter()
+                .all(|r| r.headers.contains("authorization: Bearer test-token"))
+        );
+
+        // Two namespaces over the same endpoint never share paths.
+        let (endpoint, server) = serve_cas(2);
+        let mut ns_a = test_config(&endpoint);
+        ns_a.namespace = "ns-a".into();
+        let mut ns_b = test_config(&endpoint);
+        ns_b.namespace = "ns-b".into();
+        let client_a = Client::new(ns_a).unwrap();
+        let client_b = Client::new(ns_b).unwrap();
+        client_a.put_manifest("k", b"a").unwrap();
+        client_b.put_manifest("k", b"b").unwrap();
+        let recorded = server.join().unwrap();
+        assert_eq!(recorded[0].path, "/v1/ns-a/manifests/k");
+        assert_eq!(recorded[1].path, "/v1/ns-b/manifests/k");
+    }
+
+    #[test]
+    fn token_never_leaks_into_urls_errors_or_request_lines() {
+        let (endpoint, server) = serve_n(1, |_| (500, Vec::new()));
+        let client = Client::new(Config {
+            token: "super-secret-token".into(),
+            ..test_config(&endpoint)
+        })
+        .unwrap();
+        let error = client.get_manifest("k").unwrap_err();
+        let shown = format!("{error}");
+        assert!(!shown.contains("super-secret-token"), "{shown}");
+        let recorded = server.join().unwrap();
+        assert!(!recorded[0].path.contains("super-secret-token"));
+        assert!(!recorded[0].path.contains("super%2Dsecret"));
+        assert!(
+            recorded[0]
+                .headers
+                .contains("authorization: Bearer super-secret-token")
+        );
     }
 }
