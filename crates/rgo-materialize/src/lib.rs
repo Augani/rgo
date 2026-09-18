@@ -43,6 +43,7 @@ pub fn materialize(
     if try_clone_file(object, &clone_temp) {
         set_mode(&clone_temp, mode)?;
         replace(&clone_temp, destination)?;
+        stamp_now(destination);
         return Ok(Strategy::CloneFile);
     }
     if allow_hard_link && capabilities(destination).hard_links && same_volume(object, parent) {
@@ -50,6 +51,11 @@ pub fn materialize(
         let _ = fs::remove_file(&temp);
         if is_read_only(object) && fs::hard_link(object, &temp).is_ok() {
             replace(&temp, destination)?;
+            // The destination shares the CAS object's inode, so its mtime stays at
+            // publication time. That is the safe direction for Cargo freshness (a
+            // dependency always reads as older than the dependent's own outputs)
+            // and must not be touched: stamping would mutate the shared inode and
+            // every sibling context hardlinked to the same object.
             return Ok(Strategy::HardLink);
         }
         let _ = fs::remove_file(&temp);
@@ -60,7 +66,19 @@ pub fn materialize(
         .with_context(|| format!("copying {} to {}", object.display(), destination.display()))?;
     set_mode(&temp, mode)?;
     replace(&temp, destination)?;
+    stamp_now(destination);
     Ok(Strategy::Copy)
+}
+
+/// Cargo's freshness compares dependency output mtimes against the dependent's
+/// fingerprint time, so a materialized file must not carry the CAS object's
+/// historical mtime forward — a clone inherits it, which reads as a stale or
+/// out-of-order build and makes the next `cargo build` recompile.
+fn stamp_now(destination: &Path) {
+    let now = std::time::SystemTime::now();
+    if let Ok(file) = fs::File::options().write(true).open(destination) {
+        let _ = file.set_modified(now);
+    }
 }
 
 pub fn materialize_bytes(bytes: &[u8], destination: &Path, mode: u32) -> Result<()> {

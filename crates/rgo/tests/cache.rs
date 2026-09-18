@@ -146,6 +146,23 @@ printf 'dep:%s\n' "$name" > "$out/$name.d"
         fs::read_to_string(sb.rgo_home.join("state/cache-events.log")).unwrap_or_default()
     }
 
+    /// Durable hit counter from the daemon DB (`rgo cache stats`), unlike the
+    /// event log file which the daemon drains at maintenance ticks.
+    fn cache_hits(sb: &Sandbox) -> u64 {
+        let output = sb
+            .cmd(cargo_bin("rgo"))
+            .args(["cache", "stats"])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix("Cache hits")
+                    .and_then(|rest| rest.trim().parse().ok())
+            })
+            .unwrap_or(0)
+    }
+
     /// Block until the fake rustc has been invoked `count` times — i.e. the
     /// wrapper has secured the producer role and started compiling.
     fn wait_for_compiles(fixture: &Fixture, count: usize) {
@@ -210,6 +227,12 @@ printf 'dep:%s\n' "$name" > "$out/$name.d"
     /// (rlib/rmeta/shared-library outputs, dep-info excluded since it embeds
     /// per-context paths by design).
     fn dep_artifacts(context: &std::path::Path) -> Vec<(String, Vec<u8>)> {
+        artifacts_prefixed(context, "libdep_")
+    }
+
+    /// `(name, bytes)` for every `{file_prefix}*` output under the context's
+    /// `release/deps`, sorted — dep-info `.d` files excluded (they embed paths).
+    fn artifacts_prefixed(context: &std::path::Path, file_prefix: &str) -> Vec<(String, Vec<u8>)> {
         let deps = context.join("release/deps");
         let mut files: Vec<_> = fs::read_dir(&deps)
             .into_iter()
@@ -221,7 +244,7 @@ printf 'dep:%s\n' "$name" > "$out/$name.d"
                     && p.file_name()
                         .unwrap()
                         .to_string_lossy()
-                        .starts_with("libdep_")
+                        .starts_with(file_prefix)
                     && !p.extension().is_some_and(|ext| ext == "d")
             })
             .collect();
@@ -1009,6 +1032,285 @@ printf 'dep:%s\n' "$name" > "$out/$name.d"
             "answer=52",
             "hit-built binary behaved differently"
         );
+
+        daemon.kill().unwrap();
+        let _ = daemon.wait();
+    }
+
+    /// Networked differential corpus — the scalable half of the Phase 3 gate.
+    /// Pulls real registry crates through plain cargo in three contexts
+    /// (bypassed cold reference, publisher, consumer) and asserts the hit
+    /// reproduces the publisher's bytes plus a working binary.
+    ///
+    /// Disabled unless `RGO_CORPUS_ONLINE=1`. `RGO_CORPUS_CRATES="pkg=req,…"`
+    /// overrides the crate list (env crates get build/hit/artifact checks but
+    /// no behavioral probe), `RGO_CORPUS_TOOLCHAINS="stable,beta"` overrides
+    /// the toolchain axis; the OS axis is wherever CI runs it.
+    #[test]
+    fn online_registry_corpus_hits_reproduce_publisher_outputs() {
+        if std::env::var_os("RGO_CORPUS_ONLINE").is_none() {
+            eprintln!("skipping networked corpus; set RGO_CORPUS_ONLINE=1 to run");
+            return;
+        }
+        ensure_workspace_bins_built().unwrap();
+        let sb = Sandbox::new().unwrap();
+        fixture(&sb); // enables [cache] in the sandbox config; fake rustc unused here
+        let setup = sb
+            .cmd(cargo_bin("rgo"))
+            .args(["setup", "--no-service"])
+            .output()
+            .unwrap();
+        assert!(
+            setup.status.success(),
+            "{}",
+            String::from_utf8_lossy(&setup.stderr)
+        );
+        let mut daemon = start_daemon(&sb);
+
+        // (slug, dependency TOML lines, src/main.rs content, expected stdout)
+        // Every entry's whole dep closure is asserted: all `lib*` outputs in
+        // the consumer context must equal the publisher's bytes.
+        let defaults: Vec<(&str, &str, &str, &str)> = vec![
+            (
+                "itoa",
+                "itoa = \"1\"",
+                "fn main() { print!(\"{}\", itoa::Buffer::new().format(421)); }\n",
+                "421",
+            ),
+            (
+                "memchr",
+                "memchr = \"2\"",
+                "fn main() { print!(\"{}\", memchr::memchr(b'z', b\"azb\").unwrap()); }\n",
+                "1",
+            ),
+            (
+                "semver",
+                "semver = \"1\"",
+                "fn main() { print!(\"{}\", semver::Version::parse(\"3.7.9\").unwrap().patch); }\n",
+                "9",
+            ),
+            (
+                "hex",
+                "hex = \"0.4\"",
+                "fn main() { print!(\"{}\", hex::encode([222u8, 173])); }\n",
+                "dead",
+            ),
+            (
+                "ryu",
+                "ryu = \"1\"",
+                "fn main() { print!(\"{}\", ryu::Buffer::new().format(1.25)); }\n",
+                "1.25",
+            ),
+            (
+                "unicode-width",
+                "unicode-width = \"0.1\"",
+                "fn main() { print!(\"{}\", unicode_width::UnicodeWidthStr::width(\"hello\")); }\n",
+                "5",
+            ),
+            (
+                "either",
+                "either = \"1\"",
+                "fn main() { print!(\"{}\", either::Either::<u8, u8>::Left(3).is_left()); }\n",
+                "true",
+            ),
+            (
+                "smallvec",
+                "smallvec = \"1\"",
+                "fn main() { print!(\"{}\", smallvec::SmallVec::<[u8; 4]>::from_slice(&[1, 2, 3]).len()); }\n",
+                "3",
+            ),
+            (
+                "percent-encoding",
+                "percent-encoding = \"2\"",
+                "fn main() { print!(\"{}\", percent_encoding::utf8_percent_encode(\"a b\", percent_encoding::NON_ALPHANUMERIC)); }\n",
+                "a%20b",
+            ),
+            (
+                "anyhow",
+                "anyhow = \"1\"",
+                "fn main() { print!(\"{}\", anyhow::anyhow!(\"x\")); }\n",
+                "x",
+            ),
+            (
+                "crc32fast",
+                "crc32fast = \"1\"",
+                "fn main() { print!(\"{}\", crc32fast::hash(b\"abc\")); }\n",
+                "891568578",
+            ),
+            // Real proc-macro dependency closures — the classes fixed by the
+            // bare-extern and output-ownership work, at registry scale.
+            (
+                "thiserror",
+                "thiserror = \"2\"",
+                "#[derive(thiserror::Error, Debug)]\n#[error(\"oops {0}\")]\nstruct E(u8);\nfn main() { print!(\"{}\", E(4)); }\n",
+                "oops 4",
+            ),
+            (
+                "serde",
+                "serde = { version = \"1\", features = [\"derive\"] }\nserde_json = \"1\"",
+                "#[derive(serde::Serialize)]\nstruct S { v: u8 }\nfn main() { print!(\"{}\", serde_json::to_string(&S { v: 3 }).unwrap()); }\n",
+                "{\"v\":3}",
+            ),
+        ];
+        struct CorpusEntry {
+            slug: String,
+            deps: String,
+            main: String,
+            expected: Option<String>,
+        }
+        let crates: Vec<CorpusEntry> = match std::env::var("RGO_CORPUS_CRATES") {
+            Ok(list) => list
+                .split(',')
+                .filter_map(|entry| {
+                    entry.split_once('=').map(|(pkg, req)| CorpusEntry {
+                        slug: pkg.to_owned(),
+                        deps: format!("{pkg} = \"{req}\""),
+                        main: "fn main() {}\n".to_owned(),
+                        expected: None,
+                    })
+                })
+                .collect(),
+            Err(_) => defaults
+                .into_iter()
+                .map(|(slug, deps, main, expected)| CorpusEntry {
+                    slug: slug.to_owned(),
+                    deps: deps.to_owned(),
+                    main: main.to_owned(),
+                    expected: Some(expected.to_owned()),
+                })
+                .collect(),
+        };
+        let toolchains: Vec<String> = match std::env::var("RGO_CORPUS_TOOLCHAINS") {
+            Ok(list) => list.split(',').map(str::to_owned).collect(),
+            Err(_) => vec![std::env::var("RUSTUP_TOOLCHAIN").unwrap_or_else(|_| "stable".into())],
+        };
+
+        for toolchain in &toolchains {
+            for entry in &crates {
+                let slug = format!("{toolchain}-{}", entry.slug).replace('.', "_");
+                let manifest = format!(
+                    "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\n{}\n",
+                    entry.deps
+                );
+                let main = &entry.main;
+                let app = |suffix: &str| {
+                    let dir = sb.projects.join(format!("{slug}-{suffix}"));
+                    fs::create_dir_all(dir.join("src")).unwrap();
+                    fs::write(dir.join("Cargo.toml"), &manifest).unwrap();
+                    fs::write(dir.join("src/main.rs"), main).unwrap();
+                    dir
+                };
+                let build = |dir: &std::path::Path, bypass: bool| {
+                    let mut command = sb.cargo();
+                    command
+                        .env("RUSTUP_TOOLCHAIN", toolchain)
+                        .current_dir(dir)
+                        .args(["build", "--release"]);
+                    if bypass {
+                        command.env("RGO_BYPASS", "1");
+                    }
+                    let output = command.output().unwrap();
+                    assert!(
+                        output.status.success(),
+                        "{slug} build failed: {}",
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                    output
+                };
+
+                // Whole dep closure: every `lib*` artifact the consumer's deps
+                // dir holds must equal the publisher's bytes.
+                let before = contexts(&sb);
+                build(&app("cold"), true);
+                let ctx_cold = new_context(&sb, &before);
+                assert!(
+                    !artifacts_prefixed(&ctx_cold, "lib").is_empty(),
+                    "{slug}: cold build produced no dep artifacts"
+                );
+
+                let before = contexts(&sb);
+                build(&app("pub"), false);
+                let ctx_pub = new_context(&sb, &before);
+                let published = artifacts_prefixed(&ctx_pub, "lib");
+
+                // Hit fidelity: every artifact materialized via a cache hit must
+                // reproduce the publisher's bytes verbatim. Missed crates may
+                // legitimately recompile to different bytes (build-script
+                // consumers embed per-context OUT_DIR paths; proc-macro dylibs
+                // carry linker-generated ids), so whole-closure equality is not
+                // a valid gate — the hit manifest names the outputs to check.
+                let hits_before = cache_hits(&sb);
+                let consumer = app("hit");
+                build(&consumer, false);
+                let ctx_hit = new_context(&sb, &before);
+                assert!(
+                    cache_hits(&sb) > hits_before,
+                    "{slug}: consumer recorded no cache hit; events: {}",
+                    cache_events(&sb)
+                );
+                // The event log is drained into the daemon DB at maintenance
+                // ticks, so whatever hit keys remain in the file are a valid
+                // (possibly partial) sample to check fidelity against.
+                let hit_keys: Vec<String> = cache_events(&sb)
+                    .lines()
+                    .filter_map(|line| {
+                        let v: serde_json::Value = serde_json::from_str(line).ok()?;
+                        (v["outcome"] == "hit").then(|| v["key"].as_str().unwrap_or("").to_owned())
+                    })
+                    .collect();
+                let pub_deps = ctx_pub.join("release/deps");
+                let hit_deps = ctx_hit.join("release/deps");
+                for key in &hit_keys {
+                    let manifest: serde_json::Value = serde_json::from_str(
+                        &std::fs::read_to_string(
+                            sb.rgo_home.join(format!("cas/manifests/{key}.json")),
+                        )
+                        .unwrap_or_else(|_| panic!("{slug}: manifest for hit key {key} missing")),
+                    )
+                    .unwrap();
+                    for output in manifest["outputs"].as_array().unwrap() {
+                        let name = output["name"].as_str().unwrap();
+                        let (p, h) = (pub_deps.join(name), hit_deps.join(name));
+                        if p.is_file() && h.is_file() {
+                            assert_eq!(
+                                std::fs::read(&p).unwrap(),
+                                std::fs::read(&h).unwrap(),
+                                "{slug}: hit output {name} diverged from publisher bytes"
+                            );
+                        }
+                    }
+                }
+                // The consumer's dep-closure file set must match the publisher's.
+                assert_eq!(
+                    published.iter().map(|(n, _)| n).collect::<Vec<_>>(),
+                    artifacts_prefixed(&ctx_hit, "lib")
+                        .iter()
+                        .map(|(n, _)| n)
+                        .collect::<Vec<_>>(),
+                    "{slug}: hit consumer's dep closure differs from the publisher"
+                );
+
+                if let Some(expected) = &entry.expected {
+                    let run = sb
+                        .cmd(consumer.join("target/release/app"))
+                        .output()
+                        .unwrap();
+                    assert_eq!(
+                        String::from_utf8_lossy(&run.stdout).trim(),
+                        *expected,
+                        "{slug}: hit-built binary behaved differently"
+                    );
+                }
+
+                // No-op rebuild must stay no-op: cargo prints no Compiling lines.
+                let rebuild = build(&consumer, false);
+                assert!(
+                    !String::from_utf8_lossy(&rebuild.stderr).contains("Compiling"),
+                    "{slug}: rebuild recompiled instead of staying fresh: {}",
+                    String::from_utf8_lossy(&rebuild.stderr)
+                );
+            }
+        }
 
         daemon.kill().unwrap();
         let _ = daemon.wait();

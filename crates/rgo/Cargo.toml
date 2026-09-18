@@ -29,6 +29,7 @@ rgo-testkit.workspace = true
 assert_cmd.workspace = true
 predicates.workspace = true
 tempfile.workspace = true
+serde_json.workspace = true
 
 [lints]
 workspace = true

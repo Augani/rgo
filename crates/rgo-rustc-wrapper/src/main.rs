@@ -185,7 +185,32 @@ fn acquire_cache_role(candidate: &Candidate) -> Option<CacheRole> {
         ttl_secs: DEFAULT_LEASE_TTL_SECS,
     };
     loop {
-        let response = request(message).ok()?;
+        // A burst of parallel rustc invocations can stall responses past the
+        // short socket timeout (commit writes serialize in the daemon); retry
+        // for a bounded window before degrading to a plain compile so a hit is
+        // not silently lost.
+        let response = match request(message.clone()) {
+            Ok(response) => response,
+            Err(_error) => {
+                let retry_deadline =
+                    std::time::Instant::now() + Duration::from_secs(2).min(timeout);
+                let mut retried = None;
+                while std::time::Instant::now() < retry_deadline {
+                    thread::sleep(Duration::from_millis(100));
+                    if let Ok(response) = request(message.clone()) {
+                        retried = Some(response);
+                        break;
+                    }
+                }
+                match retried {
+                    Some(response) => response,
+                    None => {
+                        record_event(Some(key), "bypass", 0, Some("daemon_unreachable".into()));
+                        return None;
+                    }
+                }
+            }
+        };
         match response {
             Response::CacheProducer { lease_id, .. } => {
                 return Some(CacheRole::Producer { lease_id });
@@ -344,7 +369,29 @@ fn classify_invocation(rustc: &Path, args: &[OsString]) -> Option<Candidate> {
             remap_workspace_paths: remap_workspace_paths_enabled(),
         },
     ) {
-        Classification::Cacheable(candidate) => Some(*candidate),
+        Classification::Cacheable(candidate) => {
+            if std::env::var_os("RGO_KEY_DEBUG").is_some() {
+                let path = home.join("state/key-debug.log");
+                if let Ok(mut file) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(path)
+                {
+                    let _ = writeln!(
+                        file,
+                        "=== {} key={} src_digest={} out_dir_digest={:?}",
+                        candidate.crate_name,
+                        candidate.key,
+                        candidate.source_digest,
+                        candidate.out_dir_digest
+                    );
+                    for arg in &candidate.normalized_args {
+                        let _ = writeln!(file, "  {arg}");
+                    }
+                }
+            }
+            Some(*candidate)
+        }
         Classification::Bypass(reason) => {
             record_event(None, "bypass", 0, Some(reason.to_string()));
             None

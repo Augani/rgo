@@ -51,6 +51,19 @@ a failure. Reasons are stable strings, recorded in `state/cache-events.log`.
 | inner rustc wrapper composition issues | `inner_wrapper` |
 | `[cache] enabled = false` (default) | `cache_disabled` |
 | daemon reports storage pressure on acquire | `free_space_pressure` |
+| daemon IPC unreachable after ~2s of retries | `daemon_unreachable` |
+
+Notes on invocation-derived key inputs:
+
+- `--cap-lints` is part of normalized args, so `cargo build -vv` (which passes
+  `--cap-lints warn` where a normal build passes `allow`) produces different
+  keys — correct, but expect a parallel key family if you mix verbosity.
+- Path-bearing `--extern` inputs are hashed by **file content**, so a
+  nondeterministic upstream artifact (build-script consumer, proc-macro dylib)
+  cascades a new key into every dependent that reads it.
+- The wrapper retries `CacheAcquire` for up to ~2s on transient IPC failures
+  (parallel commit bursts can stall responses past the 150ms socket timeout)
+  before recording `daemon_unreachable` and compiling normally.
 
 ## Integrity and recovery
 
@@ -83,6 +96,10 @@ a failure. Reasons are stable strings, recorded in `state/cache-events.log`.
   corruption counters and single-flight stats.
 - Bypasses carry the stable reason strings above; a missing or unexplained
   decision is a bug.
+- `RGO_KEY_DEBUG=1` makes the wrapper append each candidate's key, source
+  digest, `OUT_DIR` digest and full normalized arg list to
+  `state/key-debug.log` — the tool for diffing why two invocations keyed
+  differently.
 
 ## Known residual risks (why cache stays opt-in)
 
@@ -93,5 +110,12 @@ a failure. Reasons are stable strings, recorded in `state/cache-events.log`.
   `OUT_DIR` path and proc-macro dylibs carry a linker-generated per-build
   field, so cross-*compile* byte equality is only asserted for path-free
   artifacts — hits still return the publisher's verified bytes verbatim.
-- A real-cargo differential corpus (compile vs. hit on a crate matrix) remains
-  an operator gate before enabling by default, alongside perf measurement.
+- A real-cargo differential corpus (compile vs. hit on a crate matrix) is
+  implemented: `crates/rgo/tests/cache.rs` runs an offline `file://` git-dep
+  corpus always, and an env-gated registry corpus
+  (`RGO_CORPUS_ONLINE=1`, override crates/toolchains via `RGO_CORPUS_CRATES` /
+  `RGO_CORPUS_TOOLCHAINS`) which checks per-hit manifest fidelity — every
+  artifact materialized via a `hit` must equal the publisher's bytes —
+  rather than whole-closure equality (nondeterministic artifact classes).
+  Scaling it to the full 50-crate × 3-toolchain × 3-OS matrix remains an
+  operator/CI gate before enabling by default, alongside perf measurement.
