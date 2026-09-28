@@ -26,6 +26,7 @@ $oldRustupHome = $env:RUSTUP_HOME
 $oldToolchain = $env:RUSTUP_TOOLCHAIN
 $rustupHome = (& rustup show home).Trim()
 $oldPath = $env:PATH
+$realCargo = (Get-Command cargo.exe -ErrorAction Stop).Source
 function Get-RawUserPath {
     $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Environment')
     if ($null -eq $key) { return $null }
@@ -181,7 +182,64 @@ try {
     & $installScript -Uninstall -CargoHome $cargoHome -RgoHome $rgoHome
     $installed = $false
     if (Test-Path (Join-Path $cargoHome '.rgo-install.json')) { throw 'storage-only uninstall left Cargo activation behind' }
-    Write-Host 'Windows installer: verified, activated, upgraded and rolled back without a service, repaired, and removed in both wrapper modes'
+
+    $supervisedProject = Join-Path $sandbox 'supervised-cargo'
+    New-Item -ItemType Directory -Force -Path (Join-Path $supervisedProject 'src') | Out-Null
+    $supervisedManifest = Join-Path $supervisedProject 'Cargo.toml'
+    [IO.File]::WriteAllText($supervisedManifest, "[package]`nname = 'rgo_windows_supervised_installer_probe'`nversion = '0.1.0'`nedition = '2021'`n")
+    [IO.File]::WriteAllText((Join-Path $supervisedProject 'src/main.rs'), 'fn main() { println!("rgo"); }')
+    $supervisedArgs = $installArgs.Clone()
+    # Native build data has a persistent mode marker. Use a fresh storage root
+    # so this probe never mixes native and supervised GC domains.
+    $rgoHome = Join-Path $sandbox '.rgo-supervised'
+    New-Item -ItemType Directory -Path $rgoHome | Out-Null
+    $supervisedArgs['RgoHome'] = $rgoHome
+    $supervisedArgs['Supervised'] = $true
+    $supervisedArgs['RealCargo'] = $realCargo
+    & $installScript @supervisedArgs -NoService
+    $installed = $true
+    $shim = Join-Path $cargoHome 'rgo/shims/cargo.exe'
+    if (-not (Test-Path $shim)) { throw 'supervised installer did not install the owned Cargo shim' }
+    if (-not [string]::Equals((Get-Command cargo.exe).Source, $shim, [StringComparison]::OrdinalIgnoreCase)) {
+        throw 'unchanged cargo does not resolve to the owned shim'
+    }
+    $record = Get-Content -LiteralPath (Join-Path $cargoHome '.rgo-install.json') -Raw | ConvertFrom-Json
+    if ($record.schema_version -ne 3 -or $record.supervised_cargo.real_cargo -ne $realCargo) {
+        throw 'supervised installation record does not own the selected real Cargo proxy'
+    }
+    Remove-Item Env:RGO_HOME -ErrorAction SilentlyContinue
+    Push-Location $supervisedProject
+    try {
+        & cmd.exe /C 'cargo build --offline' | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw 'unchanged Cargo build failed through the installed shim' }
+    } finally { Pop-Location }
+    if (-not (Test-Path (Join-Path $supervisedProject 'target/debug/rgo_windows_supervised_installer_probe.exe'))) {
+        throw 'supervised Cargo did not leave the final binary in the project'
+    }
+    $attributed = @(Get-ChildItem -LiteralPath (Join-Path $rgoHome 'builds') -Recurse -Filter '.rgo-context.json' -File |
+        Where-Object {
+            (Get-Content -LiteralPath $_.FullName -Raw | ConvertFrom-Json).workspace_root.EndsWith(
+                '\supervised-cargo', [StringComparison]::OrdinalIgnoreCase)
+        })
+    if ($attributed.Count -ne 1) { throw 'unchanged Cargo build did not create one attributed managed context' }
+    Remove-Item -LiteralPath $shim
+    & $installScript @supervisedArgs -NoService -Repair
+    if (-not (Test-Path $shim)) { throw 'supervised repair did not restore the owned Cargo shim' }
+    & $installScript -Uninstall -CargoHome $cargoHome -RgoHome $rgoHome
+    $installed = $false
+    if (Test-Path $shim) { throw 'supervised uninstall left its Cargo shim behind' }
+    if ([string](Get-RawUserPath) -cne [string]$expectedUserPath) {
+        throw 'supervised uninstall changed user PATH despite -NoUserPath'
+    }
+    Push-Location $supervisedProject
+    try {
+        & cmd.exe /C 'cargo build --offline' | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw 'ordinary Cargo build failed after supervised uninstall' }
+    } finally { Pop-Location }
+    if (-not (Test-Path (Join-Path $supervisedProject 'target/debug/deps'))) {
+        throw 'ordinary Cargo did not build locally after supervised uninstall'
+    }
+    Write-Host 'Windows installer: native upgrade, rollback, repair, storage-only uninstall, and supervised Cargo activation, repair, and uninstall passed'
 } finally {
     if ($installed) {
         try { & $installScript -Uninstall -CargoHome $cargoHome -RgoHome $rgoHome | Out-Null }

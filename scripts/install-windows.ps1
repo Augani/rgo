@@ -1,7 +1,8 @@
 #Requires -Version 5.1
 <#
 .SYNOPSIS
-    Verify and activate a matched rgo Windows release without replacing Cargo.
+    Verify and activate a matched rgo Windows release; supervised mode adds an
+    owned Cargo shim ahead of the real Cargo proxy on PATH.
 .DESCRIPTION
     Release archives require a SHA-256 match and a GitHub artifact attestation.
     DevelopmentBundle is only for a local, disposable build probe. Version
@@ -19,6 +20,8 @@ param(
     [string]$BinDir,
     [switch]$NoService,
     [switch]$NoWrapper,
+    [switch]$Supervised,
+    [string]$RealCargo,
     [switch]$NoUserPath,
     [switch]$VerifyOnly,
     [switch]$Repair,
@@ -104,6 +107,13 @@ function Assert-PlainDirectory([string]$Path) {
 function Assert-PlainFile([string]$Path) {
     $item = Get-Item -LiteralPath $Path -Force
     Assert-Condition (-not $item.PSIsContainer -and -not ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) "installation file is not a plain file: $Path"
+}
+
+function Test-SupervisedState($State) {
+    if ($State -is [System.Collections.IDictionary]) {
+        return ($State.Contains('supervised') -and [bool]$State['supervised'])
+    }
+    return [bool]($State.PSObject.Properties['supervised'] -and $State.supervised)
 }
 
 function Download-Https([string]$Url, [string]$Destination) {
@@ -270,18 +280,32 @@ function Assert-Record($State, [string]$Cli, [string]$Wrapper) {
     }
     Assert-Condition ($State.versionDirectory -match '^rgo-v(.+)-x86_64-pc-windows-msvc$') 'installer state has an invalid release directory'
     $expectedVersion = $Matches[1]
+    $supervised = Test-SupervisedState $State
+    $activationOwned = if ($supervised) {
+        $shim = $record.supervised_cargo
+        $shim -and $record.schema_version -eq 3 -and
+        -not $record.wrapper_binary -and @($record.managed_keys).Count -eq 0 -and
+        (Test-SamePath $shim.shim_path $script:shimPath) -and
+        (Test-SamePath $shim.real_cargo $State.realCargo)
+    } else {
+        $record.schema_version -eq 2 -and -not $record.supervised_cargo -and $wrapperOwned
+    }
     Assert-Condition ((Test-SamePath $record.cargo_home $script:resolvedCargoHome) -and
         (Test-SamePath $record.rgo_home $State.rgoHome) -and
         (Test-SamePath $record.rgo_binary $Cli) -and
-        $wrapperOwned -and $record.binary_version -eq $expectedVersion -and
-        $record.schema_version -eq 2) 'Cargo activation record belongs to a different installation'
+        $activationOwned -and $record.binary_version -eq $expectedVersion) 'Cargo activation record belongs to a different installation'
 }
 
-function Assert-PlainCargoActivation([string]$Cli) {
+function Assert-PlainCargoActivation([string]$Cli, $State) {
     $previous = $env:RGO_HOME
+    $previousPath = $env:PATH
     Remove-Item Env:RGO_HOME -ErrorAction SilentlyContinue
-    try { Invoke-Checked $Cli @('doctor', '--verify') | Out-Null }
+    try {
+        if (Test-SupervisedState $State) { Prepend-ProcessPath $script:shimDir }
+        Invoke-Checked $Cli @('doctor', '--verify') | Out-Null
+    }
     finally {
+        $env:PATH = $previousPath
         if ($null -eq $previous) { Remove-Item Env:RGO_HOME -ErrorAction SilentlyContinue }
         else { $env:RGO_HOME = $previous }
     }
@@ -435,6 +459,7 @@ function Recover-UpgradeGuarded([string]$JournalPath) {
 function Invoke-NoServiceUpgrade($OldState, [string]$Top, [string]$ArchiveDigest,
     [string]$CliDigest, [string]$WrapperDigest, [string]$Extracted, [bool]$NewNoWrapper) {
     Assert-UpgradeState $OldState 'old'
+    Assert-Condition (-not (Test-SupervisedState $OldState)) 'supervised Windows upgrades require versioned shim paths; undo and use a fresh storage root for now'
     Assert-Condition ($script:NoService -and -not $script:Repair) 'version upgrades currently require -NoService and cannot use -Repair'
     $oldNoWrapper = [bool]($OldState.PSObject.Properties['noWrapper'] -and $OldState.noWrapper)
     Assert-Condition ($NewNoWrapper -eq $oldNoWrapper) 'change wrapper mode separately from a version upgrade'
@@ -488,7 +513,7 @@ function Invoke-NoServiceUpgrade($OldState, [string]$Top, [string]$ArchiveDigest
             Assert-Condition (Test-ExactText (Encoded-File $entry.path) $entry.after) "setup differed from its installer plan: $($entry.path)"
         }
         Assert-Record $newState $newCli $newWrapper
-        Assert-PlainCargoActivation $newCli
+        Assert-PlainCargoActivation $newCli $newState
         Publish-CommandCopy $newWrapper (Join-Path $script:resolvedBinDir 'rgo-rustc-wrapper.exe')
         Publish-CommandCopy $newCli (Join-Path $script:resolvedBinDir 'rgo.exe')
         Replace-JsonAtomic $script:statePath $newState
@@ -514,22 +539,73 @@ function Add-ProcessPath([string]$Directory) {
     }
 }
 
-function Add-OwnedPath([string]$Directory) {
-    $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
-    $entries = @($userPath -split ';' | Where-Object { $_ })
-    $hasEntry = @($entries | Where-Object { Test-SamePath $_ $Directory }).Count -gt 0
-    if (-not $hasEntry) {
-        [Environment]::SetEnvironmentVariable('Path', (($entries + $Directory) -join ';'), 'User')
-    }
-    Add-ProcessPath $Directory
+function Prepend-ProcessPath([string]$Directory) {
+    $entries = @($env:PATH -split ';' | Where-Object { $_ -and -not (Test-SamePath $_ $Directory) })
+    $env:PATH = (@($Directory) + $entries) -join ';'
 }
 
-function Remove-OwnedPath([string]$Directory, [string]$Previous) {
+function Expected-OwnedUserPath($State) {
+    $parts = @()
+    if (Test-SupervisedState $State) { $parts += $script:shimDir }
+    if ($State.pathAdded) {
+        # The earlier native installer normalized empty PATH entries before
+        # appending its command directory. Accept that exact owned shape.
+        $parts += @($State.priorUserPath -split ';' | Where-Object { $_ })
+        $parts += $script:resolvedBinDir
+    } elseif ($State.priorUserPath) {
+        $parts += $State.priorUserPath
+    }
+    return ($parts -join ';')
+}
+
+function Assert-OwnedUserPath($State) {
+    if ($State.noUserPath) { return }
     $current = [Environment]::GetEnvironmentVariable('Path', 'User')
-    $expected = if ($Previous) { "$Previous;$Directory" } else { $Directory }
-    if ($current -eq $Previous) { return }
-    Assert-Condition ($current -eq $expected) 'User PATH changed since activation; restore or remove the owned rgo entry before resuming uninstall'
-    [Environment]::SetEnvironmentVariable('Path', $Previous, 'User')
+    $expected = Expected-OwnedUserPath $State
+    Assert-Condition ($current -eq $State.priorUserPath -or $current -eq $expected) 'User PATH changed since activation; preserve the owned rgo entries before retrying'
+}
+
+function Publish-OwnedPath($State) {
+    if (-not $State.noUserPath) {
+        Assert-OwnedUserPath $State
+        $expected = Expected-OwnedUserPath $State
+        $current = [Environment]::GetEnvironmentVariable('Path', 'User')
+        if ($current -ne $expected) {
+            [Environment]::SetEnvironmentVariable('Path', $expected, 'User')
+        }
+    }
+    Add-ProcessPath $script:resolvedBinDir
+    if (Test-SupervisedState $State) { Prepend-ProcessPath $script:shimDir }
+}
+
+function Restore-OwnedPath($State) {
+    if ($State.noUserPath) { return }
+    Assert-OwnedUserPath $State
+    $current = [Environment]::GetEnvironmentVariable('Path', 'User')
+    if ($current -ne $State.priorUserPath) {
+        [Environment]::SetEnvironmentVariable('Path', $State.priorUserPath, 'User')
+    }
+}
+
+function Resolve-RealCargo([string]$Requested) {
+    if ($Requested) {
+        $path = Full-Path $Requested
+    } else {
+        $path = $null
+        foreach ($command in @(Get-Command cargo.exe -All -ErrorAction SilentlyContinue)) {
+            if ($command.CommandType -ne 'Application') { continue }
+            $candidate = Full-Path $command.Source
+            if ($candidate -match '[\\/]rgo[\\/]shims[\\/]cargo\.exe$') { continue }
+            $path = $candidate
+            break
+        }
+    }
+    Assert-Condition $path 'no real cargo.exe was found; pass -RealCargo with its absolute path'
+    Assert-Condition (([IO.Path]::GetFileName($path) -ieq 'cargo.exe') -and
+        -not (Test-SamePath $path $script:shimPath)) 'the real Cargo proxy must be an absolute cargo.exe outside rgo shims'
+    Assert-PlainFile $path
+    Assert-Condition ((Invoke-Checked $path @('--version')) -match '^cargo [0-9]+\.[0-9]+\.[0-9]+') 'the selected real Cargo proxy did not report a Cargo version'
+    return $path
 }
 
 function Assert-Platform {
@@ -539,6 +615,9 @@ function Assert-Platform {
 }
 
 Assert-Platform
+if ($Supervised -and -not ($Uninstall -or $VerifyOnly)) {
+    Assert-Condition ($NoService -and -not $NoWrapper) '-Supervised currently requires -NoService and cannot be combined with -NoWrapper'
+}
 if (-not $CargoHome) { $CargoHome = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { Join-Path $env:USERPROFILE '.cargo' } }
 $resolvedCargoHome = Full-Path $CargoHome
 if (-not $RgoHome) { $RgoHome = if ($env:RGO_HOME) { $env:RGO_HOME } else { Join-Path $env:USERPROFILE '.rgo' } }
@@ -547,6 +626,8 @@ if (-not $InstallRoot) { $InstallRoot = Join-Path $resolvedCargoHome 'rgo' }
 if (-not $BinDir) { $BinDir = Join-Path $resolvedCargoHome 'bin' }
 $resolvedInstallRoot = Full-Path $InstallRoot
 $resolvedBinDir = Full-Path $BinDir
+$shimDir = Join-Path $resolvedCargoHome 'rgo/shims'
+$shimPath = Join-Path $shimDir 'cargo.exe'
 Assert-Condition ((Test-ChildPath $resolvedInstallRoot $resolvedCargoHome) -and
     (Test-ChildPath $resolvedBinDir $resolvedCargoHome)) 'install root and command directory must be inside Cargo home'
 $versions = Join-Path $resolvedInstallRoot 'versions'
@@ -578,6 +659,7 @@ try {
             (Test-SamePath $state.binDir $resolvedBinDir) -and
             (Test-SamePath $state.rgoHome $resolvedRgoHome)) 'installer state belongs to a different destination'
         Assert-Condition ($state.schemaVersion -eq 1 -and $state.versionDirectory -match '^rgo-v[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?-x86_64-pc-windows-msvc$') 'installer state has an unsupported version or path'
+        Assert-OwnedUserPath $state
         $versionDir = Join-Path $versions $state.versionDirectory
         $cli = Join-Path $versionDir 'rgo.exe'
         $wrapper = Join-Path $versionDir 'rgo-rustc-wrapper.exe'
@@ -596,10 +678,13 @@ try {
             Invoke-Checked $cli $undoArgs | Out-Null
         }
         Assert-Condition (-not (Test-Path -LiteralPath (Join-Path $resolvedCargoHome '.rgo-install.json'))) 'Cargo activation remains after undo'
+        if (Test-SupervisedState $state) {
+            Assert-Condition (-not (Test-Path -LiteralPath $shimPath)) 'owned Cargo shim remains after undo'
+        }
         foreach ($path in @($ownedCli, $ownedWrapper)) {
             if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Force }
         }
-        if ($state.pathAdded) { Remove-OwnedPath $resolvedBinDir $state.priorUserPath }
+        Restore-OwnedPath $state
         if (Test-Path -LiteralPath $statePath) { Remove-Item -LiteralPath $statePath -Force }
         if (Test-Path -LiteralPath $pendingPath) { Remove-Item -LiteralPath $pendingPath -Force }
         Write-Host "Removed owned Cargo activation and commands; retained versioned binaries and managed data at $resolvedRgoHome"
@@ -674,7 +759,18 @@ try {
                 (Test-SamePath $state.binDir $resolvedBinDir) -and
                 (Test-SamePath $state.rgoHome $resolvedRgoHome)) 'installer state belongs to another destination'
             Assert-Condition ($state.schemaVersion -eq 1) 'unsupported installer state version'
+            $installedSupervised = Test-SupervisedState $state
+            if ($PSBoundParameters.ContainsKey('Supervised')) {
+                Assert-Condition ([bool]$Supervised -eq $installedSupervised) 'installation mode differs from the owned installer state'
+            }
+            if ($installedSupervised) {
+                Assert-Condition ($state.noService -and -not $NoWrapper) 'supervised Windows installation requires -NoService and cannot use -NoWrapper'
+                if ($RealCargo) {
+                    Assert-Condition (Test-SamePath (Full-Path $RealCargo) $state.realCargo) '-RealCargo differs from the owned installation'
+                }
+            }
             if ($state.versionDirectory -ne $top) {
+                Assert-Condition (-not $installedSupervised) 'supervised Windows upgrades require versioned shim paths; undo and use a fresh storage root for now'
                 $oldNoWrapper = $state.PSObject.Properties['noWrapper'] -and $state.noWrapper
                 $nextNoWrapper = if ($PSBoundParameters.ContainsKey('NoWrapper')) { [bool]$NoWrapper }
                     else { [bool]$oldNoWrapper }
@@ -683,6 +779,7 @@ try {
             }
             Assert-Condition ($state.versionDirectory -eq $top -and $state.archiveDigest -eq $digest -and
                 $state.cliDigest -eq $cliDigest -and $state.wrapperDigest -eq $wrapperDigest) 'this release tag has different bytes from the installed archive; refusing a repack'
+            Assert-OwnedUserPath $state
             Assert-Record $state $cli $wrapper
             if (-not (Test-Path -LiteralPath $versionDir)) {
                 Assert-Condition $Repair "owned version directory is missing: $versionDir"
@@ -698,7 +795,18 @@ try {
                     Copy-Item -LiteralPath $source -Destination $pair[0]
                 }
             }
-            Assert-PlainCargoActivation $cli
+            if ($installedSupervised) {
+                if (Test-Path -LiteralPath $shimPath) {
+                    Assert-PlainFile $shimPath
+                    Assert-Condition ((File-Digest $shimPath) -eq $cliDigest) 'owned Cargo shim differs from the verified release'
+                } else {
+                    Assert-Condition $Repair 'owned Cargo shim is missing; rerun with -Repair and the same verified bundle'
+                    Invoke-Checked $cli @('setup', '--supervised', '--real-cargo', $state.realCargo, '--no-service') | Out-Null
+                    Assert-PlainFile $shimPath
+                    Assert-Condition ((File-Digest $shimPath) -eq $cliDigest) 'repaired Cargo shim differs from the verified release'
+                }
+            }
+            Assert-PlainCargoActivation $cli $state
             if (Test-Path -LiteralPath $pendingPath) {
                 $pending = Read-Json $pendingPath
                 Assert-Condition ($pending.archiveDigest -eq $digest -and $pending.versionDirectory -eq $top) 'stale pending activation conflicts with installed state'
@@ -708,12 +816,14 @@ try {
             return
         }
 
+        $selectedRealCargo = if ($Supervised) { Resolve-RealCargo $RealCargo } else { $null }
         $state = [ordered]@{
             schemaVersion = 1; cargoHome = $resolvedCargoHome; rgoHome = $resolvedRgoHome
             installRoot = $resolvedInstallRoot; binDir = $resolvedBinDir
             versionDirectory = $top; archiveDigest = $digest
             cliDigest = $cliDigest; wrapperDigest = $wrapperDigest
             noService = [bool]$NoService; noWrapper = [bool]$NoWrapper; noUserPath = [bool]$NoUserPath
+            supervised = [bool]$Supervised; realCargo = $selectedRealCargo
             pathAdded = $false; priorUserPath = [Environment]::GetEnvironmentVariable('Path', 'User')
         }
         $resuming = Test-Path -LiteralPath $pendingPath
@@ -727,6 +837,12 @@ try {
             if (-not $pending.PSObject.Properties['noWrapper']) {
                 $pending | Add-Member -NotePropertyName noWrapper -NotePropertyValue $false
             }
+            if ($PSBoundParameters.ContainsKey('Supervised')) {
+                Assert-Condition ([bool]$Supervised -eq (Test-SupervisedState $pending)) 'pending activation has a different supervised mode'
+            }
+            if ((Test-SupervisedState $pending) -and $RealCargo) {
+                Assert-Condition (Test-SamePath (Full-Path $RealCargo) $pending.realCargo) '-RealCargo differs from the pending activation'
+            }
             $state = $pending
         } else {
             Assert-Condition (-not (Test-Path -LiteralPath (Join-Path $resolvedCargoHome '.rgo-install.json'))) 'Cargo is already activated outside this installer'
@@ -735,6 +851,9 @@ try {
             Assert-Condition (-not $priorCommand) 'another rgo command already resolves on PATH; remove that conflict before activation'
             $userEntries = @([Environment]::GetEnvironmentVariable('Path', 'User') -split ';' | Where-Object { $_ })
             $state.pathAdded = -not $NoUserPath -and @($userEntries | Where-Object { Test-SamePath $_ $resolvedBinDir }).Count -eq 0
+            if (Test-SupervisedState $state) {
+                Assert-Condition (@($userEntries | Where-Object { Test-SamePath $_ $shimDir }).Count -eq 0) 'Cargo shim directory is already on User PATH without installer ownership'
+            }
             Write-JsonAtomic $pendingPath $state
         }
         Stage-VerifiedVersion $extracted $versionDir $cliDigest $wrapperDigest
@@ -742,17 +861,21 @@ try {
         $setupArgs = @('setup')
         if ($state.noService) { $setupArgs += '--no-service' }
         if ($state.noWrapper) { $setupArgs += '--no-wrapper' }
+        if (Test-SupervisedState $state) { $setupArgs += @('--supervised', '--real-cargo', $state.realCargo) }
         Invoke-Checked $cli $setupArgs | Out-Null
         Assert-Record $state $cli $wrapper
-        Assert-PlainCargoActivation $cli
+        if (Test-SupervisedState $state) {
+            Assert-PlainFile $shimPath
+            Assert-Condition ((File-Digest $shimPath) -eq $cliDigest) 'owned Cargo shim differs from the verified release'
+        }
+        Assert-PlainCargoActivation $cli $state
         foreach ($pair in @(@($commandWrapper, $wrapper, $wrapperDigest), @($commandCli, $cli, $cliDigest))) {
             if (Test-Path -LiteralPath $pair[0]) {
                 Assert-PlainFile $pair[0]
                 Assert-Condition ((File-Digest $pair[0]) -eq $pair[2]) "command entrypoint changed: $($pair[0])"
             } else { Copy-Item -LiteralPath $pair[1] -Destination $pair[0] }
         }
-        if ($state.noUserPath) { Add-ProcessPath $resolvedBinDir }
-        else { Add-OwnedPath $resolvedBinDir }
+        Publish-OwnedPath $state
         Write-JsonAtomic $statePath $state
         Remove-Item -LiteralPath $pendingPath -Force
         Write-Host "Activated rgo $binaryVersion. Open a new shell and use cargo normally."
