@@ -1682,15 +1682,21 @@ fn maintenance(state: &State) -> Result<()> {
     };
     // This metadata-only recovery runs even while automatic destructive GC is
     // disabled. A nonblocking lifecycle guard defers active Cargo sessions.
-    match state
-        .pin_pruner
-        .lock()
-        .unwrap()
-        .scan(&state.paths, MAX_PIN_SCAN_ENTRIES_PER_PASS)
     {
-        Ok(0) => {}
-        Ok(pruned) => tracing::debug!(pruned, "pruned stale unpin decisions"),
-        Err(error) => tracing::warn!(%error, "pin decision recovery failed"),
+        // Pruning probes the same lifecycle guards as explicit clean. Keep it
+        // under the daemon's operation lock so maintenance cannot make a
+        // concurrent clean fail with a spurious busy-session error.
+        let _operation = state.operation_lock.lock().unwrap();
+        match state
+            .pin_pruner
+            .lock()
+            .unwrap()
+            .scan(&state.paths, MAX_PIN_SCAN_ENTRIES_PER_PASS)
+        {
+            Ok(0) => {}
+            Ok(pruned) => tracing::debug!(pruned, "pruned stale unpin decisions"),
+            Err(error) => tracing::warn!(%error, "pin decision recovery failed"),
+        }
     }
     if should_gc {
         let _ = run_gc(state, false, false, true, None)?;
