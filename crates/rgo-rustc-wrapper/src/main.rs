@@ -8,6 +8,7 @@
 //! Phase 3 adds the cacheability classifier + CAS lookup in front of the exec.
 //! Everything here must stay fast: no heavy deps, no network, no blocking on a daemon.
 
+use std::collections::HashMap;
 use std::ffi::OsString;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -332,6 +333,10 @@ fn run_cache_producer(
     context_lease_id: Option<u64>,
     cache_lease_id: Option<u64>,
 ) -> ! {
+    // Compare the compiler's outputs against the state before launching it.
+    // Filesystems can round mtimes below a high-resolution start timestamp;
+    // that must not make a newly created output look absent.
+    let before = snapshot_outputs(candidate);
     let result = run_captured_with_leases(
         &rustc,
         &candidate.compiler_args,
@@ -342,7 +347,7 @@ fn run_cache_producer(
     );
     if let Some(lease_id) = cache_lease_id {
         if result.status.success() {
-            match publish_result(store, candidate, &result) {
+            match before.and_then(|before| publish_result(store, candidate, &result, &before)) {
                 Ok(manifest) => {
                     // Publication is outside the rustc hot path, and the daemon
                     // may be flushing the manifest under concurrent CI load.
@@ -673,7 +678,6 @@ struct Captured {
     status: ExitStatus,
     stdout: Vec<u8>,
     stderr: Vec<u8>,
-    started_at: SystemTime,
 }
 
 fn run_captured_with_leases(
@@ -683,7 +687,6 @@ fn run_captured_with_leases(
     cache_lease_id: Option<u64>,
     inner: bool,
 ) -> Captured {
-    let started_at = SystemTime::now();
     let mut command = if inner {
         let wrapper = configured_inner_wrapper().unwrap_or_else(|| OsString::from(rustc));
         let mut command = Command::new(wrapper);
@@ -710,7 +713,6 @@ fn run_captured_with_leases(
                 status: exit_status(127),
                 stdout: Vec::new(),
                 stderr: Vec::new(),
-                started_at,
             };
         }
     };
@@ -776,7 +778,6 @@ fn run_captured_with_leases(
         status,
         stdout: stdout_bytes,
         stderr: stderr_bytes,
-        started_at,
     }
 }
 
@@ -784,10 +785,13 @@ fn publish_result(
     store: &Store,
     candidate: &Candidate,
     result: &Captured,
+    before: &OutputSnapshot,
 ) -> anyhow::Result<Manifest> {
-    let outputs = collect_outputs(candidate, result.started_at)?;
+    let outputs = collect_outputs(candidate, before)?;
     if outputs.is_empty() {
-        anyhow::bail!("eligible rustc invocation produced no cacheable outputs");
+        anyhow::bail!(
+            "eligible rustc invocation produced no new or detectably changed cacheable outputs"
+        );
     }
     let output_refs = outputs
         .into_iter()
@@ -826,10 +830,34 @@ fn publish_result(
     Ok(manifest)
 }
 
+type OutputSnapshot = HashMap<PathBuf, (u64, Option<SystemTime>)>;
+
+fn snapshot_outputs(candidate: &Candidate) -> anyhow::Result<OutputSnapshot> {
+    listed_outputs(candidate)?
+        .into_iter()
+        .map(|(_, path)| {
+            let metadata = std::fs::metadata(&path)?;
+            Ok((path, (metadata.len(), metadata.modified().ok())))
+        })
+        .collect()
+}
+
 fn collect_outputs(
     candidate: &Candidate,
-    started_at: SystemTime,
+    before: &OutputSnapshot,
 ) -> anyhow::Result<Vec<(String, PathBuf)>> {
+    let mut outputs = Vec::new();
+    for (kind, path) in listed_outputs(candidate)? {
+        let metadata = std::fs::metadata(&path)?;
+        let current = (metadata.len(), metadata.modified().ok());
+        if before.get(&path) != Some(&current) {
+            outputs.push((kind, path));
+        }
+    }
+    Ok(outputs)
+}
+
+fn listed_outputs(candidate: &Candidate) -> anyhow::Result<Vec<(String, PathBuf)>> {
     let mut outputs = Vec::new();
     for spec in &candidate.outputs {
         if spec.path.is_file() {
@@ -847,10 +875,7 @@ fn collect_outputs(
             {
                 continue;
             }
-            let modified = std::fs::metadata(&path)?.modified().unwrap_or(UNIX_EPOCH);
-            if modified >= started_at {
-                outputs.push((spec.kind.clone(), path));
-            }
+            outputs.push((spec.kind.clone(), path));
         }
     }
     outputs.sort_by(|left, right| left.1.cmp(&right.1));

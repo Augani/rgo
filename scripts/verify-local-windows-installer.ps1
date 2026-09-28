@@ -153,7 +153,9 @@ try {
     $installed = $false
     if (Test-Path (Join-Path $cargoHome '.rgo-install.json')) { throw 'uninstall left Cargo activation behind' }
     if (Test-Path (Join-Path $cargoHome 'bin/rgo.exe')) { throw 'uninstall left an owned CLI entrypoint behind' }
-    if ([Environment]::GetEnvironmentVariable('Path', 'User') -ne $oldUserPath) { throw 'uninstall did not restore user PATH' }
+    if ([string][Environment]::GetEnvironmentVariable('Path', 'User') -cne [string]$oldUserPath) {
+        throw 'uninstall did not restore user PATH'
+    }
     & cargo clean --manifest-path $manifest | Out-Null
     if ($LASTEXITCODE -ne 0) { throw 'plain Cargo clean failed after uninstall' }
     & cargo build --offline --manifest-path $manifest | Out-Null

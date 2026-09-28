@@ -46,8 +46,26 @@ impl Sandbox {
     /// A `Command` with the sandbox environment applied.
     pub fn cmd(&self, program: impl AsRef<Path>) -> Command {
         let mut c = Command::new(program.as_ref());
-        c.env_clear()
-            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        #[cfg(not(windows))]
+        c.env_clear();
+        #[cfg(windows)]
+        {
+            // The runner's MSVC linker configuration is distributed across
+            // process variables and a full clear makes rustc select Git's
+            // unrelated link.exe. Keep the toolchain environment while still
+            // isolating Cargo/rgo state and removing inherited overrides.
+            for key in [
+                "CARGO_TARGET_DIR",
+                "CARGO_BUILD_BUILD_DIR",
+                "RUSTC_WRAPPER",
+                "RUSTC_WORKSPACE_WRAPPER",
+                "RGO_BYPASS",
+                "RGO_LEASE_ID",
+            ] {
+                c.env_remove(key);
+            }
+        }
+        c.env("PATH", std::env::var_os("PATH").unwrap_or_default())
             .env("HOME", &self.home)
             .env("USERPROFILE", &self.home)
             .env("CARGO_HOME", &self.cargo_home)
@@ -61,31 +79,6 @@ impl Sandbox {
                 "RUSTUP_TOOLCHAIN",
                 std::env::var_os("RUSTUP_TOOLCHAIN").unwrap_or_else(|| "stable".into()),
             );
-        #[cfg(windows)]
-        {
-            // MSVC and the Windows SDK are discovered through these process
-            // settings. Stripping them can make rustc pick Git's unrelated
-            // `link.exe` from PATH when a private-home test invokes Cargo.
-            for key in [
-                "SystemRoot",
-                "WINDIR",
-                "ProgramFiles",
-                "ProgramFiles(x86)",
-                "ProgramW6432",
-                "COMSPEC",
-                "VSINSTALLDIR",
-                "VCINSTALLDIR",
-                "VCToolsInstallDir",
-                "WindowsSdkDir",
-                "WindowsSDKLibVersion",
-                "LIB",
-                "INCLUDE",
-            ] {
-                if let Some(value) = std::env::var_os(key) {
-                    c.env(key, value);
-                }
-            }
-        }
         c
     }
 

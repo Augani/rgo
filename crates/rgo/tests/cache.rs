@@ -109,6 +109,7 @@ mkdir -p "$out"
 printf 'rlib:%s\n' "$name" > "$out/lib$name.rlib"
 printf 'rmeta:%s\n' "$name" > "$out/lib$name.rmeta"
 printf 'dep:%s\n' "$name" > "$out/$name.d"
+if [ -n "$FAKE_RUSTC_OLD_MTIME" ]; then touch -t 202001010000 "$out"/*; fi
 "#,
         )
         .unwrap();
@@ -1756,6 +1757,7 @@ printf 'dep:%s\n' "$name" > "$out/$name.d"
             let mut command = sb.cmd(wrapper_bin());
             command
                 .env("FAKE_RUSTC_LOG", &fixture.log)
+                .env("FAKE_RUSTC_OLD_MTIME", "1")
                 .env("CARGO_MANIFEST_DIR", &fixture.workspace)
                 .args([
                     fixture.fake_rustc.as_os_str(),
