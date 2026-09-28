@@ -21,12 +21,13 @@ LEAVES = (
     "rgo-key",
     "rgo-materialize",
     "rgo-remote",
+    "rgo-winpipe",
 )
 PACKAGES = (*LEAVES, "rgo-core", "rgo-rustc-wrapper", "rgo-storage")
 DEPENDENCIES = {
-    "rgo-core": ("rgo-protocol", "rgo-cas", "rgo-remote"),
-    "rgo-rustc-wrapper": ("rgo-protocol", "rgo-cas", "rgo-key", "rgo-materialize"),
-    "rgo-storage": ("rgo-core", "rgo-protocol", "rgo-cas", "rgo-materialize", "rgo-remote"),
+    "rgo-core": ("rgo-protocol", "rgo-cas", "rgo-remote", "rgo-winpipe"),
+    "rgo-rustc-wrapper": ("rgo-protocol", "rgo-cas", "rgo-key", "rgo-materialize", "rgo-winpipe"),
+    "rgo-storage": ("rgo-core", "rgo-protocol", "rgo-cas", "rgo-materialize", "rgo-remote", "rgo-winpipe"),
 }
 
 

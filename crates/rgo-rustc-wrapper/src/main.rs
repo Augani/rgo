@@ -38,9 +38,6 @@ mod platform {
     #[cfg(windows)]
     use std::time::Instant;
 
-    #[cfg(windows)]
-    const ERROR_NO_DATA: i32 = 232;
-
     use interprocess::local_socket::{ConnectOptions, prelude::*};
 
     #[cfg(unix)]
@@ -70,7 +67,6 @@ mod platform {
         let inner = ConnectOptions::new()
             .name(name)
             .wait_mode(interprocess::ConnectWaitMode::Timeout(timeout))
-            .nonblocking_stream(true)
             .connect_sync()?;
         Ok(Stream {
             inner,
@@ -88,52 +84,18 @@ mod platform {
     #[cfg(windows)]
     impl Read for Stream {
         fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-            loop {
-                match self.inner.read(buf) {
-                    Ok(0) if !buf.is_empty() => {
-                        if Instant::now() >= self.deadline {
-                            return Err(io::ErrorKind::TimedOut.into());
-                        }
-                        std::thread::sleep(Duration::from_millis(2));
-                    }
-                    Err(error)
-                        if error.kind() == io::ErrorKind::WouldBlock
-                            || error.raw_os_error() == Some(ERROR_NO_DATA) =>
-                    {
-                        if Instant::now() >= self.deadline {
-                            return Err(io::ErrorKind::TimedOut.into());
-                        }
-                        std::thread::sleep(Duration::from_millis(2));
-                    }
-                    result => return result,
-                }
-            }
+            use std::os::windows::io::AsHandle;
+            let interprocess::local_socket::Stream::NamedPipe(pipe) = &self.inner;
+            rgo_winpipe::read(pipe.inner().as_handle(), buf, self.deadline)
         }
     }
 
     #[cfg(windows)]
     impl Write for Stream {
         fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-            loop {
-                match self.inner.write(buf) {
-                    Ok(0) if !buf.is_empty() => {
-                        if Instant::now() >= self.deadline {
-                            return Err(io::ErrorKind::TimedOut.into());
-                        }
-                        std::thread::sleep(Duration::from_millis(2));
-                    }
-                    Err(error)
-                        if error.kind() == io::ErrorKind::WouldBlock
-                            || error.raw_os_error() == Some(ERROR_NO_DATA) =>
-                    {
-                        if Instant::now() >= self.deadline {
-                            return Err(io::ErrorKind::TimedOut.into());
-                        }
-                        std::thread::sleep(Duration::from_millis(2));
-                    }
-                    result => return result,
-                }
-            }
+            use std::os::windows::io::AsHandle;
+            let interprocess::local_socket::Stream::NamedPipe(pipe) = &self.inner;
+            rgo_winpipe::write(pipe.inner().as_handle(), buf, self.deadline)
         }
 
         fn flush(&mut self) -> io::Result<()> {
@@ -378,13 +340,41 @@ fn run_cache_producer(
         if result.status.success() {
             match publish_result(store, candidate, &result) {
                 Ok(manifest) => {
-                    let _ = request(Request::CacheCommit {
-                        key: candidate.key.to_string(),
-                        lease_id,
-                        manifest: wire_manifest(&manifest),
-                    });
+                    // Publication is outside the rustc hot path, and the daemon
+                    // may be flushing the manifest under concurrent CI load.
+                    // A missed acknowledgement must not make the next build
+                    // silently recompile an otherwise published entry.
+                    let commit = request_with_timeout(
+                        Request::CacheCommit {
+                            key: candidate.key.to_string(),
+                            lease_id,
+                            manifest: wire_manifest(&manifest),
+                        },
+                        Duration::from_secs(2),
+                    );
+                    match commit {
+                        Ok(Response::CacheCommitted { accepted: true }) => {}
+                        Ok(other) => record_event(
+                            Some(candidate.key.to_string()),
+                            "bypass",
+                            0,
+                            Some(format!("cache_commit_rejected: {other:?}")),
+                        ),
+                        Err(error) => record_event(
+                            Some(candidate.key.to_string()),
+                            "bypass",
+                            0,
+                            Some(format!("cache_commit_failed: {error}")),
+                        ),
+                    }
                 }
                 Err(error) => {
+                    record_event(
+                        Some(candidate.key.to_string()),
+                        "bypass",
+                        0,
+                        Some(format!("cache_publish_failed: {error:#}")),
+                    );
                     let _ = request(Request::CacheFail {
                         key: candidate.key.to_string(),
                         lease_id,
@@ -1112,10 +1102,13 @@ fn workspace_root() -> Option<String> {
 }
 
 fn request(message: Request) -> Result<Response, String> {
+    request_with_timeout(message, Duration::from_millis(CLIENT_TIMEOUT_MILLIS))
+}
+
+fn request_with_timeout(message: Request, timeout: Duration) -> Result<Response, String> {
     let home = rgo_home().ok_or_else(|| "cannot determine RGO_HOME".to_owned())?;
     let socket = home.join("state").join("daemon.sock");
-    let mut stream = platform::connect(&socket, Duration::from_millis(CLIENT_TIMEOUT_MILLIS))
-        .map_err(|e| e.to_string())?;
+    let mut stream = platform::connect(&socket, timeout).map_err(|e| e.to_string())?;
     write_frame(
         &mut stream,
         &Request::Hello {

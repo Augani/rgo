@@ -17,6 +17,7 @@ rgo-key = { path = "crates/rgo-key", version = "=0.1.0" }
 rgo-cas = { path = "crates/rgo-cas", version = "=0.1.0" }
 rgo-materialize = { path = "crates/rgo-materialize", version = "=0.1.0" }
 rgo-remote = { path = "crates/rgo-remote", version = "=0.1.0" }
+rgo-winpipe = { path = "crates/rgo-winpipe", version = "=0.1.0" }
 
 anyhow = "1"
 thiserror = "2"

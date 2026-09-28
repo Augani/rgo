@@ -11,6 +11,8 @@ mod unix {
     use std::time::Duration;
 
     use assert_cmd::cargo::cargo_bin;
+    use rgo_core::ipc;
+    use rgo_protocol::{Request, Response};
     use rgo_testkit::{Sandbox, ensure_workspace_bins_built};
 
     fn wrapper_bin() -> PathBuf {
@@ -36,14 +38,25 @@ mod unix {
             .spawn()
             .unwrap();
         for _ in 0..80 {
-            if sb.rgo_home.join("state/daemon.sock").exists() {
+            if matches!(
+                ipc::request_with_timeout(
+                    &sb.rgo_home.join("state/daemon.sock"),
+                    Request::QueryStatus,
+                    Duration::from_millis(100),
+                ),
+                Ok(Response::Status(_))
+            ) {
                 return child;
             }
+            assert!(
+                child.try_wait().unwrap().is_none(),
+                "daemon exited during startup"
+            );
             thread::sleep(Duration::from_millis(25));
         }
         let _ = child.kill();
         let _ = child.wait();
-        panic!("daemon did not create its socket");
+        panic!("daemon did not answer IPC");
     }
 
     struct Fixture {
@@ -473,7 +486,12 @@ printf 'dep:%s\n' "$name" > "$out/$name.d"
                 }
             }
         }
-        assert!(corrupted > 0, "no CAS objects to corrupt");
+        assert!(
+            corrupted > 0,
+            "no CAS objects to corrupt; events: {}; daemon: {}",
+            cache_events(&sb),
+            fs::read_to_string(sb.rgo_home.join("logs/daemon.log")).unwrap_or_default(),
+        );
 
         let recovered = command_for(&sb, &fixture, "consumer", &[])
             .output()

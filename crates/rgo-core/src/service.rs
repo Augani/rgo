@@ -290,7 +290,10 @@ fn query_task_action(label: &str) -> Result<Option<TaskAction>> {
         .args(["/Query", "/TN", label, "/XML", "/HRESULT"])
         .output()
         .context("querying Task Scheduler")?;
-    if output.status.code().map(|code| code as u32) == Some(0x8007_0002) {
+    if matches!(
+        output.status.code().map(|code| code as u32),
+        Some(0x8007_0002 | 0x8007_0003)
+    ) {
         return Ok(None);
     }
     // On current Windows runners, schtasks exits with code 1 and a textual

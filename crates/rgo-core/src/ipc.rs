@@ -10,9 +10,6 @@ use std::time::Duration;
 #[cfg(windows)]
 use std::time::Instant;
 
-#[cfg(windows)]
-const ERROR_NO_DATA: i32 = 232;
-
 use anyhow::{Context, Result, bail};
 use rgo_protocol::{
     CLIENT_TIMEOUT_MILLIS, MAX_FRAME_SIZE, PROTOCOL_VERSION, Request, Response, decode_frame,
@@ -77,7 +74,6 @@ mod platform {
         ConnectOptions::new()
             .name(name)
             .wait_mode(interprocess::ConnectWaitMode::Timeout(timeout))
-            .nonblocking_stream(true)
             .connect_sync()
     }
 }
@@ -101,9 +97,8 @@ impl Connection {
         }
         #[cfg(windows)]
         {
-            // interprocess named pipes reject recv/send timeouts. Poll the
-            // nonblocking stream against one deadline for the full exchange.
-            self.stream.set_nonblocking(true)?;
+            // Windows named pipes do not expose socket timeouts. Each read or
+            // write uses a cancelable overlapped operation against this deadline.
             self.deadline = Some(Instant::now() + timeout);
         }
         Ok(())
@@ -115,34 +110,11 @@ impl Read for Connection {
         #[cfg(unix)]
         return self.stream.read(buf);
         #[cfg(windows)]
-        loop {
-            match self.stream.read(buf) {
-                Ok(0) if !buf.is_empty() => {
-                    // A Windows pipe in PIPE_NOWAIT mode can report no bytes
-                    // before the peer has replied. Keep the exchange bounded
-                    // by its deadline rather than treating that as EOF.
-                    if self
-                        .deadline
-                        .is_some_and(|deadline| Instant::now() >= deadline)
-                    {
-                        return Err(io::ErrorKind::TimedOut.into());
-                    }
-                    std::thread::sleep(Duration::from_millis(2));
-                }
-                Err(error)
-                    if error.kind() == io::ErrorKind::WouldBlock
-                        || error.raw_os_error() == Some(ERROR_NO_DATA) =>
-                {
-                    if self
-                        .deadline
-                        .is_some_and(|deadline| Instant::now() >= deadline)
-                    {
-                        return Err(io::ErrorKind::TimedOut.into());
-                    }
-                    std::thread::sleep(Duration::from_millis(2));
-                }
-                result => return result,
-            }
+        {
+            use std::os::windows::io::AsHandle;
+            let deadline = self.deadline.ok_or(io::ErrorKind::InvalidInput)?;
+            let platform::Stream::NamedPipe(pipe) = &self.stream;
+            rgo_winpipe::read(pipe.inner().as_handle(), buf, deadline)
         }
     }
 }
@@ -152,31 +124,11 @@ impl Write for Connection {
         #[cfg(unix)]
         return self.stream.write(buf);
         #[cfg(windows)]
-        loop {
-            match self.stream.write(buf) {
-                Ok(0) if !buf.is_empty() => {
-                    if self
-                        .deadline
-                        .is_some_and(|deadline| Instant::now() >= deadline)
-                    {
-                        return Err(io::ErrorKind::TimedOut.into());
-                    }
-                    std::thread::sleep(Duration::from_millis(2));
-                }
-                Err(error)
-                    if error.kind() == io::ErrorKind::WouldBlock
-                        || error.raw_os_error() == Some(ERROR_NO_DATA) =>
-                {
-                    if self
-                        .deadline
-                        .is_some_and(|deadline| Instant::now() >= deadline)
-                    {
-                        return Err(io::ErrorKind::TimedOut.into());
-                    }
-                    std::thread::sleep(Duration::from_millis(2));
-                }
-                result => return result,
-            }
+        {
+            use std::os::windows::io::AsHandle;
+            let deadline = self.deadline.ok_or(io::ErrorKind::InvalidInput)?;
+            let platform::Stream::NamedPipe(pipe) = &self.stream;
+            rgo_winpipe::write(pipe.inner().as_handle(), buf, deadline)
         }
     }
 

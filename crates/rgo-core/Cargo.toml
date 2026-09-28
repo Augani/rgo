@@ -34,6 +34,7 @@ roxmltree = "0.21.1"
 
 [target.'cfg(windows)'.dependencies]
 roxmltree = "0.21.1"
+rgo-winpipe.workspace = true
 
 [lints]
 workspace = true

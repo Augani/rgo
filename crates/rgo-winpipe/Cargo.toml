@@ -1,0 +1,20 @@
+[package]
+name = "rgo-winpipe"
+description = "Bounded overlapped named-pipe I/O shared by rgo's Windows clients and daemon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Threading",
+] }
+
+[lints]
+workspace = true
