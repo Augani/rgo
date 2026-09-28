@@ -103,6 +103,27 @@ fn setup_activates_unchanged_cargo_exe_and_undo_restores_direct_cargo() {
         paths.checked_managed_build_dirs().unwrap().len(),
         managed_before_direct
     );
+    let other_home = sandbox.home.join("other-cargo-home");
+    std::fs::create_dir_all(&other_home).unwrap();
+    let wrong_home_project = sandbox.simple_bin("windows-wrong-home").unwrap();
+    let wrong_home = sandbox
+        .cmd("cmd.exe")
+        .current_dir(&wrong_home_project)
+        .env("PATH", &path)
+        .env("CARGO_HOME", &other_home)
+        .args(["/C", "cargo", "build", "--offline"])
+        .output()
+        .unwrap();
+    assert!(
+        wrong_home.status.success(),
+        "{}",
+        String::from_utf8_lossy(&wrong_home.stderr)
+    );
+    assert!(wrong_home_project.join("target/debug/deps").exists());
+    assert_eq!(
+        paths.checked_managed_build_dirs().unwrap().len(),
+        managed_before_direct
+    );
 
     let undo = sandbox
         .cmd(&cli)

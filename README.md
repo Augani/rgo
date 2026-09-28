@@ -85,6 +85,15 @@ its current shell; custom startup layouts and GUI-launched IDEs still need
 explicit activation checks. Unattended GC remains off by default; enabling it
 is still experimental while the lifecycle safety gate is open.
 
+For a private Windows evaluation, `rgo setup --supervised --real-cargo C:\absolute\path\to\cargo.exe --no-service` installs an owned
+`$CARGO_HOME\rgo\shims\cargo.exe` copy of the matched `rgo.exe`. Put its
+directory first on `PATH` in the shell or tool launching Cargo, then run
+`rgo doctor --verify`. This leaves the rustup Cargo proxy in place; direct
+invocations of that proxy use ordinary local storage. `rgo setup --undo --no-service`
+removes the owned shim. The Windows installer does not activate
+this pilot, and Windows supervised upgrades still require undo and a fresh
+storage root. Automatic destructive GC remains disabled by default.
+
 For a private Windows evaluation, `scripts/install-windows.ps1` accepts an
 exact `-ReleaseTag`, a local `-Archive`, and its `-Sha256`, together with
 `-DevelopmentBundle -NoService` for locally built bundles. For a release
