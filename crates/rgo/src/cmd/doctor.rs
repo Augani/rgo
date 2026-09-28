@@ -102,12 +102,22 @@ pub fn run(json: bool, verify: bool) -> Result<()> {
         );
         let shim = mode["shim_path"].as_str().map(PathBuf::from);
         let owned = shim.as_ref().is_some_and(|path| {
-            std::fs::read(path).ok().as_deref() == mode["shim_contents"].as_str().map(str::as_bytes)
+            let Some(contents) = mode["shim_contents"].as_str() else {
+                return false;
+            };
+            let Ok(bytes) = std::fs::read(path) else {
+                return false;
+            };
+            if let Some(digest) = contents.strip_prefix("binary-blake3:") {
+                blake3::hash(&bytes).to_hex().as_str() == digest
+            } else {
+                bytes == contents.as_bytes()
+            }
         });
         check(owned, "supervised Cargo launcher matches its installation record; remediation: rerun `rgo setup --supervised`".into());
         let active = shim.as_ref().is_some_and(|shim| {
             std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
-                .map(|dir| dir.join("cargo"))
+                .map(|dir| dir.join(if cfg!(windows) { "cargo.exe" } else { "cargo" }))
                 .find(|path| path.is_file())
                 .is_some_and(|path| path == *shim)
         });

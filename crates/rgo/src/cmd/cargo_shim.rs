@@ -46,7 +46,10 @@ pub fn run(
         bail!("--real-cargo points back to rgo; refusing recursive launch");
     }
     let active_cargo_home = cargo_home()?;
-    let owned_shim = active_cargo_home.join("rgo/shims/cargo");
+    let owned_shim =
+        active_cargo_home
+            .join("rgo/shims")
+            .join(if cfg!(windows) { "cargo.exe" } else { "cargo" });
     if owned_shim.canonicalize().ok().as_ref() == Some(&resolved) {
         bail!("--real-cargo points back to the owned Cargo launcher");
     }

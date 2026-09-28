@@ -117,6 +117,10 @@ enum Cmd {
 }
 
 fn main() -> Result<()> {
+    #[cfg(windows)]
+    if cmd::windows_cargo_entry::is_shim_invocation()? {
+        return cmd::windows_cargo_entry::run();
+    }
     let cli = Cli::parse();
     let daemon_log = match &cli.cmd {
         Some(Cmd::Daemon {

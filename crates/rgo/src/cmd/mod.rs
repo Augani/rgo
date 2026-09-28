@@ -11,6 +11,8 @@ pub mod pin;
 pub mod setup;
 pub mod status;
 #[cfg(windows)]
+pub mod windows_cargo_entry;
+#[cfg(windows)]
 mod windows_job;
 
 use anyhow::Result;

@@ -68,8 +68,11 @@ pub fn run(
         bail!("installer activation plans require setup --no-service");
     }
     let dry_run = dry_run || installer_plan_json;
-    if supervised && !cfg!(unix) {
-        bail!("supervised Cargo setup currently requires Unix");
+    if supervised && !cfg!(any(unix, windows)) {
+        bail!("supervised Cargo setup is unsupported on this platform");
+    }
+    if supervised && cfg!(windows) && installer_plan_json {
+        bail!("Windows supervised activation is still a direct-setup pilot");
     }
     if undo && (supervised || real_cargo.is_some()) {
         bail!("setup --undo reads the installed mode; omit --supervised and --real-cargo");
@@ -216,17 +219,18 @@ pub fn run(
     let previous_shim = old_record
         .as_ref()
         .and_then(|r| r.supervised_cargo.as_ref());
-    let shim_path = cargo_home.join("rgo/shims/cargo");
+    let shim_path = cargo_home.join("rgo/shims").join(shim_name());
     let shim_dir = cargo_home.join("rgo/shims");
     if shim_dir.is_symlink() || shim_dir.parent().is_some_and(Path::is_symlink) {
         bail!("refusing a symlinked Cargo shim directory");
     }
-    if std::fs::symlink_metadata(&shim_path).is_ok_and(|metadata| metadata.file_type().is_symlink())
-    {
-        bail!(
-            "{} is a symlink; refusing to modify it",
-            shim_path.display()
-        );
+    if let Ok(metadata) = std::fs::symlink_metadata(&shim_path) {
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            bail!(
+                "{} is not a plain file; refusing to modify it",
+                shim_path.display()
+            );
+        }
     }
     if supervised && previous_shim.is_none() && shim_path.exists() {
         bail!(
@@ -234,14 +238,13 @@ pub fn run(
             shim_path.display()
         );
     }
+    let shim_preexisted = shim_path.is_file();
     if let Some(previous) = previous_shim {
         let expected = &shim_path;
         if Path::new(&previous.shim_path) != expected {
             bail!("installation record names an unexpected Cargo shim path; refusing to modify it");
         }
-        if read_optional(expected)?
-            .is_some_and(|contents| contents != previous.shim_contents.as_bytes())
-        {
+        if shim_preexisted && !shim_matches(expected, &previous.shim_contents)? {
             bail!(
                 "{} changed since setup; refusing to replace or remove it",
                 expected.display()
@@ -257,6 +260,14 @@ pub fn run(
     } else {
         None
     };
+    #[cfg(windows)]
+    if let (Some(previous), Some(next)) = (previous_shim, supervised_cargo.as_ref()) {
+        if previous.shim_contents != next.shim_contents {
+            bail!(
+                "Windows supervised Cargo upgrades require undo and a fresh storage root until the versioned shim migration is implemented"
+            );
+        }
+    }
     let legacy_service = old_record
         .as_ref()
         .is_some_and(|record| record.schema_version == 1);
@@ -586,7 +597,7 @@ pub fn run(
                 (&mode_path, old_mode.as_deref()),
             ])?;
             if let Some(shim) = &supervised_cargo {
-                restore_previous_shim(Path::new(&shim.shim_path), previous_shim)?;
+                restore_previous_shim(Path::new(&shim.shim_path), previous_shim, shim_preexisted)?;
             }
             return Err(error);
         }
@@ -626,7 +637,11 @@ pub fn run(
                     (&mode_path, old_mode.as_deref()),
                 ])?;
                 if let Some(shim) = &supervised_cargo {
-                    restore_previous_shim(Path::new(&shim.shim_path), previous_shim)?;
+                    restore_previous_shim(
+                        Path::new(&shim.shim_path),
+                        previous_shim,
+                        shim_preexisted,
+                    )?;
                 }
             }
             return Err(error);
@@ -645,7 +660,7 @@ pub fn run(
         if let Some(shim) = previous_shim {
             let path = Path::new(&shim.shim_path);
             if path.exists() {
-                if std::fs::read(path)? != shim.shim_contents.as_bytes() {
+                if !shim_matches(path, &shim.shim_contents)? {
                     bail!(
                         "{} changed during undo; refusing to remove it",
                         path.display()
@@ -672,13 +687,18 @@ pub fn run(
         println!("managed build storage: {}", paths.builds_dir().display());
         if let Some(shim) = &supervised_cargo {
             println!("supervised Cargo shim: {}", shim.shim_path);
+            let shim_dir = Path::new(&shim.shim_path)
+                .parent()
+                .context("Cargo shim has no parent")?;
+            #[cfg(unix)]
             println!(
                 "activate in a shell: export PATH={}:\"$PATH\"",
-                shell_quote(
-                    Path::new(&shim.shim_path)
-                        .parent()
-                        .context("Cargo shim has no parent")?
-                )?
+                shell_quote(shim_dir)?
+            );
+            #[cfg(windows)]
+            println!(
+                "activate in PowerShell: $env:PATH = '{};' + $env:PATH",
+                shim_dir.display().to_string().replace('\'', "''")
             );
         }
     }
@@ -880,13 +900,13 @@ fn prepare_supervised_cargo(
     rgo_home: &Path,
     requested: Option<&Path>,
 ) -> Result<SupervisedCargo> {
-    let shim = cargo_home.join("rgo/shims/cargo");
+    let shim = cargo_home.join("rgo/shims").join(shim_name());
     let installed_shim = shim.canonicalize().ok();
     let real = if let Some(path) = requested {
         path.to_path_buf()
     } else {
         std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
-            .map(|dir| dir.join("cargo"))
+            .map(|dir| dir.join(shim_name()))
             .find(|path| {
                 path != &shim
                     && path.is_file()
@@ -898,8 +918,11 @@ fn prepare_supervised_cargo(
                 "no real Cargo executable found on PATH; pass --real-cargo /absolute/path/to/cargo",
             )?
     };
-    if !real.is_absolute() || real.file_name().is_none_or(|name| name != "cargo") {
-        bail!("the real Cargo proxy must be an absolute path whose basename is `cargo`");
+    if !real.is_absolute() || real.file_name().is_none_or(|name| name != shim_name()) {
+        bail!(
+            "the real Cargo proxy must be an absolute path whose basename is `{}`",
+            shim_name()
+        );
     }
     let resolved_real = real.canonicalize().context("resolving real Cargo")?;
     if resolved_real == std::env::current_exe()?.canonicalize()?
@@ -923,12 +946,20 @@ fn prepare_supervised_cargo(
         );
     }
     let executable = std::env::current_exe()?.canonicalize()?;
+    #[cfg(windows)]
+    let _ = rgo_home;
+    #[cfg(unix)]
     let contents = format!(
         "#!/bin/sh\nexec {} cargo-shim --real-cargo {} --cargo-home {} --rgo-home {} -- \"$@\"\n",
         shell_quote(&executable)?,
         shell_quote(&real)?,
         shell_quote(cargo_home)?,
         shell_quote(rgo_home)?,
+    );
+    #[cfg(windows)]
+    let contents = format!(
+        "binary-blake3:{}",
+        blake3::hash(&std::fs::read(&executable)?).to_hex()
     );
     Ok(SupervisedCargo {
         shim_path: shim.display().to_string(),
@@ -938,7 +969,7 @@ fn prepare_supervised_cargo(
 }
 
 fn is_rgo_cargo_shim(path: &Path) -> bool {
-    path.file_name().is_some_and(|name| name == "cargo")
+    path.file_name().is_some_and(|name| name == shim_name())
         && path
             .parent()
             .and_then(Path::file_name)
@@ -950,6 +981,7 @@ fn is_rgo_cargo_shim(path: &Path) -> bool {
             .is_some_and(|name| name == "rgo")
 }
 
+#[cfg(unix)]
 fn shell_quote(path: &Path) -> Result<String> {
     let value = path
         .to_str()
@@ -957,9 +989,27 @@ fn shell_quote(path: &Path) -> Result<String> {
     Ok(format!("'{}'", value.replace('\'', "'\\''")))
 }
 
-fn restore_previous_shim(path: &Path, previous: Option<&SupervisedCargo>) -> Result<()> {
+fn restore_previous_shim(
+    path: &Path,
+    previous: Option<&SupervisedCargo>,
+    existed_before: bool,
+) -> Result<()> {
+    #[cfg(unix)]
+    let _ = existed_before;
+    #[cfg(windows)]
+    if !existed_before {
+        if path.exists() {
+            std::fs::remove_file(path)?;
+        }
+        return Ok(());
+    }
     match previous {
+        #[cfg(unix)]
         Some(previous) => write_shim(path, &previous.shim_contents),
+        #[cfg(windows)]
+        Some(previous) if shim_matches(path, &previous.shim_contents)? => Ok(()),
+        #[cfg(windows)]
+        Some(_) => bail!("cannot restore a changed Windows Cargo shim"),
         None => {
             if path.exists() {
                 std::fs::remove_file(path)?;
@@ -1014,9 +1064,59 @@ fn write_shim(path: &Path, contents: &str) -> Result<()> {
     result
 }
 
-#[cfg(not(unix))]
-fn write_shim(_path: &Path, _contents: &str) -> Result<()> {
-    bail!("supervised Cargo requires Unix")
+#[cfg(windows)]
+fn write_shim(path: &Path, contents: &str) -> Result<()> {
+    use std::io::Write;
+
+    if path.exists() {
+        if shim_matches(path, contents)? {
+            return Ok(());
+        }
+        bail!("{} differs from its owned Cargo launcher", path.display());
+    }
+    let source = std::env::current_exe()?.canonicalize()?;
+    if !shim_matches(&source, contents)? {
+        bail!("the running rgo executable changed during supervised setup");
+    }
+    let parent = path.parent().context("Cargo shim has no parent")?;
+    if parent.is_symlink() || parent.parent().is_some_and(Path::is_symlink) {
+        bail!("refusing a symlinked Cargo shim directory");
+    }
+    std::fs::create_dir_all(parent)?;
+    let temp = parent.join(format!(
+        ".cargo.{}-{}.tmp",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_nanos()
+    ));
+    let result = (|| -> Result<()> {
+        let mut input = File::open(&source)?;
+        let mut output = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp)?;
+        std::io::copy(&mut input, &mut output)?;
+        output.flush()?;
+        output.sync_all()?;
+        replace_file_atomically(&temp, path)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
+    result
+}
+
+fn shim_name() -> &'static str {
+    if cfg!(windows) { "cargo.exe" } else { "cargo" }
+}
+
+fn shim_matches(path: &Path, contents: &str) -> Result<bool> {
+    let bytes = std::fs::read(path)?;
+    if let Some(digest) = contents.strip_prefix("binary-blake3:") {
+        return Ok(blake3::hash(&bytes).to_hex().as_str() == digest);
+    }
+    Ok(bytes == contents.as_bytes())
 }
 
 fn lock_setup(cargo_home: &Path) -> Result<File> {

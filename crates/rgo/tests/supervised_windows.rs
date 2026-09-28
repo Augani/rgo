@@ -16,6 +16,95 @@ use windows_sys::Win32::System::Threading::{
 };
 
 #[test]
+fn setup_activates_unchanged_cargo_exe_and_undo_restores_direct_cargo() {
+    let sandbox = Sandbox::new().unwrap();
+    let project = sandbox.simple_bin("windows-setup-shim").unwrap();
+    let real_cargo = std::env::var_os("CARGO")
+        .map(PathBuf::from)
+        .expect("Cargo sets CARGO for integration tests");
+    let cli = PathBuf::from(env!("CARGO_BIN_EXE_rgo"));
+    let setup = sandbox
+        .cmd(&cli)
+        .args(["setup", "--supervised", "--no-service", "--real-cargo"])
+        .arg(&real_cargo)
+        .output()
+        .unwrap();
+    assert!(
+        setup.status.success(),
+        "{}",
+        String::from_utf8_lossy(&setup.stderr)
+    );
+    let shim = sandbox.cargo_home.join("rgo/shims/cargo.exe");
+    assert!(shim.is_file());
+    let path = std::env::join_paths(std::iter::once(shim.parent().unwrap().to_path_buf()).chain(
+        std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()),
+    ))
+    .unwrap();
+    let build = sandbox
+        .cmd("cmd.exe")
+        .current_dir(&project)
+        .env("PATH", &path)
+        .args(["/C", "cargo", "build", "--offline"])
+        .output()
+        .unwrap();
+    assert!(
+        build.status.success(),
+        "{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    assert!(project.join("target/debug/windows-setup-shim.exe").exists());
+    let paths = RgoPaths {
+        root: sandbox.rgo_home.clone(),
+    };
+    let contexts = paths.checked_managed_build_dirs().unwrap();
+    assert_eq!(contexts.len(), 1);
+    assert!(context::read_sidecar(&contexts[0]).is_some());
+
+    let doctor = sandbox
+        .cmd(&cli)
+        .env("PATH", &path)
+        .args(["doctor", "--verify"])
+        .output()
+        .unwrap();
+    assert!(
+        doctor.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&doctor.stdout),
+        String::from_utf8_lossy(&doctor.stderr)
+    );
+    let managed_before_direct = paths.checked_managed_build_dirs().unwrap().len();
+    let direct_project = sandbox.simple_bin("windows-direct-cargo").unwrap();
+    let direct = sandbox
+        .cmd(&real_cargo)
+        .current_dir(&direct_project)
+        .args(["build", "--offline"])
+        .output()
+        .unwrap();
+    assert!(
+        direct.status.success(),
+        "{}",
+        String::from_utf8_lossy(&direct.stderr)
+    );
+    assert!(direct_project.join("target/debug/deps").exists());
+    assert_eq!(
+        paths.checked_managed_build_dirs().unwrap().len(),
+        managed_before_direct
+    );
+
+    let undo = sandbox
+        .cmd(&cli)
+        .args(["setup", "--undo", "--no-service"])
+        .output()
+        .unwrap();
+    assert!(
+        undo.status.success(),
+        "{}",
+        String::from_utf8_lossy(&undo.stderr)
+    );
+    assert!(!shim.exists());
+}
+
+#[test]
 fn suspended_job_launcher_guards_running_cargo_and_allows_unrelated_gc() {
     let sandbox = Sandbox::new().unwrap();
     let project = sandbox.simple_bin("windows-job-guard").unwrap();
