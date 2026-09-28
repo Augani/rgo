@@ -234,14 +234,15 @@ fn explicit_daemon_home_survives_a_service_environment_without_cargo_home() {
         .stderr(Stdio::null())
         .spawn()
         .unwrap();
-    for _ in 0..80 {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while std::time::Instant::now() < deadline {
         if matches!(
             ipc::request_with_timeout(
                 &sb.rgo_home.join("state/daemon.sock"),
-                Request::QueryStatus,
+                Request::QueryRemoteStatus,
                 Duration::from_millis(100)
             ),
-            Ok(Response::Status(_))
+            Ok(Response::RemoteStatus(_))
         ) {
             daemon.kill().unwrap();
             let _ = daemon.wait();
