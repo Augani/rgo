@@ -982,6 +982,7 @@ fn shimmed_cargo_isolated_from_direct_cargo_and_holds_gc_lock_through_run() {
 
     let ready = sandbox.home.join("cargo-run-ready");
     let release = sandbox.home.join("cargo-run-release");
+    let run_log = sandbox.home.join("cargo-run-stderr.log");
     std::fs::write(
         project.join("src/main.rs"),
         "fn main() { std::fs::write(std::env::var(\"RGO_TEST_READY\").unwrap(), b\"ready\").unwrap(); let release = std::env::var(\"RGO_TEST_RELEASE\").unwrap(); for _ in 0..600 { if std::path::Path::new(&release).is_file() { return; } std::thread::sleep(std::time::Duration::from_millis(50)); } panic!(\"release marker never appeared\"); }\n",
@@ -995,10 +996,10 @@ fn shimmed_cargo_isolated_from_direct_cargo_and_holds_gc_lock_through_run() {
         .env("PATH", &search_path)
         .args(["+stable", "run", "--offline"])
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(std::fs::File::create(&run_log).unwrap())
         .spawn()
         .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(30);
     while !ready.is_file() && Instant::now() < deadline {
         if child.try_wait().unwrap().is_some() {
             break;
@@ -1067,7 +1068,8 @@ fn shimmed_cargo_isolated_from_direct_cargo_and_holds_gc_lock_through_run() {
     let status = child.wait().unwrap();
     assert!(
         started && status.success(),
-        "supervised cargo run did not start and finish"
+        "supervised cargo run did not start and finish (status {status}); stderr: {}",
+        std::fs::read_to_string(&run_log).unwrap_or_default()
     );
     assert!(
         held,

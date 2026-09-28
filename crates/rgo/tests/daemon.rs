@@ -60,14 +60,15 @@ fn start_daemon(sb: &Sandbox) -> Child {
         .stderr(Stdio::null())
         .spawn()
         .unwrap();
-    for _ in 0..80 {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while std::time::Instant::now() < deadline {
         if matches!(
             ipc::request_with_timeout(
                 &sb.rgo_home.join("state/daemon.sock"),
-                Request::QueryStatus,
+                Request::QueryRemoteStatus,
                 Duration::from_millis(100)
             ),
-            Ok(Response::Status(_))
+            Ok(Response::RemoteStatus(_))
         ) {
             return child;
         }
