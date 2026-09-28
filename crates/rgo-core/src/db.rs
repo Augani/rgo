@@ -146,6 +146,54 @@ impl StateDb {
             [],
             |row| row.get(0),
         )?;
+        let marker_exists: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'schema_meta')",
+            [],
+            |row| row.get(0),
+        )?;
+        let current: Option<i64> = if marker_exists {
+            connection
+                .query_row(
+                    "SELECT value FROM schema_meta WHERE key = 'schema_version'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?
+                .map(|value| value.parse::<i64>())
+                .transpose()
+                .context("reading schema version")?
+        } else {
+            None
+        };
+        if let Some(version) = current {
+            if version > SCHEMA_VERSION {
+                bail!(
+                    "unsupported rgo database schema {version}, expected at most {SCHEMA_VERSION}"
+                );
+            }
+        }
+        if current == Some(SCHEMA_VERSION) {
+            let protocol: Option<String> = connection
+                .query_row(
+                    "SELECT value FROM schema_meta WHERE key = 'protocol_version'",
+                    [],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let journal_mode: String =
+                connection.query_row("PRAGMA journal_mode", [], |row| row.get(0))?;
+            let expected_protocol = PROTOCOL_VERSION.to_string();
+            if protocol.as_deref() == Some(expected_protocol.as_str())
+                && journal_mode.eq_ignore_ascii_case("wal")
+            {
+                // Normal opens need connection-local settings, but rerunning
+                // the full CREATE/INSERT migration under concurrent writers
+                // creates avoidable write-lock contention.
+                connection.pragma_update(None, "journal_size_limit", WAL_SIZE_LIMIT_BYTES)?;
+                connection.pragma_update(None, "foreign_keys", "ON")?;
+                return Ok(Self { connection });
+            }
+        }
         if table_count == 0 {
             connection.pragma_update(None, "auto_vacuum", "INCREMENTAL")?;
         }
@@ -306,25 +354,8 @@ impl StateDb {
             INSERT OR IGNORE INTO remote_counters(id) VALUES (1);
             ",
         )?;
-        let current: Option<i64> = connection
-            .query_row(
-                "SELECT value FROM schema_meta WHERE key = 'schema_version'",
-                [],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()?
-            .map(|value| value.parse::<i64>())
-            .transpose()
-            .context("reading schema version")?;
-        if let Some(version) = current {
-            if version > SCHEMA_VERSION {
-                bail!(
-                    "unsupported rgo database schema {version}, expected at most {SCHEMA_VERSION}"
-                );
-            }
-            // These tables are additive, so advancing the marker is a safe
-            // migration for databases created by earlier versions.
-        }
+        // These tables are additive, so advancing an older marker is a safe
+        // migration for databases created by earlier versions.
         connection.execute(
             "INSERT OR REPLACE INTO schema_meta(key, value) VALUES ('schema_version', ?1)",
             params![SCHEMA_VERSION.to_string()],
@@ -2097,6 +2128,25 @@ mod tests {
             })
             .unwrap();
         assert_eq!(remaining, 0);
+    }
+
+    #[test]
+    fn reopening_current_schema_does_not_write_metadata() {
+        let root = tempdir().unwrap();
+        let paths = RgoPaths {
+            root: root.path().join("rgo"),
+        };
+        paths.ensure_layout().unwrap();
+        drop(StateDb::open(&paths).unwrap());
+        let observer = Connection::open(paths.db_file()).unwrap();
+        let data_version = |connection: &Connection| -> i64 {
+            connection
+                .query_row("PRAGMA data_version", [], |row| row.get(0))
+                .unwrap()
+        };
+        let before = data_version(&observer);
+        drop(StateDb::open(&paths).unwrap());
+        assert_eq!(data_version(&observer), before);
     }
 
     #[test]
