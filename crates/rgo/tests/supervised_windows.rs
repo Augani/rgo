@@ -10,6 +10,10 @@ use rgo_core::gc;
 use rgo_core::paths::RgoPaths;
 use rgo_core::supervision;
 use rgo_testkit::Sandbox;
+use windows_sys::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0, WAIT_TIMEOUT};
+use windows_sys::Win32::System::Threading::{
+    OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject,
+};
 
 #[test]
 fn suspended_job_launcher_guards_running_cargo_and_allows_unrelated_gc() {
@@ -108,4 +112,94 @@ fn main() {
             .unwrap()
             .is_some()
     );
+}
+
+#[test]
+#[allow(unsafe_code)] // Process wait proves Job Object teardown killed the child.
+fn killing_launcher_terminates_cargo_run_child_before_gc_guard_releases() {
+    let sandbox = Sandbox::new().unwrap();
+    let project = sandbox.simple_bin("windows-killed-launcher").unwrap();
+    std::fs::write(
+        project.join("src/main.rs"),
+        r#"
+fn main() {
+    let ready = std::path::PathBuf::from(std::env::var_os("RGO_TEST_READY").unwrap());
+    let staging = ready.with_extension("tmp");
+    std::fs::write(&staging, std::process::id().to_string()).unwrap();
+    std::fs::rename(staging, ready).unwrap();
+    loop { std::thread::sleep(std::time::Duration::from_millis(100)); }
+}
+"#,
+    )
+    .unwrap();
+    let real_cargo = std::env::var_os("CARGO")
+        .map(PathBuf::from)
+        .expect("Cargo sets CARGO for integration tests");
+    let ready = sandbox.home.join("running-pid");
+    let mut launcher = sandbox
+        .cmd(env!("CARGO_BIN_EXE_rgo"))
+        .current_dir(&project)
+        .env("RGO_TEST_READY", &ready)
+        .args(["cargo-shim", "--real-cargo"])
+        .arg(&real_cargo)
+        .args(["--", "run", "--offline"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !ready.exists() && Instant::now() < deadline {
+        if launcher.try_wait().unwrap().is_some() {
+            let output = launcher.wait_with_output().unwrap();
+            panic!(
+                "Cargo exited before its program started: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    if !ready.exists() {
+        launcher.kill().unwrap();
+        let output = launcher.wait_with_output().unwrap();
+        panic!(
+            "Cargo did not start its program: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let pid: u32 = std::fs::read_to_string(&ready).unwrap().parse().unwrap();
+    let program = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, pid) };
+    if program.is_null() {
+        launcher.kill().unwrap();
+        launcher.wait().unwrap();
+        panic!("cannot observe supervised program");
+    }
+    let before_kill = unsafe { WaitForSingleObject(program, 0) };
+    if before_kill != WAIT_TIMEOUT {
+        launcher.kill().unwrap();
+        launcher.wait().unwrap();
+        unsafe { CloseHandle(program) };
+        panic!("supervised program was not alive before guardian termination");
+    }
+
+    launcher.kill().unwrap();
+    launcher.wait().unwrap();
+    let termination = unsafe { WaitForSingleObject(program, 5_000) };
+    unsafe { CloseHandle(program) };
+    assert_eq!(
+        termination, WAIT_OBJECT_0,
+        "Cargo child survived its guardian"
+    );
+
+    let paths = RgoPaths {
+        root: sandbox.rgo_home.clone(),
+    };
+    let contexts = paths.checked_managed_build_dirs().unwrap();
+    assert_eq!(contexts.len(), 1);
+    assert!(
+        supervision::try_lock_gc(&paths, Some(&contexts[0]))
+            .unwrap()
+            .is_some()
+    );
+    gc::remove_atomically(&paths, &contexts[0]).unwrap();
+    assert!(!contexts[0].exists());
 }

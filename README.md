@@ -103,9 +103,9 @@ existing `-NoService` installation when the new verified bundle is installed
 with `-NoService`; the installer journals the Cargo activation files, retains
 the old binary pair, and can restore the old activation after a partial switch.
 The effective wrapper mode must remain the same during a version change.
-Service-managed upgrades remain refused. This script and its private-home CI
-probe are preparatory; no public release location or live Windows result has
-been verified from this checkout.
+Service-managed upgrades remain refused. The local-bundle installer has passed
+private-home Windows CI, but no public release asset or tagged attestation has
+been verified yet.
 
 ## Everyday commands
 
