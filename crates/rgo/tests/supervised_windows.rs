@@ -1,6 +1,6 @@
 #![cfg(windows)]
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -14,6 +14,23 @@ use windows_sys::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0, WAIT_TIMEOUT};
 use windows_sys::Win32::System::Threading::{
     OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject,
 };
+
+fn planned_file<'a>(entries: &'a serde_json::Value, path: &Path) -> &'a serde_json::Value {
+    fn key(path: &str) -> String {
+        path.strip_prefix(r"\\?\")
+            .unwrap_or(path)
+            .replace('/', "\\")
+            .to_ascii_lowercase()
+    }
+    let expected = key(&path.display().to_string());
+    entries
+        .as_object()
+        .unwrap()
+        .iter()
+        .find(|(name, _)| key(name) == expected)
+        .map(|(_, value)| value)
+        .unwrap_or_else(|| panic!("plan omitted {}", path.display()))
+}
 
 #[test]
 fn setup_activates_unchanged_cargo_exe_and_undo_restores_direct_cargo() {
@@ -497,12 +514,10 @@ fn interrupted_versioned_setup_keeps_the_old_shim_usable_and_repairs_the_new_one
         String::from_utf8_lossy(&plan.stderr)
     );
     let plan: serde_json::Value = serde_json::from_slice(&plan.stdout).unwrap();
-    let planned_binary = plan["binaries"][new_shim.display().to_string()]
-        .as_str()
-        .unwrap();
+    let planned_binary = planned_file(&plan["binaries"], &new_shim).as_str().unwrap();
     assert!(planned_binary.starts_with("binary-blake3:"));
     let planned_record: serde_json::Value = serde_json::from_str(
-        plan["files"][record_path.display().to_string()]["contents"]
+        planned_file(&plan["files"], &record_path)["contents"]
             .as_str()
             .unwrap(),
     )
@@ -512,7 +527,7 @@ fn interrupted_versioned_setup_keeps_the_old_shim_usable_and_repairs_the_new_one
         planned_binary
     );
     let fallback_path = new_shim.parent().unwrap().join(".rgo-cargo-fallback.json");
-    assert!(plan["files"][fallback_path.display().to_string()]["contents"].is_string());
+    assert!(planned_file(&plan["files"], &fallback_path)["contents"].is_string());
     assert_eq!(std::fs::read(&record_path).unwrap(), record_before_plan);
     assert!(!new_shim.exists());
 

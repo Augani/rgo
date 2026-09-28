@@ -44,6 +44,24 @@ function Get-RawUserPathKind {
         return $key.GetValueKind('Path').ToString()
     } finally { $key.Dispose() }
 }
+function Normalize-PlanPath([string]$Value) {
+    $full = [IO.Path]::GetFullPath($Value).Replace('/', '\')
+    if ($full.StartsWith('\\?\UNC\', [StringComparison]::OrdinalIgnoreCase)) {
+        return '\\' + $full.Substring(8)
+    }
+    if ($full.StartsWith('\\?\', [StringComparison]::OrdinalIgnoreCase)) {
+        return $full.Substring(4)
+    }
+    return $full
+}
+function Plan-Property($Object, [string]$Path) {
+    $expected = Normalize-PlanPath $Path
+    $entries = @($Object.PSObject.Properties | Where-Object {
+        [string]::Equals((Normalize-PlanPath $_.Name), $expected, [StringComparison]::OrdinalIgnoreCase)
+    })
+    if ($entries.Count -ne 1) { throw "installer plan omitted or duplicated $Path" }
+    return $entries[0].Value
+}
 $expectedUserPathKind = Get-RawUserPathKind
 function Get-ActivationBytes([string]$Cargo, [string]$Root) {
     $values = @{}
@@ -224,14 +242,15 @@ try {
         throw 'staged cross-version CLI did not provide a supervised installer plan'
     }
     $newShim = Join-Path $cargoHome "rgo/shims/$upgradeTag/cargo.exe"
-    $plannedBinary = $supervisedPlan.binaries.PSObject.Properties[$newShim].Value
-    $plannedRecord = $supervisedPlan.files.PSObject.Properties[$recordPath].Value.contents | ConvertFrom-Json
+    $plannedBinary = Plan-Property $supervisedPlan.binaries $newShim
+    $plannedRecord = (Plan-Property $supervisedPlan.files $recordPath).contents | ConvertFrom-Json
     $plannedFallback = Join-Path (Split-Path -Path $newShim -Parent) '.rgo-cargo-fallback.json'
     if ($plannedBinary -notmatch '^binary-blake3:[0-9a-f]{64}$' -or
         $plannedRecord.supervised_cargo.shim_contents -ne $plannedBinary -or
         $plannedRecord.binary_version -ne $upgradeVersion -or
-        $plannedRecord.supervised_cargo.shim_path -ne $newShim -or
-        -not $supervisedPlan.files.PSObject.Properties[$plannedFallback] -or
+        -not [string]::Equals((Normalize-PlanPath $plannedRecord.supervised_cargo.shim_path),
+            (Normalize-PlanPath $newShim), [StringComparison]::OrdinalIgnoreCase) -or
+        -not (Plan-Property $supervisedPlan.files $plannedFallback).contents -or
         (Test-Path -LiteralPath $newShim) -or
         ([Convert]::ToBase64String($recordBeforePlan) -cne
             [Convert]::ToBase64String([IO.File]::ReadAllBytes($recordPath)))) {
@@ -255,9 +274,36 @@ try {
     Remove-Item -LiteralPath $shim
     & $installScript @supervisedArgs -NoService -Repair
     if (-not (Test-Path $shim)) { throw 'supervised repair did not restore the owned Cargo shim' }
+    $supervisedUpgradeArgs = $supervisedArgs.Clone()
+    $supervisedUpgradeArgs['ReleaseTag'] = $upgradeTag
+    $supervisedUpgradeArgs['Archive'] = $upgradeArchive
+    $supervisedUpgradeArgs['Sha256'] = $upgradeSha
+    & $installScript @supervisedUpgradeArgs -NoService
+    $upgradedRecord = Get-Content -LiteralPath $recordPath -Raw | ConvertFrom-Json
+    $upgradedShim = Join-Path $cargoHome "rgo/shims/$upgradeTag/cargo.exe"
+    if ($upgradedRecord.binary_version -ne $upgradeVersion -or
+        -not [string]::Equals((Normalize-PlanPath $upgradedRecord.supervised_cargo.shim_path),
+            (Normalize-PlanPath $upgradedShim), [StringComparison]::OrdinalIgnoreCase) -or
+        -not (Test-Path -LiteralPath $upgradedShim) -or
+        (Get-FileHash -LiteralPath $upgradedShim -Algorithm SHA256).Hash -ne
+            (Get-FileHash -LiteralPath $upgradeCli -Algorithm SHA256).Hash -or
+        -not (Test-Path -LiteralPath $shim)) {
+        throw 'supervised upgrade did not activate the verified new shim and retain the old one'
+    }
+    if (-not [string]::Equals((Get-Command cargo.exe).Source, $upgradedShim,
+        [StringComparison]::OrdinalIgnoreCase)) {
+        throw 'unchanged cargo does not resolve to the upgraded shim'
+    }
+    Push-Location $supervisedProject
+    try {
+        & cmd.exe /C 'cargo build --offline' | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw 'unchanged Cargo build failed after supervised upgrade' }
+    } finally { Pop-Location }
     & $installScript -Uninstall -CargoHome $cargoHome -RgoHome $rgoHome
     $installed = $false
-    if (-not (Test-Path $shim) -or -not (Test-Path (Join-Path (Split-Path $shim -Parent) '.rgo-cargo-fallback.json'))) {
+    if (-not (Test-Path $shim) -or -not (Test-Path $upgradedShim) -or
+        -not (Test-Path (Join-Path (Split-Path $shim -Parent) '.rgo-cargo-fallback.json')) -or
+        -not (Test-Path (Join-Path (Split-Path $upgradedShim -Parent) '.rgo-cargo-fallback.json'))) {
         throw 'supervised uninstall did not retain its old-shell Cargo fallback'
     }
     if ([string](Get-RawUserPath) -cne [string]$expectedUserPath) {

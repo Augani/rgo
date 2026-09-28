@@ -308,6 +308,15 @@ function Assert-Record($State, [string]$Cli, [string]$Wrapper) {
         $activationOwned -and $record.binary_version -eq $expectedVersion) 'Cargo activation record belongs to a different installation'
 }
 
+function Assert-ShimFallback([string]$ShimPath, [string]$CargoHome, [string]$RealCargo) {
+    $path = Join-Path (Split-Path -Path $ShimPath -Parent) '.rgo-cargo-fallback.json'
+    Assert-PlainFile $path
+    $fallback = Read-Json $path
+    Assert-Condition ($fallback.schema_version -eq 1 -and
+        (Test-SamePath $fallback.cargo_home $CargoHome) -and
+        (Test-SamePath $fallback.real_cargo $RealCargo)) "Cargo fallback differs from its owned proxy: $path"
+}
+
 function Assert-PlainCargoActivation([string]$Cli, $State) {
     $previous = $env:RGO_HOME
     $previousPath = $env:PATH
@@ -327,7 +336,8 @@ function Test-ExactText([AllowNull()][string]$Left, [AllowNull()][string]$Right)
     return [string]::Equals($Left, $Right, [StringComparison]::Ordinal)
 }
 
-function Test-ActivationPath([string]$Path) {
+function Test-ActivationPath([string]$Path, [string]$FallbackPath) {
+    if ($FallbackPath -and (Test-SamePath $Path $FallbackPath)) { return $true }
     $allowed = @(
         (Join-Path $script:resolvedCargoHome '.rgo-home'),
         (Join-Path $script:resolvedCargoHome '.rgo-install.json'),
@@ -340,16 +350,25 @@ function Test-ActivationPath([string]$Path) {
     return @($allowed | Where-Object { Test-SamePath $_ $Path }).Count -eq 1
 }
 
-function Upgrade-Plan([string]$Cli, [bool]$NoWrapper) {
+function Upgrade-Plan([string]$Cli, [bool]$NoWrapper, [bool]$Supervised,
+    [string]$RealCargo, [string]$ShimPath) {
     $arguments = @('setup', '--installer-plan-json', '--no-service')
     if ($NoWrapper) { $arguments += '--no-wrapper' }
+    if ($Supervised) { $arguments += @('--supervised', '--real-cargo', $RealCargo) }
     $output = Invoke-Checked $Cli $arguments
     $plan = ($output -split '\r?\n')[-1] | ConvertFrom-Json
     Assert-Condition ($plan.schema_version -eq 1 -and $plan.files) 'staged CLI returned an invalid installer plan'
+    $fallbackPath = if ($Supervised) { Join-Path (Split-Path -Path $ShimPath -Parent) '.rgo-cargo-fallback.json' } else { $null }
+    if ($Supervised) {
+        Assert-Condition ($plan.binaries -and @($plan.binaries.PSObject.Properties).Count -eq 1) 'staged CLI did not plan exactly one Cargo shim binary'
+        $binary = $plan.binaries.PSObject.Properties[0]
+        Assert-Condition ((Test-SamePath $binary.Name $ShimPath) -and
+            $binary.Value -match '^binary-blake3:[0-9a-f]{64}$') 'staged CLI planned an unexpected Cargo shim binary'
+    }
     $entries = @()
     foreach ($property in $plan.files.PSObject.Properties) {
         $path = $property.Name
-        Assert-Condition (Test-ActivationPath $path) "staged CLI plans an unexpected activation write: $path"
+        Assert-Condition (Test-ActivationPath $path $fallbackPath) "staged CLI plans an unexpected activation write: $path"
         $contents = if ($null -eq $property.Value) { $null } else { $property.Value.contents }
         Assert-Condition ($null -eq $contents -or $contents -is [string]) "invalid planned contents for $path"
         $encoded = if ($null -eq $contents) { $null }
@@ -357,6 +376,16 @@ function Upgrade-Plan([string]$Cli, [bool]$NoWrapper) {
         $entries += [ordered]@{ path = $path; before = (Encoded-File $path); after = $encoded }
     }
     Assert-Condition (@($entries | Where-Object { Test-SamePath $_.path (Join-Path $script:resolvedCargoHome '.rgo-install.json') }).Count -eq 1) 'staged CLI plan omitted the installation record'
+    if ($Supervised) {
+        Assert-Condition (@($entries | Where-Object { Test-SamePath $_.path $fallbackPath }).Count -eq 1) 'staged CLI plan omitted the Cargo fallback'
+        $recordPath = Join-Path $script:resolvedCargoHome '.rgo-install.json'
+        $recordEntry = @($entries | Where-Object { Test-SamePath $_.path $recordPath })[0]
+        $record = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($recordEntry.after)) | ConvertFrom-Json
+        Assert-Condition ($record.schema_version -eq 3 -and
+            (Test-SamePath $record.supervised_cargo.shim_path $ShimPath) -and
+            (Test-SamePath $record.supervised_cargo.real_cargo $RealCargo) -and
+            $record.supervised_cargo.shim_contents -eq $binary.Value) 'staged CLI planned an inconsistent Cargo activation'
+    }
     return $entries
 }
 
@@ -369,6 +398,30 @@ function Assert-UpgradeState($State, [string]$Role) {
         $State.versionDirectory -match '^rgo-v[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?-x86_64-pc-windows-msvc$' -and
         $State.archiveDigest -match '^[0-9a-f]{64}$' -and
         $State.cliDigest -match '^[0-9a-f]{64}$' -and $State.wrapperDigest -match '^[0-9a-f]{64}$') "invalid $Role installer state"
+}
+
+function Assert-SupervisedUpgradePair($OldState, $NewState) {
+    Assert-UpgradeState $OldState 'old'
+    Assert-UpgradeState $NewState 'new'
+    Assert-Condition ((Test-SupervisedState $OldState) -and (Test-SupervisedState $NewState) -and
+        -not $OldState.noWrapper -and -not $NewState.noWrapper -and
+        $OldState.versionDirectory -ne $NewState.versionDirectory -and
+        (Test-SamePath $OldState.realCargo $NewState.realCargo) -and
+        [bool]$OldState.noUserPath -eq [bool]$NewState.noUserPath -and
+        [bool]$OldState.pathAdded -eq [bool]$NewState.pathAdded -and
+        [bool]$OldState.priorUserPathPresent -eq [bool]$NewState.priorUserPathPresent -and
+        $OldState.priorUserPathRaw -ceq $NewState.priorUserPathRaw -and
+        $OldState.priorUserPathKind -eq $NewState.priorUserPathKind -and
+        $OldState.priorUserPath -eq $NewState.priorUserPath) 'supervised upgrade states disagree about installation ownership'
+    Assert-Condition ($OldState.versionDirectory -match '^rgo-(v[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?)-x86_64-pc-windows-msvc$') 'old supervised state has an invalid version'
+    $oldShim = Join-Path (Join-Path $script:shimRoot $Matches[1]) 'cargo.exe'
+    Assert-Condition ($NewState.versionDirectory -match '^rgo-(v[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?)-x86_64-pc-windows-msvc$') 'new supervised state has an invalid version'
+    $newShim = Join-Path (Join-Path $script:shimRoot $Matches[1]) 'cargo.exe'
+    Assert-Condition ((Test-SamePath $OldState.shimPath $oldShim) -and
+        (Test-SamePath $NewState.shimPath $newShim) -and
+        -not (Test-SamePath $oldShim $newShim)) 'supervised upgrade names an unexpected Cargo shim'
+    return @{ oldShim = $oldShim; newShim = $newShim
+        newFallback = (Join-Path (Split-Path -Path $newShim -Parent) '.rgo-cargo-fallback.json') }
 }
 
 function Invoke-WithSetupLocks([scriptblock]$Action) {
@@ -407,6 +460,10 @@ function Recover-UpgradeGuarded([string]$JournalPath) {
     Assert-PlainFile $JournalPath
     Assert-Condition ((Get-Item -LiteralPath $JournalPath).Length -le 67108864) 'upgrade journal is too large'
     $journal = Read-Json $JournalPath
+    if ($journal.schemaVersion -eq 2) {
+        Recover-SupervisedUpgradeGuarded $JournalPath $journal
+        return
+    }
     Assert-Condition ($journal.schemaVersion -eq 1) 'unsupported upgrade journal'
     Assert-UpgradeState $journal.oldState 'old'
     Assert-UpgradeState $journal.newState 'new'
@@ -464,6 +521,107 @@ function Recover-UpgradeGuarded([string]$JournalPath) {
             if ((File-Digest $entry[0]) -ne $entry[3]) { Publish-CommandCopy $entry[1] $entry[0] }
         }
         Assert-Record $journal.oldState $oldCli $oldWrapper
+    }
+    Remove-Item -LiteralPath $JournalPath -Force
+}
+
+function Recover-SupervisedUpgradeGuarded([string]$JournalPath, $Journal) {
+    $pair = Assert-SupervisedUpgradePair $Journal.oldState $Journal.newState
+    $oldDir = Join-Path $script:versions $Journal.oldState.versionDirectory
+    $newDir = Join-Path $script:versions $Journal.newState.versionDirectory
+    $oldCli = Join-Path $oldDir 'rgo.exe'
+    $oldWrapper = Join-Path $oldDir 'rgo-rustc-wrapper.exe'
+    $newCli = Join-Path $newDir 'rgo.exe'
+    $newWrapper = Join-Path $newDir 'rgo-rustc-wrapper.exe'
+    foreach ($entry in @(
+        @($oldCli, $Journal.oldState.cliDigest), @($oldWrapper, $Journal.oldState.wrapperDigest),
+        @($newCli, $Journal.newState.cliDigest), @($newWrapper, $Journal.newState.wrapperDigest),
+        @($pair.oldShim, $Journal.oldState.cliDigest)
+    )) {
+        Assert-PlainFile $entry[0]
+        Assert-Condition ((File-Digest $entry[0]) -eq $entry[1]) "upgrade recovery binary changed: $($entry[0])"
+    }
+    Assert-ShimFallback $pair.oldShim $script:resolvedCargoHome $Journal.oldState.realCargo
+    $newShimExists = Test-Path -LiteralPath $pair.newShim
+    if ($newShimExists) {
+        Assert-PlainFile $pair.newShim
+        Assert-Condition ((File-Digest $pair.newShim) -eq $Journal.newState.cliDigest) 'new Cargo shim changed during upgrade'
+    }
+    $state = Read-Json $script:statePath
+    $stateJson = $state | ConvertTo-Json -Depth 8 -Compress
+    $committed = Test-ExactText $stateJson ($Journal.newState | ConvertTo-Json -Depth 8 -Compress)
+    Assert-Condition ($committed -or
+        (Test-ExactText $stateJson ($Journal.oldState | ConvertTo-Json -Depth 8 -Compress))) 'supervised upgrade journal and installer state disagree'
+    $seen = @{}
+    foreach ($entry in $Journal.files) {
+        Assert-Condition (Test-ActivationPath $entry.path $pair.newFallback) "supervised upgrade journal names an unexpected path: $($entry.path)"
+        Assert-Condition (-not $seen.ContainsKey($entry.path)) "duplicate supervised upgrade path: $($entry.path)"
+        $seen[$entry.path] = $true
+        $current = Encoded-File $entry.path
+        if ($committed) {
+            Assert-Condition (Test-ExactText $current $entry.after) "committed activation file changed: $($entry.path)"
+        } else {
+            Assert-Condition ((Test-ExactText $current $entry.before) -or
+                (Test-ExactText $current $entry.after)) "activation file changed during supervised upgrade: $($entry.path)"
+        }
+    }
+    Assert-Condition ($seen.ContainsKey((Join-Path $script:resolvedCargoHome '.rgo-install.json')) -and
+        $seen.ContainsKey($pair.newFallback)) 'supervised upgrade journal omitted the record or new fallback'
+    $commands = @(
+        @((Join-Path $script:resolvedBinDir 'rgo.exe'), $oldCli, $newCli, $Journal.oldState.cliDigest, $Journal.newState.cliDigest),
+        @((Join-Path $script:resolvedBinDir 'rgo-rustc-wrapper.exe'), $oldWrapper, $newWrapper, $Journal.oldState.wrapperDigest, $Journal.newState.wrapperDigest)
+    )
+    foreach ($entry in $commands) {
+        Assert-PlainFile $entry[0]
+        $digest = File-Digest $entry[0]
+        Assert-Condition ($digest -eq $entry[3] -or $digest -eq $entry[4]) "command entrypoint changed during supervised upgrade: $($entry[0])"
+        if ($committed) { Assert-Condition ($digest -eq $entry[4]) "committed command entrypoint is stale: $($entry[0])" }
+    }
+    if (-not $Journal.oldState.noUserPath) {
+        Select-OwnedShim $Journal.oldState
+        $expectedOldPath = Expected-OwnedUserPath $Journal.oldState
+        Select-OwnedShim $Journal.newState
+        $expectedNewPath = Expected-OwnedUserPath $Journal.newState
+        $kind = if ($Journal.oldState.priorUserPathPresent) { $Journal.oldState.priorUserPathKind } else { 'String' }
+        Assert-Condition ($Journal.userPathBefore.present -and $Journal.userPathAfter.present -and
+            $Journal.userPathBefore.value -ceq $expectedOldPath -and
+            $Journal.userPathAfter.value -ceq $expectedNewPath -and
+            $Journal.userPathBefore.kind -eq $kind -and $Journal.userPathAfter.kind -eq $kind) 'supervised upgrade journal has an invalid User PATH transition'
+        $currentPath = Get-UserPathSnapshot
+        $before = $currentPath.present -and $currentPath.kind -eq $kind -and
+            $currentPath.value -ceq $expectedOldPath
+        $after = $currentPath.present -and $currentPath.kind -eq $kind -and
+            $currentPath.value -ceq $expectedNewPath
+        Assert-Condition ($before -or $after) 'User PATH changed outside the supervised upgrade; refusing to overwrite it'
+        if ($committed) { Assert-Condition $after 'committed supervised upgrade has a stale User PATH' }
+    }
+    if ($committed) {
+        Assert-Condition $newShimExists 'committed supervised upgrade has no new Cargo shim'
+        Assert-ShimFallback $pair.newShim $script:resolvedCargoHome $Journal.newState.realCargo
+        Select-OwnedShim $Journal.newState
+        Assert-Record $Journal.newState $newCli $newWrapper
+    } else {
+        foreach ($entry in $Journal.files) {
+            $restore = if ((Test-SamePath $entry.path $pair.newFallback) -and $newShimExists) {
+                $entry.after
+            } else { $entry.before }
+            Write-EncodedFile $entry.path $restore
+        }
+        if (-not $Journal.oldState.noUserPath) {
+            $currentPath = Get-UserPathSnapshot
+            if ($currentPath.value -cne $Journal.userPathBefore.value) {
+                Set-UserPathRaw $true $Journal.userPathBefore.value $Journal.userPathBefore.kind
+            }
+        }
+        foreach ($entry in $commands) {
+            if ((File-Digest $entry[0]) -ne $entry[3]) { Publish-CommandCopy $entry[1] $entry[0] }
+        }
+        Select-OwnedShim $Journal.oldState
+        Prepend-ProcessPath $script:shimDir
+        Assert-Record $Journal.oldState $oldCli $oldWrapper
+        if ($newShimExists) {
+            Assert-ShimFallback $pair.newShim $script:resolvedCargoHome $Journal.newState.realCargo
+        }
     }
     Remove-Item -LiteralPath $JournalPath -Force
 }
@@ -542,6 +700,108 @@ function Invoke-NoServiceUpgrade($OldState, [string]$Top, [string]$ArchiveDigest
         throw $failure
     }
     Write-Host "Upgraded rgo to $Top; previous binaries remain available for running Cargo processes"
+}
+
+function Invoke-SupervisedUpgrade($OldState, [string]$Top, [string]$ArchiveDigest,
+    [string]$CliDigest, [string]$WrapperDigest, [string]$Extracted) {
+    Assert-Condition ($script:NoService -and -not $script:Repair) 'supervised version upgrades require -NoService and cannot use -Repair'
+    Assert-Condition (-not (Test-Path -LiteralPath $script:pendingPath)) 'finish the pending first installation before upgrading'
+    Assert-Condition ($OldState.versionDirectory -ne $Top) 'a release tag cannot be repacked with different bytes'
+    Assert-UpgradeState $OldState 'old'
+    Select-OwnedShim $OldState
+    $oldShim = $script:shimPath
+    $oldDir = Join-Path $script:versions $OldState.versionDirectory
+    $oldCli = Join-Path $oldDir 'rgo.exe'
+    $oldWrapper = Join-Path $oldDir 'rgo-rustc-wrapper.exe'
+    foreach ($entry in @(@($oldCli, $OldState.cliDigest), @($oldWrapper, $OldState.wrapperDigest),
+        @($oldShim, $OldState.cliDigest),
+        @((Join-Path $script:resolvedBinDir 'rgo.exe'), $OldState.cliDigest),
+        @((Join-Path $script:resolvedBinDir 'rgo-rustc-wrapper.exe'), $OldState.wrapperDigest))) {
+        Assert-PlainFile $entry[0]
+        Assert-Condition ((File-Digest $entry[0]) -eq $entry[1]) "old supervised binary changed: $($entry[0])"
+    }
+    Assert-ShimFallback $oldShim $script:resolvedCargoHome $OldState.realCargo
+    Assert-Record $OldState $oldCli $oldWrapper
+    Assert-OwnedUserPath $OldState
+    $beforePath = if ($OldState.noUserPath) { $null } else { Get-UserPathSnapshot }
+    if (-not $OldState.noUserPath) {
+        $kind = if ($OldState.priorUserPathPresent) { $OldState.priorUserPathKind } else { 'String' }
+        Assert-Condition ($beforePath.present -and $beforePath.kind -eq $kind -and
+            $beforePath.value -ceq (Expected-OwnedUserPath $OldState)) 'owned User PATH is not active; repair it before upgrading'
+    }
+    $newDir = Join-Path $script:versions $Top
+    Stage-VerifiedVersion $Extracted $newDir $CliDigest $WrapperDigest
+    $newCli = Join-Path $newDir 'rgo.exe'
+    $newWrapper = Join-Path $newDir 'rgo-rustc-wrapper.exe'
+    Assert-Condition ($Top -match '^rgo-(v[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?)-x86_64-pc-windows-msvc$') 'new release has an invalid shim version'
+    $expectedVersion = $Matches[1].Substring(1)
+    $newShim = Join-Path (Join-Path $script:shimRoot $Matches[1]) 'cargo.exe'
+    $newState = [pscustomobject]([ordered]@{
+        schemaVersion = 1; cargoHome = $script:resolvedCargoHome; rgoHome = $script:resolvedRgoHome
+        installRoot = $script:resolvedInstallRoot; binDir = $script:resolvedBinDir
+        versionDirectory = $Top; archiveDigest = $ArchiveDigest
+        cliDigest = $CliDigest; wrapperDigest = $WrapperDigest
+        noService = $true; noWrapper = $false; noUserPath = [bool]$OldState.noUserPath
+        supervised = $true; realCargo = $OldState.realCargo; shimPath = $newShim
+        pathAdded = [bool]$OldState.pathAdded; priorUserPath = $OldState.priorUserPath
+        priorUserPathPresent = [bool]$OldState.priorUserPathPresent
+        priorUserPathRaw = $OldState.priorUserPathRaw; priorUserPathKind = $OldState.priorUserPathKind
+    })
+    $pair = Assert-SupervisedUpgradePair $OldState $newState
+    if (Test-Path -LiteralPath $pair.newShim) {
+        Assert-PlainFile $pair.newShim
+        Assert-Condition ((File-Digest $pair.newShim) -eq $CliDigest) 'new Cargo shim exists with different bytes'
+        Assert-ShimFallback $pair.newShim $script:resolvedCargoHome $OldState.realCargo
+    }
+    $files = @(Upgrade-Plan $newCli $false $true $OldState.realCargo $pair.newShim)
+    $recordPath = Join-Path $script:resolvedCargoHome '.rgo-install.json'
+    $recordEntry = @($files | Where-Object { Test-SamePath $_.path $recordPath })[0]
+    $plannedRecord = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($recordEntry.after)) | ConvertFrom-Json
+    Assert-Condition ((Test-SamePath $plannedRecord.rgo_binary $newCli) -and
+        $plannedRecord.binary_version -eq $expectedVersion) 'staged CLI planned an unexpected release version'
+    $afterPath = if ($OldState.noUserPath) { $null } else {
+        Select-OwnedShim $newState
+        @{ present = $true; value = (Expected-OwnedUserPath $newState); kind = $beforePath.kind }
+    }
+    Select-OwnedShim $OldState
+    Write-JsonAtomic $script:upgradeJournalPath ([ordered]@{
+        schemaVersion = 2; oldState = $OldState; newState = $newState
+        files = $files; userPathBefore = $beforePath; userPathAfter = $afterPath
+    })
+    try {
+        Invoke-Checked $newCli @('setup', '--supervised', '--real-cargo', $OldState.realCargo, '--no-service') | Out-Null
+        foreach ($entry in $files) {
+            Assert-Condition (Test-ExactText (Encoded-File $entry.path) $entry.after) "supervised setup differed from its installer plan: $($entry.path)"
+        }
+        Assert-PlainFile $pair.newShim
+        Assert-Condition ((File-Digest $pair.newShim) -eq $CliDigest) 'new Cargo shim differs from the verified release'
+        Select-OwnedShim $newState
+        Assert-ShimFallback $pair.newShim $script:resolvedCargoHome $OldState.realCargo
+        Assert-Record $newState $newCli $newWrapper
+        Assert-PlainCargoActivation $newCli $newState
+        if (-not $OldState.noUserPath) {
+            $currentPath = Get-UserPathSnapshot
+            Assert-Condition ($currentPath.present -and $currentPath.kind -eq $beforePath.kind -and
+                $currentPath.value -ceq $beforePath.value) 'User PATH changed while supervised upgrade was staged'
+            Set-UserPathRaw $true $afterPath.value $afterPath.kind
+        }
+        Prepend-ProcessPath $script:shimDir
+        Publish-CommandCopy $newWrapper (Join-Path $script:resolvedBinDir 'rgo-rustc-wrapper.exe')
+        Publish-CommandCopy $newCli (Join-Path $script:resolvedBinDir 'rgo.exe')
+        Replace-JsonAtomic $script:statePath $newState
+        Remove-Item -LiteralPath $script:upgradeJournalPath -Force
+    } catch {
+        $failure = $_
+        try { Recover-Upgrade $script:upgradeJournalPath }
+        catch { throw "supervised upgrade failed ($failure); rollback also failed: $_" }
+        $current = Read-Json $script:statePath
+        if ($current.archiveDigest -eq $ArchiveDigest -and $current.versionDirectory -eq $Top) {
+            Write-Host "Upgrade to $Top committed; recovered its final journal cleanup"
+            return
+        }
+        throw $failure
+    }
+    Write-Host "Upgraded supervised rgo to $Top; old Cargo shims remain safe for existing shells"
 }
 
 function Add-ProcessPath([string]$Directory) {
@@ -878,11 +1138,14 @@ try {
                 }
             }
             if ($state.versionDirectory -ne $top) {
-                Assert-Condition (-not $installedSupervised) 'supervised Windows upgrades require versioned shim paths; undo and use a fresh storage root for now'
-                $oldNoWrapper = $state.PSObject.Properties['noWrapper'] -and $state.noWrapper
-                $nextNoWrapper = if ($PSBoundParameters.ContainsKey('NoWrapper')) { [bool]$NoWrapper }
-                    else { [bool]$oldNoWrapper }
-                Invoke-NoServiceUpgrade $state $top $digest $cliDigest $wrapperDigest $extracted $nextNoWrapper
+                if ($installedSupervised) {
+                    Invoke-SupervisedUpgrade $state $top $digest $cliDigest $wrapperDigest $extracted
+                } else {
+                    $oldNoWrapper = $state.PSObject.Properties['noWrapper'] -and $state.noWrapper
+                    $nextNoWrapper = if ($PSBoundParameters.ContainsKey('NoWrapper')) { [bool]$NoWrapper }
+                        else { [bool]$oldNoWrapper }
+                    Invoke-NoServiceUpgrade $state $top $digest $cliDigest $wrapperDigest $extracted $nextNoWrapper
+                }
                 return
             }
             Assert-Condition ($state.versionDirectory -eq $top -and $state.archiveDigest -eq $digest -and
