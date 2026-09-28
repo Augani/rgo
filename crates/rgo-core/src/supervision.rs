@@ -37,6 +37,7 @@ pub fn context_for_workspace(paths: &RgoPaths, workspace_root: &Path) -> Result<
 
 pub struct SessionGuard {
     _file: File,
+    #[cfg(unix)]
     _local: File,
     #[cfg(unix)]
     _descendants: File,
@@ -60,6 +61,7 @@ impl SessionGuard {
 }
 
 pub struct GcGuards {
+    #[cfg(unix)]
     _local: File,
     #[cfg(unix)]
     _legacy_global: File,
@@ -71,6 +73,7 @@ pub struct GcGuards {
 
 // POSIX record locks are process-associated. A separate flock file supplies
 // same-process exclusion and closes on exec, while the fcntl lock survives.
+#[cfg(unix)]
 fn open_local_guard(paths: &RgoPaths) -> Result<File> {
     paths.ensure_layout()?;
     let path = paths.state_dir().join("locks/process-guard.lock");
@@ -203,8 +206,11 @@ pub(crate) fn verify_lock_identity(path: &Path, file: &File) -> Result<()> {
 /// Hold for the full Cargo invocation. An unknown or multi-workspace command
 /// uses `None` so GC defers every destructive action while it runs.
 pub fn lock_cargo_session(paths: &RgoPaths, context: Option<&Path>) -> Result<SessionGuard> {
+    #[cfg(unix)]
     let local = open_local_guard(paths)?;
+    #[cfg(unix)]
     FileExt::lock_shared(&local)?;
+    #[cfg(unix)]
     verify_lock_identity(&paths.state_dir().join("locks/process-guard.lock"), &local)?;
     #[cfg(unix)]
     let descendants = {
@@ -218,6 +224,7 @@ pub fn lock_cargo_session(paths: &RgoPaths, context: Option<&Path>) -> Result<Se
     verify_lock_identity(&lock_path(paths, context, cfg!(not(unix)))?, &file)?;
     Ok(SessionGuard {
         _file: file,
+        #[cfg(unix)]
         _local: local,
         #[cfg(unix)]
         _descendants: descendants,
@@ -227,11 +234,14 @@ pub fn lock_cargo_session(paths: &RgoPaths, context: Option<&Path>) -> Result<Se
 /// GC never waits behind a Cargo session: a queued writer could block a nested
 /// shared lock and deadlock its parent build. Keep both guards through removal.
 pub fn try_lock_gc(paths: &RgoPaths, context: Option<&Path>) -> Result<Option<GcGuards>> {
+    #[cfg(unix)]
     let local = open_local_guard(paths)?;
+    #[cfg(unix)]
     if !FileExt::try_lock_exclusive(&local)? {
         tracing::debug!(guard = "process", "GC lifecycle guard is busy");
         return Ok(None);
     }
+    #[cfg(unix)]
     verify_lock_identity(&paths.state_dir().join("locks/process-guard.lock"), &local)?;
     #[cfg(unix)]
     let legacy_global = {
@@ -273,6 +283,7 @@ pub fn try_lock_gc(paths: &RgoPaths, context: Option<&Path>) -> Result<Option<Gc
         None
     };
     Ok(Some(GcGuards {
+        #[cfg(unix)]
         _local: local,
         #[cfg(unix)]
         _legacy_global: legacy_global,
@@ -363,6 +374,21 @@ mod tests {
         assert!(try_lock_gc(&paths, Some(&context)).unwrap().is_none());
         drop(global_session);
         assert!(try_lock_gc(&paths, Some(&context)).unwrap().is_some());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn an_active_windows_context_does_not_block_unrelated_gc() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = RgoPaths {
+            root: root.path().join("rgo"),
+        };
+        let active = paths.builds_dir().join("aa/active");
+        let idle = paths.builds_dir().join("bb/idle");
+        let session = lock_cargo_session(&paths, Some(&active)).unwrap();
+        assert!(try_lock_gc(&paths, Some(&active)).unwrap().is_none());
+        assert!(try_lock_gc(&paths, Some(&idle)).unwrap().is_some());
+        drop(session);
     }
 
     #[cfg(unix)]
