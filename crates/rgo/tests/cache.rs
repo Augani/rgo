@@ -96,6 +96,7 @@ if [ -n "$FAKE_RUSTC_FAIL_ONCE_FILE" ] && [ ! -e "$FAKE_RUSTC_FAIL_ONCE_FILE" ];
 fi
 if [ -n "$FAKE_RUSTC_SLEEP" ]; then sleep "$FAKE_RUSTC_SLEEP"; fi
 if [ -n "$fail_once" ]; then exit 1; fi
+if [ -n "$FAKE_RUSTC_NO_OUTPUT" ]; then exit 0; fi
 out=
 name=demo
 while [ "$#" -gt 0 ]; do
@@ -1796,6 +1797,35 @@ if [ -n "$FAKE_RUSTC_OLD_MTIME" ]; then touch -t 202001010000 "$out"/*; fi
             );
         }
 
+        daemon.kill().unwrap();
+        let _ = daemon.wait();
+    }
+
+    #[test]
+    fn unchanged_stale_output_is_never_published_as_a_compiler_result() {
+        let _serial = serial_e2e();
+        ensure_workspace_bins_built().unwrap();
+        let sb = Sandbox::new().unwrap();
+        let fixture = fixture(&sb);
+        let mut daemon = start_daemon(&sb);
+        let output_dir = out_dir(&sb, "stale-output");
+        fs::write(output_dir.join("libdemo.rmeta"), b"stale bytes").unwrap();
+
+        for _ in 0..2 {
+            let result = command_for(&sb, &fixture, "stale-output", &[])
+                .env("FAKE_RUSTC_NO_OUTPUT", "1")
+                .output()
+                .unwrap();
+            assert!(result.status.success());
+        }
+        assert_eq!(compile_count(&fixture), 2);
+        assert_eq!(
+            fs::read_dir(sb.rgo_home.join("cas/manifests"))
+                .unwrap()
+                .count(),
+            0,
+            "rgo cached a pre-existing output that rustc did not write"
+        );
         daemon.kill().unwrap();
         let _ = daemon.wait();
     }

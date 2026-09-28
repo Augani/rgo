@@ -25,14 +25,7 @@ pub fn run(foreground: bool, home: Option<PathBuf>) -> Result<()> {
     };
     if !foreground {
         let exe = std::env::current_exe().context("locating rgo executable")?;
-        Command::new(exe)
-            .args(["daemon", "--foreground", "--home"])
-            .arg(&e.paths.root)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .context("starting background daemon")?;
+        spawn_background_daemon(&exe, &e.paths.root).context("starting background daemon")?;
         return Ok(());
     }
     rgo_core::daemon::run(e.paths, e.cfg)
@@ -86,15 +79,7 @@ pub fn ensure_running(paths: &RgoPaths) -> bool {
     let Ok(exe) = std::env::current_exe() else {
         return false;
     };
-    if Command::new(exe)
-        .args(["daemon", "--foreground", "--home"])
-        .arg(&paths.root)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .is_err()
-    {
+    if spawn_background_daemon(&exe, &paths.root).is_err() {
         return false;
     }
     // Spawning a Rust binary from a cold disk or an overloaded CI host can
@@ -108,6 +93,91 @@ pub fn ensure_running(paths: &RgoPaths) -> bool {
         }
     }
     false
+}
+
+#[cfg(not(windows))]
+fn spawn_background_daemon(exe: &std::path::Path, root: &std::path::Path) -> Result<()> {
+    Command::new(exe)
+        .args(["daemon", "--foreground", "--home"])
+        .arg(root)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    Ok(())
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)] // CreateProcessW is required to disable inherited handles.
+fn spawn_background_daemon(exe: &std::path::Path, root: &std::path::Path) -> Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{
+        CREATE_NO_WINDOW, CreateProcessW, PROCESS_INFORMATION, STARTUPINFOW,
+    };
+
+    // std::process::Command inherits every inheritable Windows handle. A caller
+    // capturing `rgo gc` can otherwise wait forever for EOF because the daemon
+    // inherited its output pipe, even after the command has exited. The daemon
+    // has file logging and needs no inherited handles or standard streams.
+    let application: Vec<u16> = exe.as_os_str().encode_wide().chain(Some(0)).collect();
+    let mut command_line: Vec<u16> = "rgo daemon --foreground --home "
+        .encode_utf16()
+        .chain(quote_windows_arg(root.as_os_str()))
+        .chain(Some(0))
+        .collect();
+    let mut startup = STARTUPINFOW {
+        cb: std::mem::size_of::<STARTUPINFOW>() as u32,
+        ..Default::default()
+    };
+    let mut process = PROCESS_INFORMATION::default();
+    let created = unsafe {
+        CreateProcessW(
+            application.as_ptr(),
+            command_line.as_mut_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            0,
+            CREATE_NO_WINDOW,
+            std::ptr::null(),
+            std::ptr::null(),
+            &mut startup,
+            &mut process,
+        )
+    };
+    if created == 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    unsafe {
+        CloseHandle(process.hThread);
+        CloseHandle(process.hProcess);
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn quote_windows_arg(value: &std::ffi::OsStr) -> Vec<u16> {
+    use std::os::windows::ffi::OsStrExt;
+    let mut quoted = vec![b'"' as u16];
+    let mut backslashes = 0;
+    for word in value.encode_wide() {
+        if word == b'\\' as u16 {
+            backslashes += 1;
+            continue;
+        }
+        if word == b'"' as u16 {
+            quoted.extend(std::iter::repeat_n(b'\\' as u16, backslashes * 2 + 1));
+            quoted.push(word);
+            backslashes = 0;
+            continue;
+        }
+        quoted.extend(std::iter::repeat_n(b'\\' as u16, backslashes));
+        backslashes = 0;
+        quoted.push(word);
+    }
+    quoted.extend(std::iter::repeat_n(b'\\' as u16, backslashes * 2));
+    quoted.push(b'"' as u16);
+    quoted
 }
 
 /// Read-only health probe used by `rgo doctor`. Unlike `ensure_running`, this never starts a

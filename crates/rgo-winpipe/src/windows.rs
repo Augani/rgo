@@ -50,7 +50,9 @@ fn transfer(
         return Err(io::ErrorKind::TimedOut.into());
     }
     let raw = handle.as_raw_handle() as HANDLE;
-    let event_raw = unsafe { CreateEventW(ptr::null(), 0, 0, ptr::null()) };
+    // Overlapped pipe I/O requires a manual-reset event. The kernel resets it
+    // when the operation starts and signals it when completion is available.
+    let event_raw = unsafe { CreateEventW(ptr::null(), 1, 0, ptr::null()) };
     if event_raw.is_null() {
         return Err(io::Error::last_os_error());
     }

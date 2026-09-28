@@ -26,7 +26,15 @@ $oldRustupHome = $env:RUSTUP_HOME
 $oldToolchain = $env:RUSTUP_TOOLCHAIN
 $rustupHome = (& rustup show home).Trim()
 $oldPath = $env:PATH
-$oldUserPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+function Get-RawUserPath {
+    $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Environment')
+    if ($null -eq $key) { return $null }
+    try {
+        return $key.GetValue('Path', $null,
+            [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+    } finally { $key.Dispose() }
+}
+$expectedUserPath = Get-RawUserPath
 function Get-ActivationBytes([string]$Cargo, [string]$Root) {
     $values = @{}
     foreach ($path in @(
@@ -153,7 +161,9 @@ try {
     $installed = $false
     if (Test-Path (Join-Path $cargoHome '.rgo-install.json')) { throw 'uninstall left Cargo activation behind' }
     if (Test-Path (Join-Path $cargoHome 'bin/rgo.exe')) { throw 'uninstall left an owned CLI entrypoint behind' }
-    if ([string][Environment]::GetEnvironmentVariable('Path', 'User') -cne [string]$oldUserPath) {
+    # Compare the registry value without expanding %USERPROFILE% in either
+    # environment; the installer was invoked with -NoUserPath throughout.
+    if ([string](Get-RawUserPath) -cne [string]$expectedUserPath) {
         throw 'uninstall did not restore user PATH'
     }
     & cargo clean --manifest-path $manifest | Out-Null
@@ -177,7 +187,6 @@ try {
         try { & $installScript -Uninstall -CargoHome $cargoHome -RgoHome $rgoHome | Out-Null }
         catch { Write-Warning "Best-effort sandbox uninstall failed: $_" }
     }
-    [Environment]::SetEnvironmentVariable('Path', $oldUserPath, 'User')
     $env:HOME = $oldHome
     $env:USERPROFILE = $oldProfile
     $env:CARGO_HOME = $oldCargoHome

@@ -58,6 +58,7 @@ jobs:
         if: matrix.toolchain == 'nightly'
         run: python3 scripts/verify-nightly-layout.py
       - name: Test workspace
+        timeout-minutes: 8
         run: cargo test --workspace
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
