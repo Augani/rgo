@@ -423,6 +423,132 @@ fn main() {
 }
 
 #[test]
+fn interrupted_versioned_setup_keeps_the_old_shim_usable_and_repairs_the_new_one() {
+    let sandbox = Sandbox::new().unwrap();
+    let cli = PathBuf::from(env!("CARGO_BIN_EXE_rgo"));
+    let real_cargo = PathBuf::from(std::env::var_os("CARGO").unwrap());
+    let first = sandbox
+        .cmd(&cli)
+        .args(["setup", "--supervised", "--no-service", "--real-cargo"])
+        .arg(&real_cargo)
+        .output()
+        .unwrap();
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+
+    let new_shim = sandbox.cargo_home.join(format!(
+        "rgo/shims/v{}/cargo.exe",
+        env!("CARGO_PKG_VERSION")
+    ));
+    let old_shim = sandbox.cargo_home.join("rgo/shims/v0.1.999/cargo.exe");
+    std::fs::create_dir_all(old_shim.parent().unwrap()).unwrap();
+    std::fs::rename(&new_shim, &old_shim).unwrap();
+    std::fs::rename(
+        new_shim.parent().unwrap().join(".rgo-cargo-fallback.json"),
+        old_shim.parent().unwrap().join(".rgo-cargo-fallback.json"),
+    )
+    .unwrap();
+    let old_bytes = std::fs::read(&old_shim).unwrap();
+    let record_path = sandbox.cargo_home.join(".rgo-install.json");
+    let mut record: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&record_path).unwrap()).unwrap();
+    record["binary_version"] = serde_json::Value::String("0.1.999".into());
+    record["supervised_cargo"]["shim_path"] =
+        serde_json::Value::String(old_shim.display().to_string());
+    std::fs::write(&record_path, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
+
+    let old_fallback = old_shim.parent().unwrap().join(".rgo-cargo-fallback.json");
+    let fallback_bytes = std::fs::read(&old_fallback).unwrap();
+    std::fs::remove_file(&old_fallback).unwrap();
+    let rejected = sandbox
+        .cmd(&cli)
+        .args(["setup", "--supervised", "--no-service", "--real-cargo"])
+        .arg(&real_cargo)
+        .output()
+        .unwrap();
+    assert!(!rejected.status.success());
+    assert!(!new_shim.exists());
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&std::fs::read(&record_path).unwrap()).unwrap()
+            ["binary_version"],
+        "0.1.999"
+    );
+    std::fs::write(&old_fallback, fallback_bytes).unwrap();
+
+    let interrupted = sandbox
+        .cmd(&cli)
+        .env("RGO_SETUP_TEST_EXIT_AFTER_RECORD", "1")
+        .args(["setup", "--supervised", "--no-service", "--real-cargo"])
+        .arg(&real_cargo)
+        .output()
+        .unwrap();
+    assert_eq!(interrupted.status.code(), Some(88));
+    assert!(!new_shim.exists());
+    assert_eq!(std::fs::read(&old_shim).unwrap(), old_bytes);
+    let old_path = std::env::join_paths(
+        std::iter::once(old_shim.parent().unwrap().to_path_buf()).chain(std::env::split_paths(
+            &std::env::var_os("PATH").unwrap_or_default(),
+        )),
+    )
+    .unwrap();
+    let local_project = sandbox.simple_bin("windows-upgrade-old-shell").unwrap();
+    let local = sandbox
+        .cmd("cmd.exe")
+        .current_dir(&local_project)
+        .env("PATH", &old_path)
+        .args(["/C", "cargo", "build", "--offline"])
+        .output()
+        .unwrap();
+    assert!(
+        local.status.success(),
+        "{}",
+        String::from_utf8_lossy(&local.stderr)
+    );
+    assert!(local_project.join("target/debug/deps").is_dir());
+    let paths = RgoPaths {
+        root: sandbox.rgo_home.clone(),
+    };
+    assert!(paths.checked_managed_build_dirs().unwrap().is_empty());
+
+    let repaired = sandbox
+        .cmd(&cli)
+        .args(["setup", "--supervised", "--no-service", "--real-cargo"])
+        .arg(&real_cargo)
+        .output()
+        .unwrap();
+    assert!(
+        repaired.status.success(),
+        "{}",
+        String::from_utf8_lossy(&repaired.stderr)
+    );
+    assert!(new_shim.is_file());
+    assert_eq!(std::fs::read(&old_shim).unwrap(), old_bytes);
+    let new_path = std::env::join_paths(
+        std::iter::once(new_shim.parent().unwrap().to_path_buf()).chain(std::env::split_paths(
+            &std::env::var_os("PATH").unwrap_or_default(),
+        )),
+    )
+    .unwrap();
+    let managed_project = sandbox.simple_bin("windows-upgrade-new-shell").unwrap();
+    let managed = sandbox
+        .cmd("cmd.exe")
+        .current_dir(&managed_project)
+        .env("PATH", &new_path)
+        .args(["/C", "cargo", "build", "--offline"])
+        .output()
+        .unwrap();
+    assert!(
+        managed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&managed.stderr)
+    );
+    assert_eq!(paths.checked_managed_build_dirs().unwrap().len(), 1);
+}
+
+#[test]
 fn suspended_job_launcher_guards_running_cargo_and_allows_unrelated_gc() {
     let sandbox = Sandbox::new().unwrap();
     let project = sandbox.simple_bin("windows-job-guard").unwrap();

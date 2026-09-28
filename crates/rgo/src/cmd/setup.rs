@@ -220,31 +220,61 @@ pub fn run(
         .as_ref()
         .and_then(|r| r.supervised_cargo.as_ref());
     #[cfg(windows)]
+    let shim_path = {
+        let flat = cargo_home.join("rgo/shims").join(shim_name());
+        let versioned = cargo_home
+            .join("rgo/shims")
+            .join(format!("v{}", env!("CARGO_PKG_VERSION")))
+            .join(shim_name());
+        if let (Some(record), Some(previous)) = (old_record.as_ref(), previous_shim) {
+            let path = Path::new(&previous.shim_path);
+            let old_component = format!("v{}", record.binary_version);
+            if Path::new(&old_component).components().count() != 1 {
+                bail!("installation record has an invalid Cargo shim version");
+            }
+            let old_versioned = cargo_home
+                .join("rgo/shims")
+                .join(old_component)
+                .join(shim_name());
+            if path != flat && path != old_versioned {
+                bail!("installation record names an unexpected Cargo shim path");
+            }
+            if path
+                .parent()
+                .is_some_and(|dir| dir.is_symlink() || dir.parent().is_some_and(Path::is_symlink))
+            {
+                bail!("refusing a symlinked previous Cargo shim directory");
+            }
+            if !undo && supervised && record.binary_version != env!("CARGO_PKG_VERSION") {
+                if path == flat
+                    || !verified_windows_fallback(
+                        path,
+                        &cargo_home,
+                        Path::new(&previous.real_cargo),
+                    )?
+                {
+                    bail!(
+                        "Windows supervised upgrade requires an owned versioned shim with a verified Cargo fallback"
+                    );
+                }
+                versioned
+            } else {
+                path.to_path_buf()
+            }
+        } else {
+            versioned
+        }
+    };
+    #[cfg(unix)]
+    let shim_path = cargo_home.join("rgo/shims").join(shim_name());
+    #[cfg(windows)]
     let retain_previous_shim = if undo {
         if let Some(shim) = previous_shim {
             let path = Path::new(&shim.shim_path);
             if path.parent() == Some(cargo_home.join("rgo/shims").as_path()) {
                 false
             } else {
-                let fallback_path = super::windows_cargo_entry::fallback_path(path)?;
-                match std::fs::symlink_metadata(&fallback_path) {
-                    Ok(metadata) => {
-                        if !metadata.is_file() || metadata.file_type().is_symlink() {
-                            bail!("{} is not a plain file", fallback_path.display());
-                        }
-                        let fallback: super::windows_cargo_entry::ShimFallback =
-                            serde_json::from_slice(&std::fs::read(&fallback_path)?)?;
-                        if fallback.schema_version != 1
-                            || fallback.cargo_home != cargo_home
-                            || fallback.real_cargo != Path::new(&shim.real_cargo)
-                        {
-                            bail!("{} changed since setup", fallback_path.display());
-                        }
-                        true
-                    }
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
-                    Err(error) => return Err(error.into()),
-                }
+                verified_windows_fallback(path, &cargo_home, Path::new(&shim.real_cargo))?
             }
         } else {
             false
@@ -252,25 +282,6 @@ pub fn run(
     } else {
         false
     };
-    #[cfg(windows)]
-    let shim_path = {
-        let flat = cargo_home.join("rgo/shims").join(shim_name());
-        let versioned = cargo_home
-            .join("rgo/shims")
-            .join(format!("v{}", env!("CARGO_PKG_VERSION")))
-            .join(shim_name());
-        if let Some(previous) = previous_shim {
-            let path = Path::new(&previous.shim_path);
-            if path != flat && path != versioned {
-                bail!("installation record names an unexpected Cargo shim path");
-            }
-            path.to_path_buf()
-        } else {
-            versioned
-        }
-    };
-    #[cfg(unix)]
-    let shim_path = cargo_home.join("rgo/shims").join(shim_name());
     let shim_dir = shim_path.parent().context("Cargo shim has no parent")?;
     if shim_dir.is_symlink()
         || shim_dir.parent().is_some_and(Path::is_symlink)
@@ -303,14 +314,26 @@ pub fn run(
     }
     let shim_preexisted = shim_path.is_file();
     if let Some(previous) = previous_shim {
-        let expected = &shim_path;
-        if Path::new(&previous.shim_path) != expected {
-            bail!("installation record names an unexpected Cargo shim path; refusing to modify it");
+        let previous_path = Path::new(&previous.shim_path);
+        if previous_path != shim_path
+            && previous_path
+                .parent()
+                .is_some_and(|dir| dir.is_symlink() || dir.parent().is_some_and(Path::is_symlink))
+        {
+            bail!("refusing a symlinked previous Cargo shim directory");
         }
-        if shim_preexisted && !shim_matches(expected, &previous.shim_contents)? {
+        if let Ok(metadata) = std::fs::symlink_metadata(previous_path) {
+            if !metadata.is_file() || metadata.file_type().is_symlink() {
+                bail!("{} is not a plain file", previous_path.display());
+            }
+        }
+        if previous_path != shim_path && !previous_path.is_file() {
+            bail!("previous Cargo shim is missing; repair it before upgrading");
+        }
+        if previous_path.is_file() && !shim_matches(previous_path, &previous.shim_contents)? {
             bail!(
                 "{} changed since setup; refusing to replace or remove it",
-                expected.display()
+                previous_path.display()
             );
         }
     }
@@ -361,7 +384,10 @@ pub fn run(
     {
         bail!("owned Cargo launcher fallback changed since setup");
     }
-    if supervised && previous_shim.is_none() && shim_path.exists() {
+    if supervised
+        && previous_shim.is_none_or(|previous| Path::new(&previous.shim_path) != shim_path)
+        && shim_path.exists()
+    {
         #[cfg(windows)]
         let retained_owned = shim_fallback.as_ref().is_some_and(|(_, contents)| {
             old_shim_fallback.as_deref() == Some(contents.as_slice())
@@ -380,10 +406,15 @@ pub fn run(
     }
     #[cfg(windows)]
     if let (Some(previous), Some(next)) = (previous_shim, supervised_cargo.as_ref()) {
-        if previous.shim_contents != next.shim_contents {
-            bail!(
-                "Windows supervised Cargo upgrades require undo and a fresh storage root until the versioned shim migration is implemented"
-            );
+        if Path::new(&previous.shim_path) == shim_path
+            && previous.shim_contents != next.shim_contents
+        {
+            bail!("Windows cannot replace an active Cargo shim; use a new versioned release");
+        }
+        if Path::new(&previous.real_cargo).canonicalize()?
+            != Path::new(&next.real_cargo).canonicalize()?
+        {
+            bail!("Windows supervised upgrade cannot change the real Cargo proxy");
         }
     }
     let legacy_service = old_record
@@ -718,12 +749,18 @@ pub fn run(
                 (&owner_path, old_owner.as_deref()),
                 (&mode_path, old_mode.as_deref()),
             ])?;
+            if let Some(shim) = &supervised_cargo {
+                let previous_at_target =
+                    previous_shim.filter(|previous| previous.shim_path == shim.shim_path);
+                restore_previous_shim(
+                    Path::new(&shim.shim_path),
+                    previous_at_target,
+                    shim_preexisted,
+                )?;
+            }
             #[cfg(windows)]
             if let Some((path, _)) = &shim_fallback {
                 restore_optional(path, old_shim_fallback.as_deref())?;
-            }
-            if let Some(shim) = &supervised_cargo {
-                restore_previous_shim(Path::new(&shim.shim_path), previous_shim, shim_preexisted)?;
             }
             return Err(error);
         }
@@ -762,16 +799,18 @@ pub fn run(
                     (&owner_path, old_owner.as_deref()),
                     (&mode_path, old_mode.as_deref()),
                 ])?;
+                if let Some(shim) = &supervised_cargo {
+                    let previous_at_target =
+                        previous_shim.filter(|previous| previous.shim_path == shim.shim_path);
+                    restore_previous_shim(
+                        Path::new(&shim.shim_path),
+                        previous_at_target,
+                        shim_preexisted,
+                    )?;
+                }
                 #[cfg(windows)]
                 if let Some((path, _)) = &shim_fallback {
                     restore_optional(path, old_shim_fallback.as_deref())?;
-                }
-                if let Some(shim) = &supervised_cargo {
-                    restore_previous_shim(
-                        Path::new(&shim.shim_path),
-                        previous_shim,
-                        shim_preexisted,
-                    )?;
                 }
             }
             return Err(error);
@@ -1130,6 +1169,28 @@ fn is_rgo_cargo_shim(path: &Path) -> bool {
                 .and_then(Path::file_name)
                 .is_some_and(|name| name == "rgo")
     })
+}
+
+#[cfg(windows)]
+fn verified_windows_fallback(shim: &Path, cargo_home: &Path, real_cargo: &Path) -> Result<bool> {
+    let path = super::windows_cargo_entry::fallback_path(shim)?;
+    let metadata = match std::fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error).with_context(|| format!("reading {}", path.display())),
+    };
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        bail!("{} is not a plain file", path.display());
+    }
+    let fallback: super::windows_cargo_entry::ShimFallback =
+        serde_json::from_slice(&std::fs::read(&path)?)?;
+    if fallback.schema_version != 1
+        || fallback.cargo_home != cargo_home
+        || fallback.real_cargo != real_cargo
+    {
+        bail!("{} changed since setup", path.display());
+    }
+    Ok(true)
 }
 
 #[cfg(unix)]
