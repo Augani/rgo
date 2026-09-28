@@ -128,7 +128,13 @@ impl Write for Connection {
             use std::os::windows::io::AsHandle;
             let deadline = self.deadline.ok_or(io::ErrorKind::InvalidInput)?;
             let platform::Stream::NamedPipe(pipe) = &self.stream;
-            rgo_winpipe::write(pipe.inner().as_handle(), buf, deadline)
+            let written = rgo_winpipe::write(pipe.inner().as_handle(), buf, deadline)?;
+            if written > 0 {
+                // We bypassed interprocess's Write impl, so preserve its
+                // named-pipe linger-on-drop behavior for unread response bytes.
+                pipe.inner().mark_dirty();
+            }
+            Ok(written)
         }
     }
 

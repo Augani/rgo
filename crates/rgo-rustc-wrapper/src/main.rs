@@ -95,7 +95,11 @@ mod platform {
         fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
             use std::os::windows::io::AsHandle;
             let interprocess::local_socket::Stream::NamedPipe(pipe) = &self.inner;
-            rgo_winpipe::write(pipe.inner().as_handle(), buf, self.deadline)
+            let written = rgo_winpipe::write(pipe.inner().as_handle(), buf, self.deadline)?;
+            if written > 0 {
+                pipe.inner().mark_dirty();
+            }
+            Ok(written)
         }
 
         fn flush(&mut self) -> io::Result<()> {
