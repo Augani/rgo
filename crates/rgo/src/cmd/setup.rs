@@ -264,6 +264,16 @@ pub fn run(
             shim_path.display()
         );
     }
+    #[cfg(windows)]
+    if supervised && previous_shim.is_none() {
+        let flat = cargo_home.join("rgo/shims").join(shim_name());
+        if flat != shim_path && std::fs::symlink_metadata(&flat).is_ok() {
+            bail!(
+                "{} exists without an rgo ownership record; remove the stale Cargo launcher before activation",
+                flat.display()
+            );
+        }
+    }
     let shim_preexisted = shim_path.is_file();
     if let Some(previous) = previous_shim {
         let expected = &shim_path;

@@ -174,6 +174,17 @@ fn a_previously_owned_flat_shim_remains_repairable() {
     let sandbox = Sandbox::new().unwrap();
     let cli = PathBuf::from(env!("CARGO_BIN_EXE_rgo"));
     let real_cargo = PathBuf::from(std::env::var_os("CARGO").unwrap());
+    let flat = sandbox.cargo_home.join("rgo/shims/cargo.exe");
+    std::fs::create_dir_all(flat.parent().unwrap()).unwrap();
+    std::fs::copy(&cli, &flat).unwrap();
+    let unowned = sandbox
+        .cmd(&cli)
+        .args(["setup", "--supervised", "--no-service", "--real-cargo"])
+        .arg(&real_cargo)
+        .output()
+        .unwrap();
+    assert!(!unowned.status.success());
+    std::fs::remove_file(&flat).unwrap();
     let setup = sandbox
         .cmd(&cli)
         .args(["setup", "--supervised", "--no-service", "--real-cargo"])
@@ -189,7 +200,6 @@ fn a_previously_owned_flat_shim_remains_repairable() {
         "rgo/shims/v{}/cargo.exe",
         env!("CARGO_PKG_VERSION")
     ));
-    let flat = sandbox.cargo_home.join("rgo/shims/cargo.exe");
     let record_path = sandbox.cargo_home.join(".rgo-install.json");
     let mut record: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&record_path).unwrap()).unwrap();
