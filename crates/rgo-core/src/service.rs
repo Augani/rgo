@@ -263,20 +263,25 @@ fn parse_task_action(xml: &str) -> Result<TaskAction> {
 
 #[cfg(target_os = "windows")]
 fn task_action_matches(action: &TaskAction, executable: &Path, flavor: Flavor) -> Result<bool> {
-    let executable = executable
-        .canonicalize()
-        .unwrap_or_else(|_| executable.to_path_buf());
+    // `canonicalize` adds Windows' extended-length `\\?\` prefix, while
+    // Task Scheduler commonly exports an ordinary drive path. Compare the
+    // registered absolute spelling to the path we supplied at creation.
+    let normalize = |path: &str| {
+        path.trim()
+            .trim_matches('"')
+            .strip_prefix(r"\\?\")
+            .unwrap_or(path.trim().trim_matches('"'))
+            .replace('/', "\\")
+    };
     let paths = RgoPaths::discover()?;
     let arguments = match flavor {
         Flavor::Scoped => format!("daemon --foreground --home \"{}\"", paths.root.display()),
         Flavor::Legacy => "daemon --foreground".into(),
     };
-    Ok(action
-        .command
-        .trim()
-        .trim_matches('"')
-        .eq_ignore_ascii_case(&executable.to_string_lossy())
-        && action.arguments.trim() == arguments)
+    Ok(
+        normalize(&action.command).eq_ignore_ascii_case(&normalize(&executable.to_string_lossy()))
+            && action.arguments.trim() == arguments,
+    )
 }
 
 #[cfg(target_os = "windows")]
@@ -407,8 +412,10 @@ fn verify_service_ownership_flavor(
             };
             ensure!(
                 owned,
-                "Task Scheduler entry {} has an unowned action; refusing to replace or remove it",
-                rendered.label
+                "Task Scheduler entry {} has an unowned action (command {:?}, arguments {:?}); refusing to replace or remove it",
+                rendered.label,
+                action.command,
+                action.arguments
             );
         }
         Ok(())

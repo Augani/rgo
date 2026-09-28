@@ -1,5 +1,27 @@
+use std::path::{Path, PathBuf};
+use std::process::Output;
+
 use assert_cmd::cargo::cargo_bin;
 use rgo_testkit::{Sandbox, ensure_workspace_bins_built};
+
+fn build_script_out_dir(output: &Output) -> PathBuf {
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .find(|message| message["reason"] == "build-script-executed")
+        .and_then(|message| message["out_dir"].as_str().map(PathBuf::from))
+        .expect("Cargo did not report a build-script output directory")
+}
+
+fn add_build_script(project: &Path) {
+    std::fs::write(project.join("build.rs"), "fn main() {}\n").unwrap();
+}
+
+fn final_binary(target: &Path, name: &str) -> PathBuf {
+    target
+        .join("debug")
+        .join(format!("{name}{}", std::env::consts::EXE_SUFFIX))
+}
 
 #[test]
 fn cargo_precedence_overrides_keep_user_selected_build_and_target_roots() {
@@ -15,6 +37,7 @@ fn cargo_precedence_overrides_keep_user_selected_build_and_target_roots() {
     );
 
     let project = sandbox.simple_bin("project-override").unwrap();
+    add_build_script(&project);
     let project_build = project.join("project-build");
     let project_target = project.join("project-target");
     std::fs::create_dir_all(project.join(".cargo")).unwrap();
@@ -29,7 +52,7 @@ fn cargo_precedence_overrides_keep_user_selected_build_and_target_roots() {
     let build = sandbox
         .cargo()
         .current_dir(&project)
-        .args(["build", "--offline"])
+        .args(["build", "--offline", "--message-format=json"])
         .output()
         .unwrap();
     assert!(
@@ -37,10 +60,11 @@ fn cargo_precedence_overrides_keep_user_selected_build_and_target_roots() {
         "{}",
         String::from_utf8_lossy(&build.stderr)
     );
-    assert!(project_target.join("debug/project-override").exists());
-    assert!(project_build.join("debug/deps").is_dir());
+    assert!(final_binary(&project_target, "project-override").exists());
+    assert!(build_script_out_dir(&build).starts_with(&project_build));
 
     let env_project = sandbox.simple_bin("environment-override").unwrap();
+    add_build_script(&env_project);
     let env_build = env_project.join("env-build");
     let env_target = env_project.join("env-target");
     let build = sandbox
@@ -48,7 +72,7 @@ fn cargo_precedence_overrides_keep_user_selected_build_and_target_roots() {
         .current_dir(&env_project)
         .env("CARGO_BUILD_BUILD_DIR", &env_build)
         .env("CARGO_TARGET_DIR", &env_target)
-        .args(["build", "--offline"])
+        .args(["build", "--offline", "--message-format=json"])
         .output()
         .unwrap();
     assert!(
@@ -56,10 +80,11 @@ fn cargo_precedence_overrides_keep_user_selected_build_and_target_roots() {
         "{}",
         String::from_utf8_lossy(&build.stderr)
     );
-    assert!(env_target.join("debug/environment-override").exists());
-    assert!(env_build.join("debug/deps").is_dir());
+    assert!(final_binary(&env_target, "environment-override").exists());
+    assert!(build_script_out_dir(&build).starts_with(&env_build));
 
     let cli_project = sandbox.simple_bin("cli-override").unwrap();
+    add_build_script(&cli_project);
     let cli_target = cli_project.join("cli-target");
     let build = sandbox
         .cargo()
@@ -69,6 +94,7 @@ fn cargo_precedence_overrides_keep_user_selected_build_and_target_roots() {
             "--offline",
             "--target-dir",
             cli_target.to_str().unwrap(),
+            "--message-format=json",
         ])
         .output()
         .unwrap();
@@ -77,25 +103,22 @@ fn cargo_precedence_overrides_keep_user_selected_build_and_target_roots() {
         "{}",
         String::from_utf8_lossy(&build.stderr)
     );
-    assert!(cli_target.join("debug/cli-override").exists());
+    assert!(final_binary(&cli_target, "cli-override").exists());
     let managed = rgo_core::paths::RgoPaths {
         root: sandbox.rgo_home.clone(),
     };
     assert!(
-        managed
-            .managed_build_dirs()
-            .iter()
-            .any(|dir| dir.join("debug/deps").is_dir()),
+        build_script_out_dir(&build).starts_with(managed.builds_dir()),
         "--target-dir must not cancel the configured build directory"
     );
 
     let bypass_project = sandbox.simple_bin("bypass-override").unwrap();
-    let before = managed.managed_build_dirs().len();
+    add_build_script(&bypass_project);
     let bypass = sandbox
         .cargo()
         .current_dir(&bypass_project)
         .env("RGO_BYPASS", "1")
-        .args(["build", "--offline"])
+        .args(["build", "--offline", "--message-format=json"])
         .output()
         .unwrap();
     assert!(
@@ -104,7 +127,7 @@ fn cargo_precedence_overrides_keep_user_selected_build_and_target_roots() {
         String::from_utf8_lossy(&bypass.stderr)
     );
     assert!(
-        managed.managed_build_dirs().len() > before,
+        build_script_out_dir(&bypass).starts_with(managed.builds_dir()),
         "RGO_BYPASS must not imply that Cargo relocation is disabled"
     );
 

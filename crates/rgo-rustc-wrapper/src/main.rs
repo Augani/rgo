@@ -31,12 +31,22 @@ use rgo_protocol::{
 
 mod platform {
     use std::io;
+    #[cfg(windows)]
+    use std::io::{Read, Write};
     use std::path::Path;
     use std::time::Duration;
+    #[cfg(windows)]
+    use std::time::Instant;
 
     use interprocess::local_socket::{ConnectOptions, prelude::*};
 
+    #[cfg(unix)]
     pub type Stream = interprocess::local_socket::Stream;
+    #[cfg(windows)]
+    pub struct Stream {
+        inner: interprocess::local_socket::Stream,
+        deadline: Instant,
+    }
 
     #[cfg(unix)]
     pub fn connect(path: &Path, timeout: Duration) -> io::Result<Stream> {
@@ -54,15 +64,60 @@ mod platform {
             .to_string_lossy()
             .into_owned()
             .to_ns_name::<GenericNamespaced>()?;
-        let stream = ConnectOptions::new().name(name).connect_sync()?;
-        set_timeout(&stream, timeout)?;
-        Ok(stream)
+        let inner = ConnectOptions::new()
+            .name(name)
+            .wait_mode(interprocess::ConnectWaitMode::Timeout(timeout))
+            .nonblocking_stream(true)
+            .connect_sync()?;
+        Ok(Stream {
+            inner,
+            deadline: Instant::now() + timeout,
+        })
     }
 
+    #[cfg(unix)]
     fn set_timeout(stream: &Stream, timeout: Duration) -> io::Result<()> {
         use interprocess::local_socket::traits::Stream as _;
         stream.set_recv_timeout(Some(timeout))?;
         stream.set_send_timeout(Some(timeout))
+    }
+
+    #[cfg(windows)]
+    impl Read for Stream {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            loop {
+                match self.inner.read(buf) {
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        if Instant::now() >= self.deadline {
+                            return Err(io::ErrorKind::TimedOut.into());
+                        }
+                        std::thread::sleep(Duration::from_millis(2));
+                    }
+                    result => return result,
+                }
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    impl Write for Stream {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            loop {
+                match self.inner.write(buf) {
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        if Instant::now() >= self.deadline {
+                            return Err(io::ErrorKind::TimedOut.into());
+                        }
+                        std::thread::sleep(Duration::from_millis(2));
+                    }
+                    result => return result,
+                }
+            }
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.inner.flush()
+        }
     }
 }
 

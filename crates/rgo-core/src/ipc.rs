@@ -7,6 +7,8 @@
 use std::io::{self, Read, Write};
 use std::path::Path;
 use std::time::Duration;
+#[cfg(windows)]
+use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
 use rgo_protocol::{
@@ -64,12 +66,16 @@ mod platform {
         ListenerOptions::new().name(name).create_sync()
     }
 
-    pub fn connect(path: &Path) -> io::Result<Stream> {
+    pub fn connect(path: &Path, timeout: std::time::Duration) -> io::Result<Stream> {
         let name = path
             .to_string_lossy()
             .into_owned()
             .to_ns_name::<GenericNamespaced>()?;
-        ConnectOptions::new().name(name).connect_sync()
+        ConnectOptions::new()
+            .name(name)
+            .wait_mode(interprocess::ConnectWaitMode::Timeout(timeout))
+            .nonblocking_stream(true)
+            .connect_sync()
     }
 }
 
@@ -77,27 +83,71 @@ pub struct Listener(platform::Listener);
 
 pub struct Connection {
     stream: platform::Stream,
+    #[cfg(windows)]
+    deadline: Option<Instant>,
 }
 
 impl Connection {
     /// Bound daemon-side resource usage for clients that connect and then stop sending bytes.
-    pub fn set_timeout(&self, timeout: Duration) -> io::Result<()> {
+    pub fn set_timeout(&mut self, timeout: Duration) -> io::Result<()> {
         use interprocess::local_socket::traits::Stream as _;
-        self.stream.set_recv_timeout(Some(timeout))?;
-        self.stream.set_send_timeout(Some(timeout))?;
+        #[cfg(unix)]
+        {
+            self.stream.set_recv_timeout(Some(timeout))?;
+            self.stream.set_send_timeout(Some(timeout))?;
+        }
+        #[cfg(windows)]
+        {
+            // interprocess named pipes reject recv/send timeouts. Poll the
+            // nonblocking stream against one deadline for the full exchange.
+            self.stream.set_nonblocking(true)?;
+            self.deadline = Some(Instant::now() + timeout);
+        }
         Ok(())
     }
 }
 
 impl Read for Connection {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        self.stream.read(buf)
+        #[cfg(unix)]
+        return self.stream.read(buf);
+        #[cfg(windows)]
+        loop {
+            match self.stream.read(buf) {
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    if self
+                        .deadline
+                        .is_some_and(|deadline| Instant::now() >= deadline)
+                    {
+                        return Err(io::ErrorKind::TimedOut.into());
+                    }
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                result => return result,
+            }
+        }
     }
 }
 
 impl Write for Connection {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.stream.write(buf)
+        #[cfg(unix)]
+        return self.stream.write(buf);
+        #[cfg(windows)]
+        loop {
+            match self.stream.write(buf) {
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    if self
+                        .deadline
+                        .is_some_and(|deadline| Instant::now() >= deadline)
+                    {
+                        return Err(io::ErrorKind::TimedOut.into());
+                    }
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                result => return result,
+            }
+        }
     }
 
     fn flush(&mut self) -> io::Result<()> {
@@ -115,7 +165,11 @@ impl Listener {
     pub fn accept(&self) -> io::Result<Connection> {
         use interprocess::local_socket::traits::Listener as _;
         let stream = self.0.accept()?;
-        Ok(Connection { stream })
+        Ok(Connection {
+            stream,
+            #[cfg(windows)]
+            deadline: None,
+        })
     }
 
     pub fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()> {
@@ -130,12 +184,22 @@ impl Listener {
 }
 
 pub fn connect(path: &Path, timeout: Duration) -> Result<Connection> {
-    let stream =
-        platform::connect(path).with_context(|| format!("connecting to {}", path.display()))?;
-    use interprocess::local_socket::traits::Stream as _;
-    stream.set_recv_timeout(Some(timeout))?;
-    stream.set_send_timeout(Some(timeout))?;
-    Ok(Connection { stream })
+    #[cfg(unix)]
+    let stream = platform::connect(path);
+    #[cfg(windows)]
+    let stream = platform::connect(path, timeout);
+    let stream = stream.with_context(|| format!("connecting to {}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use interprocess::local_socket::traits::Stream as _;
+        stream.set_recv_timeout(Some(timeout))?;
+        stream.set_send_timeout(Some(timeout))?;
+    }
+    Ok(Connection {
+        stream,
+        #[cfg(windows)]
+        deadline: Some(Instant::now() + timeout),
+    })
 }
 
 pub fn request(path: &Path, message: Request) -> Result<Response> {

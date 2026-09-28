@@ -1,7 +1,7 @@
 //! Small, bounded diagnostic sink for the long-running daemon.
 
 use std::fs::OpenOptions;
-use std::io::{self, Write};
+use std::io::{self, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 
 use fs4::fs_std::FileExt;
@@ -48,7 +48,8 @@ impl BoundedLog {
         lock.lock_exclusive()?;
         let mut log = OpenOptions::new()
             .create(true)
-            .append(true)
+            .truncate(false)
+            .write(true)
             .open(&self.path)?;
         let entry = if entry.len() as u64 > self.max_bytes {
             &entry[..self.max_bytes as usize]
@@ -58,9 +59,12 @@ impl BoundedLog {
         let rotate = log.metadata()?.len() > self.max_bytes.saturating_sub(entry.len() as u64);
         if rotate {
             log.set_len(0)?;
-            if (ROTATED_LOG.len() + entry.len()) as u64 <= self.max_bytes {
-                log.write_all(ROTATED_LOG)?;
-            }
+        }
+        // The stable external lock serializes all rgo writers. A writable
+        // handle can truncate on Windows; append-only handles cannot.
+        log.seek(SeekFrom::End(0))?;
+        if rotate && (ROTATED_LOG.len() + entry.len()) as u64 <= self.max_bytes {
+            log.write_all(ROTATED_LOG)?;
         }
         log.write_all(entry)
     }
