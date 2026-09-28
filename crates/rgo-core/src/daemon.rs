@@ -242,7 +242,7 @@ pub fn run(paths: RgoPaths, cfg: Resolved) -> Result<()> {
                 thread::spawn(move || {
                     let _permit = permit;
                     if let Err(error) = serve_connection(connection, &state) {
-                        tracing::debug!(%error, "daemon client disconnected with error");
+                        tracing::warn!(%error, "daemon client disconnected with error");
                     }
                 });
             }

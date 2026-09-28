@@ -79,7 +79,9 @@ fn start_daemon(sb: &Sandbox) -> Child {
     }
     let _ = child.kill();
     let _ = child.wait();
-    panic!("daemon did not create its socket");
+    let diagnostics = std::fs::read_to_string(sb.rgo_home.join("logs/daemon.log"))
+        .unwrap_or_else(|error| format!("daemon log unavailable: {error}"));
+    panic!("daemon did not answer IPC: {diagnostics}");
 }
 
 #[cfg(unix)]
@@ -249,7 +251,9 @@ fn explicit_daemon_home_survives_a_service_environment_without_cargo_home() {
     }
     let _ = daemon.kill();
     let _ = daemon.wait();
-    panic!("explicit daemon home did not create the expected socket");
+    let diagnostics = std::fs::read_to_string(sb.rgo_home.join("logs/daemon.log"))
+        .unwrap_or_else(|error| format!("daemon log unavailable: {error}"));
+    panic!("explicit daemon home did not answer IPC: {diagnostics}");
 }
 
 #[test]

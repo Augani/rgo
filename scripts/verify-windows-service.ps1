@@ -54,7 +54,15 @@ try {
     $taskName = [regex]::Match($serviceLine[0], '^would install service ([^ ]+) at ').Groups[1].Value
 
     $setupAttempted = $true
-    $setup = Invoke-Checked $cli @('setup')
+    try {
+        $setup = Invoke-Checked $cli @('setup')
+    } catch {
+        $daemonLog = Join-Path $rgoHome 'logs/daemon.log'
+        if (Test-Path $daemonLog) {
+            Write-Warning "Daemon diagnostics from private test home:`n$(Get-Content -Raw $daemonLog)"
+        }
+        throw
+    }
     if ($setup -notmatch 'daemon service: healthy') {
         throw "Setup did not verify a healthy scheduled daemon: $setup"
     }

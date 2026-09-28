@@ -28,10 +28,11 @@ fn plain_cargo_build_is_relocated_and_binary_still_uplifted() {
     );
 
     let proj = sb.simple_bin("hello").unwrap();
+    std::fs::write(proj.join("build.rs"), "fn main() {}\n").unwrap();
     let build = sb
         .cargo()
         .current_dir(&proj)
-        .args(["build", "--offline"])
+        .args(["build", "--offline", "--message-format=json"])
         .output()
         .unwrap();
     assert!(
@@ -47,29 +48,25 @@ fn plain_cargo_build_is_relocated_and_binary_still_uplifted() {
         bin.exists(),
         "final binary must still be uplifted into the checkout's target/"
     );
+    let out_dir = String::from_utf8_lossy(&build.stdout)
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .find(|message| message["reason"] == "build-script-executed")
+        .and_then(|message| message["out_dir"].as_str().map(std::path::PathBuf::from))
+        .expect("Cargo did not report the build-script output directory");
+    let builds_root = sb.rgo_home.join("builds");
     assert!(
-        !proj.join("target/debug/deps").exists(),
-        "intermediates must NOT be in the checkout"
+        out_dir.starts_with(&builds_root),
+        "Cargo reported intermediate output outside the managed root: {}",
+        out_dir.display()
     );
-
-    // Cargo's {workspace-path-hash} expands to two components: builds/xx/yyyy
-    let shards: Vec<_> = std::fs::read_dir(sb.rgo_home.join("builds"))
-        .unwrap()
-        .flatten()
-        .collect();
-    assert_eq!(shards.len(), 1);
-    let builds: Vec<_> = std::fs::read_dir(shards[0].path())
-        .unwrap()
-        .flatten()
-        .collect();
-    assert_eq!(builds.len(), 1, "exactly one managed build-dir expected");
+    let context = out_dir
+        .ancestors()
+        .take_while(|directory| directory.starts_with(&builds_root))
+        .find(|directory| directory.join(".rgo-context.json").is_file());
     assert!(
-        builds[0].path().join("debug/deps").exists(),
-        "intermediates live in the managed build-dir"
-    );
-    assert!(
-        builds[0].path().join(".rgo-context.json").exists(),
-        "wrapper wrote the sidecar"
+        context.is_some(),
+        "wrapper did not write the context sidecar"
     );
 
     let ls = sb.cmd(cargo_bin("rgo")).arg("ls").output().unwrap();

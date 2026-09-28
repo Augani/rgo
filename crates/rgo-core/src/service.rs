@@ -293,11 +293,21 @@ fn query_task_action(label: &str) -> Result<Option<TaskAction>> {
     if output.status.code().map(|code| code as u32) == Some(0x8007_0002) {
         return Ok(None);
     }
+    // On current Windows runners, schtasks exits with code 1 and a textual
+    // not-found error even with /HRESULT. An absent task is safe to treat as
+    // absent; every other query failure still blocks service mutation.
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if output.status.code() == Some(1)
+        && matches!(
+            stderr.trim(),
+            "ERROR: The system cannot find the path specified."
+                | "ERROR: The system cannot find the file specified."
+        )
+    {
+        return Ok(None);
+    }
     if !output.status.success() {
-        bail!(
-            "querying Task Scheduler entry {label}: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
+        bail!("querying Task Scheduler entry {label}: {}", stderr.trim());
     }
     let xml = decode_task_xml(&output.stdout)?;
     parse_task_action(&xml).map(Some)
