@@ -166,7 +166,37 @@ fn setup_activates_unchanged_cargo_exe_and_undo_restores_direct_cargo() {
         "{}",
         String::from_utf8_lossy(&undo.stderr)
     );
-    assert!(!shim.exists());
+    assert!(!record_path.exists());
+    assert!(shim.exists());
+    let after_undo = sandbox.simple_bin("windows-after-undo").unwrap();
+    let stale_shell = sandbox
+        .cmd("cmd.exe")
+        .current_dir(&after_undo)
+        .env("PATH", &path)
+        .args(["/C", "cargo", "build", "--offline"])
+        .output()
+        .unwrap();
+    assert!(
+        stale_shell.status.success(),
+        "{}",
+        String::from_utf8_lossy(&stale_shell.stderr)
+    );
+    assert!(after_undo.join("target/debug/deps").is_dir());
+    assert_eq!(
+        paths.checked_managed_build_dirs().unwrap().len(),
+        managed_before_direct
+    );
+    let reinstall = sandbox
+        .cmd(&cli)
+        .args(["setup", "--supervised", "--no-service", "--real-cargo"])
+        .arg(&real_cargo)
+        .output()
+        .unwrap();
+    assert!(
+        reinstall.status.success(),
+        "{}",
+        String::from_utf8_lossy(&reinstall.stderr)
+    );
 }
 
 #[test]

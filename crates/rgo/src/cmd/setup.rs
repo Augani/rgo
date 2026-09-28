@@ -220,6 +220,39 @@ pub fn run(
         .as_ref()
         .and_then(|r| r.supervised_cargo.as_ref());
     #[cfg(windows)]
+    let retain_previous_shim = if undo {
+        if let Some(shim) = previous_shim {
+            let path = Path::new(&shim.shim_path);
+            if path.parent() == Some(cargo_home.join("rgo/shims").as_path()) {
+                false
+            } else {
+                let fallback_path = super::windows_cargo_entry::fallback_path(path)?;
+                match std::fs::symlink_metadata(&fallback_path) {
+                    Ok(metadata) => {
+                        if !metadata.is_file() || metadata.file_type().is_symlink() {
+                            bail!("{} is not a plain file", fallback_path.display());
+                        }
+                        let fallback: super::windows_cargo_entry::ShimFallback =
+                            serde_json::from_slice(&std::fs::read(&fallback_path)?)?;
+                        if fallback.schema_version != 1
+                            || fallback.cargo_home != cargo_home
+                            || fallback.real_cargo != Path::new(&shim.real_cargo)
+                        {
+                            bail!("{} changed since setup", fallback_path.display());
+                        }
+                        true
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+                    Err(error) => return Err(error.into()),
+                }
+            }
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+    #[cfg(windows)]
     let shim_path = {
         let flat = cargo_home.join("rgo/shims").join(shim_name());
         let versioned = cargo_home
@@ -258,12 +291,6 @@ pub fn run(
             );
         }
     }
-    if supervised && previous_shim.is_none() && shim_path.exists() {
-        bail!(
-            "{} exists without an rgo ownership record",
-            shim_path.display()
-        );
-    }
     #[cfg(windows)]
     if supervised && previous_shim.is_none() {
         let flat = cargo_home.join("rgo/shims").join(shim_name());
@@ -297,6 +324,60 @@ pub fn run(
     } else {
         None
     };
+    #[cfg(windows)]
+    let shim_fallback = supervised_cargo
+        .as_ref()
+        .map(|shim| -> Result<(PathBuf, Vec<u8>)> {
+            let path = super::windows_cargo_entry::fallback_path(&shim_path)?;
+            let contents = serde_json::to_vec_pretty(&super::windows_cargo_entry::ShimFallback {
+                schema_version: 1,
+                cargo_home: cargo_home.clone(),
+                real_cargo: PathBuf::from(&shim.real_cargo),
+            })?;
+            Ok((path, contents))
+        })
+        .transpose()?;
+    #[cfg(windows)]
+    if let Some((path, _)) = &shim_fallback {
+        if let Ok(metadata) = std::fs::symlink_metadata(path) {
+            if !metadata.is_file() || metadata.file_type().is_symlink() {
+                bail!("{} is not a plain file", path.display());
+            }
+        }
+    }
+    #[cfg(windows)]
+    let old_shim_fallback = shim_fallback
+        .as_ref()
+        .map(|(path, _)| read_optional(path))
+        .transpose()?
+        .flatten();
+    #[cfg(windows)]
+    if previous_shim.is_some()
+        && shim_fallback.as_ref().is_some_and(|(_, contents)| {
+            old_shim_fallback
+                .as_deref()
+                .is_some_and(|old| old != contents)
+        })
+    {
+        bail!("owned Cargo launcher fallback changed since setup");
+    }
+    if supervised && previous_shim.is_none() && shim_path.exists() {
+        #[cfg(windows)]
+        let retained_owned = shim_fallback.as_ref().is_some_and(|(_, contents)| {
+            old_shim_fallback.as_deref() == Some(contents.as_slice())
+                && supervised_cargo.as_ref().is_some_and(|shim| {
+                    shim_matches(&shim_path, &shim.shim_contents).unwrap_or(false)
+                })
+        });
+        #[cfg(not(windows))]
+        let retained_owned = false;
+        if !retained_owned {
+            bail!(
+                "{} exists without an rgo ownership record",
+                shim_path.display()
+            );
+        }
+    }
     #[cfg(windows)]
     if let (Some(previous), Some(next)) = (previous_shim, supervised_cargo.as_ref()) {
         if previous.shim_contents != next.shim_contents {
@@ -608,6 +689,10 @@ pub fn run(
         let prepare = (|| -> Result<()> {
             atomic_write_state(&pointer_path, &format!("{root}\n"))?;
             write_optional(&inner_path, next_inner)?;
+            #[cfg(windows)]
+            if let Some((path, contents)) = &shim_fallback {
+                atomic_write_state_bytes(path, contents)?;
+            }
             atomic_write_state_bytes(
                 &record_path,
                 record_bytes
@@ -633,6 +718,10 @@ pub fn run(
                 (&owner_path, old_owner.as_deref()),
                 (&mode_path, old_mode.as_deref()),
             ])?;
+            #[cfg(windows)]
+            if let Some((path, _)) = &shim_fallback {
+                restore_optional(path, old_shim_fallback.as_deref())?;
+            }
             if let Some(shim) = &supervised_cargo {
                 restore_previous_shim(Path::new(&shim.shim_path), previous_shim, shim_preexisted)?;
             }
@@ -673,6 +762,10 @@ pub fn run(
                     (&owner_path, old_owner.as_deref()),
                     (&mode_path, old_mode.as_deref()),
                 ])?;
+                #[cfg(windows)]
+                if let Some((path, _)) = &shim_fallback {
+                    restore_optional(path, old_shim_fallback.as_deref())?;
+                }
                 if let Some(shim) = &supervised_cargo {
                     restore_previous_shim(
                         Path::new(&shim.shim_path),
@@ -687,6 +780,12 @@ pub fn run(
     }
     if dry_run {
         if let Some(shim) = previous_shim.filter(|_| undo) {
+            #[cfg(windows)]
+            println!(
+                "would retain supervised Cargo shim as an ordinary Cargo fallback {}",
+                shim.shim_path
+            );
+            #[cfg(not(windows))]
             println!("would remove supervised Cargo shim {}", shim.shim_path);
         } else if let Some(shim) = &supervised_cargo {
             println!("would install supervised Cargo shim {}", shim.shim_path);
@@ -703,8 +802,14 @@ pub fn run(
                         path.display()
                     );
                 }
-                std::fs::remove_file(path)
-                    .with_context(|| format!("removing {}", path.display()))?;
+                #[cfg(windows)]
+                let retained = retain_previous_shim;
+                #[cfg(not(windows))]
+                let retained = false;
+                if !retained {
+                    std::fs::remove_file(path)
+                        .with_context(|| format!("removing {}", path.display()))?;
+                }
             }
         }
         write_optional(&inner_path, None)?;
@@ -1047,6 +1152,8 @@ fn restore_previous_shim(
         Some(previous) if shim_matches(path, &previous.shim_contents)? => Ok(()),
         #[cfg(windows)]
         Some(_) => bail!("cannot restore a changed Windows Cargo shim"),
+        #[cfg(windows)]
+        None if existed_before => Ok(()),
         None => {
             if path.exists() {
                 std::fs::remove_file(path)?;

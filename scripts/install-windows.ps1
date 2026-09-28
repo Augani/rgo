@@ -778,7 +778,15 @@ try {
         }
         Assert-Condition (-not (Test-Path -LiteralPath (Join-Path $resolvedCargoHome '.rgo-install.json'))) 'Cargo activation remains after undo'
         if (Test-SupervisedState $state) {
-            Assert-Condition (-not (Test-Path -LiteralPath $shimPath)) 'owned Cargo shim remains after undo'
+            if ($state.PSObject.Properties['shimPath'] -and $state.shimPath) {
+                if (Test-Path -LiteralPath $shimPath) {
+                    Assert-PlainFile $shimPath
+                    Assert-Condition ((File-Digest $shimPath) -eq $state.cliDigest) 'retained Cargo fallback changed during undo'
+                    Assert-PlainFile (Join-Path $shimDir '.rgo-cargo-fallback.json')
+                }
+            } else {
+                Assert-Condition (-not (Test-Path -LiteralPath $shimPath)) 'legacy Cargo shim remains after undo'
+            }
         }
         foreach ($path in @($ownedCli, $ownedWrapper)) {
             if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Force }
@@ -786,7 +794,7 @@ try {
         Restore-OwnedPath $state
         if (Test-Path -LiteralPath $statePath) { Remove-Item -LiteralPath $statePath -Force }
         if (Test-Path -LiteralPath $pendingPath) { Remove-Item -LiteralPath $pendingPath -Force }
-        Write-Host "Removed owned Cargo activation and commands; retained versioned binaries and managed data at $resolvedRgoHome"
+        Write-Host "Removed owned Cargo activation and commands; retained the versioned Cargo fallback for old shells and managed data at $resolvedRgoHome"
         return
     }
 
@@ -896,15 +904,18 @@ try {
                 }
             }
             if ($installedSupervised) {
-                if (Test-Path -LiteralPath $shimPath) {
-                    Assert-PlainFile $shimPath
-                    Assert-Condition ((File-Digest $shimPath) -eq $cliDigest) 'owned Cargo shim differs from the verified release'
-                } else {
-                    Assert-Condition $Repair 'owned Cargo shim is missing; rerun with -Repair and the same verified bundle'
+                $fallbackPath = Join-Path $shimDir '.rgo-cargo-fallback.json'
+                if (-not (Test-Path -LiteralPath $shimPath) -or -not (Test-Path -LiteralPath $fallbackPath)) {
+                    Assert-Condition $Repair 'owned Cargo shim or fallback is missing; rerun with -Repair and the same verified bundle'
                     Invoke-Checked $cli @('setup', '--supervised', '--real-cargo', $state.realCargo, '--no-service') | Out-Null
-                    Assert-PlainFile $shimPath
-                    Assert-Condition ((File-Digest $shimPath) -eq $cliDigest) 'repaired Cargo shim differs from the verified release'
                 }
+                Assert-PlainFile $shimPath
+                Assert-Condition ((File-Digest $shimPath) -eq $cliDigest) 'owned Cargo shim differs from the verified release'
+                Assert-PlainFile $fallbackPath
+                $fallback = Read-Json $fallbackPath
+                Assert-Condition ($fallback.schema_version -eq 1 -and
+                    (Test-SamePath $fallback.cargo_home $resolvedCargoHome) -and
+                    (Test-SamePath $fallback.real_cargo $state.realCargo)) 'owned Cargo fallback differs from the installer state'
             }
             Assert-PlainCargoActivation $cli $state
             if (Test-Path -LiteralPath $pendingPath) {
@@ -979,6 +990,12 @@ try {
         if (Test-SupervisedState $state) {
             Assert-PlainFile $shimPath
             Assert-Condition ((File-Digest $shimPath) -eq $cliDigest) 'owned Cargo shim differs from the verified release'
+            $fallbackPath = Join-Path $shimDir '.rgo-cargo-fallback.json'
+            Assert-PlainFile $fallbackPath
+            $fallback = Read-Json $fallbackPath
+            Assert-Condition ($fallback.schema_version -eq 1 -and
+                (Test-SamePath $fallback.cargo_home $resolvedCargoHome) -and
+                (Test-SamePath $fallback.real_cargo $state.realCargo)) 'owned Cargo fallback differs from the installer state'
         }
         Assert-PlainCargoActivation $cli $state
         foreach ($pair in @(@($commandWrapper, $wrapper, $wrapperDigest), @($commandCli, $cli, $cliDigest))) {

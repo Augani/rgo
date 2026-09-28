@@ -236,7 +236,9 @@ try {
     if (-not (Test-Path $shim)) { throw 'supervised repair did not restore the owned Cargo shim' }
     & $installScript -Uninstall -CargoHome $cargoHome -RgoHome $rgoHome
     $installed = $false
-    if (Test-Path $shim) { throw 'supervised uninstall left its Cargo shim behind' }
+    if (-not (Test-Path $shim) -or -not (Test-Path (Join-Path (Split-Path $shim -Parent) '.rgo-cargo-fallback.json'))) {
+        throw 'supervised uninstall did not retain its old-shell Cargo fallback'
+    }
     if ([string](Get-RawUserPath) -cne [string]$expectedUserPath) {
         throw 'supervised uninstall changed user PATH despite -NoUserPath'
     }
