@@ -107,3 +107,7 @@ finally {
     $env:RUSTUP_HOME = $priorRustupHome
     $env:RUSTUP_TOOLCHAIN = $priorToolchain
 }
+
+# The expected failed `schtasks /Query` after undo leaves LASTEXITCODE=1 even
+# though the probe completed successfully; PowerShell otherwise propagates it.
+exit 0

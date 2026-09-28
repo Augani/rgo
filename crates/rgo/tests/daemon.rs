@@ -813,12 +813,23 @@ fn maintenance_reclaims_orphans_via_auto_gc() {
         .stderr(Stdio::null())
         .spawn()
         .unwrap();
+    let socket = sb.rgo_home.join("state/daemon.sock");
+    let mut ready = false;
     for _ in 0..80 {
-        if sb.rgo_home.join("state/daemon.sock").exists() {
+        if matches!(
+            ipc::request_with_timeout(&socket, Request::QueryStatus, Duration::from_millis(100)),
+            Ok(Response::Status(_))
+        ) {
+            ready = true;
             break;
         }
+        assert!(
+            daemon.try_wait().unwrap().is_none(),
+            "daemon exited during startup"
+        );
         thread::sleep(Duration::from_millis(25));
     }
+    assert!(ready, "daemon did not answer IPC during startup");
     let project = sb.simple_bin("auto-gc-project").unwrap();
     let build = sb
         .cmd(cargo_bin("rgo"))
@@ -840,7 +851,9 @@ fn maintenance_reclaims_orphans_via_auto_gc() {
     }
     assert!(
         !context_dir.exists(),
-        "daemon maintenance did not auto-GC the aged orphan"
+        "daemon maintenance did not auto-GC the aged orphan; status: {:?}; daemon: {}",
+        ipc::request_with_timeout(&socket, Request::QueryStatus, Duration::from_secs(2)),
+        std::fs::read_to_string(sb.rgo_home.join("logs/daemon.log")).unwrap_or_default(),
     );
     daemon.kill().unwrap();
     let _ = daemon.wait();

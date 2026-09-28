@@ -89,9 +89,9 @@ pub struct Connection {
 impl Connection {
     /// Bound daemon-side resource usage for clients that connect and then stop sending bytes.
     pub fn set_timeout(&mut self, timeout: Duration) -> io::Result<()> {
-        use interprocess::local_socket::traits::Stream as _;
         #[cfg(unix)]
         {
+            use interprocess::local_socket::traits::Stream as _;
             self.stream.set_recv_timeout(Some(timeout))?;
             self.stream.set_send_timeout(Some(timeout))?;
         }

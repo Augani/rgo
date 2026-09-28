@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, ensure};
 use rgo_core::config::Config;
@@ -97,9 +97,13 @@ pub fn ensure_running(paths: &RgoPaths) -> bool {
     {
         return false;
     }
-    for _ in 0..40 {
-        thread::sleep(Duration::from_millis(25));
-        if daemon_responds(paths) {
+    // Spawning a Rust binary from a cold disk or an overloaded CI host can
+    // exceed one second. This path is for explicit commands/opted-in
+    // maintenance, never the compiler wrapper's 150 ms fail-open probe.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(50));
+        if daemon_responds_with_timeout(paths, Duration::from_millis(250)) {
             return true;
         }
     }
@@ -113,15 +117,15 @@ pub fn is_available(paths: &RgoPaths) -> bool {
 }
 
 fn daemon_responds(paths: &RgoPaths) -> bool {
+    daemon_responds_with_timeout(paths, Duration::from_secs(2))
+}
+
+fn daemon_responds_with_timeout(paths: &RgoPaths, timeout: Duration) -> bool {
     // Health must not depend on a full storage scan. A status computation can
     // fail because one managed path is unreadable while the daemon is alive;
     // treating that as a dead daemon would start a duplicate and hide the
     // actual error from `rgo status`.
-    match ipc::request_with_timeout(
-        &paths.socket_path(),
-        Request::QueryRemoteStatus,
-        Duration::from_secs(2),
-    ) {
+    match ipc::request_with_timeout(&paths.socket_path(), Request::QueryRemoteStatus, timeout) {
         Ok(Response::RemoteStatus(_)) => true,
         Ok(other) => {
             tracing::debug!(response = ?other, "daemon health check returned unexpected response");

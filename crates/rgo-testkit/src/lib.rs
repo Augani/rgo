@@ -61,6 +61,31 @@ impl Sandbox {
                 "RUSTUP_TOOLCHAIN",
                 std::env::var_os("RUSTUP_TOOLCHAIN").unwrap_or_else(|| "stable".into()),
             );
+        #[cfg(windows)]
+        {
+            // MSVC and the Windows SDK are discovered through these process
+            // settings. Stripping them can make rustc pick Git's unrelated
+            // `link.exe` from PATH when a private-home test invokes Cargo.
+            for key in [
+                "SystemRoot",
+                "WINDIR",
+                "ProgramFiles",
+                "ProgramFiles(x86)",
+                "ProgramW6432",
+                "COMSPEC",
+                "VSINSTALLDIR",
+                "VCINSTALLDIR",
+                "VCToolsInstallDir",
+                "WindowsSdkDir",
+                "WindowsSDKLibVersion",
+                "LIB",
+                "INCLUDE",
+            ] {
+                if let Some(value) = std::env::var_os(key) {
+                    c.env(key, value);
+                }
+            }
+        }
         c
     }
 
