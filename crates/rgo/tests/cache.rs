@@ -1764,11 +1764,17 @@ printf 'dep:%s\n' "$name" > "$out/$name.d"
         invoke("bin-first", "bin", "dep-info,metadata");
         invoke("bin-second", "bin", "dep-info,metadata");
 
-        assert_eq!(
-            compile_count(&fixture),
-            2,
-            "proc-macro and metadata-only bin second builds should hit"
-        );
+        let compiles = compile_count(&fixture);
+        if compiles != 2 {
+            let events = fs::read_to_string(sb.rgo_home.join("state/cache-events.log"))
+                .unwrap_or_else(|error| format!("cache event log unavailable: {error}"));
+            let status = sb.cmd(cargo_bin("rgo")).arg("status").output().unwrap();
+            panic!(
+                "proc-macro and metadata-only bin second builds should hit; compiled {compiles} times; cache events: {events}; status: {} {}",
+                String::from_utf8_lossy(&status.stdout),
+                String::from_utf8_lossy(&status.stderr)
+            );
+        }
 
         daemon.kill().unwrap();
         let _ = daemon.wait();

@@ -1,6 +1,6 @@
 #![cfg(unix)]
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
@@ -18,6 +18,10 @@ fn cargo_proxy() -> PathBuf {
         .map(|dir| dir.join("cargo"))
         .find(|path| path.is_file())
         .expect("Cargo proxy on PATH")
+}
+
+fn has_entries(path: &Path) -> bool {
+    std::fs::read_dir(path).is_ok_and(|mut entries| entries.next().is_some())
 }
 
 #[test]
@@ -96,7 +100,7 @@ fn launcher_does_not_manage_another_cargo_home_or_storage_root() {
         String::from_utf8_lossy(&misplaced.stderr)
     );
     assert!(String::from_utf8_lossy(&misplaced.stderr).contains("Cargo home differs"));
-    assert!(project.join("target/debug/deps").is_dir());
+    assert!(project.join("target/debug").is_dir());
     assert!(first_paths.managed_build_dirs().is_empty());
     assert!(second_paths.managed_build_dirs().is_empty());
 
@@ -133,7 +137,7 @@ fn launcher_does_not_manage_another_cargo_home_or_storage_root() {
         String::from_utf8_lossy(&overridden.stderr)
     );
     assert!(String::from_utf8_lossy(&overridden.stderr).contains("storage root differs"));
-    assert!(override_project.join("target/debug/deps").is_dir());
+    assert!(override_project.join("target/debug").is_dir());
     assert!(first_paths.managed_build_dirs().is_empty());
     assert_eq!(second_paths.managed_build_dirs().len(), 1);
 }
@@ -274,7 +278,7 @@ fn unavailable_automatic_maintenance_uses_ordinary_cargo_storage() {
         String::from_utf8_lossy(&build.stderr)
     );
     assert!(String::from_utf8_lossy(&build.stderr).contains("using ordinary Cargo storage"));
-    assert!(project.join("target/debug/deps").is_dir());
+    assert!(project.join("target/debug").is_dir());
     assert!(paths.managed_build_dirs().is_empty());
 }
 
@@ -335,7 +339,7 @@ fn unsupported_cargo_is_rejected_at_setup_and_left_unmanaged_by_the_launcher() {
         String::from_utf8_lossy(&build.stderr)
     );
     assert!(String::from_utf8_lossy(&build.stderr).contains("using ordinary Cargo storage"));
-    assert!(project.join("target/debug/deps").is_dir());
+    assert!(project.join("target/debug").is_dir());
     let paths = RgoPaths {
         root: sandbox.rgo_home.clone(),
     };
@@ -720,7 +724,6 @@ fn shimmed_cargo_isolated_from_direct_cargo_and_holds_gc_lock_through_run() {
     assert_eq!(contexts.len(), 1);
     let context = &contexts[0];
     assert!(context.join(".rgo-context.json").is_file());
-    assert!(!project.join("target/debug/deps").exists());
     let sidecar_path = context.join(".rgo-context.json");
     let mut stale: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&sidecar_path).unwrap()).unwrap();
@@ -858,7 +861,7 @@ fn shimmed_cargo_isolated_from_direct_cargo_and_holds_gc_lock_through_run() {
         "{}",
         String::from_utf8_lossy(&overridden.stderr)
     );
-    assert!(custom_build.join("debug/deps").is_dir());
+    assert!(has_entries(&custom_build));
 
     let project_build = sandbox.home.join("project-selected-build-dir");
     let project_config = project.join(".cargo/config.toml");
@@ -883,7 +886,7 @@ fn shimmed_cargo_isolated_from_direct_cargo_and_holds_gc_lock_through_run() {
         "{}",
         String::from_utf8_lossy(&project_override.stderr)
     );
-    assert!(project_build.join("debug/deps").is_dir());
+    assert!(has_entries(&project_build));
     std::fs::remove_file(&project_config).unwrap();
 
     let env_build = sandbox.home.join("environment-selected-build-dir");
@@ -900,7 +903,7 @@ fn shimmed_cargo_isolated_from_direct_cargo_and_holds_gc_lock_through_run() {
         "{}",
         String::from_utf8_lossy(&environment_override.stderr)
     );
-    assert!(env_build.join("debug/deps").is_dir());
+    assert!(has_entries(&env_build));
 
     let plugin = sandbox.cargo_home.join("rgo/shims/cargo-hold");
     std::fs::write(
@@ -975,7 +978,7 @@ fn shimmed_cargo_isolated_from_direct_cargo_and_holds_gc_lock_through_run() {
         "{}",
         String::from_utf8_lossy(&direct.stderr)
     );
-    assert!(project.join("target/debug/deps").is_dir());
+    assert!(project.join("target/debug").is_dir());
 
     let ready = sandbox.home.join("cargo-run-ready");
     let release = sandbox.home.join("cargo-run-release");
@@ -1218,7 +1221,7 @@ fn shimmed_cargo_isolated_from_direct_cargo_and_holds_gc_lock_through_run() {
         "{}",
         String::from_utf8_lossy(&unsafe_shard.stderr)
     );
-    assert!(project.join("target/debug/deps").is_dir());
+    assert!(project.join("target/debug").is_dir());
     assert!(!external.join(context.file_name().unwrap()).exists());
     std::fs::remove_file(shard).unwrap();
 

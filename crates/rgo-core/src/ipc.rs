@@ -10,6 +10,9 @@ use std::time::Duration;
 #[cfg(windows)]
 use std::time::Instant;
 
+#[cfg(windows)]
+const ERROR_NO_DATA: i32 = 232;
+
 use anyhow::{Context, Result, bail};
 use rgo_protocol::{
     CLIENT_TIMEOUT_MILLIS, MAX_FRAME_SIZE, PROTOCOL_VERSION, Request, Response, decode_frame,
@@ -114,7 +117,22 @@ impl Read for Connection {
         #[cfg(windows)]
         loop {
             match self.stream.read(buf) {
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                Ok(0) if !buf.is_empty() => {
+                    // A Windows pipe in PIPE_NOWAIT mode can report no bytes
+                    // before the peer has replied. Keep the exchange bounded
+                    // by its deadline rather than treating that as EOF.
+                    if self
+                        .deadline
+                        .is_some_and(|deadline| Instant::now() >= deadline)
+                    {
+                        return Err(io::ErrorKind::TimedOut.into());
+                    }
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                Err(error)
+                    if error.kind() == io::ErrorKind::WouldBlock
+                        || error.raw_os_error() == Some(ERROR_NO_DATA) =>
+                {
                     if self
                         .deadline
                         .is_some_and(|deadline| Instant::now() >= deadline)
@@ -136,7 +154,19 @@ impl Write for Connection {
         #[cfg(windows)]
         loop {
             match self.stream.write(buf) {
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                Ok(0) if !buf.is_empty() => {
+                    if self
+                        .deadline
+                        .is_some_and(|deadline| Instant::now() >= deadline)
+                    {
+                        return Err(io::ErrorKind::TimedOut.into());
+                    }
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                Err(error)
+                    if error.kind() == io::ErrorKind::WouldBlock
+                        || error.raw_os_error() == Some(ERROR_NO_DATA) =>
+                {
                     if self
                         .deadline
                         .is_some_and(|deadline| Instant::now() >= deadline)

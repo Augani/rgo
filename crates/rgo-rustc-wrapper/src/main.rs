@@ -38,6 +38,9 @@ mod platform {
     #[cfg(windows)]
     use std::time::Instant;
 
+    #[cfg(windows)]
+    const ERROR_NO_DATA: i32 = 232;
+
     use interprocess::local_socket::{ConnectOptions, prelude::*};
 
     #[cfg(unix)]
@@ -87,7 +90,16 @@ mod platform {
         fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
             loop {
                 match self.inner.read(buf) {
-                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    Ok(0) if !buf.is_empty() => {
+                        if Instant::now() >= self.deadline {
+                            return Err(io::ErrorKind::TimedOut.into());
+                        }
+                        std::thread::sleep(Duration::from_millis(2));
+                    }
+                    Err(error)
+                        if error.kind() == io::ErrorKind::WouldBlock
+                            || error.raw_os_error() == Some(ERROR_NO_DATA) =>
+                    {
                         if Instant::now() >= self.deadline {
                             return Err(io::ErrorKind::TimedOut.into());
                         }
@@ -104,7 +116,16 @@ mod platform {
         fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
             loop {
                 match self.inner.write(buf) {
-                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    Ok(0) if !buf.is_empty() => {
+                        if Instant::now() >= self.deadline {
+                            return Err(io::ErrorKind::TimedOut.into());
+                        }
+                        std::thread::sleep(Duration::from_millis(2));
+                    }
+                    Err(error)
+                        if error.kind() == io::ErrorKind::WouldBlock
+                            || error.raw_os_error() == Some(ERROR_NO_DATA) =>
+                    {
                         if Instant::now() >= self.deadline {
                             return Err(io::ErrorKind::TimedOut.into());
                         }
