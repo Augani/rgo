@@ -361,7 +361,7 @@ function Upgrade-Plan([string]$Cli, [bool]$NoWrapper, [bool]$Supervised,
     $fallbackPath = if ($Supervised) { Join-Path (Split-Path -Path $ShimPath -Parent) '.rgo-cargo-fallback.json' } else { $null }
     if ($Supervised) {
         Assert-Condition ($plan.binaries -and @($plan.binaries.PSObject.Properties).Count -eq 1) 'staged CLI did not plan exactly one Cargo shim binary'
-        $binary = $plan.binaries.PSObject.Properties[0]
+        $binary = @($plan.binaries.PSObject.Properties)[0]
         Assert-Condition ((Test-SamePath $binary.Name $ShimPath) -and
             $binary.Value -match '^binary-blake3:[0-9a-f]{64}$') 'staged CLI planned an unexpected Cargo shim binary'
     }
@@ -555,8 +555,9 @@ function Recover-SupervisedUpgradeGuarded([string]$JournalPath, $Journal) {
     $seen = @{}
     foreach ($entry in $Journal.files) {
         Assert-Condition (Test-ActivationPath $entry.path $pair.newFallback) "supervised upgrade journal names an unexpected path: $($entry.path)"
-        Assert-Condition (-not $seen.ContainsKey($entry.path)) "duplicate supervised upgrade path: $($entry.path)"
-        $seen[$entry.path] = $true
+        $key = Full-Path $entry.path
+        Assert-Condition (-not $seen.ContainsKey($key)) "duplicate supervised upgrade path: $($entry.path)"
+        $seen[$key] = $true
         $current = Encoded-File $entry.path
         if ($committed) {
             Assert-Condition (Test-ExactText $current $entry.after) "committed activation file changed: $($entry.path)"
@@ -565,8 +566,8 @@ function Recover-SupervisedUpgradeGuarded([string]$JournalPath, $Journal) {
                 (Test-ExactText $current $entry.after)) "activation file changed during supervised upgrade: $($entry.path)"
         }
     }
-    Assert-Condition ($seen.ContainsKey((Join-Path $script:resolvedCargoHome '.rgo-install.json')) -and
-        $seen.ContainsKey($pair.newFallback)) 'supervised upgrade journal omitted the record or new fallback'
+    Assert-Condition ($seen.ContainsKey((Full-Path (Join-Path $script:resolvedCargoHome '.rgo-install.json'))) -and
+        $seen.ContainsKey((Full-Path $pair.newFallback))) 'supervised upgrade journal omitted the record or new fallback'
     $commands = @(
         @((Join-Path $script:resolvedBinDir 'rgo.exe'), $oldCli, $newCli, $Journal.oldState.cliDigest, $Journal.newState.cliDigest),
         @((Join-Path $script:resolvedBinDir 'rgo-rustc-wrapper.exe'), $oldWrapper, $newWrapper, $Journal.oldState.wrapperDigest, $Journal.newState.wrapperDigest)

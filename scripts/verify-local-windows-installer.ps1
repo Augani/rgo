@@ -278,6 +278,25 @@ try {
     $supervisedUpgradeArgs['ReleaseTag'] = $upgradeTag
     $supervisedUpgradeArgs['Archive'] = $upgradeArchive
     $supervisedUpgradeArgs['Sha256'] = $upgradeSha
+    $oldSupervisedState = [IO.File]::ReadAllText((Join-Path $cargoHome 'rgo/installer-windows.json'))
+    $oldSupervisedRecord = [IO.File]::ReadAllText($recordPath)
+    try {
+        $env:RGO_SETUP_TEST_EXIT_AFTER_RECORD = '1'
+        try {
+            & $installScript @supervisedUpgradeArgs -NoService
+            throw 'forced supervised setup interruption unexpectedly succeeded'
+        } catch {
+            if ($_.Exception.Message -notmatch 'exit 88') { throw }
+        }
+    } finally { Remove-Item Env:RGO_SETUP_TEST_EXIT_AFTER_RECORD -ErrorAction SilentlyContinue }
+    if ((Test-Path (Join-Path $cargoHome 'rgo/installer-windows-upgrade.json')) -or
+        [IO.File]::ReadAllText((Join-Path $cargoHome 'rgo/installer-windows.json')) -cne $oldSupervisedState -or
+        [IO.File]::ReadAllText($recordPath) -cne $oldSupervisedRecord -or
+        (Test-Path -LiteralPath $newShim) -or
+        -not [string]::Equals((Get-Command cargo.exe).Source, $shim,
+            [StringComparison]::OrdinalIgnoreCase)) {
+        throw 'interrupted supervised upgrade did not restore the old activation'
+    }
     & $installScript @supervisedUpgradeArgs -NoService
     $upgradedRecord = Get-Content -LiteralPath $recordPath -Raw | ConvertFrom-Json
     $upgradedShim = Join-Path $cargoHome "rgo/shims/$upgradeTag/cargo.exe"
@@ -298,6 +317,19 @@ try {
     try {
         & cmd.exe /C 'cargo build --offline' | Out-Null
         if ($LASTEXITCODE -ne 0) { throw 'unchanged Cargo build failed after supervised upgrade' }
+    } finally { Pop-Location }
+    $staleProject = Join-Path $sandbox 'stale-supervised-cargo'
+    New-Item -ItemType Directory -Path (Join-Path $staleProject 'src') | Out-Null
+    [IO.File]::WriteAllText((Join-Path $staleProject 'Cargo.toml'),
+        "[package]`nname = 'rgo_windows_stale_shim_probe'`nversion = '0.1.0'`nedition = '2021'`n")
+    [IO.File]::WriteAllText((Join-Path $staleProject 'src/main.rs'), 'fn main() {}')
+    Push-Location $staleProject
+    try {
+        & $shim build --offline | Out-Null
+        if ($LASTEXITCODE -ne 0 -or
+            -not (Test-Path (Join-Path $staleProject 'target/debug/rgo_windows_stale_shim_probe.exe'))) {
+            throw 'old-shell Cargo did not fall back to local storage after supervised upgrade'
+        }
     } finally { Pop-Location }
     & $installScript -Uninstall -CargoHome $cargoHome -RgoHome $rgoHome
     $installed = $false
