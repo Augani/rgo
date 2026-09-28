@@ -18,15 +18,13 @@ use rgo_protocol::{
 use super::{daemon, env};
 
 pub fn run(args: Vec<OsString>) -> Result<()> {
-    let cargo = std::env::var_os("CARGO")
-        .filter(|c| !c.is_empty())
-        .unwrap_or_else(|| "cargo".into());
+    let (cargo, prefix, args) = cargo_invocation(args);
 
     let mut lease = None;
     let mut manifest = None;
     if std::env::var_os(BYPASS_ENV).is_none() {
         if let Ok(e) = env() {
-            manifest = attribute(&cargo, &args).ok().flatten();
+            manifest = attribute(&cargo, &prefix, &args).ok().flatten();
             if let Some(manifest_path) = &manifest {
                 if daemon::ensure_running(&e.paths) {
                     let workspace_root = std::path::Path::new(manifest_path)
@@ -50,7 +48,7 @@ pub fn run(args: Vec<OsString>) -> Result<()> {
     }
 
     let mut command = Command::new(&cargo);
-    command.args(&args);
+    command.args(&prefix).args(&args);
     if std::env::var_os(BYPASS_ENV).is_some() {
         for (key, _) in std::env::vars_os() {
             if key.to_string_lossy().starts_with("RGO_") {
@@ -72,12 +70,39 @@ pub fn run(args: Vec<OsString>) -> Result<()> {
     std::process::exit(exit_code(status));
 }
 
+fn cargo_invocation(args: Vec<OsString>) -> (OsString, Vec<OsString>, Vec<OsString>) {
+    // Cargo's CARGO environment variable may name the real cargo binary,
+    // which does not parse rustup's +toolchain directive. Preserve that
+    // directive by asking rustup to select the requested cargo explicitly.
+    if let Some(toolchain) = args
+        .first()
+        .and_then(|arg| arg.to_str())
+        .and_then(|arg| arg.strip_prefix('+'))
+        .filter(|toolchain| !toolchain.is_empty())
+    {
+        return (
+            "rustup".into(),
+            vec!["run".into(), toolchain.into(), "cargo".into()],
+            args.into_iter().skip(1).collect(),
+        );
+    }
+    (
+        std::env::var_os("CARGO")
+            .filter(|cargo| !cargo.is_empty())
+            .unwrap_or_else(|| "cargo".into()),
+        Vec::new(),
+        args,
+    )
+}
+
 /// Ask Cargo for the workspace root; the build-dir itself is only learned when a compile
 /// happens (via the wrapper), so here we just make sure a `cargo locate-project` succeeds
 /// and stash the result for the wrapper / future daemon.
-fn attribute(cargo: &OsString, args: &[OsString]) -> Result<Option<String>> {
+fn attribute(cargo: &OsString, prefix: &[OsString], args: &[OsString]) -> Result<Option<String>> {
     let mut locate = Command::new(cargo);
-    locate.args(["locate-project", "--workspace", "--message-format=plain"]);
+    locate
+        .args(prefix)
+        .args(["locate-project", "--workspace", "--message-format=plain"]);
     if let Some(manifest_path) = argument_value(args, "--manifest-path") {
         locate.args(["--manifest-path".into(), manifest_path]);
     }
