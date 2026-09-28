@@ -127,8 +127,15 @@ fn hash_path(path: &Path) -> blake3::Hash {
 fn hash_path(path: &Path) -> blake3::Hash {
     use std::os::windows::ffi::OsStrExt;
     let mut hasher = blake3::Hasher::new();
-    for word in path.as_os_str().encode_wide() {
-        hasher.update(&word.to_le_bytes());
+    // Paths returned by Windows directory enumeration use backslashes, while
+    // a caller can spell the same context with forward slashes. Hash path
+    // components, not the raw separator bytes, so both lock the same file.
+    for component in path.components() {
+        let words: Vec<u16> = component.as_os_str().encode_wide().collect();
+        hasher.update(&(words.len() as u64).to_le_bytes());
+        for word in words {
+            hasher.update(&word.to_le_bytes());
+        }
     }
     hasher.finalize()
 }
@@ -389,6 +396,21 @@ mod tests {
         assert!(try_lock_gc(&paths, Some(&active)).unwrap().is_none());
         assert!(try_lock_gc(&paths, Some(&idle)).unwrap().is_some());
         drop(session);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_lock_identity_ignores_separator_spelling() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = RgoPaths {
+            root: root.path().join("rgo"),
+        };
+        let forward = paths.builds_dir().join("aa/context");
+        let native = paths.builds_dir().join("aa").join("context");
+        assert_eq!(
+            lock_path(&paths, Some(&forward), true).unwrap(),
+            lock_path(&paths, Some(&native), true).unwrap()
+        );
     }
 
     #[cfg(unix)]

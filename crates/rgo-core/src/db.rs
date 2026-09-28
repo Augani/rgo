@@ -13,7 +13,9 @@ use fs4::fs_std::FileExt;
 use rgo_protocol::{
     CacheEvent, CacheManifest, CacheStatsReport, LeaseScope, PROTOCOL_VERSION, RemoteStatusReport,
 };
-use rusqlite::{Connection, ErrorCode, OpenFlags, OptionalExtension, params};
+use rusqlite::{
+    Connection, ErrorCode, OpenFlags, OptionalExtension, Transaction, TransactionBehavior, params,
+};
 
 use crate::context;
 use crate::paths::RgoPaths;
@@ -467,7 +469,12 @@ impl StateDb {
     ) -> Result<()> {
         let path = normalize(build_dir);
         let now = unix_now();
-        self.connection.execute(
+        // A touch updates two related records. Keep them in one short write
+        // transaction so concurrent clients queue for a single writer turn
+        // instead of racing for the WAL lock twice per touch.
+        let transaction =
+            Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
+        transaction.execute(
             "INSERT INTO contexts(build_dir, workspace_root, last_seen, last_used, physical_bytes, incremental_bytes)
              VALUES(?1, ?2, ?3, ?3, COALESCE(?4, 0), COALESCE(?5, 0))
              ON CONFLICT(build_dir) DO UPDATE SET
@@ -484,11 +491,12 @@ impl StateDb {
                 incremental_bytes.map(|v| v as i64),
             ],
         )?;
-        self.connection.execute(
+        transaction.execute(
             "INSERT INTO access_summary(build_dir, touch_count, last_touched) VALUES(?1, 1, ?2)
              ON CONFLICT(build_dir) DO UPDATE SET touch_count=touch_count+1, last_touched=excluded.last_touched",
             params![path.to_string_lossy(), now],
         )?;
+        transaction.commit()?;
         Ok(())
     }
 
