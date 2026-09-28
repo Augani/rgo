@@ -155,4 +155,13 @@ def verify() -> None:
 
 
 if __name__ == "__main__":
-    verify()
+    # Cargo's temporary --config patch overrides can append [[patch.unused]]
+    # records to the workspace lockfile. They must not leak into a committed
+    # lockfile: a subsequent --locked build rejects those transient records.
+    lockfile = ROOT / "Cargo.lock"
+    original_lockfile = lockfile.read_bytes()
+    try:
+        verify()
+    finally:
+        if lockfile.read_bytes() != original_lockfile:
+            lockfile.write_bytes(original_lockfile)
