@@ -124,7 +124,7 @@ fn spawn_background_daemon(exe: &std::path::Path, root: &std::path::Path) -> Res
     let application: Vec<u16> = exe.as_os_str().encode_wide().chain(Some(0)).collect();
     let mut command_line: Vec<u16> = "rgo daemon --foreground --home "
         .encode_utf16()
-        .chain(quote_windows_arg(root.as_os_str()))
+        .chain(super::windows_job::quote_windows_arg(root.as_os_str()))
         .chain(Some(0))
         .collect();
     let startup = STARTUPINFOW {
@@ -154,31 +154,6 @@ fn spawn_background_daemon(exe: &std::path::Path, root: &std::path::Path) -> Res
         CloseHandle(process.hProcess);
     }
     Ok(())
-}
-
-#[cfg(windows)]
-fn quote_windows_arg(value: &std::ffi::OsStr) -> Vec<u16> {
-    use std::os::windows::ffi::OsStrExt;
-    let mut quoted = vec![b'"' as u16];
-    let mut backslashes = 0;
-    for word in value.encode_wide() {
-        if word == b'\\' as u16 {
-            backslashes += 1;
-            continue;
-        }
-        if word == b'"' as u16 {
-            quoted.extend(std::iter::repeat_n(b'\\' as u16, backslashes * 2 + 1));
-            quoted.push(word);
-            backslashes = 0;
-            continue;
-        }
-        quoted.extend(std::iter::repeat_n(b'\\' as u16, backslashes));
-        backslashes = 0;
-        quoted.push(word);
-    }
-    quoted.extend(std::iter::repeat_n(b'\\' as u16, backslashes * 2));
-    quoted.push(b'"' as u16);
-    quoted
 }
 
 /// Read-only health probe used by `rgo doctor`. Unlike `ensure_running`, this never starts a

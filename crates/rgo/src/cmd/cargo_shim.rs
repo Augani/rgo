@@ -1,45 +1,43 @@
-//! Unix launcher for full-lifetime supervision of unchanged Cargo commands.
+//! Pilot launcher for full-lifetime supervision of unchanged Cargo commands.
 //! The real Cargo path is explicit so it cannot recurse through a PATH shim.
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use std::ffi::{OsStr, OsString};
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use std::path::{Path, PathBuf};
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use std::process::Command;
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use anyhow::{Context, Result, bail};
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use rgo_core::cargo_config;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use rgo_core::config::Config;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use rgo_core::context;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use rgo_core::paths::{RgoPaths, cargo_home};
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use rgo_core::supervision;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use rgo_protocol::BYPASS_ENV;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use serde::Deserialize;
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[derive(Deserialize)]
 struct CargoProject {
     root: PathBuf,
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub fn run(
     real_cargo: &Path,
     expected_cargo_home: Option<&Path>,
     expected_rgo_home: Option<&Path>,
     args: Vec<OsString>,
 ) -> Result<()> {
-    use std::os::unix::process::CommandExt;
-
     if !real_cargo.is_absolute() {
         bail!("--real-cargo must be an absolute path to the existing Cargo executable");
     }
@@ -64,9 +62,9 @@ pub fn run(
         return exec_real_cargo(real_cargo, &args);
     }
     let (toolchain, cargo_args) = split_toolchain(&args);
-    let mut command = Command::new(real_cargo);
+    let mut command_args = Vec::new();
     if let Some(toolchain) = toolchain {
-        command.arg(toolchain);
+        command_args.push(toolchain.to_os_string());
     }
     let mut selection = if std::env::var_os(BYPASS_ENV).is_some() {
         None
@@ -121,15 +119,28 @@ pub fn run(
             "build.build-dir={}",
             serde_json::to_string(&build_dir.to_string_lossy().as_ref())?
         );
-        command.args([OsStr::new("--config"), OsStr::new(&setting)]);
+        command_args.push(OsString::from("--config"));
+        command_args.push(OsString::from(setting));
     }
-    command.args(cargo_args);
-    session.retain_across_exec()?;
-    let error = command.exec();
-    Err(error).with_context(|| format!("executing {}", real_cargo.display()))
+    command_args.extend(cargo_args.iter().cloned());
+    #[cfg(unix)]
+    {
+        run_supervised(real_cargo, &command_args, session)
+    }
+    #[cfg(windows)]
+    {
+        run_supervised_windows(
+            real_cargo,
+            &command_args,
+            &args,
+            &paths,
+            selection.is_some(),
+            session,
+        )
+    }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn same_directory(expected: &Path, active: &Path) -> bool {
     expected.is_absolute()
         && expected.is_dir()
@@ -147,7 +158,67 @@ fn exec_real_cargo(real_cargo: &Path, args: &[OsString]) -> Result<()> {
     Err(error).with_context(|| format!("executing {}", real_cargo.display()))
 }
 
+#[cfg(windows)]
+fn exec_real_cargo(real_cargo: &Path, args: &[OsString]) -> Result<()> {
+    let status = Command::new(real_cargo)
+        .args(args)
+        .status()
+        .with_context(|| format!("executing {}", real_cargo.display()))?;
+    std::process::exit(status.code().unwrap_or(1))
+}
+
 #[cfg(unix)]
+fn run_supervised(
+    real_cargo: &Path,
+    args: &[OsString],
+    session: supervision::SessionGuard,
+) -> Result<()> {
+    use std::os::unix::process::CommandExt;
+
+    session.retain_across_exec()?;
+    let error = Command::new(real_cargo).args(args).exec();
+    Err(error).with_context(|| format!("executing {}", real_cargo.display()))
+}
+
+#[cfg(windows)]
+fn run_supervised_windows(
+    real_cargo: &Path,
+    args: &[OsString],
+    fallback_args: &[OsString],
+    paths: &RgoPaths,
+    managed: bool,
+    session: supervision::SessionGuard,
+) -> Result<()> {
+    let mut job = match super::windows_job::JobGuard::spawn(real_cargo, args) {
+        Ok(job) => job,
+        Err(error) => {
+            eprintln!(
+                "rgo: supervised Cargo job unavailable ({error:#}); using ordinary Cargo storage"
+            );
+            // Creation failed before Cargo could execute. If this invocation
+            // had selected a context, take the conservative global guard
+            // before releasing that context's guard and dropping its override.
+            if managed {
+                let global = supervision::lock_cargo_session(paths, None)?;
+                drop(session);
+                let _guard = global;
+                return exec_real_cargo(real_cargo, fallback_args);
+            }
+            let _guard = session;
+            return exec_real_cargo(real_cargo, fallback_args);
+        }
+    };
+    let code = job.wait_primary()?;
+    // The primary Cargo process can exit before a compiler or build-script
+    // descendant. Keep both the job and the filesystem guard through the
+    // complete process tree, then return Cargo's own exit code.
+    job.wait_empty()?;
+    drop(job);
+    drop(session);
+    std::process::exit(code as i32)
+}
+
+#[cfg(any(unix, windows))]
 fn split_toolchain(args: &[OsString]) -> (Option<&OsStr>, &[OsString]) {
     if args
         .first()
@@ -159,7 +230,7 @@ fn split_toolchain(args: &[OsString]) -> (Option<&OsStr>, &[OsString]) {
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn select_context(
     real_cargo: &Path,
     toolchain: Option<&OsStr>,
@@ -231,7 +302,7 @@ fn select_context(
     Ok(Some((dir, root.to_path_buf())))
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn config_may_override_build_dir() -> Result<bool> {
     if std::env::var_os("CARGO_BUILD_BUILD_DIR").is_some() {
         return Ok(true);
@@ -245,7 +316,7 @@ fn config_may_override_build_dir() -> Result<bool> {
     Ok(config_directory_may_override(&cargo_home()?))
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn config_directory_may_override(directory: &Path) -> bool {
     let legacy = directory.join("config");
     let modern = directory.join("config.toml");
@@ -266,7 +337,7 @@ fn config_directory_may_override(directory: &Path) -> bool {
         .unwrap_or(true)
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn workspace_command(args: &[OsString]) -> Option<&str> {
     const WORKSPACE_COMMANDS: &[&str] = &[
         "build", "b", "check", "c", "run", "r", "test", "t", "bench", "doc", "d", "clean", "rustc",
@@ -294,7 +365,7 @@ fn workspace_command(args: &[OsString]) -> Option<&str> {
     None
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn argument_value<'a>(args: &'a [OsString], flag: &str) -> Option<&'a OsStr> {
     let mut iter = args.iter();
     while let Some(argument) = iter.next() {
@@ -315,12 +386,12 @@ fn argument_value<'a>(args: &'a [OsString], flag: &str) -> Option<&'a OsStr> {
     None
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 pub fn run(
     _real_cargo: &std::path::Path,
     _expected_cargo_home: Option<&std::path::Path>,
     _expected_rgo_home: Option<&std::path::Path>,
     _args: Vec<std::ffi::OsString>,
 ) -> anyhow::Result<()> {
-    anyhow::bail!("the supervised Cargo pilot is not available on Windows yet")
+    anyhow::bail!("the supervised Cargo pilot is not available on this platform")
 }

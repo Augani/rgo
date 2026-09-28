@@ -10,6 +10,8 @@ pub mod passthrough;
 pub mod pin;
 pub mod setup;
 pub mod status;
+#[cfg(windows)]
+mod windows_job;
 
 use anyhow::Result;
 use rgo_core::config::{Config, Resolved};
