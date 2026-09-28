@@ -478,6 +478,44 @@ fn interrupted_versioned_setup_keeps_the_old_shim_usable_and_repairs_the_new_one
     );
     std::fs::write(&old_fallback, fallback_bytes).unwrap();
 
+    let record_before_plan = std::fs::read(&record_path).unwrap();
+    let plan = sandbox
+        .cmd(&cli)
+        .args([
+            "setup",
+            "--installer-plan-json",
+            "--supervised",
+            "--real-cargo",
+        ])
+        .arg(&real_cargo)
+        .arg("--no-service")
+        .output()
+        .unwrap();
+    assert!(
+        plan.status.success(),
+        "{}",
+        String::from_utf8_lossy(&plan.stderr)
+    );
+    let plan: serde_json::Value = serde_json::from_slice(&plan.stdout).unwrap();
+    let planned_binary = plan["binaries"][new_shim.display().to_string()]
+        .as_str()
+        .unwrap();
+    assert!(planned_binary.starts_with("binary-blake3:"));
+    let planned_record: serde_json::Value = serde_json::from_str(
+        plan["files"][record_path.display().to_string()]["contents"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        planned_record["supervised_cargo"]["shim_contents"],
+        planned_binary
+    );
+    let fallback_path = new_shim.parent().unwrap().join(".rgo-cargo-fallback.json");
+    assert!(plan["files"][fallback_path.display().to_string()]["contents"].is_string());
+    assert_eq!(std::fs::read(&record_path).unwrap(), record_before_plan);
+    assert!(!new_shim.exists());
+
     let interrupted = sandbox
         .cmd(&cli)
         .env("RGO_SETUP_TEST_EXIT_AFTER_RECORD", "1")

@@ -53,6 +53,8 @@ struct PlannedFile {
 struct InstallerPlan {
     schema_version: u32,
     files: BTreeMap<String, Option<PlannedFile>>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    binaries: BTreeMap<String, String>,
 }
 
 pub fn run(
@@ -70,9 +72,6 @@ pub fn run(
     let dry_run = dry_run || installer_plan_json;
     if supervised && !cfg!(any(unix, windows)) {
         bail!("supervised Cargo setup is unsupported on this platform");
-    }
-    if supervised && cfg!(windows) && installer_plan_json {
-        bail!("Windows supervised activation is still a direct-setup pilot");
     }
     if undo && (supervised || real_cargo.is_some()) {
         bail!("setup --undo reads the installed mode; omit --supervised and --real-cargo");
@@ -657,6 +656,10 @@ pub fn run(
 
     if installer_plan_json {
         let mut files = BTreeMap::new();
+        #[cfg(windows)]
+        let mut binaries = BTreeMap::new();
+        #[cfg(not(windows))]
+        let binaries: BTreeMap<String, String> = BTreeMap::new();
         let mut add = |path: &Path, contents: Option<String>, mode: u32| {
             files.insert(
                 path.display().to_string(),
@@ -676,6 +679,13 @@ pub fn run(
         add(&owner_path, Some(format!("{cargo_home_text}\n")), 0o600);
         add(&mode_path, Some(format!("{desired_mode}\n")), 0o600);
         if let Some(shim) = &supervised_cargo {
+            #[cfg(windows)]
+            {
+                let (path, contents) = shim_fallback.as_ref().context("missing Cargo fallback")?;
+                add(path, Some(String::from_utf8(contents.clone())?), 0o600);
+                binaries.insert(shim.shim_path.clone(), shim.shim_contents.clone());
+            }
+            #[cfg(unix)]
             add(
                 Path::new(&shim.shim_path),
                 Some(shim.shim_contents.clone()),
@@ -696,6 +706,7 @@ pub fn run(
             serde_json::to_string(&InstallerPlan {
                 schema_version: 1,
                 files,
+                binaries,
             })?
         );
         return Ok(());

@@ -216,6 +216,27 @@ try {
     if ($record.schema_version -ne 3 -or $record.supervised_cargo.real_cargo -ne $realCargo) {
         throw 'supervised installation record does not own the selected real Cargo proxy'
     }
+    $recordPath = Join-Path $cargoHome '.rgo-install.json'
+    $recordBeforePlan = [IO.File]::ReadAllBytes($recordPath)
+    $upgradeCli = Join-Path $upgradeStage 'rgo.exe'
+    $supervisedPlan = (& $upgradeCli setup --installer-plan-json --supervised --real-cargo $realCargo --no-service | Out-String).Trim() | ConvertFrom-Json
+    if ($LASTEXITCODE -ne 0 -or $supervisedPlan.schema_version -ne 1) {
+        throw 'staged cross-version CLI did not provide a supervised installer plan'
+    }
+    $newShim = Join-Path $cargoHome "rgo/shims/$upgradeTag/cargo.exe"
+    $plannedBinary = $supervisedPlan.binaries.PSObject.Properties[$newShim].Value
+    $plannedRecord = $supervisedPlan.files.PSObject.Properties[$recordPath].Value.contents | ConvertFrom-Json
+    $plannedFallback = Join-Path (Split-Path -Path $newShim -Parent) '.rgo-cargo-fallback.json'
+    if ($plannedBinary -notmatch '^binary-blake3:[0-9a-f]{64}$' -or
+        $plannedRecord.supervised_cargo.shim_contents -ne $plannedBinary -or
+        $plannedRecord.binary_version -ne $upgradeVersion -or
+        $plannedRecord.supervised_cargo.shim_path -ne $newShim -or
+        -not $supervisedPlan.files.PSObject.Properties[$plannedFallback] -or
+        (Test-Path -LiteralPath $newShim) -or
+        ([Convert]::ToBase64String($recordBeforePlan) -cne
+            [Convert]::ToBase64String([IO.File]::ReadAllBytes($recordPath)))) {
+        throw 'supervised cross-version plan changed activation or omitted its verified new shim'
+    }
     Remove-Item Env:RGO_HOME -ErrorAction SilentlyContinue
     Push-Location $supervisedProject
     try {
