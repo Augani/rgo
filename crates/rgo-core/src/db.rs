@@ -6,7 +6,7 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use fs4::fs_std::FileExt;
@@ -472,32 +472,51 @@ impl StateDb {
         // A touch updates two related records. Keep them in one short write
         // transaction so concurrent clients queue for a single writer turn
         // instead of racing for the WAL lock twice per touch.
-        let transaction =
-            Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
-        transaction.execute(
-            "INSERT INTO contexts(build_dir, workspace_root, last_seen, last_used, physical_bytes, incremental_bytes)
-             VALUES(?1, ?2, ?3, ?3, COALESCE(?4, 0), COALESCE(?5, 0))
-             ON CONFLICT(build_dir) DO UPDATE SET
-               workspace_root=COALESCE(excluded.workspace_root, contexts.workspace_root),
-               last_seen=excluded.last_seen,
-               last_used=excluded.last_used,
-               physical_bytes=COALESCE(?4, contexts.physical_bytes),
-               incremental_bytes=COALESCE(?5, contexts.incremental_bytes)",
-            params![
-                path.to_string_lossy(),
-                workspace_root,
-                now,
-                physical_bytes.map(|v| v as i64),
-                incremental_bytes.map(|v| v as i64),
-            ],
-        )?;
-        transaction.execute(
-            "INSERT INTO access_summary(build_dir, touch_count, last_touched) VALUES(?1, 1, ?2)
-             ON CONFLICT(build_dir) DO UPDATE SET touch_count=touch_count+1, last_touched=excluded.last_touched",
-            params![path.to_string_lossy(), now],
-        )?;
-        transaction.commit()?;
-        Ok(())
+        // A WAL writer can still receive SQLITE_BUSY while another connection
+        // closes/checkpoints or briefly holds the single writer lock. Retry
+        // only that transient class, with a finite bound, so attribution is
+        // not silently lost under concurrent Cargo clients.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut delay = Duration::from_millis(10);
+        loop {
+            let result = (|| -> rusqlite::Result<()> {
+                let transaction =
+                    Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
+                transaction.execute(
+                    "INSERT INTO contexts(build_dir, workspace_root, last_seen, last_used, physical_bytes, incremental_bytes)
+                     VALUES(?1, ?2, ?3, ?3, COALESCE(?4, 0), COALESCE(?5, 0))
+                     ON CONFLICT(build_dir) DO UPDATE SET
+                       workspace_root=COALESCE(excluded.workspace_root, contexts.workspace_root),
+                       last_seen=excluded.last_seen,
+                       last_used=excluded.last_used,
+                       physical_bytes=COALESCE(?4, contexts.physical_bytes),
+                       incremental_bytes=COALESCE(?5, contexts.incremental_bytes)",
+                    params![
+                        path.to_string_lossy(),
+                        workspace_root,
+                        now,
+                        physical_bytes.map(|v| v as i64),
+                        incremental_bytes.map(|v| v as i64),
+                    ],
+                )?;
+                transaction.execute(
+                    "INSERT INTO access_summary(build_dir, touch_count, last_touched) VALUES(?1, 1, ?2)
+                     ON CONFLICT(build_dir) DO UPDATE SET touch_count=touch_count+1, last_touched=excluded.last_touched",
+                    params![path.to_string_lossy(), now],
+                )?;
+                transaction.commit()
+            })();
+            match result {
+                Ok(()) => return Ok(()),
+                Err(error) if is_sqlite_busy(&error) && Instant::now() < deadline => {
+                    std::thread::sleep(
+                        delay.min(deadline.saturating_duration_since(Instant::now())),
+                    );
+                    delay = (delay * 2).min(Duration::from_millis(100));
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
     }
 
     pub fn acquire(&self, scope: &LeaseScope, pid: u32, ttl_secs: u32) -> Result<(u64, u32)> {
@@ -1604,6 +1623,14 @@ fn is_sqlite_corruption(error: &anyhow::Error) -> bool {
             )) if matches!(info.code, ErrorCode::DatabaseCorrupt | ErrorCode::NotADatabase)
         )
     })
+}
+
+fn is_sqlite_busy(error: &rusqlite::Error) -> bool {
+    matches!(
+        error,
+        rusqlite::Error::SqliteFailure(info, _)
+            if matches!(info.code, ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked)
+    )
 }
 
 fn normalize(path: &Path) -> PathBuf {

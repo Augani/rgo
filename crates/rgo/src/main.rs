@@ -55,7 +55,7 @@ enum Cmd {
         /// Do not set build.rustc-workspace-wrapper (context attribution then relies on `rgo <cmd>`).
         #[arg(long)]
         no_wrapper: bool,
-        /// Install an opt-in Unix Cargo launcher under $CARGO_HOME/rgo/shims.
+        /// Install an opt-in Cargo launcher under $CARGO_HOME/rgo/shims.
         #[arg(long)]
         supervised: bool,
         /// Absolute path to the real Cargo proxy, retaining its `cargo` basename.

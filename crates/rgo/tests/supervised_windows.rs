@@ -72,6 +72,19 @@ fn setup_activates_unchanged_cargo_exe_and_undo_restores_direct_cargo() {
         String::from_utf8_lossy(&doctor.stdout),
         String::from_utf8_lossy(&doctor.stderr)
     );
+    std::fs::remove_file(&shim).unwrap();
+    let repaired = sandbox
+        .cmd(&cli)
+        .args(["setup", "--supervised", "--no-service", "--real-cargo"])
+        .arg(&real_cargo)
+        .output()
+        .unwrap();
+    assert!(
+        repaired.status.success(),
+        "{}",
+        String::from_utf8_lossy(&repaired.stderr)
+    );
+    assert!(shim.is_file());
     let managed_before_direct = paths.checked_managed_build_dirs().unwrap().len();
     let direct_project = sandbox.simple_bin("windows-direct-cargo").unwrap();
     let direct = sandbox
