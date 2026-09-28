@@ -259,6 +259,15 @@ try {
     }
     $ownedKind = if ($null -eq $expectedUserPathKind) { 'String' } else { $expectedUserPathKind }
     if ((Get-RawUserPathKind) -ne $ownedKind) { throw 'supervised installer changed the User PATH registry type' }
+    $installedProcessPath = $env:PATH
+    try {
+        $env:PATH = ([Environment]::GetEnvironmentVariable('Path', 'Machine'),
+            [Environment]::GetEnvironmentVariable('Path', 'User')) -join ';'
+        if (-not [string]::Equals((Get-Command cargo.exe -ErrorAction Stop).Source, $shim,
+            [StringComparison]::OrdinalIgnoreCase)) {
+            throw 'a newly composed Windows PATH would not resolve cargo.exe to the owned shim'
+        }
+    } finally { $env:PATH = $installedProcessPath }
     & $installScript -Uninstall -CargoHome $cargoHome -RgoHome $rgoHome
     $installed = $false
     if ([string](Get-RawUserPath) -cne [string]$expectedUserPath -or
