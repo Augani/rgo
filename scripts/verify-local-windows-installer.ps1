@@ -253,7 +253,8 @@ try {
     & $installScript @userPathArgs -NoService
     $installed = $true
     $ownedUserPath = Get-RawUserPath
-    if (-not $ownedUserPath.StartsWith("$shim;", [StringComparison]::OrdinalIgnoreCase)) {
+    $shimDirectory = Split-Path -Path $shim -Parent
+    if (-not $ownedUserPath.StartsWith("$shimDirectory;", [StringComparison]::OrdinalIgnoreCase)) {
         throw 'supervised installer did not prepend the shim to raw User PATH'
     }
     $ownedKind = if ($null -eq $expectedUserPathKind) { 'String' } else { $expectedUserPathKind }
