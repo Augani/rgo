@@ -600,7 +600,7 @@ function Resolve-RealCargo([string]$Requested) {
             break
         }
     }
-    Assert-Condition $path 'no real cargo.exe was found; pass -RealCargo with its absolute path'
+    Assert-Condition ([bool]$path) 'no real cargo.exe was found; pass -RealCargo with its absolute path'
     Assert-Condition (([IO.Path]::GetFileName($path) -ieq 'cargo.exe') -and
         -not (Test-SamePath $path $script:shimPath)) 'the real Cargo proxy must be an absolute cargo.exe outside rgo shims'
     Assert-PlainFile $path
@@ -816,14 +816,13 @@ try {
             return
         }
 
-        $selectedRealCargo = if ($Supervised) { Resolve-RealCargo $RealCargo } else { $null }
         $state = [ordered]@{
             schemaVersion = 1; cargoHome = $resolvedCargoHome; rgoHome = $resolvedRgoHome
             installRoot = $resolvedInstallRoot; binDir = $resolvedBinDir
             versionDirectory = $top; archiveDigest = $digest
             cliDigest = $cliDigest; wrapperDigest = $wrapperDigest
             noService = [bool]$NoService; noWrapper = [bool]$NoWrapper; noUserPath = [bool]$NoUserPath
-            supervised = [bool]$Supervised; realCargo = $selectedRealCargo
+            supervised = [bool]$Supervised; realCargo = $null
             pathAdded = $false; priorUserPath = [Environment]::GetEnvironmentVariable('Path', 'User')
         }
         $resuming = Test-Path -LiteralPath $pendingPath
@@ -845,6 +844,7 @@ try {
             }
             $state = $pending
         } else {
+            if (Test-SupervisedState $state) { $state.realCargo = Resolve-RealCargo $RealCargo }
             Assert-Condition (-not (Test-Path -LiteralPath (Join-Path $resolvedCargoHome '.rgo-install.json'))) 'Cargo is already activated outside this installer'
             Assert-Condition (-not (Test-Path -LiteralPath $commandCli) -and -not (Test-Path -LiteralPath $commandWrapper)) 'rgo command entrypoint already exists outside this installer'
             $priorCommand = Get-Command rgo -ErrorAction SilentlyContinue
