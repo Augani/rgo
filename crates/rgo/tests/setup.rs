@@ -669,11 +669,21 @@ fn setup_rejects_a_mismatched_wrapper_before_activation() {
     std::fs::write(&wrapper, "#!/bin/sh\necho 'wrong wrapper'\n").unwrap();
     std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-    let result = sandbox
-        .cmd(&rgo)
-        .args(["setup", "--no-service"])
-        .output()
-        .unwrap();
+    // A just-copied executable can briefly report ETXTBSY on Linux runners.
+    // Retry only that transient exec error; all other launch failures remain
+    // immediate test failures.
+    let result = (0..10)
+        .find_map(
+            |_| match sandbox.cmd(&rgo).args(["setup", "--no-service"]).output() {
+                Ok(result) => Some(result),
+                Err(error) if error.raw_os_error() == Some(libc::ETXTBSY) => {
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    None
+                }
+                Err(error) => panic!("launching copied rgo: {error}"),
+            },
+        )
+        .expect("copied rgo remained busy for one second");
     assert!(!result.status.success());
     assert!(String::from_utf8_lossy(&result.stderr).contains("not a matching rgo wrapper"));
     assert!(!sandbox.cargo_home.join("config.toml").exists());

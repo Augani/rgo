@@ -127,7 +127,7 @@ fn spawn_background_daemon(exe: &std::path::Path, root: &std::path::Path) -> Res
         .chain(quote_windows_arg(root.as_os_str()))
         .chain(Some(0))
         .collect();
-    let mut startup = STARTUPINFOW {
+    let startup = STARTUPINFOW {
         cb: std::mem::size_of::<STARTUPINFOW>() as u32,
         ..Default::default()
     };
@@ -142,7 +142,7 @@ fn spawn_background_daemon(exe: &std::path::Path, root: &std::path::Path) -> Res
             CREATE_NO_WINDOW,
             std::ptr::null(),
             std::ptr::null(),
-            &mut startup,
+            &startup,
             &mut process,
         )
     };
