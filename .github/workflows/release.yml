@@ -60,7 +60,7 @@ jobs:
           cp README.md doc.md LICENSE-MIT LICENSE-APACHE "$stage/"
           mkdir -p artifacts
           if [ "${{ matrix.os }}" = "windows-latest" ]; then
-            powershell -NoProfile -Command "Compress-Archive -Path '$stage' -DestinationPath 'artifacts/$name.zip'"
+            powershell -NoProfile -File scripts/package-windows-release.ps1 -Stage "$stage" -Name "$name" -Archive "artifacts/$name.zip"
           else
             tar -C "$RUNNER_TEMP" -czf "artifacts/$name.tar.gz" "$name"
           fi
@@ -86,13 +86,12 @@ jobs:
           path: artifacts/
           if-no-files-found: error
 
-  release:
-    name: Publish GitHub release
+  bundle:
+    name: Verify complete release bundle
     needs: build
-    if: startsWith(github.ref, 'refs/tags/') && github.event.repository.visibility == 'public'
     runs-on: ubuntu-latest
     permissions:
-      contents: write
+      contents: read
       id-token: write
       attestations: write
     steps:
@@ -110,15 +109,54 @@ jobs:
           cp scripts/install-windows.ps1 dist/rgo-install-windows.ps1
           (cd dist && shasum -a 256 rgo-install-unix.py rgo-install-windows.ps1 >> SHA256SUMS.txt)
           sort -o dist/SHA256SUMS.txt dist/SHA256SUMS.txt
+          test "$(wc -l < dist/SHA256SUMS.txt)" -eq 6
+          (cd dist && sha256sum --check SHA256SUMS.txt)
+      - name: Verify Windows ZIP paths
+        run: |
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+          from zipfile import ZipFile
+
+          top = f"rgo-{os.environ['GITHUB_REF_NAME']}-x86_64-pc-windows-msvc"
+          archive = Path('dist') / f'{top}.zip'
+          expected = sorted(f'{top}/{name}' for name in (
+              'rgo.exe', 'rgo-rustc-wrapper.exe', 'README.md', 'doc.md',
+              'LICENSE-MIT', 'LICENSE-APACHE'))
+          with ZipFile(archive) as bundle:
+              actual = sorted(member.filename for member in bundle.infolist())
+          if actual != expected:
+              raise SystemExit(f'unexpected Windows ZIP entries: {actual}')
+          PY
       - name: Attest Unix installer
+        if: startsWith(github.ref, 'refs/tags/')
         uses: actions/attest@v4
         with:
           subject-path: dist/rgo-install-unix.py
       - name: Attest Windows installer
+        if: startsWith(github.ref, 'refs/tags/')
         uses: actions/attest@v4
         with:
           subject-path: dist/rgo-install-windows.ps1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-bundle
+          path: dist/
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub release
+    needs: bundle
+    if: startsWith(github.ref, 'refs/tags/') && github.event.repository.visibility == 'public'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-bundle
+          path: dist
       - name: Create release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release create "${{ github.ref_name }}" dist/* --title "rgo ${{ github.ref_name }}" --generate-notes --verify-tag
+        run: gh release create "$GITHUB_REF_NAME" dist/* --title "rgo $GITHUB_REF_NAME" --generate-notes --verify-tag
