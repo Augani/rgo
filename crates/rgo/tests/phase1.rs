@@ -203,6 +203,23 @@ fn explicit_clean_reports_a_locked_context_instead_of_claiming_removal() {
     assert!(context_dir.join("output").is_file());
 
     drop(guard);
+    // The daemon's first request and other test activity can overlap the
+    // release. Observe the same nonblocking GC guard that clean requires
+    // before asserting that a later command can remove the context.
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        if supervision::try_lock_gc(&paths, Some(&context_dir))
+            .unwrap()
+            .is_some()
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "context lifecycle guard remained held after the session ended"
+        );
+        thread::sleep(Duration::from_millis(25));
+    }
     let cleaned = sandbox
         .cmd(cargo_bin("rgo"))
         .args(["clean", "aa/context"])
