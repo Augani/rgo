@@ -7,7 +7,7 @@ name: Release
 on:
   push:
     tags: ["v*"]
-  workflow_dispatch:
+  workflow_dispatch: {}
 
 jobs:
   build:
@@ -68,7 +68,7 @@ jobs:
         shell: bash
         run: |
           cd artifacts
-          shasum -a 256 * > "SHA256SUMS-${{ matrix.target }}.txt"
+          shasum -a 256 ./* > "SHA256SUMS-${{ matrix.target }}.txt"
           cat "SHA256SUMS-${{ matrix.target }}.txt"
       - name: Attest release bundle
         if: github.event.repository.visibility == 'public' && startsWith(github.ref, 'refs/tags/')

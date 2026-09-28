@@ -195,6 +195,7 @@ fn explicit_clean_reports_a_locked_context_instead_of_claiming_removal() {
     let guard = supervision::lock_cargo_session(&paths, Some(&context_dir)).unwrap();
     let blocked = sandbox
         .cmd(cargo_bin("rgo"))
+        .env("RGO_LOG", "debug")
         .args(["clean", "aa/context"])
         .output()
         .unwrap();
@@ -227,8 +228,9 @@ fn explicit_clean_reports_a_locked_context_instead_of_claiming_removal() {
         .unwrap();
     assert!(
         cleaned.status.success(),
-        "{}",
-        String::from_utf8_lossy(&cleaned.stderr)
+        "{}\ndaemon log:\n{}",
+        String::from_utf8_lossy(&cleaned.stderr),
+        std::fs::read_to_string(paths.logs_dir().join("daemon.log")).unwrap_or_default()
     );
     assert!(String::from_utf8_lossy(&cleaned.stdout).contains("removed aa/context"));
     assert!(!context_dir.exists());

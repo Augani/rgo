@@ -229,6 +229,7 @@ pub fn lock_cargo_session(paths: &RgoPaths, context: Option<&Path>) -> Result<Se
 pub fn try_lock_gc(paths: &RgoPaths, context: Option<&Path>) -> Result<Option<GcGuards>> {
     let local = open_local_guard(paths)?;
     if !FileExt::try_lock_exclusive(&local)? {
+        tracing::debug!(guard = "process", "GC lifecycle guard is busy");
         return Ok(None);
     }
     verify_lock_identity(&paths.state_dir().join("locks/process-guard.lock"), &local)?;
@@ -236,6 +237,7 @@ pub fn try_lock_gc(paths: &RgoPaths, context: Option<&Path>) -> Result<Option<Gc
     let legacy_global = {
         let file = open_lock(paths, None, true)?;
         if !FileExt::try_lock_exclusive(&file)? {
+            tracing::debug!(guard = "legacy-global", "GC lifecycle guard is busy");
             return Ok(None);
         }
         verify_lock_identity(&lock_path(paths, None, true)?, &file)?;
@@ -243,6 +245,7 @@ pub fn try_lock_gc(paths: &RgoPaths, context: Option<&Path>) -> Result<Option<Gc
     };
     let global = open_lock(paths, None, cfg!(not(unix)))?;
     if !try_lock_exclusive(&global)? {
+        tracing::debug!(guard = "global", "GC lifecycle guard is busy");
         return Ok(None);
     }
     verify_lock_identity(&lock_path(paths, None, cfg!(not(unix)))?, &global)?;
@@ -250,6 +253,7 @@ pub fn try_lock_gc(paths: &RgoPaths, context: Option<&Path>) -> Result<Option<Gc
     let legacy_context_guard = if let Some(context) = context {
         let file = open_lock(paths, Some(context), true)?;
         if !FileExt::try_lock_exclusive(&file)? {
+            tracing::debug!(guard = "legacy-context", "GC lifecycle guard is busy");
             return Ok(None);
         }
         verify_lock_identity(&lock_path(paths, Some(context), true)?, &file)?;
@@ -260,6 +264,7 @@ pub fn try_lock_gc(paths: &RgoPaths, context: Option<&Path>) -> Result<Option<Gc
     let context_guard = if let Some(context) = context {
         let file = open_lock(paths, Some(context), cfg!(not(unix)))?;
         if !try_lock_exclusive(&file)? {
+            tracing::debug!(guard = "context", "GC lifecycle guard is busy");
             return Ok(None);
         }
         verify_lock_identity(&lock_path(paths, Some(context), cfg!(not(unix)))?, &file)?;
