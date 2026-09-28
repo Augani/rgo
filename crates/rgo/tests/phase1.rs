@@ -3,6 +3,7 @@ use std::thread;
 use std::time::Duration;
 
 use assert_cmd::cargo::cargo_bin;
+use rgo_core::{context, paths::RgoPaths, supervision};
 use rgo_testkit::{Sandbox, ensure_workspace_bins_built};
 
 #[test]
@@ -73,7 +74,7 @@ fn automatic_gc_without_pressure_is_quiet_and_does_not_start_a_daemon() {
 }
 
 #[test]
-fn doctor_is_read_only_for_daemon_state() {
+fn doctor_does_not_start_daemon_and_emits_structured_output() {
     ensure_workspace_bins_built().unwrap();
     let sandbox = Sandbox::new().unwrap();
     let result = sandbox
@@ -84,6 +85,29 @@ fn doctor_is_read_only_for_daemon_state() {
     assert!(result.status.success());
     assert!(!sandbox.rgo_home.join("state/daemon.sock").exists());
     assert!(!sandbox.rgo_home.join("state/daemon.pid").exists());
+    let json = sandbox
+        .cmd(cargo_bin("rgo"))
+        .args(["doctor", "--json"])
+        .output()
+        .unwrap();
+    assert!(json.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
+    assert_eq!(report["schema_version"], 1);
+    assert!(
+        report["entries"]
+            .as_array()
+            .is_some_and(|entries| !entries.is_empty())
+    );
+    assert!(
+        report["entries"]
+            .as_array()
+            .is_some_and(
+                |entries| entries.iter().any(|entry| entry["level"] == "warning"
+                    && entry["message"]
+                        .as_str()
+                        .is_some_and(|message| message.contains("automatic GC disabled")))
+            )
+    );
 }
 
 #[test]
@@ -98,6 +122,94 @@ fn gc_target_rejects_non_concrete_sizes_before_startup() {
     assert!(!result.status.success());
     assert!(String::from_utf8_lossy(&result.stderr).contains("invalid size"));
     assert!(!sandbox.rgo_home.join("state/daemon.sock").exists());
+}
+
+#[test]
+fn pressure_gc_reclaims_idle_unpinned_only_contexts_in_private_home() {
+    ensure_workspace_bins_built().unwrap();
+    let sandbox = Sandbox::new().unwrap();
+    let paths = RgoPaths {
+        root: sandbox.rgo_home.clone(),
+    };
+    paths.ensure_layout().unwrap();
+    for index in 0..3 {
+        let workspace = sandbox.projects.join(format!("pressure-{index}"));
+        std::fs::create_dir_all(&workspace).unwrap();
+        let manifest = workspace.join("Cargo.toml");
+        std::fs::write(&manifest, "[workspace]\n").unwrap();
+        let dir = paths.builds_dir().join(format!("{index:02x}/context"));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("data"), vec![index as u8 + 1; 2 * 1024 * 1024]).unwrap();
+        context::write_sidecar(&dir, &workspace, &manifest, None).unwrap();
+    }
+
+    let automatic = sandbox
+        .cmd(cargo_bin("rgo"))
+        .args(["gc", "--auto"])
+        .output()
+        .unwrap();
+    assert!(automatic.status.success());
+    assert_eq!(
+        paths.managed_build_dirs().len(),
+        3,
+        "unattended deletion must stay disabled until Cargo lifecycle safety is proven"
+    );
+    assert!(!paths.socket_path().exists());
+
+    let result = sandbox
+        .cmd(cargo_bin("rgo"))
+        .args(["gc", "--target", "1MB"])
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(
+        paths.managed_build_dirs().is_empty(),
+        "every safely idle context must remain eligible under pressure: {}",
+        String::from_utf8_lossy(&result.stdout)
+    );
+}
+
+#[test]
+fn explicit_clean_reports_a_locked_context_instead_of_claiming_removal() {
+    ensure_workspace_bins_built().unwrap();
+    let sandbox = Sandbox::new().unwrap();
+    let paths = RgoPaths {
+        root: sandbox.rgo_home.clone(),
+    };
+    paths.ensure_layout().unwrap();
+    let project = sandbox.simple_bin("clean-locked").unwrap();
+    let context_dir = paths.builds_dir().join("aa/context");
+    std::fs::create_dir_all(&context_dir).unwrap();
+    std::fs::write(context_dir.join("output"), b"keep").unwrap();
+    context::write_sidecar(&context_dir, &project, &project.join("Cargo.toml"), None).unwrap();
+
+    let guard = supervision::lock_cargo_session(&paths, Some(&context_dir)).unwrap();
+    let blocked = sandbox
+        .cmd(cargo_bin("rgo"))
+        .args(["clean", "aa/context"])
+        .output()
+        .unwrap();
+    assert!(!blocked.status.success());
+    assert!(String::from_utf8_lossy(&blocked.stderr).contains("supervised Cargo invocation"));
+    assert!(context_dir.join("output").is_file());
+
+    drop(guard);
+    let cleaned = sandbox
+        .cmd(cargo_bin("rgo"))
+        .args(["clean", "aa/context"])
+        .output()
+        .unwrap();
+    assert!(
+        cleaned.status.success(),
+        "{}",
+        String::from_utf8_lossy(&cleaned.stderr)
+    );
+    assert!(String::from_utf8_lossy(&cleaned.stdout).contains("removed aa/context"));
+    assert!(!context_dir.exists());
 }
 
 #[test]

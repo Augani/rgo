@@ -5,7 +5,7 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context as _, Result};
+use anyhow::{Context as _, Result, ensure};
 use fs4::fs_std::FileExt;
 use rgo_protocol::{ContextSidecar, PROTOCOL_VERSION, SIDECAR_FILE};
 use tracing::debug;
@@ -20,6 +20,13 @@ pub struct BuildContext {
     pub last_used: SystemTime,
     pub usage: Usage,
     pub incremental_usage: Usage,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkspaceState {
+    Present,
+    MissingManifest,
+    Unavailable,
 }
 
 impl BuildContext {
@@ -37,27 +44,35 @@ impl BuildContext {
         }
     }
 
-    /// Workspace manifest recorded in the sidecar no longer exists.
+    /// A missing manifest is confirmed only while its workspace volume is
+    /// available. Permission failures and missing mounts are not orphan proof.
     pub fn is_orphan(&self) -> bool {
-        self.sidecar
-            .as_ref()
-            .is_some_and(|s| !Path::new(&s.manifest_path).exists())
+        self.workspace_state() == Some(WorkspaceState::MissingManifest)
     }
 
-    /// Whether the context carries the pin marker. The marker file inside the build
-    /// dir is the durable record of a pin; the SQLite `pins` table is a derived index
-    /// that `StateDb::reconcile_contexts` rebuilds from these markers so pins survive
-    /// database loss.
-    pub fn is_pinned(&self) -> bool {
-        is_pinned_dir(&self.dir)
+    pub fn workspace_unavailable(&self) -> bool {
+        // Without rgo's sidecar, this directory has no verified workspace
+        // owner. Keep it out of unattended cleanup rather than treating the
+        // missing attribution as an eligible idle context.
+        self.workspace_state()
+            .is_none_or(|state| state == WorkspaceState::Unavailable)
+    }
+
+    pub fn workspace_state(&self) -> Option<WorkspaceState> {
+        self.sidecar.as_ref().map(workspace_state)
+    }
+
+    /// Pin intent is recorded outside Cargo's build tree. The in-context
+    /// marker is recognized for installations created before that record.
+    pub fn is_pinned(&self, paths: &RgoPaths) -> bool {
+        is_pinned(paths, &self.dir)
     }
 
     pub fn idle_for(&self, now: SystemTime) -> Duration {
         now.duration_since(self.last_used).unwrap_or_default()
     }
 
-    /// Cargo holds `<build-dir>/<profile>/.cargo-build-lock` for the duration of a build
-    /// (the target-dir gets `.cargo-lock`; we check both names for older layouts).
+    /// Cargo holds `<build-dir>/<profile>/.cargo-build-lock` for the duration of a build.
     /// A recently modified lock is treated as "probably live" until Phase 2 leases exist.
     pub fn recently_locked(&self, within: Duration, now: SystemTime) -> bool {
         lock_files(&self.dir).any(|p| {
@@ -69,30 +84,511 @@ impl BuildContext {
     }
 }
 
-/// Defense-in-depth liveness check used immediately before destructive operations. Cargo keeps
-/// one of these locks for the duration of a build; an unavailable lock file is treated as live.
+pub fn workspace_state(sidecar: &ContextSidecar) -> WorkspaceState {
+    let root = Path::new(&sidecar.workspace_root);
+    let manifest = Path::new(&sidecar.manifest_path);
+    if manifest.parent() != Some(root) {
+        return WorkspaceState::Unavailable;
+    }
+    let root_metadata = match std::fs::metadata(root) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            if !matches!(
+                std::fs::symlink_metadata(root),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound
+            ) {
+                return WorkspaceState::Unavailable;
+            }
+            return root
+                .parent()
+                .and_then(|parent| {
+                    let metadata = std::fs::metadata(parent).ok()?;
+                    workspace_identity_matches(parent, &metadata, sidecar)
+                })
+                .filter(|matches| *matches)
+                .map_or(WorkspaceState::Unavailable, |_| {
+                    WorkspaceState::MissingManifest
+                });
+        }
+        Err(_) => return WorkspaceState::Unavailable,
+    };
+    let identity = workspace_identity_matches(root, &root_metadata, sidecar);
+    if identity == Some(false) || (sidecar.workspace_mount_id.is_some() && identity.is_none()) {
+        return WorkspaceState::Unavailable;
+    }
+    match std::fs::symlink_metadata(manifest) {
+        Ok(_) => match std::fs::metadata(manifest) {
+            Ok(metadata) if metadata.is_file() => WorkspaceState::Present,
+            _ => WorkspaceState::Unavailable,
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            if identity == Some(true) {
+                WorkspaceState::MissingManifest
+            } else {
+                WorkspaceState::Unavailable
+            }
+        }
+        Err(_) => WorkspaceState::Unavailable,
+    }
+}
+
+/// Defense-in-depth liveness heuristic used immediately before destructive operations.
+/// A held documented profile lock blocks deletion, but its absence does not prove the
+/// whole Cargo session is idle.
 pub fn lock_files_for_safety(build_dir: &Path) -> bool {
-    lock_files(build_dir).any(|path| {
-        let Ok(file) = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&path)
-        else {
-            return true;
-        };
-        match file.try_lock_exclusive() {
-            Ok(true) => false,
-            Ok(false) | Err(_) => true,
+    let Ok(profiles) = checked_profile_dirs(build_dir) else {
+        return true;
+    };
+    profiles.into_iter().any(|profile| {
+        let path = profile.join(".cargo-build-lock");
+        match std::fs::symlink_metadata(&path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                // A disappeared profile is a race, not evidence that its
+                // lock was absent throughout this deletion check.
+                !std::fs::symlink_metadata(&profile)
+                    .is_ok_and(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())
+            }
+            Err(_) => true,
+            Ok(metadata) if !metadata.file_type().is_file() => true,
+            Ok(_) => {
+                let Ok(file) = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(&path)
+                else {
+                    return true;
+                };
+                !matches!(file.try_lock_exclusive(), Ok(true))
+            }
         }
     })
 }
 
-/// Marker file rgo writes at the top level of a managed build dir while the context
-/// is pinned. Removing it out-of-band drops the pin on the next reconcile.
+/// The fast inventory path may skip unreadable entries for display. A deletion
+/// check must instead fail closed on any directory or lock it cannot inspect.
+fn checked_profile_dirs(build_dir: &Path) -> std::io::Result<Vec<PathBuf>> {
+    let metadata = std::fs::symlink_metadata(build_dir)?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err(std::io::Error::other(
+            "build context is not a real directory",
+        ));
+    }
+    let first = checked_subdirs(build_dir)?;
+    let mut profiles = first.clone();
+    for dir in first {
+        profiles.extend(checked_subdirs(&dir)?);
+    }
+    Ok(profiles)
+}
+
+fn checked_subdirs(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
+    let mut dirs = Vec::new();
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let kind = entry.file_type()?;
+        if kind.is_symlink() {
+            return Err(std::io::Error::other("uninspectable profile symlink"));
+        }
+        if kind.is_dir() {
+            dirs.push(entry.path());
+        }
+    }
+    Ok(dirs)
+}
+
+/// Compatibility marker at the top of a managed build dir. New pin intent is
+/// also stored under `state/pins`, which Cargo cannot remove with `clean`.
 pub const PIN_MARKER: &str = ".rgo-pin";
 
 pub fn is_pinned_dir(dir: &Path) -> bool {
-    dir.join(PIN_MARKER).is_file()
+    match std::fs::symlink_metadata(dir.join(PIN_MARKER)) {
+        Ok(_) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(_) => true,
+    }
+}
+
+/// A pin intent lives outside Cargo's build directory so an explicit or
+/// interrupted `cargo clean` cannot silently turn it into an unpinned context.
+/// The in-context marker is still accepted for older installations.
+pub fn is_pinned(paths: &RgoPaths, dir: &Path) -> bool {
+    use std::io::Read;
+
+    let Ok(record) = pin_record_path(paths, dir) else {
+        return true;
+    };
+    match std::fs::symlink_metadata(&record) {
+        Ok(metadata) if !metadata.is_file() || metadata.file_type().is_symlink() => true,
+        Ok(metadata) if metadata.len() != b"unpin\n".len() as u64 => true,
+        Ok(_) => {
+            let mut contents = Vec::with_capacity(7);
+            !(std::fs::File::open(record)
+                .and_then(|file| file.take(7).read_to_end(&mut contents))
+                .is_ok()
+                && contents == b"unpin\n") // Malformed/torn writes protect the context.
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => is_pinned_dir(dir),
+        Err(_) => true,
+    }
+}
+
+fn pin_record_path(paths: &RgoPaths, dir: &Path) -> Result<PathBuf> {
+    let relative = dir.strip_prefix(paths.builds_dir())?;
+    ensure!(
+        paths.is_managed_build_dir(dir),
+        "not a managed build context"
+    );
+    let mut components = relative.components();
+    let shard = components.next().context("missing context shard")?;
+    let name = components.next().context("missing context name")?;
+    ensure!(
+        components.next().is_none()
+            && matches!(shard, std::path::Component::Normal(_))
+            && matches!(name, std::path::Component::Normal(_)),
+        "invalid managed context path"
+    );
+    let mut file = name.as_os_str().to_os_string();
+    file.push(".pin");
+    Ok(paths.pin_records_dir().join(shard.as_os_str()).join(file))
+}
+
+pub fn write_durable_pin(paths: &RgoPaths, dir: &Path) -> Result<()> {
+    let _decision_lock = lock_pin_decisions(paths)?;
+    let record = pin_record_path(paths, dir)?;
+    let parent = ensure_pin_parent(paths, &record)?;
+    let metadata = std::fs::symlink_metadata(&record);
+    match metadata {
+        Ok(metadata) => ensure!(
+            metadata.is_file() && !metadata.file_type().is_symlink(),
+            "unsafe pin record {}",
+            record.display()
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error).with_context(|| format!("checking {}", record.display())),
+    }
+    use std::io::Write;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&record)
+        .with_context(|| format!("writing {}", record.display()))?;
+    file.write_all(b"pin\n")?;
+    file.sync_all()?;
+    sync_pin_parent(parent)?;
+    Ok(())
+}
+
+/// Import an old marker only if no newer explicit pin/unpin decision exists.
+pub fn migrate_legacy_pin(paths: &RgoPaths, dir: &Path) -> Result<()> {
+    let _decision_lock = lock_pin_decisions(paths)?;
+    let record = pin_record_path(paths, dir)?;
+    let parent = ensure_pin_parent(paths, &record)?;
+    use std::io::Write;
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&record)
+    {
+        Ok(mut file) => {
+            file.write_all(b"pin\n")?;
+            file.sync_all()?;
+            sync_pin_parent(parent)?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let metadata = std::fs::symlink_metadata(&record)?;
+            ensure!(
+                metadata.is_file() && !metadata.file_type().is_symlink(),
+                "unsafe pin record {}",
+                record.display()
+            );
+        }
+        Err(error) => return Err(error).with_context(|| format!("writing {}", record.display())),
+    }
+    Ok(())
+}
+
+fn ensure_pin_parent<'a>(paths: &RgoPaths, record: &'a Path) -> Result<&'a Path> {
+    paths.ensure_layout()?;
+    let parent = record.parent().context("pin record has no parent")?;
+    match std::fs::symlink_metadata(parent) {
+        Ok(metadata) => ensure!(
+            metadata.is_dir() && !metadata.file_type().is_symlink(),
+            "unsafe pin record directory {}",
+            parent.display()
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::create_dir(parent)?;
+            sync_pin_parent(&paths.pin_records_dir())?;
+        }
+        Err(error) => return Err(error).with_context(|| format!("checking {}", parent.display())),
+    }
+    Ok(parent)
+}
+
+fn sync_pin_parent(parent: &Path) -> Result<()> {
+    #[cfg(unix)]
+    std::fs::File::open(parent)?.sync_all()?;
+    #[cfg(not(unix))]
+    let _ = parent;
+    Ok(())
+}
+
+pub fn remove_durable_pin(paths: &RgoPaths, dir: &Path) -> Result<()> {
+    let _decision_lock = lock_pin_decisions(paths)?;
+    let record = pin_record_path(paths, dir)?;
+    let parent = ensure_pin_parent(paths, &record)?;
+    use std::io::Write;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&record)
+        .with_context(|| format!("writing {}", record.display()))?;
+    file.write_all(b"unpin\n")?;
+    file.sync_all()?;
+    sync_pin_parent(parent)?;
+    remove_pin_marker(dir)?;
+    Ok(())
+}
+
+/// Remove an obsolete unpin decision only when no supervised Cargo session
+/// can be between reading that decision and restoring a legacy marker.
+pub fn try_prune_unpin_decision(paths: &RgoPaths, dir: &Path) -> Result<bool> {
+    let Some(_lifecycle) = crate::supervision::try_lock_gc(paths, Some(dir))? else {
+        return Ok(false);
+    };
+    prune_unpin_decision_guarded(paths, dir)
+}
+
+/// Walk durable decisions incrementally so a daemon restart can recover
+/// tombstones left by a crash or by a session that was active at unpin time.
+/// The open directory iterators carry the cursor between maintenance passes;
+/// no pass revisits the prefix of a large shard just to reach its next entry.
+#[derive(Default)]
+pub(crate) struct PinPruneScanner {
+    shards: Option<std::fs::ReadDir>,
+    records: Option<std::fs::ReadDir>,
+    shard_name: Option<std::ffi::OsString>,
+}
+
+impl PinPruneScanner {
+    /// Inspect at most `limit` directory entries, counting both shards and
+    /// records. A completed sweep restarts on the next call so records that
+    /// appeared during a sweep are eventually examined too.
+    pub(crate) fn scan(&mut self, paths: &RgoPaths, limit: usize) -> Result<usize> {
+        let mut examined = 0;
+        let mut pruned = 0;
+        while examined < limit {
+            if let Some(records) = &mut self.records {
+                match records.next() {
+                    Some(Ok(entry)) => {
+                        examined += 1;
+                        if !entry.file_type()?.is_file() {
+                            continue;
+                        }
+                        let record = entry.path();
+                        if record.extension() != Some(std::ffi::OsStr::new("pin")) {
+                            continue;
+                        }
+                        let Some(name) = record.file_stem() else {
+                            continue;
+                        };
+                        let Some(shard) = &self.shard_name else {
+                            continue;
+                        };
+                        let context = paths.builds_dir().join(shard).join(name);
+                        // This cheap read excludes pins and malformed records.
+                        // The guarded prune rechecks the decision under its lock.
+                        if !is_pinned(paths, &context) && try_prune_unpin_decision(paths, &context)?
+                        {
+                            pruned += 1;
+                        }
+                    }
+                    Some(Err(error)) => {
+                        examined += 1;
+                        tracing::warn!(%error, "reading durable pin record");
+                    }
+                    None => {
+                        self.records = None;
+                        self.shard_name = None;
+                    }
+                }
+                continue;
+            }
+            if self.shards.is_none() {
+                self.shards = match std::fs::read_dir(paths.pin_records_dir()) {
+                    Ok(entries) => Some(entries),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        return Ok(pruned);
+                    }
+                    Err(error) => return Err(error).context("reading durable pin records"),
+                };
+            }
+            match self.shards.as_mut().unwrap().next() {
+                Some(Ok(entry)) => {
+                    examined += 1;
+                    if entry.file_type()?.is_dir() {
+                        self.records = Some(std::fs::read_dir(entry.path())?);
+                        self.shard_name = Some(entry.file_name());
+                    }
+                }
+                Some(Err(error)) => {
+                    examined += 1;
+                    tracing::warn!(%error, "reading durable pin shard");
+                }
+                None => {
+                    self.shards = None;
+                    break;
+                }
+            }
+        }
+        Ok(pruned)
+    }
+}
+
+/// The caller must hold the context's exclusive lifecycle guard through this
+/// call. GC uses this before releasing its guard after removing a context.
+pub(crate) fn prune_unpin_decision_guarded(paths: &RgoPaths, dir: &Path) -> Result<bool> {
+    let _decision_lock = lock_pin_decisions(paths)?;
+    let record = pin_record_path(paths, dir)?;
+    match std::fs::symlink_metadata(dir) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Ok(_) => return Ok(false),
+        Err(error) => return Err(error).with_context(|| format!("checking {}", dir.display())),
+    }
+    match std::fs::symlink_metadata(&record) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Ok(metadata)
+            if metadata.is_file()
+                && !metadata.file_type().is_symlink()
+                && metadata.len() == b"unpin\n".len() as u64 => {}
+        Ok(_) => return Ok(false),
+        Err(error) => return Err(error).with_context(|| format!("checking {}", record.display())),
+    }
+    use std::io::Read;
+    let mut contents = Vec::with_capacity(7);
+    std::fs::File::open(&record)?
+        .take(7)
+        .read_to_end(&mut contents)?;
+    if contents != b"unpin\n" {
+        return Ok(false);
+    }
+    std::fs::remove_file(&record)?;
+    sync_pin_parent(record.parent().context("pin record has no parent")?)?;
+    Ok(true)
+}
+
+fn lock_pin_decisions(paths: &RgoPaths) -> Result<std::fs::File> {
+    paths.ensure_layout()?;
+    let path = paths.state_dir().join("locks/pin-decisions.lock");
+    let file = crate::supervision::open_lock_file(&path)
+        .with_context(|| format!("opening {}", path.display()))?;
+    file.lock_exclusive()?;
+    crate::supervision::verify_lock_identity(&path, &file)?;
+    Ok(file)
+}
+
+/// Enumerate durable pin intents, including contexts removed by Cargo clean.
+pub fn durable_pin_contexts(paths: &RgoPaths) -> Result<Vec<PathBuf>> {
+    let shards = match std::fs::read_dir(paths.pin_records_dir()) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error).context("reading durable pin records"),
+    };
+    let mut contexts = Vec::new();
+    for shard in shards {
+        let shard = shard?;
+        let kind = shard.file_type()?;
+        ensure!(
+            kind.is_dir(),
+            "unsafe durable pin shard {}",
+            shard.path().display()
+        );
+        for record in std::fs::read_dir(shard.path())? {
+            let record = record?;
+            let kind = record.file_type()?;
+            ensure!(
+                kind.is_file(),
+                "unsafe durable pin record {}",
+                record.path().display()
+            );
+            let path = record.path();
+            ensure!(
+                path.extension() == Some(std::ffi::OsStr::new("pin")),
+                "unknown durable pin record {}",
+                path.display()
+            );
+            let name = path.file_stem().context("pin record has no context name")?;
+            let context = paths.builds_dir().join(shard.file_name()).join(name);
+            if is_pinned(paths, &context) {
+                contexts.push(context);
+            }
+        }
+    }
+    contexts.sort();
+    Ok(contexts)
+}
+
+pub fn workspace_device(root: &Path) -> Option<u64> {
+    let metadata = std::fs::metadata(root).ok()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Some(metadata.dev())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+        None
+    }
+}
+
+pub fn workspace_mount_id(root: &Path) -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        use rustix::fs::{AtFlags, CWD, StatxFlags, statx};
+        let stat = statx(CWD, root, AtFlags::empty(), StatxFlags::MNT_ID).ok()?;
+        (stat.stx_mask & StatxFlags::MNT_ID.bits() != 0).then_some(stat.stx_mnt_id)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = root;
+        None
+    }
+}
+
+fn workspace_identity_matches(
+    path: &Path,
+    metadata: &std::fs::Metadata,
+    sidecar: &ContextSidecar,
+) -> Option<bool> {
+    let device = workspace_device_matches(metadata, sidecar.workspace_device)?;
+    if !device {
+        return Some(false);
+    }
+    #[cfg(target_os = "linux")]
+    {
+        Some(workspace_mount_id(path)? == sidecar.workspace_mount_id?)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (path, sidecar);
+        Some(true)
+    }
+}
+
+fn workspace_device_matches(metadata: &std::fs::Metadata, recorded: Option<u64>) -> Option<bool> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        recorded.map(|device| device == metadata.dev())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (metadata, recorded);
+        None
+    }
 }
 
 pub fn write_pin_marker(dir: &Path) -> Result<()> {
@@ -152,17 +648,21 @@ pub fn git_common_dir(workspace_root: &Path) -> Option<PathBuf> {
 pub fn list(paths: &RgoPaths) -> Result<Vec<BuildContext>> {
     let mut out = Vec::new();
     let mut scanner = Scanner::new();
-    for dir in paths.managed_build_dirs() {
+    let mut incremental_scanner = Scanner::new();
+    for dir in paths.checked_managed_build_dirs()? {
         let sidecar = read_sidecar(&dir);
-        let usage = scanner.measure(&dir);
-        let incremental_usage =
-            incremental_dirs(&dir)
-                .map(|d| scanner.measure(&d))
-                .fold(Usage::default(), |a, b| Usage {
-                    physical_bytes: a.physical_bytes + b.physical_bytes,
-                    logical_bytes: a.logical_bytes + b.logical_bytes,
-                    files: a.files + b.files,
-                });
+        let usage = scanner.measure_checked(&dir)?;
+        let mut incremental_usage = Usage::default();
+        for directory in incremental_dirs_checked(&dir)? {
+            let measured = incremental_scanner.measure_checked(&directory)?;
+            incremental_usage.physical_bytes = incremental_usage
+                .physical_bytes
+                .saturating_add(measured.physical_bytes);
+            incremental_usage.logical_bytes = incremental_usage
+                .logical_bytes
+                .saturating_add(measured.logical_bytes);
+            incremental_usage.files = incremental_usage.files.saturating_add(measured.files);
+        }
         let last_used = last_used(&dir, sidecar.as_ref());
         out.push(BuildContext {
             dir,
@@ -204,6 +704,8 @@ pub fn write_sidecar(
         version: PROTOCOL_VERSION,
         workspace_root: workspace_root.display().to_string(),
         manifest_path: manifest_path.display().to_string(),
+        workspace_device: workspace_device(workspace_root),
+        workspace_mount_id: workspace_mount_id(workspace_root),
         toolchain,
         first_seen,
         last_seen: now,
@@ -215,6 +717,46 @@ pub fn write_sidecar(
     Ok(())
 }
 
+/// Prepare the two rgo-owned path components for a supervised build without
+/// following a pre-existing shard or context symlink. The storage root is
+/// already private and initialized before the launcher takes its session lock.
+pub fn ensure_managed_context_dir(paths: &RgoPaths, dir: &Path) -> Result<()> {
+    let root = paths.builds_dir();
+    let relative = dir.strip_prefix(&root)?;
+    let mut components = relative.components();
+    let shard = components.next().context("missing context shard")?;
+    let name = components.next().context("missing context name")?;
+    ensure!(
+        components.next().is_none()
+            && matches!(shard, std::path::Component::Normal(_))
+            && matches!(name, std::path::Component::Normal(_)),
+        "invalid managed context path {}",
+        dir.display()
+    );
+    let root_metadata = std::fs::symlink_metadata(&root)?;
+    ensure!(
+        root_metadata.is_dir() && !root_metadata.file_type().is_symlink(),
+        "unsafe managed build root {}",
+        root.display()
+    );
+    for path in [root.join(shard.as_os_str()), dir.to_path_buf()] {
+        match std::fs::create_dir(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => {
+                return Err(error).with_context(|| format!("creating {}", path.display()));
+            }
+        }
+        let metadata = std::fs::symlink_metadata(&path)?;
+        ensure!(
+            metadata.is_dir() && !metadata.file_type().is_symlink(),
+            "unsafe managed build path {}",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
 pub fn unix_now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -223,15 +765,35 @@ pub fn unix_now() -> u64 {
 }
 
 /// `<build-dir>/<profile>/incremental` and `<build-dir>/<triple>/<profile>/incremental`.
-pub fn incremental_dirs(build_dir: &Path) -> impl Iterator<Item = PathBuf> {
-    profile_dirs(build_dir)
-        .map(|p| p.join("incremental"))
-        .filter(|p| p.is_dir())
+/// A deletion plan must not mistake an unreadable or symlinked profile for
+/// absent incremental state.
+pub(crate) fn incremental_dirs_checked(build_dir: &Path) -> Result<Vec<PathBuf>> {
+    let mut dirs = Vec::new();
+    for profile in checked_profile_dirs(build_dir)
+        .with_context(|| format!("enumerating profiles under {}", build_dir.display()))?
+    {
+        let incremental = profile.join("incremental");
+        match std::fs::symlink_metadata(&incremental) {
+            Ok(metadata) => {
+                ensure!(
+                    metadata.is_dir() && !metadata.file_type().is_symlink(),
+                    "unsafe incremental directory {}",
+                    incremental.display()
+                );
+                dirs.push(incremental);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| format!("checking {}", incremental.display()));
+            }
+        }
+    }
+    Ok(dirs)
 }
 
 fn lock_files(build_dir: &Path) -> impl Iterator<Item = PathBuf> {
     profile_dirs(build_dir)
-        .flat_map(|p| [p.join(".cargo-build-lock"), p.join(".cargo-lock")])
+        .map(|p| p.join(".cargo-build-lock"))
         .filter(|p| p.is_file())
 }
 
@@ -272,6 +834,27 @@ mod tests {
     use super::*;
     use crate::size::Usage;
 
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_pin_decision_lock_fails_closed() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let paths = RgoPaths {
+            root: root.path().join("rgo"),
+        };
+        paths.ensure_layout().unwrap();
+        let external = root.path().join("external");
+        std::fs::write(&external, "untouched").unwrap();
+        symlink(
+            &external,
+            paths.state_dir().join("locks/pin-decisions.lock"),
+        )
+        .unwrap();
+        assert!(lock_pin_decisions(&paths).is_err());
+        assert_eq!(std::fs::read_to_string(&external).unwrap(), "untouched");
+    }
+
     fn context_at(last_used: SystemTime) -> BuildContext {
         BuildContext {
             dir: PathBuf::from("/nonexistent"),
@@ -305,8 +888,201 @@ mod tests {
         assert!(!is_pinned_dir(&dir));
         // Removing a missing marker is idempotent.
         remove_pin_marker(&dir).unwrap();
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(dir.join("missing-target"), dir.join(PIN_MARKER)).unwrap();
+            assert!(
+                is_pinned_dir(&dir),
+                "a broken pin marker must protect the context"
+            );
+            std::fs::remove_file(dir.join(PIN_MARKER)).unwrap();
+        }
         // Writing a marker for a missing directory fails loudly.
         assert!(write_pin_marker(&root.path().join("gone")).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn context_budget_scan_rejects_symlinked_build_shard() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = RgoPaths {
+            root: root.path().join("rgo"),
+        };
+        paths.ensure_layout().unwrap();
+        let external = root.path().join("external");
+        std::fs::create_dir_all(external.join("context")).unwrap();
+        std::os::unix::fs::symlink(&external, paths.builds_dir().join("aa")).unwrap();
+        assert!(list(&paths).is_err(), "a shard symlink hid build bytes");
+    }
+
+    #[test]
+    fn incremental_subtotal_counts_hardlinks_within_incremental_state() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = RgoPaths {
+            root: root.path().join("rgo"),
+        };
+        let context = paths.builds_dir().join("aa/context");
+        let incremental = context.join("debug/incremental");
+        std::fs::create_dir_all(&incremental).unwrap();
+        let file = incremental.join("cache");
+        std::fs::write(&file, vec![0u8; 8192]).unwrap();
+        std::fs::hard_link(&file, context.join("uplifted")).unwrap();
+        let contexts = list(&paths).unwrap();
+        assert_eq!(contexts.len(), 1);
+        assert_eq!(
+            contexts[0].usage.physical_bytes,
+            contexts[0].incremental_usage.physical_bytes
+        );
+        assert!(contexts[0].incremental_usage.physical_bytes > 0);
+    }
+
+    #[test]
+    fn absent_context_unpin_record_waits_for_the_supervised_session_to_end() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = RgoPaths {
+            root: root.path().join("rgo"),
+        };
+        let dir = paths.builds_dir().join("aa/removed");
+        write_durable_pin(&paths, &dir).unwrap();
+        remove_durable_pin(&paths, &dir).unwrap();
+        let record = pin_record_path(&paths, &dir).unwrap();
+        assert!(record.is_file());
+
+        let session = crate::supervision::lock_cargo_session(&paths, Some(&dir)).unwrap();
+        assert!(!try_prune_unpin_decision(&paths, &dir).unwrap());
+        assert!(record.is_file());
+        drop(session);
+
+        assert!(try_prune_unpin_decision(&paths, &dir).unwrap());
+        assert!(!record.exists());
+        assert!(!is_pinned(&paths, &dir));
+    }
+
+    #[test]
+    fn incremental_pin_scan_recovers_absent_unpin_decisions() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = RgoPaths {
+            root: root.path().join("rgo"),
+        };
+        let absent = (0..9)
+            .map(|index| paths.builds_dir().join(format!("aa/gone-{index}")))
+            .collect::<Vec<_>>();
+        for dir in &absent {
+            remove_durable_pin(&paths, dir).unwrap();
+        }
+        let present = paths.builds_dir().join("bb/present");
+        std::fs::create_dir_all(&present).unwrap();
+        remove_durable_pin(&paths, &present).unwrap();
+        let pinned = paths.builds_dir().join("cc/pinned");
+        write_durable_pin(&paths, &pinned).unwrap();
+
+        let mut scan = PinPruneScanner::default();
+        // Two entries per pass is smaller than the number of decisions. The
+        // iterator must progress rather than repeatedly checking its prefix.
+        for _ in 0..20 {
+            scan.scan(&paths, 2).unwrap();
+        }
+        for dir in &absent {
+            assert!(!pin_record_path(&paths, dir).unwrap().exists());
+        }
+        assert!(pin_record_path(&paths, &present).unwrap().exists());
+        assert!(pin_record_path(&paths, &pinned).unwrap().exists());
+        assert!(is_pinned(&paths, &pinned));
+
+        std::fs::remove_dir(&present).unwrap();
+        for _ in 0..20 {
+            scan.scan(&paths, 2).unwrap();
+        }
+        assert!(!pin_record_path(&paths, &present).unwrap().exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn malformed_profile_lock_state_blocks_deletion() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let context = root.path().join("context");
+        let profile = context.join("debug");
+        std::fs::create_dir_all(&profile).unwrap();
+        assert!(!lock_files_for_safety(&context));
+        symlink(
+            profile.join("missing-lock"),
+            profile.join(".cargo-build-lock"),
+        )
+        .unwrap();
+        assert!(lock_files_for_safety(&context));
+        std::fs::remove_file(profile.join(".cargo-build-lock")).unwrap();
+        symlink(profile.join("missing-directory"), profile.join("deps")).unwrap();
+        assert!(lock_files_for_safety(&context));
+    }
+
+    #[test]
+    fn missing_manifest_requires_an_available_workspace_volume() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        let manifest = workspace.join("Cargo.toml");
+        std::fs::write(&manifest, "[workspace]\n").unwrap();
+        let sidecar = ContextSidecar {
+            version: PROTOCOL_VERSION,
+            workspace_root: workspace.display().to_string(),
+            manifest_path: manifest.display().to_string(),
+            workspace_device: workspace_device(&workspace),
+            workspace_mount_id: workspace_mount_id(&workspace),
+            toolchain: None,
+            first_seen: 0,
+            last_seen: 0,
+        };
+        assert_eq!(workspace_state(&sidecar), WorkspaceState::Present);
+        std::fs::remove_file(&manifest).unwrap();
+        #[cfg(unix)]
+        let expected_deleted = if cfg!(target_os = "linux") && sidecar.workspace_mount_id.is_none()
+        {
+            WorkspaceState::Unavailable
+        } else {
+            WorkspaceState::MissingManifest
+        };
+        #[cfg(unix)]
+        assert_eq!(workspace_state(&sidecar), expected_deleted);
+        std::fs::remove_dir(&workspace).unwrap();
+        #[cfg(unix)]
+        assert_eq!(workspace_state(&sidecar), expected_deleted);
+        #[cfg(not(unix))]
+        assert_eq!(workspace_state(&sidecar), WorkspaceState::Unavailable);
+        std::fs::create_dir(&workspace).unwrap();
+        let legacy = ContextSidecar {
+            workspace_device: None,
+            workspace_mount_id: None,
+            ..sidecar.clone()
+        };
+        assert_eq!(workspace_state(&legacy), WorkspaceState::Unavailable);
+        #[cfg(target_os = "linux")]
+        {
+            let old_linux = ContextSidecar {
+                workspace_mount_id: None,
+                ..sidecar.clone()
+            };
+            assert_eq!(workspace_state(&old_linux), WorkspaceState::Unavailable);
+        }
+        let changed_volume = ContextSidecar {
+            workspace_device: Some(u64::MAX),
+            ..sidecar.clone()
+        };
+        #[cfg(unix)]
+        assert_eq!(
+            workspace_state(&changed_volume),
+            WorkspaceState::Unavailable
+        );
+        let _ = changed_volume;
+        #[cfg(target_os = "linux")]
+        {
+            let changed_mount = ContextSidecar {
+                workspace_mount_id: Some(u64::MAX),
+                ..sidecar
+            };
+            assert_eq!(workspace_state(&changed_mount), WorkspaceState::Unavailable);
+        }
     }
 
     #[test]

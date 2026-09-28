@@ -13,7 +13,7 @@ use std::process::Command;
 use blake3::Hasher;
 use serde::{Deserialize, Serialize};
 
-pub const CACHE_SCHEMA_VERSION: u32 = 2;
+pub const CACHE_SCHEMA_VERSION: u32 = 3;
 pub const WORKSPACE_REMAP_PREFIX: &str = "/rgo/workspace";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -39,6 +39,7 @@ pub enum BypassReason {
     UnsafeWorkspacePath,
     UnsupportedWorkspaceSource,
     InvalidOutDir,
+    UnsupportedEncoding,
 }
 
 impl std::fmt::Display for BypassReason {
@@ -64,6 +65,7 @@ impl std::fmt::Display for BypassReason {
             Self::UnsafeWorkspacePath => "unsafe_workspace_path",
             Self::UnsupportedWorkspaceSource => "unsupported_workspace_source",
             Self::InvalidOutDir => "invalid_out_dir",
+            Self::UnsupportedEncoding => "unsupported_encoding",
         };
         f.write_str(value)
     }
@@ -138,6 +140,15 @@ pub fn classify(
     env: &[(OsString, OsString)],
     roots: &AllowedRoots,
 ) -> Classification {
+    // Lossy conversion would let distinct compiler inputs share a key. A cache miss is
+    // cheaper than guessing at the meaning of platform-native strings.
+    if args.iter().any(|arg| arg.to_str().is_none())
+        || env
+            .iter()
+            .any(|(key, value)| key.to_str().is_none() || value.to_str().is_none())
+    {
+        return Classification::Bypass(BypassReason::UnsupportedEncoding);
+    }
     let crate_types = comma_values(args, "--crate-type");
     if crate_types.is_empty() {
         return Classification::Bypass(BypassReason::UnsupportedCrateType);
@@ -339,13 +350,7 @@ pub fn classify(
         remap_path_prefix.as_ref(),
         out_dir.as_deref(),
     );
-    let env_digest = relevant_environment(
-        env,
-        out_dir_digest.as_deref(),
-        source_kind,
-        &source_root,
-        remap_path_prefix.as_ref(),
-    );
+    let env_digest = relevant_environment(env, out_dir_digest.as_deref());
     let compiler_identity = match compiler_identity(rustc) {
         Ok(identity) => identity,
         Err(_) => return Classification::Bypass(BypassReason::CompilerIdentity),
@@ -709,17 +714,22 @@ fn normalize_path_token(value: &str, root: &str, replacement: &str) -> String {
         roots.push(format!("/{without_private}"));
     }
     for root in roots {
-        if value == root
-            || value
-                .strip_prefix(&root)
-                .is_some_and(|rest| rest.starts_with('/') || rest.starts_with('\\'))
+        if let Some(rest) = value
+            .strip_prefix(&root)
+            .filter(|rest| rest.is_empty() || rest.starts_with('/') || rest.starts_with('\\'))
         {
-            return replacement.to_owned();
+            return format!("{replacement}{rest}");
         }
         if let Some(index) = value.find(&root) {
             let prefix = &value[..index];
-            if prefix.ends_with('=') || prefix.ends_with(':') {
-                return format!("{prefix}{replacement}");
+            let rest = &value[index + root.len()..];
+            if (prefix.ends_with('=') || prefix.ends_with(':'))
+                && (rest.is_empty()
+                    || rest.starts_with('/')
+                    || rest.starts_with('\\')
+                    || rest.starts_with('='))
+            {
+                return format!("{prefix}{replacement}{rest}");
             }
         }
     }
@@ -729,34 +739,16 @@ fn normalize_path_token(value: &str, root: &str, replacement: &str) -> String {
 fn relevant_environment(
     env: &[(OsString, OsString)],
     out_dir_digest: Option<&str>,
-    source_kind: SourceKind,
-    source_root: &Path,
-    remap_path_prefix: Option<&(String, String)>,
 ) -> Vec<(String, String)> {
     let mut values = env
         .iter()
-        .filter_map(|(key, value)| {
-            let key = key.to_string_lossy();
-            let relevant = key.starts_with("CARGO_PKG_")
-                || key.starts_with("CARGO_CFG_")
-                || key == "CARGO_CRATE_NAME"
-                || key == "CARGO_MANIFEST_DIR"
-                || key == "RUSTUP_TOOLCHAIN";
-            relevant.then(|| {
-                let value = if key == "CARGO_MANIFEST_DIR"
-                    && source_kind == SourceKind::Workspace
-                    && remap_path_prefix.is_some()
-                    && path_under(Path::new(&value), source_root)
-                {
-                    WORKSPACE_REMAP_PREFIX.to_owned()
-                } else {
-                    value.to_string_lossy().into_owned()
-                };
-                (
-                    key.into_owned(),
-                    blake3::hash(value.as_bytes()).to_hex().to_string(),
-                )
-            })
+        .map(|(key, value)| {
+            (
+                key.to_string_lossy().into_owned(),
+                blake3::hash(value.to_string_lossy().as_bytes())
+                    .to_hex()
+                    .to_string(),
+            )
         })
         .collect::<Vec<_>>();
     if let Some(digest) = out_dir_digest {
@@ -887,7 +879,7 @@ mod tests {
     }
 
     #[test]
-    fn workspace_remapping_makes_equivalent_worktrees_share_a_key() {
+    fn workspace_remapping_preserves_environment_dependent_paths() {
         let dir = tempfile::tempdir().unwrap();
         let first = dir.path().join("first/member");
         let second = dir.path().join("second/member");
@@ -944,12 +936,60 @@ mod tests {
             Classification::Cacheable(candidate) => candidate,
             other => panic!("expected cacheable candidate, got {other:?}"),
         };
-        assert_eq!(first_with.key, second_with.key);
+        // rustc can embed CARGO_MANIFEST_DIR with env! even when source paths are
+        // remapped. Different values must therefore produce different cache keys.
+        assert_ne!(first_with.key, second_with.key);
         assert!(
             first_with
                 .compiler_args
                 .iter()
                 .any(|arg| arg.to_string_lossy().contains("--remap-path-prefix="))
+        );
+    }
+
+    #[test]
+    fn arbitrary_environment_changes_and_missing_values_change_keys() {
+        let (_dir, root, source) = fixture();
+        let args = vec![
+            "--crate-name".into(),
+            "demo".into(),
+            "--crate-type=lib".into(),
+            "--emit=metadata".into(),
+            "--out-dir".into(),
+            root.as_os_str().to_owned(),
+            source.into_os_string(),
+        ];
+        let roots = AllowedRoots {
+            build_root: root.clone(),
+            source_roots: vec![root.parent().unwrap().to_path_buf()],
+            workspace_roots: Vec::new(),
+            remap_workspace_paths: false,
+        };
+        let key =
+            |env: &[(OsString, OsString)]| match classify(Path::new("rustc"), &args, env, &roots) {
+                Classification::Cacheable(candidate) => candidate.key,
+                other => panic!("expected cacheable invocation: {other:?}"),
+            };
+        let absent = key(&[]);
+        let alpha = key(&[("APP_BUILD_FLAVOR".into(), "alpha".into())]);
+        let beta = key(&[("APP_BUILD_FLAVOR".into(), "beta".into())]);
+        assert_ne!(absent, alpha);
+        assert_ne!(alpha, beta);
+    }
+
+    #[test]
+    fn normalized_paths_keep_their_relative_suffixes() {
+        assert_eq!(
+            normalize_path_token("/work/a/src/lib.rs", "/work/a", "<SRC>"),
+            "<SRC>/src/lib.rs"
+        );
+        assert_eq!(
+            normalize_path_token("/work/a/src/other.rs", "/work/a", "<SRC>"),
+            "<SRC>/src/other.rs"
+        );
+        assert_eq!(
+            normalize_path_token("--extern=dep=/work/a/libdep.rlib", "/work/a", "<SRC>"),
+            "--extern=dep=<SRC>/libdep.rlib"
         );
     }
 

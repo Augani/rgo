@@ -2,7 +2,7 @@ use assert_cmd::cargo::cargo_bin;
 use rgo_testkit::{Sandbox, ensure_workspace_bins_built};
 
 #[test]
-fn adopt_reports_then_deletes_only_approved_intermediates() {
+fn adopt_reports_target_storage_and_refuses_unsafe_selective_delete() {
     ensure_workspace_bins_built().unwrap();
     let sandbox = Sandbox::new().unwrap();
     let project = sandbox.projects.join("legacy");
@@ -33,7 +33,12 @@ fn adopt_reports_then_deletes_only_approved_intermediates() {
         .output()
         .unwrap();
     assert!(report.status.success());
-    assert!(String::from_utf8_lossy(&report.stdout).contains("Report only"));
+    let stdout = String::from_utf8_lossy(&report.stdout);
+    assert!(stdout.contains("Report only"), "{stdout}");
+    assert!(
+        stdout.contains("includes final outputs and user files"),
+        "{stdout}"
+    );
     assert!(target.join("deps/liblegacy.rlib").exists());
 
     let delete = sandbox
@@ -41,13 +46,14 @@ fn adopt_reports_then_deletes_only_approved_intermediates() {
         .args(["adopt", "--delete", project.to_str().unwrap()])
         .output()
         .unwrap();
+    assert!(!delete.status.success());
     assert!(
-        delete.status.success(),
-        "adopt --delete failed: {}",
+        String::from_utf8_lossy(&delete.stderr).contains("deletion is unavailable"),
+        "{}",
         String::from_utf8_lossy(&delete.stderr)
     );
-    assert!(!target.join("deps").exists());
-    assert!(!target.join("build").exists());
+    assert!(target.join("deps/liblegacy.rlib").exists());
+    assert!(target.join("build").exists());
     assert!(final_binary.exists());
     assert_eq!(std::fs::read(final_binary).unwrap(), b"keep me");
     assert!(target.join("examples/example").exists());

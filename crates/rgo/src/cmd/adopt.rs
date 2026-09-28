@@ -1,11 +1,16 @@
 use std::path::PathBuf;
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use rgo_core::adopt;
 
 use super::human;
 
 pub fn run(roots: Vec<PathBuf>, delete: bool) -> Result<()> {
+    if delete {
+        bail!(
+            "legacy target deletion is unavailable: rgo cannot safely identify Cargo intermediates without depending on undocumented build-dir layout. `rgo adopt` remains read-only"
+        );
+    }
     let roots = if roots.is_empty() {
         adopt::default_roots()
     } else {
@@ -37,32 +42,17 @@ pub fn run(roots: Vec<PathBuf>, delete: bool) -> Result<()> {
             println!("  workspace: abandoned or manifest not found");
         }
         if let Some(reason) = &candidate.skipped_reason {
-            println!("  SKIP: {reason}");
-        } else if candidate.intermediates.is_empty() {
-            println!("  nothing reclaimable (final artifacts are preserved)");
+            println!("  note: {reason}");
+        }
+        if candidate.usage.physical_bytes == 0 {
+            println!("  no allocated files observed");
         } else {
-            for item in &candidate.intermediates {
-                println!(
-                    "  candidate: {} ({})",
-                    item.path.display(),
-                    human(item.usage.physical_bytes)
-                );
-            }
-            println!("  reclaimable: {}", human(candidate.reclaimable_bytes()));
+            println!(
+                "  target storage estimate: {} (includes final outputs and user files)",
+                human(candidate.usage.physical_bytes)
+            );
         }
     }
-    if !delete {
-        println!(
-            "\nReport only. Re-run with `rgo adopt --delete` to remove approved intermediates."
-        );
-        return Ok(());
-    }
-    let paths = rgo_core::paths::RgoPaths::discover()?;
-    paths.ensure_layout()?;
-    let reclaimed = adopt::delete(&report, &paths)?;
-    println!(
-        "Removed {} of approved legacy intermediates.",
-        human(reclaimed)
-    );
+    println!("\nReport only. No files were removed.");
     Ok(())
 }

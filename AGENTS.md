@@ -1,7 +1,7 @@
 # rgo — notes for contributors and agents
 
 - Architecture vision: `doc.md`. Implementable plan and current status: `PLAN.md` (wins on conflict).
-- Build: `cargo build` (must build all bins; `cargo test -p rgo` alone does not rebuild `rgo-rustc-wrapper`).
+- Build: `cargo build` (must build all bins; `cargo test -p rgo-storage` alone does not rebuild `rgo-rustc-wrapper`).
 - Verify: `cargo clippy --all-targets` (workspace lints: clippy::all = warn, keep at zero) and `cargo test`.
 - Integration tests use `rgo-testkit::Sandbox` (private HOME/CARGO_HOME/RGO_HOME) and run real cargo
   offline. Never run `rgo setup` against the developer's real `$CARGO_HOME` from tests.

@@ -59,6 +59,11 @@ fn stats(e: &super::Env) -> Result<()> {
                 e.cfg.cache.enabled,
                 Store::new(e.paths.cas_dir(), e.paths.quarantine_dir())?.object_bytes()?,
             )?;
+            report.observations_incomplete = e
+                .paths
+                .state_dir()
+                .join(rgo_protocol::CACHE_EVENT_LOG_TRUNCATED)
+                .is_file();
             report.remote = db.remote_status(
                 e.cfg.cache.enabled && e.cfg.remote.enabled,
                 None,
@@ -74,6 +79,9 @@ fn stats(e: &super::Env) -> Result<()> {
     println!("Cache hits           {}", report.hits);
     println!("Cache misses         {}", report.misses);
     println!("Cache bypasses       {}", report.bypasses);
+    if report.observations_incomplete {
+        println!("Cache observations   incomplete (events dropped, malformed, or still draining)");
+    }
     println!("Single-flight active {}", report.active_builds);
     println!("Single-flight waits  {}", report.single_flight_waiters);
     println!("Single-flight timeouts {}", report.single_flight_timeouts);

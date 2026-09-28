@@ -2,10 +2,9 @@
 
 The dependency cache (`[cache] enabled = true`) is opt-in and conservatively
 scoped. Every artifact key is a BLAKE3 digest over a fixed, length-delimited
-field list; changing any input produces a different key, so an incorrect key
-can only cause a *miss*, never a wrong hit — provided every input that affects
-output bytes is represented below. This document is the audit table for that
-claim (schema version `rgo-cache-v2`).
+field list. The key schema is `rgo-cache-v3`. The classifier still has
+unverified dynamic-input classes, so caching remains experimental and disabled
+by default. A key collision can return incorrect output.
 
 ## Key inputs
 
@@ -13,13 +12,13 @@ claim (schema version `rgo-cache-v2`).
 |---|---|---|
 | schema tag | `rgo-cache-v{N}` constant | versioned; a format change rotates all keys |
 | compiler identity | full `rustc -vV` output | version, commit, host, LLVM — not just a version number |
-| normalized args | all rustc args after normalization | paths rewritten to roots-relative form; ordering preserved |
+| normalized args | all rustc args after normalization | managed paths rewritten relative to the validated build context, preserving the profile/artifact suffix; ordering preserved |
 | source digest | BLAKE3 over `(relpath, bytes)` for every file in the package source root, sorted | strict mode: any symlink fails the digest → bypass |
-| source kind | Registry / Git / Workspace | registry and git checkouts are immutable inputs; workspace members are handled separately |
+| source kind | Registry / Git / Workspace | registry and git checkout contents are digested; workspace members are handled separately |
 | extern inputs | `(name=file, file-content digest)` for every `--extern` | externs must resolve inside managed roots, else bypass; bare `--extern proc_macro` (no path) records `sysroot` — it is pinned by compiler identity. Newer cargo may pass the same crate twice (`.rlib` and `.rmeta` externs); each artifact's digest is keyed separately |
-| env digest | `(name, BLAKE3(value))` for `CARGO_PKG_*`, `CARGO_CFG_*`, `CARGO_CRATE_NAME`, `CARGO_MANIFEST_DIR`, `RUSTUP_TOOLCHAIN` | plus `OUT_DIR_CONTENTS` digest when `OUT_DIR` is set |
+| env digest | `(name, BLAKE3(value))` for every inherited environment variable | conservative response to arbitrary `env!` and `option_env!`; missing versus present values differ; plus `OUT_DIR_CONTENTS` digest when `OUT_DIR` is set. Environment churn can reduce hits. |
 | target triple | `--target` value when present | cross builds never collide with host builds |
-| remap prefix | `(from, to)` of the applied `--remap-path-prefix` | workspace "from" is omitted so equivalent worktrees share one key |
+| remap prefix | `(from, to)` of the applied `--remap-path-prefix` | source path normalization preserves relative suffixes; environment-dependent absolute paths can still distinguish worktrees |
 | OUT_DIR digest | content digest of the build-script output dir | build-script-produced inputs change the key |
 
 ## Classifier table
@@ -49,6 +48,7 @@ a failure. Reasons are stable strings, recorded in `state/cache-events.log`.
 | `rustc -vV` fails | `compiler_identity` |
 | no `--out-dir` derivable output | `missing_output_directory` |
 | conflicting/multiple workspace remaps | `remap_conflict` |
+| non-UTF-8 argument or environment name/value | `unsupported_encoding` |
 | inner rustc wrapper composition issues | `inner_wrapper` |
 | `[cache] enabled = false` (default) | `cache_disabled` |
 | daemon reports storage pressure on acquire | `free_space_pressure` |
@@ -70,8 +70,9 @@ Notes on invocation-derived key inputs:
   `<profile>/build/<pkg>/<hash>/out/` with colocated `fingerprint/`. The wrapper
   is layout-agnostic (it works from each invocation's `--out-dir`), and the
   whole `build/` tree is already a documented intermediate, so relocation and
-  caching work on both layouts. Nightly also adds a `.cargo-artifact-lock`,
-  which the liveness heuristic watches alongside `.cargo-build-lock`.
+  caching can work on both layouts. Cargo may also use an artifact lock for
+  final outputs; rgo has not established a complete lock protocol for safe
+  unattended deletion on the new layout. See P2 of the installation plan.
 
 ## Integrity and recovery
 
@@ -118,12 +119,10 @@ Notes on invocation-derived key inputs:
   `OUT_DIR` path and proc-macro dylibs carry a linker-generated per-build
   field, so cross-*compile* byte equality is only asserted for path-free
   artifacts — hits still return the publisher's verified bytes verbatim.
-- A real-cargo differential corpus (compile vs. hit on a crate matrix) is
-  implemented: `crates/rgo/tests/cache.rs` runs an offline `file://` git-dep
-  corpus always, and an env-gated registry corpus
+- A real-Cargo offline `file://` Git dependency corpus compares path-free
+  outputs with a bypass control and runs the resulting binary. The conservative
+  all-environment key can miss across Cargo contexts, so this corpus is no
+  longer evidence of cross-project hits. An env-gated registry corpus
   (`RGO_CORPUS_ONLINE=1`, override crates/toolchains via `RGO_CORPUS_CRATES` /
-  `RGO_CORPUS_TOOLCHAINS`) which checks per-hit manifest fidelity — every
-  artifact materialized via a `hit` must equal the publisher's bytes —
-  rather than whole-closure equality (nondeterministic artifact classes).
-  Scaling it to the full 50-crate × 3-toolchain × 3-OS matrix remains an
-  operator/CI gate before enabling by default, alongside perf measurement.
+  `RGO_CORPUS_TOOLCHAINS`) requires its separate operator/CI run. Dynamic
+  input validation and measured reuse remain gates before enabling by default.

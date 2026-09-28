@@ -3,6 +3,22 @@
 > Companion to `doc.md` (the architecture vision). This document turns it into an
 > ordered, shippable plan. Where this plan disagrees with `doc.md`, this plan wins.
 
+> **2026-09-28 review update:** A new [research review](docs/installation-storage-research.md)
+> reproduced an incorrect opt-in cache hit and a pressure-GC case that cannot meet its
+> target, and identified compatibility/lifecycle gaps. Earlier checked milestones below
+> record implementation history; they do **not** establish current release readiness.
+> The [installation and storage work plan](docs/installation-storage-plan.md) is the
+> current checklist for the next release. Its unchecked items remain release gates;
+> compiler caching remains off by default.
+
+| Capability | Implemented | Local validation | Platform validation | Release gate |
+|---|---|---|---|---|
+| Cargo-native intermediate relocation | Yes | Plain-Cargo sandbox tests | Incomplete for supported version/OS matrix | Open: activation and precedence |
+| Pressure and age cleanup | Partial | Policy fixtures, including one-context-per-workspace pressure | Incomplete | Open: full Cargo-session safety and bounded storage |
+| Optional compiler-result cache | Partial, off by default | Wrong-hit regression and offline corpus | Incomplete | Open: dynamic inputs and useful cross-project reuse |
+| One-command installation and lifecycle | Partial setup and installer pilots, no published endpoint | Fresh-process custom-root, recovery, and activation-probe sandbox tests | Incomplete | Open: distribution, repair, upgrade, uninstall |
+| Compiler RAM control | No | No claim | No claim | Outside storage release |
+
 ## 0. What changed vs. `doc.md`, and why
 
 `doc.md` treats the rustc-wrapper + CAS as the core and the managed build roots as a
@@ -12,30 +28,38 @@ priorities invert:
 | Fact (verified against current Cargo docs) | Consequence |
 |---|---|
 | `build.build-dir` is **stable**, settable from `$CARGO_HOME/config.toml` or `CARGO_BUILD_BUILD_DIR`, and supports `{workspace-root}`, `{cargo-cache-home}`, `{workspace-path-hash}` templates. | rgo can relocate intermediates for **every project on the machine** with one global config line. No cargo shim required for the base product. |
-| Cargo officially splits *final* artifacts (target-dir: uplifted bins, `doc/`, `package/`) from *intermediate* artifacts (build-dir: `deps/`, `incremental/`, `build/`, `.fingerprint/`, build-script out dirs). | Leave `target-dir` **in the checkout**. `target/debug/myapp` keeps existing, so scripts, Dockerfiles, IDE launch configs, `cargo run` all behave identically. Only the 95%+ bloat moves. |
+| Cargo officially splits *final* artifacts (target-dir: uplifted bins, `doc/`, `package/`) from *intermediate* artifacts (build-dir: `deps/`, `incremental/`, `build/`, `.fingerprint/`, build-script out dirs). | Leave `target-dir` **in the checkout**. `target/debug/myapp` keeps existing, so scripts, Dockerfiles, IDE launch configs, `cargo run` keep their expected paths. Relocation by itself does not reduce total disk use; savings require proven cleanup or reuse. |
 | Cargo `-Z gc` for build artifacts is nightly-only; stable auto-clean only covers `~/.cargo/registry` + git caches. | Bounded, machine-wide build-dir GC is genuinely unsolved upstream. That is rgo's Phase 1 product. |
 | Cargo's build-dir *layout* is documented as internal/unstable. | GC treats each build-dir as an **opaque unit** (plus a documented `incremental/` sub-tier). Never fingerprint-surgery inside it. |
 | Two worktrees cannot safely share one mutable build-dir (fingerprints/dep-info embed absolute paths). | Cross-worktree dedup comes from the CAS layer (Phase 3), not from sharing build-dirs. Build-dirs stay per-(workspace-path, context). |
 
-Resulting shape:
+Resulting implementation sequence (historical; the current release gates are in the linked installation checklist):
 
 ```
-Phase 1  Relocate + bound + GC + observe        -> solves the disk problem for everyone, zero risk
+Phase 1  Relocate + policy + GC + observe       -> storage control after safety and reclamation gates pass
 Phase 2  Daemon, leases, live-build safety       -> makes GC safe under concurrent agents/IDEs
 Phase 3  rustc wrapper + CAS                     -> dedup across worktrees/projects (the doc's core)
 Phase 4  Single-flight, path remap, composition  -> the hard correctness work
 Phase 5  Remote CAS (optional, never required)
 ```
 
-Each phase is independently useful and shippable. Users install once; later phases
-light up automatically via `rgo` upgrades without changing their workflow.
+These phases can be developed independently. Storage cleanup is not shippable
+as unattended bounded storage until the P2 lifecycle and P3 budget gates pass.
 
 ### Explicitly dropped / deferred from `doc.md`
 
-- **Cargo shim as a default.** Not needed for Phase 1–2. `rgo build` etc. exist as a
-  convenience passthrough, and the shim becomes opt-in only when Phase 3 needs to inject
-  `RUSTC_WRAPPER` per-invocation — and even then the global-config route
-  (`build.rustc-wrapper`) is preferred over intercepting `cargo`.
+- **Cargo shim as an unproven default.** Global configuration currently handles
+  relocation and wrapper installation, but Cargo's profile locks do not prove
+  safe whole-context deletion for ordinary launches. P2 now records an explicit
+  supervised-Cargo pilot: isolate only shimmed builds in a managed namespace,
+  guard their full lifecycle with non-evictable locks, and leave direct Cargo in
+  its ordinary checkout directory. It must pass the mixed-launch, PATH/rustup,
+  signal, GC-race, and platform gates before becoming the default. Global-config
+  relocation and `gc.auto = false` remain the current development behavior.
+  With explicit `gc.auto = true`, the Unix pilot now starts a daemon from an
+  unchanged Cargo invocation and falls back to local Cargo storage if startup
+  fails; a private macOS fixture observed an idle context reclaimed. This is
+  evaluation evidence, not completion of the P2/P3 release gates.
 - **15 crates up front.** Collapse to 5 crates now; split when a boundary actually hurts.
 - **Repository identity via Git common dir for build roots.** Build-dirs are keyed by
   what Cargo keys them by (manifest path). Git/worktree identity is only needed for the
@@ -47,54 +71,57 @@ light up automatically via `rgo` upgrades without changing their workflow.
 
 ### Install
 
-```bash
-cargo install rgo            # or brew / prebuilt binaries
-rgo setup                    # one-time; idempotent; explains every change before it makes it
-```
+The verified one-command installer and registry publishing are release work.
+For development evaluation, build both workspace binaries and run `rgo setup`
+in a private Cargo home; `rgo setup --dry-run` previews the config edit.
 
-`rgo setup` does exactly three things, all reversible via `rgo setup --undo`:
+`rgo setup` currently:
 
-1. Creates `~/.rgo/` (or `$RGO_HOME`, respecting `XDG_DATA_HOME` on Linux).
-2. Adds a clearly-fenced block to `$CARGO_HOME/config.toml`:
+1. Creates `~/.rgo/` (or `$RGO_HOME`).
+2. Adds a clearly-fenced block to Cargo's active home config (`config` or `config.toml`):
    ```toml
    # >>> rgo managed (do not edit inside fence; `rgo setup --undo` removes it) >>>
    [build]
    build-dir = "/Users/me/.rgo/builds/{workspace-path-hash}"
    # <<< rgo managed <<<
    ```
-   (Absolute path is written, not `{cargo-cache-home}`, so it survives `CARGO_HOME` changes.)
-3. Installs a per-user background service (launchd agent / systemd user unit / Windows
-   Task Scheduler) that runs `rgo daemon` on login. If the user declines, GC runs
-   opportunistically from `rgo` commands and a lightweight `rgo gc --auto` cron mode.
+   (An absolute path is written; moving `CARGO_HOME` later requires a new setup.)
+3. Stores a small activation pointer and ownership record in Cargo home for
+   fresh-process discovery and recovery.
+4. Attempts to install a per-user background service (launchd agent / systemd user
+   unit / Windows Task Scheduler). Service failure is reported as degraded setup.
+   Unattended destructive GC is disabled by default pending the P2 safety gate.
 
 After that, **users use plain `cargo` as before.** No project changes. Existing
 `target/` dirs are untouched (Cargo just stops writing intermediates into them);
-`rgo doctor` offers to reclaim the now-dead `target/debug/deps` etc.
+`rgo adopt` reports total legacy `target/` storage without deleting it. A
+selective migration command remains a release gate because Cargo's private
+subdirectory layout cannot be used under the contributor contract.
 
 ### Precedence guarantees (non-negotiable, ties to doc invariants 12–14)
 
-- Project `.cargo/config.toml` `build.build-dir`/`target-dir`, `CARGO_TARGET_DIR`,
-  `CARGO_BUILD_BUILD_DIR`, and `--target-dir` **all win** over rgo (Cargo's own
-  precedence does this for us). `rgo doctor` reports such projects as "unmanaged (by
-  project choice)".
+- Project `.cargo/config.toml` `build.build-dir` and `CARGO_BUILD_BUILD_DIR`
+  can override rgo's intermediate root. Project `target-dir`, `CARGO_TARGET_DIR`,
+  and `--target-dir` change final-output paths but do not cancel an effective
+  managed build directory. Doctor must report these independently.
 - `RGO_BYPASS=1` makes every rgo binary a pure passthrough (wrapper `exec`s rustc,
   `rgo <cargo-cmd>` execs cargo with rgo env stripped). Note: the global config line
   is still honored by cargo — that's fine, it is harmless. `rgo setup --undo` is the
   full escape hatch.
-- Older Cargo (before `build-dir` stabilized) silently ignores the key and behaves as
-  before. `rgo doctor` reports the minimum version per installed toolchain.
+- Cargo before 1.91 cannot use the configured build directory. `rgo doctor`
+  reports the version boundary; the full capability matrix remains open.
 
 ### Commands
 
 ```
 rgo setup [--undo] [--no-service] [--dry-run]
 rgo status                  # storage summary (physical bytes), budget, reclaimable
-rgo doctor                  # config precedence, conflicting wrappers, toolchains, fs caps, service health
+rgo doctor [--json] [--verify] # diagnostics; --verify probes Cargo and filesystem with disposable writes
 rgo gc [--dry-run] [--aggressive] [--target <bytes>]
 rgo ls                      # every managed build-dir: workspace path, exists?, size, last used, pinned?
 rgo pin <path|id> / rgo unpin
 rgo clean <path|id>         # remove one context (refuses if leased)
-rgo adopt [--delete] [<dir>...] # report stray target/ dirs; --delete removes only approved intermediates
+rgo adopt [<dir>...]            # report legacy target/ storage; selective deletion is disabled pending a safe Cargo-supported path
 rgo daemon [--foreground]   # Phase 2
 rgo cache stats|explain|verify   # Phase 3
 rgo build|run|test|check|clippy|doc|bench|<anything>   # passthrough to cargo with `rgo` env; unknown -> passthrough
@@ -163,7 +190,7 @@ min_free_space = "auto"     # auto = max(10% of volume, 20GB)
 incremental_retention = "7d"        # incremental/ dirs untouched this long are tier-2
 context_retention = "30d"           # whole build-dirs untouched this long are tier-3
 orphan_grace = "1h"                 # build-dir whose workspace manifest no longer exists
-auto = true                         # allow daemon/opportunistic GC
+auto = false                        # current development default until P2 safety is proven
 
 [cache]                              # Phase 3
 enabled = false
@@ -203,8 +230,9 @@ build directory") without needing filesystem watchers.
   not double count.
 - Sizes are cached per build-dir in SQLite with the dir's top-level mtime + a cheap
   sampled re-scan; full rescans run in the daemon at low priority.
-- Last-used = max(mtime of `<build-dir>/*/.cargo-lock` files or the dir itself, sidecar
-  `last_seen`). Never rely on atime (often disabled).
+- Last-used heuristic = max(mtime of documented `<profile>/.cargo-build-lock`
+  files or the build-dir itself, sidecar `last_seen`). It does not observe every
+  no-op Cargo session; do not use it as a complete build-lifetime signal.
 
 ### 3.4 GC policy (`rgo-core::gc`)
 
@@ -221,10 +249,11 @@ tier 4  (only when free-space reserve breached, --aggressive, or hard ceiling)
         unpinned contexts by LRU regardless of age, never the most recently used per workspace
 ```
 
-Safety rules (mechanism, not policy — tested independently):
-- Never delete a context with an active lease (Phase 2). Phase 1 fallback: skip any
-  build-dir containing a `.cargo-lock` file modified in the last 10 minutes *or* held by
-  a live process (try non-blocking `flock` on it — Cargo holds it for the build's duration).
+Safety rules (mechanism, not policy — full-lifetime exclusion remains unproven):
+- Never delete a context with an active rgo lease. The current heuristic also skips
+  contexts with a documented `.cargo-build-lock` modified in the last 10 minutes
+  or held by a process. This does not cover all unchanged Cargo launches or the
+  rename/waiter race, so unattended destructive GC remains disabled by default.
 - Pinned contexts are never eligible.
 - Delete = `rename` to `~/.rgo/tmp/gc-<uuid>` (same volume, atomic) then remove
   recursively. A crash mid-delete leaves only tier-0 garbage.
@@ -246,7 +275,7 @@ Doctor checks (each with a fix suggestion, some with `--fix`):
 
 - [x] `rgo setup` / `--undo` idempotent, dry-run prints config and service changes, never clobbers user config outside the fence.
 - [x] Plain `cargo build` in any existing project writes intermediates to `~/.rgo/builds/…` and `target/debug/<bin>` still exists and runs.
-- [x] Projects with their own `target-dir`/`build-dir` config are untouched and reported by `rgo adopt` and `rgo doctor`.
+- [ ] Projects with their own `target-dir`/`build-dir` config are classified by their effective intermediate and final paths in `rgo adopt` and `rgo doctor`. A target-only override does not disable rgo's build directory.
 - [x] `rgo gc` reclaims in tier order, reports tier 0, and rechecks live locks immediately before atomic staging.
 - [x] Deleting a checkout → context shows as orphan → removed after grace by daemon/opportunistic GC.
 - [x] `rgo status` uses hardlink-aware physical allocation accounting.
@@ -439,10 +468,10 @@ Work in this order. Items marked **release-blocking** must be complete before th
   - Test project `build-dir`, project `target-dir`, `CARGO_BUILD_BUILD_DIR`, `CARGO_TARGET_DIR`, and `--target-dir` overrides with real Cargo.
   - Test `RGO_BYPASS=1` for both the CLI passthrough and rustc wrapper, including removal of inherited `RGO_*` coordination variables.
   - Test unknown Cargo subcommands, `+toolchain`, non-UTF-8 arguments where supported, signals, stdio, and exact exit-code propagation.
-- [x] Expand `rgo adopt` safety coverage.
-  - Cover nested workspaces, custom profiles, cross-target output, symlinks, unreadable paths, and builds that become live between scan and deletion.
-  - Confirm final binaries, examples, docs, package output, and user-created files are never selected.
-  - Add an explicit confirmation UX if interactive deletion is introduced; non-interactive deletion must remain narrowly scoped.
+- [ ] Complete `rgo adopt` migration safely.
+  - Read-only discovery covers nested workspaces, symlinks, and unreadable paths, and reports total target storage without classifying private subdirectories.
+  - The former selective deletion path is disabled; it depended on undocumented `deps`, `build`, and `.fingerprint` layout and could race with a new Cargo process.
+  - Find a Cargo-supported cleanup route that preserves requested outputs, or review a narrow contributor-contract exception with a complete concurrency proof before restoring deletion.
 - [x] Dogfood storage behavior on representative large projects.
   - Recorded in `docs/dogfood-2026-09-18.md` and `docs/benchmarks.md`: plain build checkout `target/` ~194.3 MiB vs managed ~8.7 MiB; orphan GC reclaimed ~181.2 MiB while preserving a live context.
   - Confirm checkout `target/` directories retain requested final outputs while intermediates remain bounded centrally. (verified)
@@ -467,7 +496,7 @@ Work in this order. Items marked **release-blocking** must be complete before th
   - Bounded frame size (`MAX_FRAME_SIZE`), per-connection read/write timeouts, and a bounded connection-admission semaphore; malformed-client and bad-handshake tests prove the daemon survives.
 - [x] Complete SQLite recovery coverage.
   - Corrupt DBs are quarantined to `meta.sqlite.corrupt-<ts>` and rebuilt from filesystem truth without blocking Cargo.
-  - Pins survive DB rebuild via the `.rgo-pin` filesystem marker; `reconcile_contexts` rebuilds the pins table from markers (unit + daemon integration coverage).
+  - Pins survive DB rebuild and `cargo clean` via records under `state/pins`; setup and `reconcile_contexts` migrate legacy `.rgo-pin` markers. The pins table indexes existing contexts from both signals, while `rgo ls` exposes retained pins for absent contexts (unit + supervised integration coverage).
 - [x] Complete the specified concurrency torture suite.
   - `concurrent_builds_survive_aggressive_gc` runs 20 parallel builds across five worktrees while `rgo gc --aggressive` loops; `concurrent_writers_survive_wal_busy_contention` hammers SQLite.
   - Assert zero live-context deletion, zero leaked leases after TTL, no deadlocks, and no rgo-attributable build failures.
@@ -483,7 +512,7 @@ Work in this order. Items marked **release-blocking** must be complete before th
   - An env-gated online corpus also exists: `online_registry_corpus_hits_reproduce_publisher_outputs` (enabled via `RGO_CORPUS_ONLINE=1`, crates/toolchains overridable via `RGO_CORPUS_CRATES` / `RGO_CORPUS_TOOLCHAINS`) runs ~41 real registry crates — including serde+serde_json, tokio, clap, rayon, futures, toml, and regex closures with proc-macro and build-script deps — through cold/publisher/consumer builds and asserts per-hit manifest fidelity (hit-materialized outputs equal the publisher's bytes), dep-closure name-set equality, probe behavior, and a no-op rebuild that stays fresh.
   - The corpus caught three production bugs so far: shared-`--out-dir` scan poisoning (siblings' outputs entering a manifest → `materialization_failed`), bare `--extern proc_macro` rejecting every real proc-macro compile, and clonefile materialization inheriting stale CAS mtimes that made Cargo rebuild dependents on the next build. All are fixed and covered.
   - It also surfaced a real resilience gap: transient daemon IPC failures (parallel commit bursts exceeding the 150ms socket timeout) silently fell back to recompiles; the wrapper now retries `CacheAcquire` for ~2s and records an observable `daemon_unreachable` bypass instead of degrading silently.
-  - Running the corpus on nightly (cargo 1.100) exposed forward-compat work, all fixed: the per-unit build-dir layout (`<profile>/build/<pkg>/<hash>/out/` + `.cargo-artifact-lock`) needed layout-agnostic artifact discovery in tests and a new lock in the liveness heuristic; nightly's default `-Z embed-metadata=no` needed a keyed `-Z` allowlist (other `-Z` flags still bypass); and duplicate `--extern` pairs (`.rlib` + `.rmeta` for one crate) needed per-artifact digests instead of name-keyed dedup. The corpus passes on both stable and nightly on this host.
+  - Running the corpus on nightly (cargo 1.100) exposed forward-compat work: test artifact discovery needed to avoid assuming one private per-unit layout; nightly's default `-Z embed-metadata=no` needed a keyed `-Z` allowlist (other `-Z` flags still bypass); and duplicate `--extern` pairs (`.rlib` + `.rmeta` for one crate) needed per-artifact digests instead of name-keyed dedup. Those cache fixes passed the local corpus. An earlier `.cargo-artifact-lock` liveness heuristic was removed because it exceeds the contributor layout contract; nightly GC safety remains unproven.
   - The release gate remains scaling the corpus to ≥50 popular registry crates across three toolchains and all three supported operating systems — a CI-matrix-scale exercise.
   - Include features, custom profiles, cross compilation, path/git dependencies, multiple registries, clippy, rustdoc, tests, benches, and examples.
 - [x] Audit and lock down artifact-key completeness.
@@ -498,7 +527,7 @@ Work in this order. Items marked **release-blocking** must be complete before th
   - Hardlink, copy fallback, and cross-volume behavior covered by rgo-materialize tests and the APFS cross-volume dogfood run.
   - Read-only CAS objects cannot be mutated through hardlinks; physical-byte accounting is hardlink-aware.
 - [x] Finish cache observability.
-  - `cache-events.log` plus `rgo cache explain` report stable hit/miss/bypass/timeout/corruption reasons without sensitive values; events are drained into the DB by daemon maintenance.
+  - `cache-events.log` plus `rgo cache explain` report stable hit/miss/bypass/timeout/corruption reasons without sensitive values; events are drained into the DB by daemon maintenance. The event log is bounded and status marks observations incomplete if the limit is reached.
 - [x] Establish performance gates.
   - `hits_are_byte_identical_materially_faster_and_explained` asserts hits beat a slow compile; `bypassed_wrapper_overhead_stays_bounded` fails if bypass overhead exceeds 100ms; methodology recorded in `docs/benchmarks.md`.
 
@@ -511,8 +540,8 @@ Work in this order. Items marked **release-blocking** must be complete before th
   - Setup preserves pre-existing wrappers with diagnostics instead of overwriting them.
 - [x] Finish single-flight fault coverage.
   - `single_flight_timeout_and_producer_failure_fall_back_to_compiling` covers producer death, waiter timeout, and bounded fallback to independent compiles; concurrent identical keys elect one producer.
-- [x] Validate opt-in workspace path remapping.
-  - `workspace_remap_shares_hits_across_equivalent_worktrees` proves identical checkouts miss without opt-in and hit with `remap_workspace_paths = true`; remap state participates in the key so remapped and un-remapped keys can never collide.
+- [ ] Validate opt-in workspace path remapping for equivalent worktrees.
+  - The conservative environment key keeps different `CARGO_MANIFEST_DIR` values distinct even when source paths are remapped. `workspace_remap_keeps_environment_dependent_worktrees_distinct` proves that safety property; recovering sound cross-worktree hits remains a P6 gate.
 - [x] Validate widened cache classes independently.
   - `widened_classes_proc_macro_and_metadata_only_bin_are_cacheable` covers proc-macro crates and metadata-only binaries; build-script `OUT_DIR` consumers stay digested-or-bypassed per the classifier tables.
 - [x] Add repository/worktree grouping for UX without sharing mutable build roots.
@@ -554,6 +583,6 @@ Work in this order. Items marked **release-blocking** must be complete before th
 | A tool/script assumes `target/debug/deps/*.rlib` exists (rare; e.g. some coverage or wasm tooling). | Documented; `rgo doctor` can flag known tools; per-project opt-out is just the project's own `.cargo/config.toml` (already wins). |
 | `rust-analyzer` sets its own `--target-dir` in some configs. | Cargo precedence handles it; doctor reports it. |
 | User already has `build.rustc-workspace-wrapper`. | Setup refuses to overwrite; sidecar attribution falls back to passthrough-verb or age-only GC. |
-| GC deleting a dir a build is about to reuse (race between `.cargo-lock` check and delete). | Phase 1: rename-then-delete + 10-minute recency window; Phase 2: leases. Cargo recreates missing dirs, so worst case is a rebuild, never corruption. |
+| GC deleting a dir a build is about to reuse (race between lock check and delete). | Rename and recency checks are insufficient for ordinary Cargo launches and already-waiting processes. Keep unattended destructive GC off until a Cargo-wide coordination mechanism and race evidence establish safety. |
 | Home dir on a small volume; projects on a big external disk. | `storage.root` configurable; setup warns when the root volume is smaller than the largest project volume; per-volume roots are a possible later feature. |
 | Cross-device: build-dir and target-dir on different volumes → Cargo copies instead of hardlinks uplifted bins. | Correct, just slightly slower; note in doctor. |

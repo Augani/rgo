@@ -18,7 +18,14 @@ pub struct Sandbox {
 
 impl Sandbox {
     pub fn new() -> Result<Self> {
-        let root = tempfile::tempdir()?;
+        // Filesystem-specific CI probes must place the *whole* private sandbox
+        // on the mounted volume. Setting RGO_HOME in the parent process is not
+        // enough because every child command receives this sandbox's RGO_HOME.
+        let root = if let Some(parent) = std::env::var_os("RGO_TEST_SANDBOX_PARENT") {
+            tempfile::tempdir_in(parent)?
+        } else {
+            tempfile::tempdir()?
+        };
         let home = root.path().join("home");
         let cargo_home = home.join(".cargo");
         let rgo_home = home.join(".rgo");
@@ -122,11 +129,18 @@ impl Sandbox {
     }
 }
 
-/// `cargo test -p rgo` does not rebuild sibling bin packages, so integration tests that
+/// `cargo test -p rgo-storage` does not rebuild sibling bin packages, so integration tests that
 /// rely on `rgo-rustc-wrapper` must build it explicitly (in the real environment, not the sandbox).
 pub fn ensure_workspace_bins_built() -> Result<()> {
     let status = Command::new(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()))
-        .args(["build", "--quiet", "-p", "rgo-rustc-wrapper", "-p", "rgo"])
+        .args([
+            "build",
+            "--quiet",
+            "-p",
+            "rgo-rustc-wrapper",
+            "-p",
+            "rgo-storage",
+        ])
         .current_dir(env!("CARGO_MANIFEST_DIR"))
         .status()
         .context("building workspace bins")?;

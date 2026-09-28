@@ -1,11 +1,13 @@
 [package]
-name = "rgo"
+name = "rgo-storage"
 description = "Bounded, machine-managed Rust build storage. Install once, use cargo normally."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
+# Integration tests use the unpublished workspace-only rgo-testkit.
+exclude = ["tests/"]
 
 [[bin]]
 name = "rgo"
@@ -19,10 +21,14 @@ rgo-materialize.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 serde_json.workspace = true
+serde.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 bytesize.workspace = true
 humantime.workspace = true
+fs4.workspace = true
+tempfile.workspace = true
+libc.workspace = true
 
 [dev-dependencies]
 rgo-testkit.workspace = true

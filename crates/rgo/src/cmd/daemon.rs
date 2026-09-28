@@ -1,20 +1,33 @@
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
+use rgo_core::config::Config;
 use rgo_core::ipc;
 use rgo_core::paths::RgoPaths;
 use rgo_protocol::{Request, Response};
 
 use super::env;
 
-pub fn run(foreground: bool) -> Result<()> {
-    let e = env()?;
+pub fn run(foreground: bool, home: Option<PathBuf>) -> Result<()> {
+    if foreground {
+        close_inherited_descriptors()?;
+    }
+    let e = if let Some(root) = home {
+        ensure!(root.is_absolute(), "daemon --home must be an absolute path");
+        let paths = RgoPaths { root };
+        let cfg = Config::load(&paths.config_file())?.resolve(&paths.root)?;
+        super::Env { paths, cfg }
+    } else {
+        env()?
+    };
     if !foreground {
         let exe = std::env::current_exe().context("locating rgo executable")?;
         Command::new(exe)
-            .args(["daemon", "--foreground"])
+            .args(["daemon", "--foreground", "--home"])
+            .arg(&e.paths.root)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -23,6 +36,44 @@ pub fn run(foreground: bool) -> Result<()> {
         return Ok(());
     }
     rgo_core::daemon::run(e.paths, e.cfg)
+}
+
+/// A daemon outlives the command that started it. On Unix, an inherited
+/// non-stdio pipe descriptor can keep that command's output reader open even
+/// after the command exits. No daemon socket is opened before this point.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[allow(unsafe_code)]
+fn close_inherited_descriptors() -> Result<()> {
+    let directory = if cfg!(target_os = "linux") {
+        "/proc/self/fd"
+    } else {
+        "/dev/fd"
+    };
+    let mut descriptors = Vec::new();
+    for entry in std::fs::read_dir(directory)
+        .with_context(|| format!("enumerating inherited descriptors in {directory}"))?
+    {
+        let entry = entry?;
+        if let Some(fd) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<i32>().ok())
+            .filter(|fd| *fd > 2)
+        {
+            descriptors.push(fd);
+        }
+    }
+    for descriptor in descriptors {
+        // The descriptor used to enumerate /dev/fd may already be closed by
+        // ReadDir's Drop. close(2) safely reports EBADF for that entry.
+        unsafe { libc::close(descriptor) };
+    }
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn close_inherited_descriptors() -> Result<()> {
+    Ok(())
 }
 
 /// Best-effort daemon startup used by commands that must coordinate state. A failed start is
@@ -36,7 +87,8 @@ pub fn ensure_running(paths: &RgoPaths) -> bool {
         return false;
     };
     if Command::new(exe)
-        .args(["daemon", "--foreground"])
+        .args(["daemon", "--foreground", "--home"])
+        .arg(&paths.root)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -61,12 +113,16 @@ pub fn is_available(paths: &RgoPaths) -> bool {
 }
 
 fn daemon_responds(paths: &RgoPaths) -> bool {
+    // Health must not depend on a full storage scan. A status computation can
+    // fail because one managed path is unreadable while the daemon is alive;
+    // treating that as a dead daemon would start a duplicate and hide the
+    // actual error from `rgo status`.
     match ipc::request_with_timeout(
         &paths.socket_path(),
-        Request::QueryStatus,
+        Request::QueryRemoteStatus,
         Duration::from_secs(2),
     ) {
-        Ok(Response::Status(_)) => true,
+        Ok(Response::RemoteStatus(_)) => true,
         Ok(other) => {
             tracing::debug!(response = ?other, "daemon health check returned unexpected response");
             false

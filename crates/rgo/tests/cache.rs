@@ -6,11 +6,21 @@ mod unix {
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
     use std::process::{Child, Command, Stdio};
+    use std::sync::{Mutex, MutexGuard};
     use std::thread;
     use std::time::Duration;
 
     use assert_cmd::cargo::cargo_bin;
     use rgo_testkit::{Sandbox, ensure_workspace_bins_built};
+
+    // These end-to-end cases each launch a daemon and compiler processes. Running
+    // separate sandboxes simultaneously can starve the short IPC timeout and
+    // turn a correct single-flight hit into a load-dependent fallback compile.
+    static E2E_LOCK: Mutex<()> = Mutex::new(());
+
+    fn serial_e2e() -> MutexGuard<'static, ()> {
+        E2E_LOCK.lock().unwrap_or_else(|poison| poison.into_inner())
+    }
 
     fn start_daemon(sb: &Sandbox) -> Child {
         let mut child = sb
@@ -61,8 +71,13 @@ if [ "$1" = "-vV" ]; then
   exit 0
 fi
 printf 'compile\n' >> "$FAKE_RUSTC_LOG"
+fail_once=
+if [ -n "$FAKE_RUSTC_FAIL_ONCE_FILE" ] && [ ! -e "$FAKE_RUSTC_FAIL_ONCE_FILE" ]; then
+  : > "$FAKE_RUSTC_FAIL_ONCE_FILE"
+  fail_once=1
+fi
 if [ -n "$FAKE_RUSTC_SLEEP" ]; then sleep "$FAKE_RUSTC_SLEEP"; fi
-if [ -n "$FAKE_RUSTC_FAIL" ]; then exit 1; fi
+if [ -n "$fail_once" ]; then exit 1; fi
 out=
 name=demo
 while [ "$#" -gt 0 ]; do
@@ -312,6 +327,7 @@ printf 'dep:%s\n' "$name" > "$out/$name.d"
 
     #[test]
     fn eligible_dependency_invocation_hits_across_build_contexts() {
+        let _serial = serial_e2e();
         ensure_workspace_bins_built().unwrap();
         let sb = Sandbox::new().unwrap();
         let fixture = fixture(&sb);
@@ -333,16 +349,17 @@ printf 'dep:%s\n' "$name" > "$out/$name.d"
         assert_eq!(
             compile_count(&fixture),
             1,
-            "concurrent identical keys should have one producer"
+            "concurrent identical keys should have one producer; events: {}",
+            cache_events(&sb)
         );
 
-        let first = command_for("first", None).output().unwrap();
+        let first = command_for("first", Some("1")).output().unwrap();
         assert!(
             first.status.success(),
             "first failed: {}",
             String::from_utf8_lossy(&first.stderr)
         );
-        let second = command_for("second", None).output().unwrap();
+        let second = command_for("second", Some("1")).output().unwrap();
         assert!(
             second.status.success(),
             "second failed: {}",
@@ -369,6 +386,7 @@ printf 'dep:%s\n' "$name" > "$out/$name.d"
 
     #[test]
     fn hits_are_byte_identical_materially_faster_and_explained() {
+        let _serial = serial_e2e();
         ensure_workspace_bins_built().unwrap();
         let sb = Sandbox::new().unwrap();
         let fixture = fixture(&sb);
@@ -388,9 +406,9 @@ printf 'dep:%s\n' "$name" > "$out/$name.d"
 
         // The hit must return all outputs byte-identical and faster than compiling.
         let started = std::time::Instant::now();
-        let hit = command_for(&sb, &fixture, "consumer", &[])
-            .output()
-            .unwrap();
+        let mut hit_command = command_for(&sb, &fixture, "consumer", &[]);
+        hit_command.env("FAKE_RUSTC_SLEEP", "3");
+        let hit = hit_command.output().unwrap();
         let elapsed = started.elapsed();
         assert!(
             hit.status.success(),
@@ -419,6 +437,7 @@ printf 'dep:%s\n' "$name" > "$out/$name.d"
 
     #[test]
     fn corrupt_cas_objects_quarantine_and_recover_by_recompiling() {
+        let _serial = serial_e2e();
         ensure_workspace_bins_built().unwrap();
         let sb = Sandbox::new().unwrap();
         let fixture = fixture(&sb);
@@ -479,6 +498,7 @@ printf 'dep:%s\n' "$name" > "$out/$name.d"
 
     #[test]
     fn unwritable_cas_degrades_to_plain_compiles() {
+        let _serial = serial_e2e();
         ensure_workspace_bins_built().unwrap();
         let sb = Sandbox::new().unwrap();
         let fixture = fixture(&sb);
@@ -523,6 +543,7 @@ printf 'dep:%s\n' "$name" > "$out/$name.d"
 
     #[test]
     fn unsafe_invocations_always_compile_and_explain_the_bypass() {
+        let _serial = serial_e2e();
         ensure_workspace_bins_built().unwrap();
         let sb = Sandbox::new().unwrap();
         let fixture = fixture(&sb);
@@ -563,6 +584,7 @@ printf 'dep:%s\n' "$name" > "$out/$name.d"
 
     #[test]
     fn single_flight_timeout_and_producer_failure_fall_back_to_compiling() {
+        let _serial = serial_e2e();
         ensure_workspace_bins_built().unwrap();
         let sb = Sandbox::new().unwrap();
         let fixture = fixture(&sb);
@@ -579,7 +601,9 @@ printf 'dep:%s\n' "$name" > "$out/$name.d"
         producer_cmd.env("FAKE_RUSTC_SLEEP", "3");
         let mut producer = producer_cmd.spawn().unwrap();
         wait_for_compiles(&fixture, 1);
-        let waiter = command_for(&sb, &fixture, "waiter", &[]).output().unwrap();
+        let mut waiter_command = command_for(&sb, &fixture, "waiter", &[]);
+        waiter_command.env("FAKE_RUSTC_SLEEP", "3");
+        let waiter = waiter_command.output().unwrap();
         assert!(
             waiter.status.success(),
             "{}",
@@ -600,14 +624,18 @@ printf 'dep:%s\n' "$name" > "$out/$name.d"
             "fail-producer",
             &["--crate-name", "failcrate"],
         );
+        let failure_marker = sb.projects.join("failed-once");
         failing
             .env("FAKE_RUSTC_SLEEP", "1")
-            .env("FAKE_RUSTC_FAIL", "1");
+            .env("FAKE_RUSTC_FAIL_ONCE_FILE", &failure_marker);
         let mut failing = failing.spawn().unwrap();
         wait_for_compiles(&fixture, 3);
-        let waiter = command_for(&sb, &fixture, "fail-waiter", &["--crate-name", "failcrate"])
-            .output()
-            .unwrap();
+        let mut waiter_command =
+            command_for(&sb, &fixture, "fail-waiter", &["--crate-name", "failcrate"]);
+        waiter_command
+            .env("FAKE_RUSTC_SLEEP", "1")
+            .env("FAKE_RUSTC_FAIL_ONCE_FILE", &failure_marker);
+        let waiter = waiter_command.output().unwrap();
         assert!(
             waiter.status.success(),
             "waiter must compile after producer failure: {}",
@@ -626,6 +654,7 @@ printf 'dep:%s\n' "$name" > "$out/$name.d"
 
     #[test]
     fn inner_wrapper_composition_and_sccache_workspace_caching() {
+        let _serial = serial_e2e();
         ensure_workspace_bins_built().unwrap();
         let sb = Sandbox::new().unwrap();
         let fixture = fixture(&sb);
@@ -674,7 +703,8 @@ printf 'dep:%s\n' "$name" > "$out/$name.d"
         assert_eq!(fs::read_to_string(&sccache_log).unwrap().lines().count(), 1);
 
         // sccache + workspace source: rgo owns workspace caching, so the inner
-        // wrapper is skipped entirely and equivalent worktrees share one compile.
+        // wrapper is skipped. Different CARGO_MANIFEST_DIR values stay distinct
+        // because user code can embed them through env!.
         let ws_a = worktree_sources(&sb, "ws-a");
         let ws_b = worktree_sources(&sb, "ws-b");
         let first = workspace_command_for(&sb, &fixture, &ws_a, "ws-a-ctx");
@@ -703,8 +733,8 @@ printf 'dep:%s\n' "$name" > "$out/$name.d"
         );
         assert_eq!(
             compile_count(&fixture),
-            4,
-            "equivalent worktree should hit rgo's workspace cache under sccache"
+            5,
+            "worktrees with different compile-time environments must not collide"
         );
         assert_eq!(
             fs::read_to_string(&sccache_log).unwrap().lines().count(),
@@ -717,7 +747,8 @@ printf 'dep:%s\n' "$name" > "$out/$name.d"
     }
 
     #[test]
-    fn workspace_remap_shares_hits_across_equivalent_worktrees() {
+    fn workspace_remap_keeps_environment_dependent_worktrees_distinct() {
+        let _serial = serial_e2e();
         ensure_workspace_bins_built().unwrap();
         let sb = Sandbox::new().unwrap();
         let fixture = fixture(&sb);
@@ -741,8 +772,7 @@ printf 'dep:%s\n' "$name" > "$out/$name.d"
             "un-remapped worktrees must miss"
         );
 
-        // With remap_workspace_paths, the checkout location leaves the key. The key
-        // itself changes when remap is enabled, so the first remapped build misses…
+        // Remapping changes the key, so the first remapped build misses.
         fs::write(
             sb.rgo_home.join("config.toml"),
             "[cache]\nenabled = true\nremap_workspace_paths = true\n",
@@ -758,7 +788,8 @@ printf 'dep:%s\n' "$name" > "$out/$name.d"
         );
         assert_eq!(compile_count(&fixture), 3, "first remapped key is a miss");
 
-        // …and the equivalent worktree then hits that shared workspace key.
+        // CARGO_MANIFEST_DIR can still be embedded by env!, so the other
+        // worktree needs a separate compile even with source remapping.
         let fourth = workspace_command_for(&sb, &fixture, &ws_b, "remapped-b")
             .output()
             .unwrap();
@@ -769,13 +800,13 @@ printf 'dep:%s\n' "$name" > "$out/$name.d"
         );
         assert_eq!(
             compile_count(&fixture),
-            3,
-            "remapped worktree should hit the shared workspace key"
+            4,
+            "remapped worktrees with different environments must not collide"
         );
         assert_eq!(
             outputs(&sb, "remapped-b"),
             outputs(&sb, "remapped-a"),
-            "remapped hit outputs differ from a direct compile"
+            "equivalent fixture compiles should produce the same outputs"
         );
 
         daemon.kill().unwrap();
@@ -787,6 +818,7 @@ printf 'dep:%s\n' "$name" > "$out/$name.d"
     /// hashing, or classification work may run on the bypass path.
     #[test]
     fn bypassed_wrapper_overhead_stays_bounded() {
+        let _serial = serial_e2e();
         ensure_workspace_bins_built().unwrap();
         let sb = Sandbox::new().unwrap();
         let fixture = fixture(&sb);
@@ -834,7 +866,8 @@ printf 'dep:%s\n' "$name" > "$out/$name.d"
     /// must produce byte-identical artifacts, and the hit-produced binary
     /// must behave identically.
     #[test]
-    fn real_cargo_git_dependency_hits_reproduce_cold_compiles() {
+    fn real_cargo_git_dependency_builds_match_bypass_control() {
+        let _serial = serial_e2e();
         ensure_workspace_bins_built().unwrap();
         if Command::new("git").arg("--version").output().is_err() {
             eprintln!("git unavailable; skipping real-cargo differential test");
@@ -1016,9 +1049,10 @@ printf 'dep:%s\n' "$name" > "$out/$name.d"
             "cold and published dependency artifacts diverged (nondeterminism or key drift)"
         );
 
-        // Consumer: a third checkout must serve every dependency from the CAS —
-        // including the build-script consumer and the proc-macro — reproducing the
-        // publisher's exact bytes plus a working binary.
+        // Consumer: a third checkout may compile when its environment differs.
+        // Path-free output remains comparable to the bypass control, and the
+        // resulting binary must behave the same. Cache hits are deliberately
+        // not required until dynamic input validation can recover safe reuse.
         let app_c = app("diff-c");
         let before = contexts(&sb);
         let hit = sb
@@ -1034,15 +1068,9 @@ printf 'dep:%s\n' "$name" > "$out/$name.d"
         );
         let ctx_c = new_context(&sb, &before);
         assert_eq!(
-            published_artifacts,
-            dep_artifacts(&ctx_c),
-            "materialized hit outputs differ from the cold/published artifacts"
-        );
-        let hits = cache_events(&sb).matches("\"outcome\":\"hit\"").count();
-        assert!(
-            hits >= 5,
-            "expected cache hits for all five dependencies; events: {}",
-            cache_events(&sb)
+            path_free(&published_artifacts),
+            path_free(&dep_artifacts(&ctx_c)),
+            "path-free consumer artifacts diverged from the bypass control"
         );
         let binary = app_c.join("target/release/app");
         let run = sb.cmd(&binary).output().unwrap();
@@ -1051,6 +1079,125 @@ printf 'dep:%s\n' "$name" > "$out/$name.d"
             "answer=52",
             "hit-built binary behaved differently"
         );
+
+        daemon.kill().unwrap();
+        let _ = daemon.wait();
+    }
+
+    #[test]
+    fn real_cargo_cache_respects_arbitrary_compile_time_environment() {
+        let _serial = serial_e2e();
+        ensure_workspace_bins_built().unwrap();
+        let sb = Sandbox::new().unwrap();
+        fixture(&sb); // enable the optional cache only inside this private home
+        let setup = sb
+            .cmd(cargo_bin("rgo"))
+            .args(["setup", "--no-service"])
+            .output()
+            .unwrap();
+        assert!(
+            setup.status.success(),
+            "{}",
+            String::from_utf8_lossy(&setup.stderr)
+        );
+        let mut daemon = start_daemon(&sb);
+
+        let dependency = sb.projects.join("environment-dependency");
+        fs::create_dir_all(dependency.join("src")).unwrap();
+        fs::write(
+            dependency.join("Cargo.toml"),
+            "[package]\nname='environment_dependency'\nversion='0.1.0'\nedition='2021'\n",
+        )
+        .unwrap();
+        fs::write(
+            dependency.join("src/lib.rs"),
+            "pub fn value() -> &'static str { env!(\"APP_BUILD_FLAVOR\") }\n",
+        )
+        .unwrap();
+        for args in [
+            vec!["init", "-q"],
+            vec!["add", "-A"],
+            vec![
+                "-c",
+                "user.name=rgo test",
+                "-c",
+                "user.email=rgo@example.invalid",
+                "commit",
+                "-qm",
+                "fixture",
+            ],
+        ] {
+            let output = sb
+                .cmd("git")
+                .current_dir(&dependency)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        for (name, expected, bypass) in [
+            ("publisher", "alpha", false),
+            ("consumer", "beta", false),
+            ("uncached-control", "beta", true),
+        ] {
+            let project = sb.projects.join(name);
+            fs::create_dir_all(project.join("src")).unwrap();
+            fs::write(
+                project.join("Cargo.toml"),
+                format!(
+                    "[package]\nname='environment_probe'\nversion='0.1.0'\nedition='2021'\n[dependencies]\nenvironment_dependency={{git='file://{}'}}\n",
+                    dependency.display()
+                ),
+            )
+            .unwrap();
+            fs::write(
+                project.join("src/main.rs"),
+                "fn main() { println!(\"{}\", environment_dependency::value()); }\n",
+            )
+            .unwrap();
+            let fetched = sb
+                .cmd("cargo")
+                .current_dir(&project)
+                .arg("fetch")
+                .output()
+                .unwrap();
+            assert!(
+                fetched.status.success(),
+                "{}",
+                String::from_utf8_lossy(&fetched.stderr)
+            );
+            let mut build = sb.cargo();
+            build
+                .current_dir(&project)
+                .env("APP_BUILD_FLAVOR", expected)
+                .args(["build", "--offline"]);
+            if bypass {
+                build.env("RGO_BYPASS", "1");
+            }
+            let built = build.output().unwrap();
+            assert!(
+                built.status.success(),
+                "{}",
+                String::from_utf8_lossy(&built.stderr)
+            );
+            let executable = project.join(if cfg!(windows) {
+                "target/debug/environment_probe.exe"
+            } else {
+                "target/debug/environment_probe"
+            });
+            let result = sb.cmd(&executable).output().unwrap();
+            assert!(result.status.success());
+            assert_eq!(
+                String::from_utf8_lossy(&result.stdout).trim(),
+                expected,
+                "{name}"
+            );
+        }
 
         daemon.kill().unwrap();
         let _ = daemon.wait();
@@ -1067,6 +1214,7 @@ printf 'dep:%s\n' "$name" > "$out/$name.d"
     /// the toolchain axis; the OS axis is wherever CI runs it.
     #[test]
     fn online_registry_corpus_hits_reproduce_publisher_outputs() {
+        let _serial = serial_e2e();
         if std::env::var_os("RGO_CORPUS_ONLINE").is_none() {
             eprintln!("skipping networked corpus; set RGO_CORPUS_ONLINE=1 to run");
             return;
@@ -1575,6 +1723,7 @@ printf 'dep:%s\n' "$name" > "$out/$name.d"
 
     #[test]
     fn widened_classes_proc_macro_and_metadata_only_bin_are_cacheable() {
+        let _serial = serial_e2e();
         ensure_workspace_bins_built().unwrap();
         let sb = Sandbox::new().unwrap();
         let fixture = fixture(&sb);

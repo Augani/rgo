@@ -24,12 +24,16 @@ bytesize.workspace = true
 directories.workspace = true
 walkdir.workspace = true
 fs4.workspace = true
-sysinfo.workspace = true
+rustix.workspace = true
 rusqlite.workspace = true
 interprocess.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+roxmltree = "0.21.1"
+
+[target.'cfg(windows)'.dependencies]
+roxmltree = "0.21.1"
 
 [lints]
 workspace = true

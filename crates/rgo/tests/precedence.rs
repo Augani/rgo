@@ -78,6 +78,35 @@ fn cargo_precedence_overrides_keep_user_selected_build_and_target_roots() {
         String::from_utf8_lossy(&build.stderr)
     );
     assert!(cli_target.join("debug/cli-override").exists());
+    let managed = rgo_core::paths::RgoPaths {
+        root: sandbox.rgo_home.clone(),
+    };
+    assert!(
+        managed
+            .managed_build_dirs()
+            .iter()
+            .any(|dir| dir.join("debug/deps").is_dir()),
+        "--target-dir must not cancel the configured build directory"
+    );
+
+    let bypass_project = sandbox.simple_bin("bypass-override").unwrap();
+    let before = managed.managed_build_dirs().len();
+    let bypass = sandbox
+        .cargo()
+        .current_dir(&bypass_project)
+        .env("RGO_BYPASS", "1")
+        .args(["build", "--offline"])
+        .output()
+        .unwrap();
+    assert!(
+        bypass.status.success(),
+        "{}",
+        String::from_utf8_lossy(&bypass.stderr)
+    );
+    assert!(
+        managed.managed_build_dirs().len() > before,
+        "RGO_BYPASS must not imply that Cargo relocation is disabled"
+    );
 
     let metadata = sandbox
         .cmd(cargo_bin("rgo"))
@@ -109,4 +138,72 @@ fn cargo_precedence_overrides_keep_user_selected_build_and_target_roots() {
         String::from_utf8_lossy(&toolchain.stderr)
     );
     assert!(String::from_utf8_lossy(&toolchain.stdout).contains("cargo"));
+}
+
+#[test]
+fn setup_uses_cargos_legacy_home_config_when_present() {
+    ensure_workspace_bins_built().unwrap();
+    for both_files in [false, true] {
+        let sandbox = Sandbox::new().unwrap();
+        let legacy = sandbox.cargo_home.join("config");
+        let user_config = "[net]\noffline = true\n";
+        std::fs::write(&legacy, user_config).unwrap();
+        let modern = sandbox.cargo_home.join("config.toml");
+        if both_files {
+            std::fs::write(&modern, "[term]\ncolor = 'never'\n").unwrap();
+        }
+
+        let setup = sandbox
+            .cmd(cargo_bin("rgo"))
+            .args(["setup", "--no-service"])
+            .output()
+            .unwrap();
+        assert!(
+            setup.status.success(),
+            "{}",
+            String::from_utf8_lossy(&setup.stderr)
+        );
+        assert!(
+            std::fs::read_to_string(&legacy)
+                .unwrap()
+                .contains("rgo managed")
+        );
+        if both_files {
+            assert_eq!(
+                std::fs::read_to_string(&modern).unwrap(),
+                "[term]\ncolor = 'never'\n"
+            );
+        } else {
+            assert!(!modern.exists());
+        }
+
+        let project = sandbox.simple_bin("legacy-project").unwrap();
+        let build = sandbox
+            .cargo()
+            .current_dir(&project)
+            .args(["build", "--offline"])
+            .output()
+            .unwrap();
+        assert!(
+            build.status.success(),
+            "{}",
+            String::from_utf8_lossy(&build.stderr)
+        );
+        let managed = rgo_core::paths::RgoPaths {
+            root: sandbox.rgo_home.clone(),
+        };
+        assert_eq!(managed.managed_build_dirs().len(), 1);
+
+        let undo = sandbox
+            .cmd(cargo_bin("rgo"))
+            .args(["setup", "--undo", "--no-service"])
+            .output()
+            .unwrap();
+        assert!(
+            undo.status.success(),
+            "{}",
+            String::from_utf8_lossy(&undo.stderr)
+        );
+        assert_eq!(std::fs::read_to_string(&legacy).unwrap(), user_config);
+    }
 }

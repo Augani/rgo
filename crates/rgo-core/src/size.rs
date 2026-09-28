@@ -5,7 +5,10 @@
 use std::collections::HashSet;
 use std::path::Path;
 
+use anyhow::{Context, Result, ensure};
 use walkdir::WalkDir;
+
+use crate::paths::RgoPaths;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Usage {
@@ -47,6 +50,77 @@ impl Scanner {
         }
         u
     }
+
+    /// Measure an expected path without hiding unreadable or disappearing
+    /// entries. Budget decisions must not treat a partial traversal as a
+    /// complete byte count.
+    pub fn measure_checked(&mut self, path: &Path) -> Result<Usage> {
+        let mut usage = Usage::default();
+        for entry in WalkDir::new(path).follow_links(false) {
+            let entry = entry.with_context(|| format!("walking {}", path.display()))?;
+            let metadata = entry
+                .metadata()
+                .with_context(|| format!("reading metadata for {}", entry.path().display()))?;
+            if !metadata.is_file() {
+                continue;
+            }
+            if let Some(key) = inode_key(entry.path(), &metadata) {
+                if md_nlink(entry.path(), &metadata) > 1 && !self.seen.insert(key) {
+                    continue;
+                }
+            }
+            usage.files = usage.files.saturating_add(1);
+            usage.logical_bytes = usage.logical_bytes.saturating_add(metadata.len());
+            usage.physical_bytes = usage
+                .physical_bytes
+                .saturating_add(physical_len(entry.path(), &metadata));
+        }
+        Ok(usage)
+    }
+
+    /// Missing optional domains count as empty before initial setup. Once a
+    /// domain exists, a failed traversal is an error rather than zero usage.
+    pub fn measure_optional(&mut self, path: &Path) -> Result<Usage> {
+        match std::fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
+                self.measure_checked(path)
+            }
+            Ok(_) => anyhow::bail!("unsafe storage domain {}", path.display()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Usage::default()),
+            Err(error) => Err(error).with_context(|| format!("checking {}", path.display())),
+        }
+    }
+}
+
+/// Files under rgo's root other than managed build contexts and CAS. This
+/// includes temporary, quarantine, state, logs, and owned root-level files.
+/// Unknown entries are counted but never selected for deletion by this scan.
+pub fn auxiliary_usage(paths: &RgoPaths) -> Result<Usage> {
+    let entries = match std::fs::read_dir(&paths.root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Usage::default()),
+        Err(error) => {
+            return Err(error).with_context(|| format!("reading {}", paths.root.display()));
+        }
+    };
+    let mut scanner = Scanner::new();
+    let mut total = Usage::default();
+    for entry in entries {
+        let path = entry?.path();
+        if path == paths.builds_dir() || path == paths.cas_dir() {
+            continue;
+        }
+        ensure!(
+            !std::fs::symlink_metadata(&path)?.file_type().is_symlink(),
+            "unsafe symlinked auxiliary entry {}",
+            path.display()
+        );
+        let usage = scanner.measure_checked(&path)?;
+        total.physical_bytes = total.physical_bytes.saturating_add(usage.physical_bytes);
+        total.logical_bytes = total.logical_bytes.saturating_add(usage.logical_bytes);
+        total.files = total.files.saturating_add(usage.files);
+    }
+    Ok(total)
 }
 
 #[cfg(unix)]
@@ -187,5 +261,42 @@ mod tests {
         assert_eq!(u.files, 1);
         assert_eq!(u.logical_bytes, 8192);
         assert!(u.physical_bytes >= 8192);
+    }
+
+    #[test]
+    fn optional_budget_domain_rejects_a_file_in_place_of_a_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let domain = root.path().join("cas");
+        assert_eq!(
+            Scanner::new().measure_optional(&domain).unwrap(),
+            Usage::default()
+        );
+        std::fs::write(&domain, b"unexpected").unwrap();
+        assert!(Scanner::new().measure_optional(&domain).is_err());
+    }
+
+    #[test]
+    fn auxiliary_usage_counts_temp_and_state_without_builds_or_cas() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = RgoPaths {
+            root: root.path().join("rgo"),
+        };
+        paths.ensure_layout().unwrap();
+        std::fs::write(paths.tmp_dir().join("staging"), vec![0u8; 8192]).unwrap();
+        std::fs::write(paths.state_dir().join("metadata"), vec![0u8; 8192]).unwrap();
+        let build = paths.builds_dir().join("aa/context");
+        std::fs::create_dir_all(&build).unwrap();
+        std::fs::write(build.join("output"), vec![0u8; 8192]).unwrap();
+        std::fs::create_dir_all(paths.cas_dir()).unwrap();
+        std::fs::write(paths.cas_dir().join("object"), vec![0u8; 8192]).unwrap();
+        let expected = Scanner::new().measure(&paths.tmp_dir()).physical_bytes
+            + Scanner::new().measure(&paths.state_dir()).physical_bytes;
+        assert_eq!(auxiliary_usage(&paths).unwrap().physical_bytes, expected);
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(paths.tmp_dir(), paths.root.join("unexpected-link"))
+                .unwrap();
+            assert!(auxiliary_usage(&paths).is_err());
+        }
     }
 }

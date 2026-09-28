@@ -1,5 +1,6 @@
 //! `rgo` CLI. Thin shell over `rgo-core`. Unknown subcommands pass through to cargo.
 
+mod bounded_log;
 mod cmd;
 
 use std::ffi::OsString;
@@ -20,28 +21,58 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// Experimental supervised Cargo launcher used only in private probes.
+    #[command(hide = true)]
+    CargoShim {
+        #[arg(long)]
+        real_cargo: std::path::PathBuf,
+        /// Cargo home that owns this PATH launcher; a different active home is passed through.
+        #[arg(long)]
+        cargo_home: Option<std::path::PathBuf>,
+        /// Storage root that owns this PATH launcher; an override is passed through.
+        #[arg(long)]
+        rgo_home: Option<std::path::PathBuf>,
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        cargo_args: Vec<OsString>,
+    },
     /// Inspect and verify the opt-in compiler-result cache.
     Cache {
         #[command(subcommand)]
         command: cmd::cache::Command,
     },
-    /// One-time machine setup: config fence in $CARGO_HOME/config.toml, ~/.rgo layout, background service.
+    /// Activate managed storage and a background service.
     Setup {
         #[arg(long)]
         undo: bool,
         #[arg(long)]
         dry_run: bool,
+        /// Private installer protocol: report the exact no-service activation writes.
+        #[arg(long, hide = true, requires = "no_service", conflicts_with_all = ["undo", "dry_run"])]
+        installer_plan_json: bool,
         /// Skip installing the launchd/systemd/schtasks service.
         #[arg(long)]
         no_service: bool,
         /// Do not set build.rustc-workspace-wrapper (context attribution then relies on `rgo <cmd>`).
         #[arg(long)]
         no_wrapper: bool,
+        /// Install an opt-in Unix Cargo launcher under $CARGO_HOME/rgo/shims.
+        #[arg(long)]
+        supervised: bool,
+        /// Absolute path to the real Cargo proxy, retaining its `cargo` basename.
+        #[arg(long, requires = "supervised")]
+        real_cargo: Option<std::path::PathBuf>,
     },
     /// Storage summary: managed bytes, budget, reclaimable.
     Status,
     /// Check configuration precedence, conflicting wrappers, toolchains, filesystem, service health.
-    Doctor,
+    Doctor {
+        /// Emit structured diagnostics for installers and other tools.
+        #[arg(long)]
+        json: bool,
+        /// Run a disposable plain-Cargo build and fail if managed activation is not observed.
+        #[arg(long)]
+        verify: bool,
+    },
     /// Reclaim storage in tier order (tmp, orphans, stale incremental, stale contexts, pressure).
     Gc {
         #[arg(long)]
@@ -68,9 +99,9 @@ enum Cmd {
     Clean {
         id: String,
     },
-    /// Find stray `target/` directories outside rgo and offer to remove their intermediates.
+    /// Report legacy `target/` directories and their total allocated storage.
     Adopt {
-        /// Delete only the documented intermediate directories after scanning.
+        /// Former deletion option; now fails because safe selective removal is unproven.
         #[arg(long)]
         delete: bool,
         roots: Vec<std::path::PathBuf>,
@@ -79,29 +110,80 @@ enum Cmd {
     Daemon {
         #[arg(long)]
         foreground: bool,
+        /// Storage root for a service-launched daemon, independent of its environment.
+        #[arg(long, hide = true)]
+        home: Option<std::path::PathBuf>,
     },
 }
 
 fn main() -> Result<()> {
-    tracing_subscriber::fmt()
+    let cli = Cli::parse();
+    let daemon_log = match &cli.cmd {
+        Some(Cmd::Daemon {
+            foreground: true,
+            home,
+        }) => {
+            let paths = if let Some(root) = home {
+                rgo_core::paths::RgoPaths { root: root.clone() }
+            } else {
+                rgo_core::paths::RgoPaths::discover()?
+            };
+            Some(bounded_log::BoundedLog::new(
+                paths.logs_dir().join("daemon.log"),
+            ))
+        }
+        _ => None,
+    };
+    let subscriber = tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_env("RGO_LOG").add_directive("info".parse()?),
         )
         .without_time()
-        .with_target(false)
-        .init();
+        .with_target(false);
+    if let Some(log) = &daemon_log {
+        subscriber.with_writer(log.clone()).init();
+        let log = log.clone();
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |panic| {
+            let _ = log.append(format!("daemon panic: {panic}\n").as_bytes());
+            previous(panic);
+        }));
+    } else {
+        subscriber.init();
+    }
 
-    let cli = Cli::parse();
-    match cli.cmd {
+    let result = match cli.cmd {
+        Some(Cmd::CargoShim {
+            real_cargo,
+            cargo_home,
+            rgo_home,
+            cargo_args,
+        }) => cmd::cargo_shim::run(
+            &real_cargo,
+            cargo_home.as_deref(),
+            rgo_home.as_deref(),
+            cargo_args,
+        ),
         Some(Cmd::Cache { command }) => cmd::cache::run(command),
         Some(Cmd::Setup {
             undo,
             dry_run,
+            installer_plan_json,
             no_service,
             no_wrapper,
-        }) => cmd::setup::run(undo, dry_run, no_service, no_wrapper),
+            supervised,
+            real_cargo,
+        }) => cmd::setup::run(
+            undo,
+            dry_run,
+            installer_plan_json,
+            no_service,
+            no_wrapper,
+            supervised,
+            real_cargo,
+        ),
         Some(Cmd::Status) => cmd::status::run(),
-        Some(Cmd::Doctor) => cmd::doctor::run(),
+        Some(Cmd::Doctor { json, verify }) => cmd::doctor::run(json, verify),
         Some(Cmd::Gc {
             dry_run,
             aggressive,
@@ -113,7 +195,11 @@ fn main() -> Result<()> {
         Some(Cmd::Unpin { id }) => cmd::pin::run(&id, false),
         Some(Cmd::Clean { id }) => cmd::clean::run(&id),
         Some(Cmd::Adopt { roots, delete }) => cmd::adopt::run(roots, delete),
-        Some(Cmd::Daemon { foreground }) => cmd::daemon::run(foreground),
+        Some(Cmd::Daemon { foreground, home }) => cmd::daemon::run(foreground, home),
         None => cmd::passthrough::run(cli.cargo_args),
+    };
+    if let Some(error) = result.as_ref().err().filter(|_| daemon_log.is_some()) {
+        tracing::error!(error = %format!("{error:#}"), "daemon exited with an error");
     }
+    result
 }

@@ -1,45 +1,29 @@
-//! Discovery and safe removal of legacy Cargo target intermediates.
+//! Read-only discovery of legacy Cargo target directories.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime};
 
 use anyhow::Result;
-use fs4::fs_std::FileExt;
 use walkdir::{DirEntry, WalkDir};
 
 use crate::cargo_config;
-use crate::gc;
-use crate::paths::RgoPaths;
 use crate::size::{Scanner, Usage};
 
 const DEFAULT_ROOTS: [&str; 4] = ["Projects", "src", "code", "dev"];
-const ADOPT_LIVE_WINDOW: Duration = Duration::from_secs(10 * 60);
-
-#[derive(Debug, Clone)]
-pub struct AdoptPath {
-    pub path: PathBuf,
-    pub usage: Usage,
-}
-
 #[derive(Debug, Clone)]
 pub struct Candidate {
     pub target_dir: PathBuf,
     pub project_root: Option<PathBuf>,
-    pub intermediates: Vec<AdoptPath>,
+    /// Allocated-byte estimate for this target directory, including requested
+    /// outputs and user files. External hardlinks may make this larger than
+    /// unique physical usage. It is not a reclaimable-byte estimate.
+    pub usage: Usage,
     pub skipped_reason: Option<String>,
 }
 
 impl Candidate {
-    pub fn reclaimable_bytes(&self) -> u64 {
-        self.intermediates
-            .iter()
-            .map(|item| item.usage.physical_bytes)
-            .sum()
-    }
-
-    pub fn eligible(&self) -> bool {
-        self.skipped_reason.is_none() && !self.intermediates.is_empty()
+    pub fn has_storage(&self) -> bool {
+        self.usage.physical_bytes > 0
     }
 }
 
@@ -74,11 +58,8 @@ pub fn scan(roots: &[PathBuf]) -> Result<ScanReport> {
         if !root.is_dir() {
             continue;
         }
-        for item in WalkDir::new(root)
-            .follow_links(false)
-            .into_iter()
-            .filter_entry(|entry| entry.depth() == 0 || should_descend(entry))
-        {
+        let mut entries = WalkDir::new(root).follow_links(false).into_iter();
+        while let Some(item) = entries.next() {
             let entry = match item {
                 Ok(entry) => entry,
                 Err(error) => {
@@ -89,14 +70,21 @@ pub fn scan(roots: &[PathBuf]) -> Result<ScanReport> {
                     continue;
                 }
             };
-            if entry.file_type().is_dir()
-                && entry.file_name() == "target"
-                && !seen
+            if entry.depth() > 0 && !should_descend(&entry) {
+                entries.skip_current_dir();
+                continue;
+            }
+            if entry.file_type().is_dir() && entry.file_name() == "target" {
+                if !seen
                     .iter()
                     .any(|parent: &PathBuf| entry.path().starts_with(parent))
-                && seen.insert(entry.path().to_path_buf())
-            {
-                candidates.push(scan_target(entry.path())?);
+                    && seen.insert(entry.path().to_path_buf())
+                {
+                    candidates.push(scan_target(entry.path())?);
+                }
+                // `scan_target` measures the directory. Do not traverse its
+                // artifact tree again while searching for other projects.
+                entries.skip_current_dir();
             }
         }
     }
@@ -107,97 +95,32 @@ pub fn scan(roots: &[PathBuf]) -> Result<ScanReport> {
     })
 }
 
-pub fn delete(report: &ScanReport, paths: &RgoPaths) -> Result<u64> {
-    let mut reclaimed = 0;
-    for candidate in &report.candidates {
-        if !candidate.eligible() || recently_locked(&candidate.target_dir) {
-            continue;
-        }
-        for item in &candidate.intermediates {
-            if item.path.exists() {
-                match gc::remove_atomically(paths, &item.path) {
-                    Ok(()) => reclaimed += item.usage.physical_bytes,
-                    Err(error) => tracing::warn!(
-                        path = %item.path.display(),
-                        %error,
-                        "skipping legacy intermediate"
-                    ),
-                }
-            }
-        }
-    }
-    Ok(reclaimed)
-}
-
 fn scan_target(target: &Path) -> Result<Candidate> {
     let project_root = find_project_root(target);
-    let skipped_reason = project_root
+    let override_reason = project_root
         .as_deref()
         .and_then(|root| project_override_reason_in_workspace(target, root));
-    let mut intermediates = Vec::new();
-    let skipped_reason = skipped_reason.or_else(|| {
-        target
-            .read_dir()
-            .is_err()
-            .then(|| "target directory is unreadable".to_owned())
-    });
-    if skipped_reason.is_none() && !recently_locked(target) {
-        let mut scanner = Scanner::new();
-        for entry in WalkDir::new(target)
-            .follow_links(false)
-            .into_iter()
-            .filter_entry(|entry| entry.depth() == 0 || should_descend(entry))
-            .filter_map(Result::ok)
-        {
-            if entry.file_type().is_dir() && is_documented_intermediate(target, entry.path()) {
-                let usage = scanner.measure(entry.path());
-                intermediates.push(AdoptPath {
-                    path: entry.path().to_path_buf(),
-                    usage,
-                });
-            }
-        }
-    }
-    let skipped_reason = skipped_reason
-        .or_else(|| recently_locked(target).then(|| "active Cargo lock detected".into()));
+    let unreadable = target.read_dir().is_err();
+    let skipped_reason = unreadable
+        .then(|| "target directory is unreadable".to_owned())
+        .or(override_reason);
+    let usage = if !unreadable {
+        Scanner::new().measure(target)
+    } else {
+        Usage::default()
+    };
     Ok(Candidate {
         target_dir: target.to_path_buf(),
         project_root,
-        intermediates,
+        usage,
         skipped_reason,
     })
-}
-
-fn is_documented_intermediate(target: &Path, path: &Path) -> bool {
-    let Ok(relative) = path.strip_prefix(target) else {
-        return false;
-    };
-    let components = relative
-        .components()
-        .map(|component| component.as_os_str().to_string_lossy())
-        .collect::<Vec<_>>();
-    let Some(name) = components.last().map(|value| value.as_ref()) else {
-        return false;
-    };
-    if !matches!(name, "deps" | "build" | "incremental" | ".fingerprint") {
-        return false;
-    }
-    match components.as_slice() {
-        // Host profile: target/debug/deps, target/release/build, and custom profiles.
-        [profile, _] if !profile.is_empty() => true,
-        // Cross-target profile: target/<triple>/debug/deps. Target triples contain a dash;
-        // this prevents a user-created target/debug/custom/deps tree from being selected.
-        [triple, profile, _] if triple.contains('-') && !profile.is_empty() => true,
-        _ => false,
-    }
 }
 
 fn should_descend(entry: &DirEntry) -> bool {
     let name = entry.file_name().to_string_lossy();
     !entry.file_type().is_dir()
-        || ((!name.starts_with('.') || name == ".fingerprint")
-            && name != "node_modules"
-            && name != "vendor")
+        || (!name.starts_with('.') && name != "node_modules" && name != "vendor")
 }
 
 fn find_project_root(target: &Path) -> Option<PathBuf> {
@@ -261,48 +184,12 @@ fn project_override_reason_in_workspace(target: &Path, workspace_root: &Path) ->
     None
 }
 
-fn recently_locked(target: &Path) -> bool {
-    let now = SystemTime::now();
-    WalkDir::new(target)
-        .follow_links(false)
-        .into_iter()
-        .filter_map(Result::ok)
-        .filter(|entry| entry.file_type().is_file())
-        .filter(|entry| {
-            matches!(
-                entry.file_name().to_str(),
-                Some(".cargo-lock" | ".cargo-build-lock" | ".cargo-artifact-lock")
-            )
-        })
-        .any(|entry| {
-            let lock_held = std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(entry.path())
-                .ok()
-                .map(|file| match file.try_lock_exclusive() {
-                    Ok(true) => false,
-                    Ok(false) | Err(_) => true,
-                })
-                .unwrap_or(true);
-            if lock_held {
-                return true;
-            }
-            std::fs::metadata(entry.path())
-                .and_then(|metadata| metadata.modified())
-                .map(|modified| {
-                    now.duration_since(modified).unwrap_or_default() < ADOPT_LIVE_WINDOW
-                })
-                .unwrap_or(false)
-        })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn reports_only_documented_intermediates() {
+    fn reports_total_target_storage_without_classifying_private_subdirectories() {
         let root = tempfile::tempdir().unwrap();
         let project = root.path().join("project");
         let target = project.join("target/debug");
@@ -319,24 +206,8 @@ mod tests {
         std::fs::write(target.join("deps/libx.rlib"), b"intermediate").unwrap();
         let report = scan(&[root.path().to_path_buf()]).unwrap();
         let candidate = &report.candidates[0];
-        assert!(
-            candidate
-                .intermediates
-                .iter()
-                .any(|item| item.path.ends_with("deps"))
-        );
-        assert!(
-            !candidate
-                .intermediates
-                .iter()
-                .any(|item| item.path.ends_with("examples"))
-        );
-        assert!(
-            !candidate
-                .intermediates
-                .iter()
-                .any(|item| item.path.ends_with("custom/user/deps"))
-        );
+        assert_eq!(candidate.usage.files, 2);
+        assert!(candidate.usage.physical_bytes > 0);
     }
 
     #[test]
@@ -366,7 +237,7 @@ mod tests {
     }
 
     #[test]
-    fn scans_cross_target_profiles_without_following_symlinks() {
+    fn scans_target_roots_without_following_symlinks() {
         let root = tempfile::tempdir().unwrap();
         let project = root.path().join("workspace");
         let target = project.join("target/aarch64-unknown-linux-gnu/custom");
@@ -409,18 +280,7 @@ mod tests {
             .iter()
             .find(|candidate| candidate.target_dir == project.join("target"))
             .unwrap();
-        assert!(
-            candidate
-                .intermediates
-                .iter()
-                .any(|item| item.path.ends_with("aarch64-unknown-linux-gnu/custom/deps"))
-        );
-        assert!(
-            !candidate
-                .intermediates
-                .iter()
-                .any(|item| item.path.ends_with("examples"))
-        );
+        assert_eq!(candidate.usage.files, 2);
         let member_candidate = report
             .candidates
             .iter()
@@ -463,7 +323,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn adopt_accounting_deduplicates_hardlinked_intermediates() {
+    fn adopt_accounting_deduplicates_hardlinked_target_files() {
         let root = tempfile::tempdir().unwrap();
         let project = root.path().join("project");
         let target = project.join("target/debug");
@@ -480,47 +340,13 @@ mod tests {
 
         let report = scan(&[root.path().to_path_buf()]).unwrap();
         let candidate = &report.candidates[0];
-        let files = candidate
-            .intermediates
-            .iter()
-            .map(|item| item.usage.files)
-            .sum::<u64>();
-        assert_eq!(files, 1);
-        assert!(candidate.reclaimable_bytes() > 0);
-    }
-
-    #[test]
-    fn active_lock_detected_before_delete() {
-        let root = tempfile::tempdir().unwrap();
-        let project = root.path().join("project");
-        let target = project.join("target/debug");
-        std::fs::create_dir_all(target.join("deps")).unwrap();
-        std::fs::write(
-            project.join("Cargo.toml"),
-            "[package]\nname='x'\nversion='0.1.0'\n",
-        )
-        .unwrap();
-        std::fs::write(target.join("deps/libx.rlib"), b"intermediate").unwrap();
-        let report = scan(&[root.path().to_path_buf()]).unwrap();
-        let lock_path = target.join(".cargo-build-lock");
-        std::fs::write(&lock_path, b"live").unwrap();
-        let lock = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&lock_path)
-            .unwrap();
-        assert!(lock.lock_exclusive().is_ok());
-        let paths = RgoPaths {
-            root: root.path().join("rgo"),
-        };
-        paths.ensure_layout().unwrap();
-        assert_eq!(delete(&report, &paths).unwrap(), 0);
-        assert!(target.join("deps/libx.rlib").exists());
+        assert_eq!(candidate.usage.files, 1);
+        assert!(candidate.usage.physical_bytes > 0);
     }
 
     #[cfg(unix)]
     #[test]
-    fn unreadable_scan_paths_are_reported_instead_of_deleted() {
+    fn unreadable_scan_paths_are_reported() {
         use std::os::unix::fs::PermissionsExt;
 
         let root = tempfile::tempdir().unwrap();

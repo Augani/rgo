@@ -12,6 +12,10 @@ pub const DEFAULT_LEASE_TTL_SECS: u32 = 30;
 pub const DEFAULT_HEARTBEAT_SECS: u32 = 10;
 pub const DEFAULT_SINGLE_FLIGHT_TIMEOUT_SECS: u32 = 30;
 pub const CLIENT_TIMEOUT_MILLIS: u64 = 150;
+pub const CACHE_EVENT_LOG_FILE: &str = "cache-events.log";
+pub const CACHE_EVENT_LOG_LOCK: &str = "cache-events.lock";
+pub const CACHE_EVENT_LOG_TRUNCATED: &str = "cache-events.truncated";
+pub const CACHE_EVENT_LOG_MAX_BYTES: u64 = 16 * 1024 * 1024;
 
 pub const SIDECAR_FILE: &str = ".rgo-context.json";
 pub const BYPASS_ENV: &str = "RGO_BYPASS";
@@ -23,6 +27,14 @@ pub struct ContextSidecar {
     pub version: u32,
     pub workspace_root: String,
     pub manifest_path: String,
+    /// Unix device ID at attribution time. Older sidecars omit it and cannot
+    /// prove that a missing workspace is on an available volume.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_device: Option<u64>,
+    /// Linux mount ID at attribution time. A device ID alone cannot
+    /// distinguish a bind mount from its underlying filesystem.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_mount_id: Option<u64>,
     pub toolchain: Option<String>,
     pub first_seen: u64,
     pub last_seen: u64,
@@ -222,6 +234,10 @@ pub struct CacheStatsReport {
     pub hits: u64,
     pub misses: u64,
     pub bypasses: u64,
+    /// At least one wrapper observation was dropped because the event log
+    /// filled or a malformed record could not be replayed.
+    #[serde(default)]
+    pub observations_incomplete: bool,
     pub last_verify_at: u64,
     pub last_verify_error: Option<String>,
     pub single_flight_producers: u64,
@@ -251,11 +267,36 @@ pub struct CacheVerifyReport {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct StatusReport {
     pub managed_bytes: u64,
+    #[serde(default)]
+    pub build_bytes: Option<u64>,
+    #[serde(default)]
+    pub cas_bytes: Option<u64>,
+    #[serde(default)]
+    pub auxiliary_bytes: u64,
+    #[serde(default)]
+    pub protected_context_bytes: u64,
     pub incremental_bytes: u64,
+    /// Estimated build-context and old temp/quarantine bytes eligible under an
+    /// aggressive pass. CAS eviction is planned separately and is not included.
     pub reclaimable_bytes: u64,
+    /// Estimated bytes with an eligible action across builds, CAS, and temp
+    /// storage under an aggressive preview. This is not a free-space promise.
+    #[serde(default)]
+    pub eligible_managed_bytes: Option<u64>,
+    /// Portion of the configured budget excess that no currently eligible
+    /// action can cover. Absent in reports from older daemons.
+    #[serde(default)]
+    pub unmet_budget_bytes: Option<u64>,
+    #[serde(default)]
+    pub unmet_budget_reason: Option<String>,
     pub soft_watermark_bytes: u64,
     pub hard_limit_bytes: u64,
+    /// Legacy numeric field; zero also represented a failed volume probe.
     pub volume_free_bytes: u64,
+    /// None means the filesystem's free space could not be measured. This
+    /// optional field keeps older daemon/client report shapes readable.
+    #[serde(default)]
+    pub volume_free_observed_bytes: Option<u64>,
     pub min_free_bytes: u64,
     pub contexts: u64,
     pub orphaned_contexts: u64,
@@ -313,8 +354,42 @@ pub struct GcReport {
     pub target_bytes: u64,
     pub reclaimed_bytes: u64,
     pub planned_bytes: u64,
+    /// Actions selected by the planner but rejected by deletion-time safety checks or I/O.
+    #[serde(default)]
+    pub skipped_execution_actions: u64,
+    #[serde(default)]
+    pub skipped_execution_bytes: u64,
+    #[serde(default)]
+    pub first_execution_skip: Option<String>,
     pub skipped_live: u64,
     pub skipped_leased: u64,
+    #[serde(default)]
+    pub skipped_pinned: u64,
+    #[serde(default)]
+    pub skipped_unavailable: u64,
+    #[serde(default)]
+    pub protected_context_bytes: u64,
+    /// CAS eviction is conservatively deferred while any cache producer,
+    /// fetch, or consumer lease is active. Measured at the start of the pass.
+    #[serde(default)]
+    pub cas_eviction_deferred_bytes: u64,
+    #[serde(default)]
+    pub min_free_bytes: u64,
+    /// Allocated-byte estimate measured after a real GC pass; absent for previews.
+    #[serde(default)]
+    pub remaining_managed_bytes: Option<u64>,
+    #[serde(default)]
+    pub remaining_build_bytes: Option<u64>,
+    #[serde(default)]
+    pub remaining_cas_bytes: Option<u64>,
+    #[serde(default)]
+    pub remaining_auxiliary_bytes: Option<u64>,
+    /// Filesystem free space observed before and after GC. Other processes can
+    /// change these values, so their difference is not attributed to rgo.
+    #[serde(default)]
+    pub volume_free_before_bytes: Option<u64>,
+    #[serde(default)]
+    pub volume_free_after_bytes: Option<u64>,
     pub actions: Vec<GcAction>,
 }
 
@@ -414,6 +489,24 @@ mod tests {
     }
 
     #[test]
+    fn older_sidecars_without_workspace_identity_remain_readable() {
+        let old = r#"{"version":5,"workspace_root":"/work","manifest_path":"/work/Cargo.toml","toolchain":null,"first_seen":1,"last_seen":2}"#;
+        let sidecar: ContextSidecar = serde_json::from_str(old).unwrap();
+        assert_eq!(sidecar.workspace_device, None);
+        assert_eq!(sidecar.workspace_mount_id, None);
+        assert!(
+            !serde_json::to_string(&sidecar)
+                .unwrap()
+                .contains("workspace_device")
+        );
+        assert!(
+            !serde_json::to_string(&sidecar)
+                .unwrap()
+                .contains("workspace_mount_id")
+        );
+    }
+
+    #[test]
     fn cache_messages_are_versioned_and_round_trip() {
         let request = Request::CacheLookup {
             key: "deadbeef".into(),
@@ -427,6 +520,39 @@ mod tests {
         };
         let json = serde_json::to_string(&response).unwrap();
         assert!(json.contains("cache_miss"));
+    }
+
+    #[test]
+    fn status_distinguishes_unknown_free_space_without_breaking_older_reports() {
+        let mut older = serde_json::to_value(StatusReport {
+            volume_free_bytes: 0,
+            ..Default::default()
+        })
+        .unwrap();
+        older
+            .as_object_mut()
+            .unwrap()
+            .remove("volume_free_observed_bytes");
+        older
+            .as_object_mut()
+            .unwrap()
+            .remove("eligible_managed_bytes");
+        older.as_object_mut().unwrap().remove("unmet_budget_bytes");
+        older.as_object_mut().unwrap().remove("unmet_budget_reason");
+        let decoded: StatusReport = serde_json::from_value(older).unwrap();
+        assert_eq!(decoded.volume_free_observed_bytes, None);
+        assert_eq!(decoded.eligible_managed_bytes, None);
+        assert_eq!(decoded.unmet_budget_bytes, None);
+        assert_eq!(decoded.unmet_budget_reason, None);
+
+        let current = StatusReport {
+            volume_free_bytes: 0,
+            volume_free_observed_bytes: Some(0),
+            ..Default::default()
+        };
+        let decoded: StatusReport =
+            serde_json::from_value(serde_json::to_value(current).unwrap()).unwrap();
+        assert_eq!(decoded.volume_free_observed_bytes, Some(0));
     }
 
     #[test]

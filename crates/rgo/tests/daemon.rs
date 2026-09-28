@@ -5,11 +5,52 @@ use std::thread;
 use std::time::Duration;
 
 use assert_cmd::cargo::cargo_bin;
-#[cfg(unix)]
 use rgo_core::ipc;
 #[cfg(unix)]
-use rgo_protocol::{PROTOCOL_VERSION, Request, Response};
+use rgo_protocol::PROTOCOL_VERSION;
+use rgo_protocol::{Request, Response};
 use rgo_testkit::{Sandbox, ensure_workspace_bins_built};
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[allow(unsafe_code)]
+#[test]
+fn daemon_closes_inherited_nonstdio_descriptors() {
+    use std::io::Read;
+    use std::os::fd::AsRawFd;
+    use std::os::unix::net::UnixStream;
+
+    let sb = Sandbox::new().unwrap();
+    let paths = rgo_core::paths::RgoPaths {
+        root: sb.rgo_home.clone(),
+    };
+    paths.ensure_layout().unwrap();
+    let (mut reader, writer) = UnixStream::pair().unwrap();
+    assert_eq!(
+        unsafe { libc::fcntl(writer.as_raw_fd(), libc::F_SETFD, 0) },
+        0
+    );
+    let mut daemon = sb
+        .cmd(cargo_bin("rgo"))
+        .args(["daemon", "--foreground", "--home"])
+        .arg(&sb.rgo_home)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    drop(writer);
+    reader
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    let result = reader.read(&mut [0u8; 1]);
+    let _ = daemon.kill();
+    let _ = daemon.wait();
+    assert_eq!(
+        result.unwrap(),
+        0,
+        "daemon retained an inherited pipe descriptor"
+    );
+}
 
 fn start_daemon(sb: &Sandbox) -> Child {
     let mut child = sb
@@ -20,14 +61,195 @@ fn start_daemon(sb: &Sandbox) -> Child {
         .spawn()
         .unwrap();
     for _ in 0..80 {
-        if sb.rgo_home.join("state/daemon.sock").exists() {
+        if matches!(
+            ipc::request_with_timeout(
+                &sb.rgo_home.join("state/daemon.sock"),
+                Request::QueryStatus,
+                Duration::from_millis(100)
+            ),
+            Ok(Response::Status(_))
+        ) {
             return child;
         }
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "daemon exited during startup"
+        );
         thread::sleep(Duration::from_millis(25));
     }
     let _ = child.kill();
     let _ = child.wait();
     panic!("daemon did not create its socket");
+}
+
+#[cfg(unix)]
+#[test]
+fn status_surfaces_a_daemon_measurement_error_without_starting_another_daemon() {
+    ensure_workspace_bins_built().unwrap();
+    let sb = Sandbox::new().unwrap();
+    let mut daemon = start_daemon(&sb);
+    let manifests = sb.rgo_home.join("cas/manifests");
+    let moved = sb.rgo_home.join("cas/manifests.saved");
+    std::fs::rename(&manifests, &moved).unwrap();
+    std::fs::write(&manifests, b"not a directory").unwrap();
+
+    let status = sb.cmd(cargo_bin("rgo")).arg("status").output().unwrap();
+    assert!(!status.status.success());
+    let error = String::from_utf8_lossy(&status.stderr);
+    assert!(error.contains("daemon status failed"), "{error}");
+    assert!(!String::from_utf8_lossy(&status.stdout).contains("Daemon               unavailable"));
+    assert!(daemon.try_wait().unwrap().is_none());
+
+    std::fs::remove_file(&manifests).unwrap();
+    std::fs::rename(moved, manifests).unwrap();
+    daemon.kill().unwrap();
+    daemon.wait().unwrap();
+}
+
+#[test]
+fn gc_reclaims_fresh_staging_and_quarantine_within_one_pass() {
+    ensure_workspace_bins_built().unwrap();
+    let sb = Sandbox::new().unwrap();
+    let paths = rgo_core::paths::RgoPaths {
+        root: sb.rgo_home.clone(),
+    };
+    paths.ensure_layout().unwrap();
+    let staged = paths.tmp_dir().join("gc-123-456-abandoned");
+    std::fs::create_dir(&staged).unwrap();
+    std::fs::write(staged.join("data"), vec![b'a'; 1024 * 1024]).unwrap();
+    let quarantined = paths.quarantine_dir().join("corrupt.bad");
+    std::fs::write(&quarantined, vec![b'b'; 1024 * 1024]).unwrap();
+    let unknown = paths.tmp_dir().join("unknown-new-file");
+    std::fs::write(&unknown, vec![b'c'; 1024 * 1024]).unwrap();
+    let reclaimable = rgo_core::size::Scanner::new()
+        .measure_checked(&staged)
+        .unwrap()
+        .physical_bytes
+        + rgo_core::size::Scanner::new()
+            .measure_checked(&quarantined)
+            .unwrap()
+            .physical_bytes;
+    let mut daemon = start_daemon(&sb);
+    let before = match ipc::request_with_timeout(
+        &paths.socket_path(),
+        Request::QueryStatus,
+        Duration::from_secs(2),
+    )
+    .unwrap()
+    {
+        Response::Status(status) => status,
+        response => panic!("expected status before cleanup, got {response:?}"),
+    };
+    let target = before
+        .managed_bytes
+        .saturating_sub(reclaimable)
+        .saturating_add(512 * 1024);
+    let gc = sb
+        .cmd(cargo_bin("rgo"))
+        .args(["gc", "--target", &format!("{target}B")])
+        .output()
+        .unwrap();
+    assert!(
+        gc.status.success(),
+        "{}",
+        String::from_utf8_lossy(&gc.stderr)
+    );
+    assert!(!staged.exists());
+    assert!(!quarantined.exists());
+    assert!(unknown.exists());
+    let after = match ipc::request_with_timeout(
+        &paths.socket_path(),
+        Request::QueryStatus,
+        Duration::from_secs(2),
+    )
+    .unwrap()
+    {
+        Response::Status(status) => status,
+        response => panic!("expected status after cleanup, got {response:?}"),
+    };
+    assert!(
+        after.managed_bytes <= target,
+        "GC left {} managed bytes above target {target}",
+        after.managed_bytes
+    );
+    daemon.kill().unwrap();
+    daemon.wait().unwrap();
+}
+
+#[test]
+fn maintenance_recovers_unpin_decision_with_auto_gc_disabled() {
+    ensure_workspace_bins_built().unwrap();
+    let sb = Sandbox::new().unwrap();
+    let paths = rgo_core::paths::RgoPaths {
+        root: sb.rgo_home.clone(),
+    };
+    let absent = paths.builds_dir().join("aa/interrupted-unpin");
+    rgo_core::context::remove_durable_pin(&paths, &absent).unwrap();
+    let record = paths.pin_records_dir().join("aa/interrupted-unpin.pin");
+    assert!(record.exists());
+    std::fs::write(paths.config_file(), "[gc]\nauto = false\n").unwrap();
+
+    let mut daemon = sb
+        .cmd(cargo_bin("rgo"))
+        .args(["daemon", "--foreground"])
+        .env("RGO_DAEMON_POLL_SECS", "1")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while record.exists() && std::time::Instant::now() < deadline {
+        assert!(daemon.try_wait().unwrap().is_none(), "daemon exited early");
+        thread::sleep(Duration::from_millis(100));
+    }
+    let _ = daemon.kill();
+    let _ = daemon.wait();
+    assert!(
+        !record.exists(),
+        "maintenance kept an obsolete unpin decision"
+    );
+}
+
+#[test]
+fn explicit_daemon_home_survives_a_service_environment_without_cargo_home() {
+    ensure_workspace_bins_built().unwrap();
+    let sb = Sandbox::new().unwrap();
+    assert!(
+        sb.cmd(cargo_bin("rgo"))
+            .args(["setup", "--no-service"])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let mut daemon = sb
+        .cmd(cargo_bin("rgo"))
+        .env_remove("RGO_HOME")
+        .env("CARGO_HOME", sb.projects.join("unrelated-cargo-home"))
+        .args(["daemon", "--foreground", "--home"])
+        .arg(&sb.rgo_home)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    for _ in 0..80 {
+        if matches!(
+            ipc::request_with_timeout(
+                &sb.rgo_home.join("state/daemon.sock"),
+                Request::QueryStatus,
+                Duration::from_millis(100)
+            ),
+            Ok(Response::Status(_))
+        ) {
+            daemon.kill().unwrap();
+            let _ = daemon.wait();
+            return;
+        }
+        assert!(daemon.try_wait().unwrap().is_none());
+        thread::sleep(Duration::from_millis(25));
+    }
+    let _ = daemon.kill();
+    let _ = daemon.wait();
+    panic!("explicit daemon home did not create the expected socket");
 }
 
 #[test]
@@ -194,10 +416,40 @@ fn daemon_rejects_bad_handshakes_and_survives_malformed_clients() {
     malformed.write_all(&(2u32.to_be_bytes())).unwrap();
     malformed.write_all(b"{}").unwrap();
     drop(malformed);
-    assert!(matches!(
-        ipc::request_with_timeout(&socket, Request::QueryStatus, Duration::from_secs(2)).unwrap(),
-        Response::Status(_)
-    ));
+    let before =
+        match ipc::request_with_timeout(&socket, Request::QueryStatus, Duration::from_secs(2))
+            .unwrap()
+        {
+            Response::Status(status) => status,
+            response => panic!("expected status after malformed client, got {response:?}"),
+        };
+    let temp_file = sb.rgo_home.join("tmp/accounted-by-status");
+    std::fs::write(
+        &temp_file,
+        (0..8192).map(|i| (i % 251) as u8).collect::<Vec<_>>(),
+    )
+    .unwrap();
+    let allocated = rgo_core::size::Scanner::new()
+        .measure(&temp_file)
+        .physical_bytes;
+    assert!(allocated > 0);
+    let after =
+        match ipc::request_with_timeout(&socket, Request::QueryStatus, Duration::from_secs(2))
+            .unwrap()
+        {
+            Response::Status(status) => status,
+            response => panic!("expected status after adding temp file, got {response:?}"),
+        };
+    assert!(after.auxiliary_bytes >= before.auxiliary_bytes + allocated);
+    assert!(after.managed_bytes >= before.managed_bytes + allocated);
+    assert_eq!(
+        after.managed_bytes,
+        after
+            .build_bytes
+            .unwrap()
+            .saturating_add(after.cas_bytes.unwrap())
+            .saturating_add(after.auxiliary_bytes)
+    );
 
     daemon.kill().unwrap();
     let _ = daemon.wait();
@@ -270,7 +522,7 @@ fn age_context_into_orphan(project: &std::path::Path, context_dir: &std::path::P
                 stack.push(path);
             } else if matches!(
                 path.file_name().and_then(|n| n.to_str()),
-                Some(".cargo-build-lock") | Some(".cargo-lock")
+                Some(".cargo-build-lock")
             ) {
                 std::fs::remove_file(&path).unwrap();
             }
@@ -288,6 +540,11 @@ fn age_context_into_orphan(project: &std::path::Path, context_dir: &std::path::P
 fn pin_survives_database_rebuild_and_protects_context_from_gc() {
     ensure_workspace_bins_built().unwrap();
     let sb = Sandbox::new().unwrap();
+    std::fs::write(
+        sb.rgo_home.join("config.toml"),
+        "[storage]\nmax_size = '1B'\nmin_free_space = '0B'\n",
+    )
+    .unwrap();
     assert!(
         sb.cmd(cargo_bin("rgo"))
             .args(["setup", "--no-service"])
@@ -331,9 +588,15 @@ fn pin_survives_database_rebuild_and_protects_context_from_gc() {
         String::from_utf8_lossy(&pin.stderr)
     );
     assert!(context_dir.join(".rgo-pin").is_file());
+    let paths = rgo_core::paths::RgoPaths {
+        root: sb.rgo_home.clone(),
+    };
+    let decision = paths.pin_records_dir().join(format!("{id}.pin"));
+    assert!(rgo_core::context::is_pinned(&paths, &context_dir));
 
-    // Lose the entire database: the pin marker inside the build dir is the durable
-    // record, and a restarted daemon must rebuild the pins table from it.
+    // Lose the database and the legacy marker: the stable pin record must
+    // rebuild the index without depending on Cargo's build directory.
+    rgo_core::context::remove_pin_marker(&context_dir).unwrap();
     daemon.kill().unwrap();
     let _ = daemon.wait();
     for entry in std::fs::read_dir(sb.rgo_home.join("state"))
@@ -349,15 +612,48 @@ fn pin_survives_database_rebuild_and_protects_context_from_gc() {
     let ls = sb.cmd(cargo_bin("rgo")).arg("ls").output().unwrap();
     assert!(
         String::from_utf8_lossy(&ls.stdout).contains("PIN"),
-        "pin must survive a full database rebuild: {}",
-        String::from_utf8_lossy(&ls.stdout)
+        "pin must survive a full database rebuild (status {}): stdout={}, stderr={}",
+        ls.status,
+        String::from_utf8_lossy(&ls.stdout),
+        String::from_utf8_lossy(&ls.stderr)
     );
 
     // Even an aged orphan is untouchable while pinned.
     age_context_into_orphan(&project, &context_dir);
+    let status = match ipc::request_with_timeout(
+        &sb.rgo_home.join("state/daemon.sock"),
+        Request::QueryStatus,
+        Duration::from_secs(2),
+    )
+    .unwrap()
+    {
+        Response::Status(status) => status,
+        response => panic!("expected status for pinned context, got {response:?}"),
+    };
+    assert!(status.protected_context_bytes > 0);
+    assert!(status.eligible_managed_bytes.is_some());
+    assert!(status.unmet_budget_bytes.unwrap() > 0);
+    assert!(
+        status
+            .unmet_budget_reason
+            .as_deref()
+            .unwrap()
+            .contains("protected build contexts")
+    );
+    let visible_status = sb.cmd(cargo_bin("rgo")).arg("status").output().unwrap();
+    assert!(visible_status.status.success());
+    let visible_status = String::from_utf8_lossy(&visible_status.stdout);
+    assert!(
+        visible_status.contains("Budget unmet est."),
+        "{visible_status}"
+    );
+    assert!(
+        visible_status.contains("protected build contexts"),
+        "{visible_status}"
+    );
     let gc = sb
         .cmd(cargo_bin("rgo"))
-        .args(["gc", "--aggressive"])
+        .args(["gc", "--target", "1B"])
         .output()
         .unwrap();
     assert!(
@@ -369,6 +665,12 @@ fn pin_survives_database_rebuild_and_protects_context_from_gc() {
         context_dir.exists(),
         "pinned context was collected despite the pin"
     );
+    let gc_output = String::from_utf8_lossy(&gc.stdout);
+    assert!(gc_output.contains("Target still unmet"), "{gc_output}");
+    assert!(gc_output.contains("Protected builds"), "{gc_output}");
+    assert!(gc_output.contains("build contexts"), "{gc_output}");
+    assert!(gc_output.contains("compiler cache"), "{gc_output}");
+    assert!(gc_output.contains("other rgo state"), "{gc_output}");
 
     let unpin = sb
         .cmd(cargo_bin("rgo"))
@@ -400,6 +702,30 @@ fn pin_survives_database_rebuild_and_protects_context_from_gc() {
     assert!(
         !context_dir.exists(),
         "unpinned aged orphan should have been collected"
+    );
+    assert!(!decision.exists(), "GC kept an obsolete unpin decision");
+    // A context removed by Cargo can still have a durable pin intent. Its ID
+    // must remain usable for explicit unpin even before the next build.
+    rgo_core::context::write_durable_pin(&paths, &context_dir).unwrap();
+    let listed = sb.cmd(cargo_bin("rgo")).arg("ls").output().unwrap();
+    assert!(listed.status.success());
+    let listed = String::from_utf8_lossy(&listed.stdout);
+    assert!(listed.contains(&id));
+    assert!(listed.contains("context absent; pin retained"));
+    let unpin_absent = sb
+        .cmd(cargo_bin("rgo"))
+        .args(["unpin", &id])
+        .output()
+        .unwrap();
+    assert!(
+        unpin_absent.status.success(),
+        "{}",
+        String::from_utf8_lossy(&unpin_absent.stderr)
+    );
+    assert!(!rgo_core::context::is_pinned(&paths, &context_dir));
+    assert!(
+        !decision.exists(),
+        "unpinning an absent context kept its tombstone"
     );
     daemon.kill().unwrap();
     let _ = daemon.wait();
@@ -472,7 +798,7 @@ fn maintenance_reclaims_orphans_via_auto_gc() {
     // Tiny storage budget so the watermark check fires for a single context.
     std::fs::write(
         sb.rgo_home.join("config.toml"),
-        "[storage]\nmax_size = \"1KB\"\n",
+        "[storage]\nmax_size = \"1KB\"\n[gc]\nauto = true\n",
     )
     .unwrap();
     let mut daemon = sb

@@ -19,7 +19,8 @@ pub struct Config {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Storage {
-    /// Hard ceiling for everything under `builds/` + `cas/`.
+    /// Configured recovery target for managed builds and CAS, not a strict
+    /// quota while active/pinned work or filesystem constraints prevent GC.
     pub max_size: Size,
     /// Fraction of `max_size` at which background GC starts.
     pub soft_watermark: f64,
@@ -36,6 +37,10 @@ pub struct Gc {
     pub context_retention: Duration,
     #[serde(with = "humantime_serde")]
     pub orphan_grace: Duration,
+    /// Age limit for unused compiler-result manifests. Shared objects remain
+    /// until their final manifest reference is removed.
+    #[serde(with = "humantime_serde")]
+    pub cache_retention: Duration,
     pub auto: bool,
 }
 
@@ -109,7 +114,11 @@ impl Default for Gc {
             incremental_retention: Duration::from_secs(7 * 86400),
             context_retention: Duration::from_secs(30 * 86400),
             orphan_grace: Duration::from_secs(3600),
-            auto: true,
+            cache_retention: Duration::from_secs(30 * 86400),
+            // Whole-context deletion is not yet proven safe for Cargo processes
+            // waiting on a lock whose directory is renamed. Keep unattended
+            // destructive maintenance off until the P2 lifecycle gate closes.
+            auto: false,
         }
     }
 }
@@ -174,7 +183,7 @@ impl Config {
         if !(0.1..=1.0).contains(&self.storage.soft_watermark) {
             bail!("storage.soft_watermark must be within 0.1..=1.0");
         }
-        let volume_total = volume_total_bytes(root).unwrap_or(0);
+        let volume_total = volume_total_bytes_checked(root).context("resolving storage volume")?;
         const GB: u64 = 1 << 30;
         let max_size = match self.storage.max_size {
             Size::Bytes(b) => b,
@@ -199,26 +208,40 @@ impl Config {
 
 /// Total capacity of the filesystem containing `path` (walks up until a mount is found).
 pub fn volume_total_bytes(path: &Path) -> Option<u64> {
-    volume_stats(path).map(|(t, _)| t)
+    volume_total_bytes_checked(path).ok()
 }
 /// Free (available to this user) bytes on the filesystem containing `path`.
 pub fn volume_free_bytes(path: &Path) -> Option<u64> {
-    volume_stats(path).map(|(_, f)| f)
+    volume_free_bytes_checked(path).ok()
 }
 
-fn volume_stats(path: &Path) -> Option<(u64, u64)> {
-    let disks = sysinfo::Disks::new_with_refreshed_list();
+pub fn volume_total_bytes_checked(path: &Path) -> Result<u64> {
+    volume_stats_checked(path).map(|(total, _)| total)
+}
+
+pub fn volume_free_bytes_checked(path: &Path) -> Result<u64> {
+    volume_stats_checked(path).map(|(_, free)| free)
+}
+
+fn volume_stats_checked(path: &Path) -> Result<(u64, u64)> {
     let mut probe = path;
     loop {
-        // Pick the mount point that is the longest prefix of `probe`.
-        if let Some(d) = disks
-            .iter()
-            .filter(|d| probe.starts_with(d.mount_point()))
-            .max_by_key(|d| d.mount_point().as_os_str().len())
-        {
-            return Some((d.total_space(), d.available_space()));
+        // Query the filesystem containing the actual path rather than
+        // inferring a mount from its spelling. This follows symlinked roots,
+        // including a custom RGO_HOME on another volume. A not-yet-created
+        // root inherits the nearest existing ancestor's filesystem.
+        match fs4::statvfs(probe) {
+            Ok(stats) => return Ok((stats.total_space(), stats.available_space())),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                probe = probe.parent().with_context(|| {
+                    format!("no existing volume ancestor for {}", path.display())
+                })?;
+            }
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("probing volume at {}", probe.display()));
+            }
         }
-        probe = probe.parent()?;
     }
 }
 
@@ -245,6 +268,7 @@ mod tests {
         let c: Config = toml::from_str("").unwrap();
         assert_eq!(c.storage.max_size, Size::Auto);
         assert_eq!(c.gc.orphan_grace, Duration::from_secs(3600));
+        assert!(!c.gc.auto);
         assert!(!c.cache.enabled);
         assert!(!c.remote.enabled);
         assert_eq!(c.remote.token_env, "RGO_REMOTE_TOKEN");
@@ -252,6 +276,40 @@ mod tests {
         assert_eq!(
             c.cache.single_flight_timeout,
             Duration::from_secs(rgo_protocol::DEFAULT_SINGLE_FLIGHT_TIMEOUT_SECS as u64)
+        );
+    }
+
+    #[test]
+    fn volume_probe_uses_existing_parent_of_a_new_storage_root() {
+        let temporary = tempfile::tempdir().unwrap();
+        let new_root = temporary.path().join("not-created/rgo");
+        assert_eq!(
+            volume_total_bytes(&new_root),
+            volume_total_bytes(temporary.path())
+        );
+        assert!(volume_free_bytes(&new_root).is_some());
+    }
+
+    #[test]
+    fn failed_volume_probe_does_not_invent_automatic_limits() {
+        let temporary = tempfile::tempdir().unwrap();
+        let file = temporary.path().join("not-a-directory");
+        std::fs::write(&file, b"file").unwrap();
+        let impossible_root = file.join("rgo");
+        assert!(volume_free_bytes_checked(&impossible_root).is_err());
+        assert!(volume_free_bytes(&impossible_root).is_none());
+        assert!(Config::default().resolve(&impossible_root).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn volume_probe_follows_a_symlinked_storage_root() {
+        let temporary = tempfile::tempdir().unwrap();
+        let link = temporary.path().join("storage-link");
+        std::os::unix::fs::symlink(temporary.path(), &link).unwrap();
+        assert_eq!(
+            volume_total_bytes(&link),
+            volume_total_bytes(temporary.path())
         );
     }
 

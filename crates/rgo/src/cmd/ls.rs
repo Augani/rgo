@@ -42,8 +42,11 @@ pub fn run() -> Result<()> {
     let print_row = |c: &context::BuildContext| {
         let ws = match &c.sidecar {
             Some(s) if c.is_orphan() => format!("{} (orphan)", s.workspace_root),
+            Some(s) if c.workspace_unavailable() => {
+                format!("{} (workspace unavailable; protected)", s.workspace_root)
+            }
             Some(s) => s.workspace_root.clone(),
-            None => "? (unattributed)".to_owned(),
+            None => "? (unattributed; protected)".to_owned(),
         };
         let idle = humantime::format_duration(std::time::Duration::from_secs(
             c.idle_for(now).as_secs() / 60 * 60,
@@ -54,7 +57,7 @@ pub fn run() -> Result<()> {
             human(c.usage.physical_bytes),
             human(c.incremental_usage.physical_bytes),
             idle,
-            if pinned.iter().any(|p| same_path(p, &c.dir)) {
+            if c.is_pinned(&e.paths) || pinned.iter().any(|p| same_path(p, &c.dir)) {
                 "PIN"
             } else {
                 ""
@@ -85,6 +88,19 @@ pub fn run() -> Result<()> {
         }
         print_row(&contexts[index]);
         emitted[index] = true;
+    }
+    for path in context::durable_pin_contexts(&e.paths)? {
+        if contexts.iter().any(|context| context.dir == path) {
+            continue;
+        }
+        let id = path
+            .strip_prefix(e.paths.builds_dir())?
+            .display()
+            .to_string();
+        println!(
+            "{:<18} {:>10} {:>10} {:>10}  {:<3} {:<3} (context absent; pin retained)",
+            id, "-", "-", "-", "PIN", ""
+        );
     }
     Ok(())
 }

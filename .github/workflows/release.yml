@@ -1,6 +1,6 @@
 name: Release
 
-# Reproducible release binaries + checksums for every tag. Equivalent automation to
+# Versioned release binaries + checksums for every tag. Equivalent automation to
 # cargo-dist without the extra tool: each archive always contains `rgo` and
 # `rgo-rustc-wrapper` side by side because `rgo setup` requires the wrapper next to the CLI.
 
@@ -9,20 +9,21 @@ on:
     tags: ["v*"]
   workflow_dispatch:
 
-permissions:
-  contents: write
-
 jobs:
   build:
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
     strategy:
       fail-fast: false
       matrix:
         include:
           - { name: macos-aarch64, os: macos-14, target: aarch64-apple-darwin, ext: "" }
-          - { name: macos-x86_64, os: macos-13, target: x86_64-apple-darwin, ext: "" }
-          - { name: linux-x86_64, os: ubuntu-latest, target: x86_64-unknown-linux-gnu, ext: "" }
+          - { name: macos-x86_64, os: macos-15-intel, target: x86_64-apple-darwin, ext: "" }
+          - { name: linux-x86_64, os: ubuntu-22.04, target: x86_64-unknown-linux-gnu, ext: "" }
           - { name: windows-x86_64, os: windows-latest, target: x86_64-pc-windows-msvc, ext: ".exe" }
     steps:
       - uses: actions/checkout@v4
@@ -31,7 +32,20 @@ jobs:
           toolchain: stable
           targets: ${{ matrix.target }}
       - name: Build release binaries
-        run: cargo build --release --locked --target ${{ matrix.target }} -p rgo -p rgo-rustc-wrapper
+        run: cargo build --release --locked --target ${{ matrix.target }} -p rgo-storage -p rgo-rustc-wrapper
+      - name: Verify matched binaries and tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin_dir="target/${{ matrix.target }}/release"
+          cli_version=$("$bin_dir/rgo${{ matrix.ext }}" --version)
+          wrapper_version=$("$bin_dir/rgo-rustc-wrapper${{ matrix.ext }}" --rgo-version)
+          version="${cli_version#rgo }"
+          [[ "$cli_version" == "rgo $version" ]]
+          [[ "$wrapper_version" == "rgo-rustc-wrapper $version protocol "* ]]
+          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+            [[ "$GITHUB_REF_NAME" == "v$version" ]]
+          fi
       - name: Package archive
         shell: bash
         env:
@@ -56,6 +70,11 @@ jobs:
           cd artifacts
           shasum -a 256 * > "SHA256SUMS-${{ matrix.target }}.txt"
           cat "SHA256SUMS-${{ matrix.target }}.txt"
+      - name: Attest release bundle
+        if: github.event.repository.visibility == 'public' && startsWith(github.ref, 'refs/tags/')
+        uses: actions/attest@v4
+        with:
+          subject-path: artifacts/rgo-${{ github.ref_name }}-${{ matrix.target }}.*
       - uses: actions/upload-artifact@v4
         with:
           name: release-${{ matrix.name }}
@@ -65,9 +84,14 @@ jobs:
   release:
     name: Publish GitHub release
     needs: build
-    if: startsWith(github.ref, 'refs/tags/')
+    if: startsWith(github.ref, 'refs/tags/') && github.event.repository.visibility == 'public'
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
     steps:
+      - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
           pattern: release-*
@@ -77,7 +101,18 @@ jobs:
         run: |
           cat dist/SHA256SUMS-*.txt > dist/SHA256SUMS.txt
           rm dist/SHA256SUMS-*.txt
+          cp scripts/install-unix.py dist/rgo-install-unix.py
+          cp scripts/install-windows.ps1 dist/rgo-install-windows.ps1
+          (cd dist && shasum -a 256 rgo-install-unix.py rgo-install-windows.ps1 >> SHA256SUMS.txt)
           sort -o dist/SHA256SUMS.txt dist/SHA256SUMS.txt
+      - name: Attest Unix installer
+        uses: actions/attest@v4
+        with:
+          subject-path: dist/rgo-install-unix.py
+      - name: Attest Windows installer
+        uses: actions/attest@v4
+        with:
+          subject-path: dist/rgo-install-windows.ps1
       - name: Create release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

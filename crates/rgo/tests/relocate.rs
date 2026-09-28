@@ -151,7 +151,7 @@ fn worktrees_of_one_repo_group_under_a_header_in_ls() {
 }
 
 #[test]
-fn deleting_the_checkout_makes_the_context_an_orphan() {
+fn deleting_the_checkout_reports_its_workspace_state() {
     ensure_workspace_bins_built().unwrap();
     let sb = Sandbox::new().unwrap();
     assert!(
@@ -170,8 +170,15 @@ fn deleting_the_checkout_makes_the_context_an_orphan() {
             .unwrap()
             .success()
     );
+    let orphan_supported =
+        cfg!(target_os = "macos") || rgo_core::context::workspace_mount_id(&proj).is_some();
     std::fs::remove_dir_all(&proj).unwrap();
 
     let out = sb.cmd(cargo_bin("rgo")).arg("ls").output().unwrap();
-    assert!(String::from_utf8_lossy(&out.stdout).contains("(orphan)"));
+    let expected = if orphan_supported {
+        "(orphan)"
+    } else {
+        "(workspace unavailable; protected)"
+    };
+    assert!(String::from_utf8_lossy(&out.stdout).contains(expected));
 }

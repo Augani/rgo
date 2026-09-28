@@ -1,7 +1,8 @@
-use std::path::Path;
+use std::cell::RefCell;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use rgo_core::adopt;
 use rgo_core::cargo_config;
 use rgo_core::config::volume_free_bytes;
@@ -9,44 +10,158 @@ use rgo_core::ipc;
 use rgo_core::paths::cargo_home;
 use rgo_core::service;
 use rgo_protocol::{PROTOCOL_VERSION, Request, Response};
+use serde::Serialize;
 
 use super::{daemon, env, human};
 
-pub fn run() -> Result<()> {
-    let e = env()?;
-    let mut problems = 0;
-    let mut check = |ok: bool, msg: String| {
-        println!("{} {msg}", if ok { "ok  " } else { "WARN" });
-        if !ok {
-            problems += 1;
-        }
-    };
+#[derive(Default, Serialize)]
+struct DoctorReport {
+    schema_version: u32,
+    warnings: usize,
+    activation_verified: Option<bool>,
+    entries: Vec<DoctorEntry>,
+}
 
-    let cfg_path = cargo_home()?.join("config.toml");
+#[derive(Serialize)]
+struct DoctorEntry {
+    level: &'static str,
+    message: String,
+}
+
+impl DoctorReport {
+    fn check(&mut self, ok: bool, message: String) {
+        if !ok {
+            self.warnings += 1;
+        }
+        self.entries.push(DoctorEntry {
+            level: if ok { "ok" } else { "warning" },
+            message,
+        });
+    }
+
+    fn info(&mut self, message: String) {
+        self.entries.push(DoctorEntry {
+            level: "info",
+            message,
+        });
+    }
+
+    fn print(&self, json: bool) -> Result<()> {
+        if json {
+            println!("{}", serde_json::to_string_pretty(self)?);
+        } else {
+            for entry in &self.entries {
+                println!(
+                    "{} {}",
+                    match entry.level {
+                        "ok" => "ok  ",
+                        "warning" => "WARN",
+                        _ => "info",
+                    },
+                    entry.message
+                );
+            }
+            if self.warnings == 0 {
+                println!("all good");
+            } else {
+                println!("{} warning(s)", self.warnings);
+            }
+        }
+        Ok(())
+    }
+}
+
+pub fn run(json: bool, verify: bool) -> Result<()> {
+    let e = env()?;
+    let report = RefCell::new(DoctorReport {
+        schema_version: 1,
+        ..DoctorReport::default()
+    });
+    let mut check = |ok: bool, msg: String| report.borrow_mut().check(ok, msg);
+    let mut info = |msg: String| report.borrow_mut().info(msg);
+    let mut supervised_ready = true;
+
+    let cargo_home = cargo_home()?;
+    let cfg_path = cargo_config::effective_home_config(&cargo_home);
     let insp = cargo_config::inspect(&cargo_config::read_or_empty(&cfg_path)?)?;
-    check(
-        insp.has_fence,
-        format!(
-            "rgo fence present in {}; remediation: run `rgo setup`",
-            cfg_path.display()
-        ),
-    );
-    check(
-        insp.build_dir_outside_fence.is_none(),
-        format!(
-            "no conflicting build.build-dir outside fence ({:?}); remediation: remove the override from {}",
-            insp.build_dir_outside_fence,
-            cfg_path.display()
-        ),
-    );
-    check(
-        insp.target_dir.is_none(),
-        format!(
-            "no global build.target-dir ({:?}); remediation: remove the override from {}",
-            insp.target_dir,
-            cfg_path.display()
-        ),
-    );
+    let supervised = std::fs::read(cargo_home.join(".rgo-install.json"))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .and_then(|record| record.get("supervised_cargo").cloned())
+        .filter(|value| value.is_object());
+    if insp.has_include {
+        info("Cargo home config includes other files; rgo leaves any included wrapper settings in place and cannot infer their effective chain from the home file alone".into());
+    }
+    if let Some(mode) = &supervised {
+        check(
+            !insp.has_fence,
+            format!(
+                "no global rgo build-directory fence in {}",
+                cfg_path.display()
+            ),
+        );
+        let shim = mode["shim_path"].as_str().map(PathBuf::from);
+        let owned = shim.as_ref().is_some_and(|path| {
+            std::fs::read(path).ok().as_deref() == mode["shim_contents"].as_str().map(str::as_bytes)
+        });
+        check(owned, "supervised Cargo launcher matches its installation record; remediation: rerun `rgo setup --supervised`".into());
+        let active = shim.as_ref().is_some_and(|shim| {
+            std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+                .map(|dir| dir.join("cargo"))
+                .find(|path| path.is_file())
+                .is_some_and(|path| path == *shim)
+        });
+        supervised_ready =
+            owned && active && !insp.has_fence && insp.build_dir_outside_fence.is_none();
+        check(
+            active,
+            format!(
+                "Cargo on PATH resolves to the supervised launcher {}; remediation: put its directory before the real Cargo proxy on PATH",
+                shim.as_deref().unwrap_or(Path::new("<missing>")).display()
+            ),
+        );
+        info(format!(
+            "real Cargo proxy: {}",
+            mode["real_cargo"].as_str().unwrap_or("<missing>")
+        ));
+        if let Some(build_dir) = &insp.build_dir_outside_fence {
+            check(
+                false,
+                format!(
+                    "global build.build-dir = {build_dir:?} could let direct Cargo enter the managed namespace; remove it before supervised activation"
+                ),
+            );
+        }
+    } else {
+        check(
+            insp.has_fence,
+            format!(
+                "rgo fence present in {}; remediation: run `rgo setup`",
+                cfg_path.display()
+            ),
+        );
+        check(
+            insp.configured_build_dir.as_deref() == Some(e.paths.build_dir_template().as_str()),
+            format!(
+                "global build.build-dir = {:?} (expected {:?}); remediation: run `rgo setup`",
+                insp.configured_build_dir,
+                e.paths.build_dir_template()
+            ),
+        );
+        check(
+            insp.build_dir_outside_fence.is_none(),
+            format!(
+                "no conflicting build.build-dir outside fence ({:?}); remediation: remove the override from {}",
+                insp.build_dir_outside_fence,
+                cfg_path.display()
+            ),
+        );
+    }
+    if let Some(target) = &insp.target_dir {
+        info(format!(
+            "global build.target-dir = {target:?}; this changes final outputs, not the configured build directory"
+        ));
+    }
     if insp.has_fence {
         let inner = e
             .paths
@@ -57,18 +172,24 @@ pub fn run() -> Result<()> {
             .and_then(|path| std::fs::read_to_string(path).ok())
             .map(|value| value.trim().to_owned())
             .filter(|value| !value.is_empty());
-        let outer = std::env::current_exe()
-            .ok()
-            .map(|path| path.display().to_string())
-            .unwrap_or_else(|| "rgo-rustc-wrapper".into());
-        println!(
-            "info wrapper chain: {} -> {}",
-            outer,
-            inner.as_deref().unwrap_or("rustc")
-        );
+        if let Some(outer) = &insp.configured_rustc_wrapper {
+            info(format!(
+                "wrapper chain: {} -> {}",
+                outer,
+                inner.as_deref().unwrap_or("rustc")
+            ));
+            check(
+                std::path::Path::new(outer).is_file(),
+                format!(
+                    "configured wrapper exists at {outer:?}; remediation: reinstall the matched binaries, or run `rgo setup --undo` using any working rgo executable"
+                ),
+            );
+        } else {
+            info("wrapper chain: storage-only (no global compiler wrapper)".into());
+        }
     }
     if let Some(w) = &insp.rustc_wrapper {
-        println!("info build.rustc-wrapper = {w:?}");
+        info(format!("build.rustc-wrapper = {w:?}"));
         check(
             false,
             "existing build.rustc-wrapper takes precedence; rgo dependency caching is disconnected; remediation: remove it and run `rgo setup`, or keep it and use rgo for storage management only".into(),
@@ -82,8 +203,12 @@ pub fn run() -> Result<()> {
             ),
         );
     }
+    if let Some(target) = std::env::var_os("CARGO_TARGET_DIR") {
+        info(format!(
+            "CARGO_TARGET_DIR = {target:?}; this changes final outputs, not the configured build directory"
+        ));
+    }
     for var in [
-        "CARGO_TARGET_DIR",
         "CARGO_BUILD_BUILD_DIR",
         "RUSTC_WRAPPER",
         "RUSTC_WORKSPACE_WRAPPER",
@@ -154,16 +279,16 @@ pub fn run() -> Result<()> {
             Request::QueryStatus,
             std::time::Duration::from_secs(10),
         ) {
-            println!(
-                "info daemon pid {}: {} active lease(s), {} pinned context(s)",
+            info(format!(
+                "daemon pid {}: {} active lease(s), {} pinned context(s)",
                 status.daemon_pid, status.active_leases, status.pinned_contexts
-            );
-            println!(
-                "info last GC reclaimed {}",
+            ));
+            info(format!(
+                "last GC reclaimed {}",
                 human(status.last_gc_reclaimed_bytes)
-            );
-            println!(
-                "info cache {}: {} hit(s), {} miss(es), {} bypass(es), {} CAS",
+            ));
+            info(format!(
+                "cache {}: {} hit(s), {} miss(es), {} bypass(es), {} CAS",
                 if status.cache.enabled {
                     "enabled"
                 } else {
@@ -173,25 +298,25 @@ pub fn run() -> Result<()> {
                 status.cache.misses,
                 status.cache.bypasses,
                 human(status.cache.cas_bytes)
-            );
-            println!(
-                "info single-flight: {} active, {} producer(s), {} waiter(s), {} timeout(s), {} takeover(s)",
+            ));
+            info(format!(
+                "single-flight: {} active, {} producer(s), {} waiter(s), {} timeout(s), {} takeover(s)",
                 status.cache.active_builds,
                 status.cache.single_flight_producers,
                 status.cache.single_flight_waiters,
                 status.cache.single_flight_timeouts,
                 status.cache.single_flight_takeovers
-            );
-            println!(
-                "info workspace path remapping: {}",
+            ));
+            info(format!(
+                "workspace path remapping: {}",
                 if e.cfg.cache.remap_workspace_paths {
                     "enabled (opt-in semantic change)"
                 } else {
                     "disabled"
                 }
-            );
-            println!(
-                "info remote CAS: {} (healthy {}, queue {}, {} upload(s), {} download(s))",
+            ));
+            info(format!(
+                "remote CAS: {} (healthy {}, queue {}, {} upload(s), {} download(s))",
                 if status.remote.enabled {
                     "enabled"
                 } else {
@@ -201,34 +326,55 @@ pub fn run() -> Result<()> {
                 status.remote.queue_depth,
                 status.remote.uploads,
                 status.remote.downloads
-            );
+            ));
             if let Some(error) = status.remote.last_error {
                 let _ = error;
-                println!("info remote last error: present (details omitted by doctor)");
+                info("remote last error: present (details omitted by doctor)".into());
             }
         }
     }
-    let free = volume_free_bytes(&e.paths.root).unwrap_or(0);
-    check(
-        free >= e.cfg.min_free_space,
-        format!(
-            "volume free {} >= reserve {}{}",
-            human(free),
-            human(e.cfg.min_free_space),
-            if free < e.cfg.min_free_space {
-                "; remediation: free space or lower [storage].minimum-free-space"
-            } else {
-                ""
-            }
-        ),
-    );
-    println!(
-        "info budget: hard {} / soft {}",
+    if let Some(free) = volume_free_bytes(&e.paths.root) {
+        check(
+            free >= e.cfg.min_free_space,
+            format!(
+                "volume free {} >= reserve {}{}",
+                human(free),
+                human(e.cfg.min_free_space),
+                if free < e.cfg.min_free_space {
+                    "; remediation: free space or lower [storage].minimum-free-space"
+                } else {
+                    ""
+                }
+            ),
+        );
+    } else {
+        check(
+            false,
+            format!(
+                "volume free unknown at {}; cannot verify the reserve",
+                e.paths.root.display()
+            ),
+        );
+    }
+    info(format!(
+        "budget: hard {} / soft {}",
         human(e.cfg.max_size),
         human(e.cfg.soft_watermark)
+    ));
+    check(
+        e.cfg.gc.auto,
+        if e.cfg.gc.auto {
+            "automatic GC enabled (experimental lifecycle safety; active builds and pins can delay reclamation)".into()
+        } else {
+            "automatic GC disabled while the Cargo lifecycle safety gate remains open; run `rgo gc` for controlled cleanup".into()
+        },
     );
     check_toolchains(&mut check);
-    check_filesystem(&e.paths.root, &mut check);
+    if verify {
+        check_filesystem(&e.paths.root, &mut check, &mut info);
+    } else {
+        info("filesystem hardlink, clone, and case-sensitivity probe deferred to `rgo doctor --verify`".into());
+    }
     match service::status(&std::env::current_exe()?) {
         Ok(status) if status.supported => check(
             status.installed && status.running,
@@ -254,14 +400,11 @@ pub fn run() -> Result<()> {
             let candidates = report
                 .candidates
                 .iter()
-                .filter(|candidate| candidate.eligible())
+                .filter(|candidate| candidate.has_storage())
                 .count();
-            check(
-                candidates == 0,
-                format!(
-                    "no reclaimable legacy target directories ({candidates} found; remediation: run `rgo adopt` then `rgo adopt --delete`)"
-                ),
-            );
+            info(format!(
+                "legacy target directories with allocated files: {candidates} (inspect with `rgo adopt`; totals include final outputs)"
+            ));
             check(
                 report.skipped.is_empty(),
                 format!(
@@ -278,10 +421,88 @@ pub fn run() -> Result<()> {
         ),
     }
 
-    if problems == 0 {
-        println!("all good");
-    } else {
-        println!("{problems} warning(s)");
+    let mut report = report.into_inner();
+    if verify {
+        let result = if supervised_ready {
+            verify_plain_cargo(&e.paths, insp.configured_rustc_wrapper.as_deref())
+        } else {
+            Err(anyhow::anyhow!(
+                "supervised Cargo launcher is not active and owned"
+            ))
+        };
+        report.activation_verified = Some(result.is_ok());
+        match &result {
+            Ok(()) => report.check(
+                true,
+                "plain Cargo build placed build-script output in the managed root; configured wrapper attribution was also verified when present".into(),
+            ),
+            Err(error) => report.check(
+                false,
+                format!("plain Cargo activation probe failed: {error:#}"),
+            ),
+        }
+        report.print(json)?;
+        if let Err(error) = result {
+            bail!("activation verification failed: {error:#}");
+        }
+        return Ok(());
+    }
+    report.print(json)
+}
+
+fn verify_plain_cargo(paths: &rgo_core::paths::RgoPaths, wrapper: Option<&str>) -> Result<()> {
+    if let Some(wrapper) = wrapper {
+        anyhow::ensure!(
+            Path::new(wrapper).is_file(),
+            "configured wrapper {wrapper:?} is missing"
+        );
+    }
+    let probe = tempfile::tempdir()?;
+    let root = probe.path();
+    std::fs::create_dir_all(root.join("src"))?;
+    std::fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname = \"rgo_activation_probe\"\nversion = \"0.0.0\"\nedition = \"2021\"\n",
+    )?;
+    std::fs::write(root.join("src/main.rs"), "fn main() {}\n")?;
+    std::fs::write(root.join("build.rs"), "fn main() {}\n")?;
+    let output = Command::new("cargo")
+        .args(["build", "--offline", "--message-format=json"])
+        .current_dir(root)
+        .output()?;
+    anyhow::ensure!(
+        output.status.success(),
+        "cargo build failed: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    let build_script_out = output
+        .stdout
+        .split(|byte| *byte == b'\n')
+        .filter_map(|line| serde_json::from_slice::<serde_json::Value>(line).ok())
+        .find_map(|event| {
+            (event["reason"] == "build-script-executed")
+                .then(|| event["out_dir"].as_str().map(str::to_owned))
+                .flatten()
+        })
+        .ok_or_else(|| anyhow::anyhow!("Cargo emitted no build-script output location"))?;
+    let actual = std::fs::canonicalize(&build_script_out)?;
+    let expected = std::fs::canonicalize(paths.builds_dir())?;
+    anyhow::ensure!(
+        actual.starts_with(&expected),
+        "Cargo placed build-script output at {} rather than under {}",
+        actual.display(),
+        expected.display()
+    );
+    if wrapper.is_some() {
+        let manifest = std::fs::canonicalize(root.join("Cargo.toml"))?;
+        anyhow::ensure!(
+            paths.checked_managed_build_dirs()?.iter().any(|dir| {
+                rgo_core::context::read_sidecar(dir).is_some_and(|sidecar| {
+                    std::fs::canonicalize(&sidecar.manifest_path).is_ok_and(|path| path == manifest)
+                })
+            }),
+            "Cargo reached the managed build root but rgo's configured wrapper did not attribute this context"
+        );
     }
     Ok(())
 }
@@ -319,33 +540,27 @@ fn check_toolchains(check: &mut impl FnMut(bool, String)) {
             continue;
         };
         let text = String::from_utf8_lossy(&output.stdout);
-        let compatible = parse_version(&text).is_some_and(|version| version >= (1, 85, 0));
+        let compatible = cargo_config::supports_build_dir(&text);
         check(
             compatible,
             format!(
-                "toolchain {name}: {}build-dir compatible (requires Cargo >= 1.85.0){}",
+                "toolchain {name}: {}build-dir compatible (requires Cargo >= 1.91.0){}",
                 text.trim(),
                 if compatible {
                     ""
                 } else {
-                    "; remediation: upgrade the toolchain or use `rgo setup --no-wrapper`"
+                    "; relocation is unavailable with this Cargo; upgrade the toolchain to manage intermediates"
                 }
             ),
         );
     }
 }
 
-fn parse_version(text: &str) -> Option<(u32, u32, u32)> {
-    text.split_whitespace()
-        .find(|part| part.chars().next().is_some_and(|c| c.is_ascii_digit()))?
-        .split('.')
-        .take(3)
-        .map(|part| part.parse().ok())
-        .collect::<Option<Vec<u32>>>()
-        .and_then(|parts| (parts.len() == 3).then(|| (parts[0], parts[1], parts[2])))
-}
-
-fn check_filesystem(root: &Path, check: &mut impl FnMut(bool, String)) {
+fn check_filesystem(
+    root: &Path,
+    check: &mut impl FnMut(bool, String),
+    info: &mut impl FnMut(String),
+) {
     let base = if root.is_dir() {
         root.to_path_buf()
     } else {
@@ -395,22 +610,22 @@ fn check_filesystem(root: &Path, check: &mut impl FnMut(bool, String)) {
                     }
                 ),
             );
-            println!(
-                "info filesystem case sensitivity: {}",
+            info(format!(
+                "filesystem case sensitivity: {}",
                 if case_sensitive {
                     "sensitive"
                 } else {
                     "insensitive"
                 }
-            );
-            println!(
-                "info allocation accounting: {}",
+            ));
+            info(format!(
+                "allocation accounting: {}",
                 if cfg!(windows) {
                     "Windows allocation metadata"
                 } else {
                     "filesystem allocated blocks"
                 }
-            );
+            ));
         }
         Err(error) => check(
             false,
@@ -419,5 +634,26 @@ fn check_filesystem(root: &Path, check: &mut impl FnMut(bool, String)) {
                 root.display()
             ),
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use rgo_core::cargo_config;
+
+    #[test]
+    fn cargo_build_dir_boundary_includes_prerelease_banners() {
+        for (banner, compatible) in [
+            ("cargo 1.90.0 (abc 2025-01-01)", false),
+            ("cargo 1.91.0 (abc 2025-01-01)", true),
+            ("cargo 1.91.0-beta.1 (abc 2025-01-01)", true),
+            ("cargo 1.100.0-nightly (abc 2026-09-01)", true),
+        ] {
+            assert_eq!(
+                cargo_config::supports_build_dir(banner),
+                compatible,
+                "{banner}"
+            );
+        }
     }
 }

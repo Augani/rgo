@@ -1,0 +1,774 @@
+#Requires -Version 5.1
+<#
+.SYNOPSIS
+    Verify and activate a matched rgo Windows release without replacing Cargo.
+.DESCRIPTION
+    Release archives require a SHA-256 match and a GitHub artifact attestation.
+    DevelopmentBundle is only for a local, disposable build probe. Version
+    upgrades are limited to installations made with -NoService.
+#>
+param(
+    [string]$ReleaseTag,
+    [string]$Repository,
+    [string]$Archive,
+    [string]$Sha256Sums,
+    [string]$Sha256,
+    [string]$CargoHome,
+    [string]$RgoHome,
+    [string]$InstallRoot,
+    [string]$BinDir,
+    [switch]$NoService,
+    [switch]$NoWrapper,
+    [switch]$NoUserPath,
+    [switch]$VerifyOnly,
+    [switch]$Repair,
+    [switch]$Uninstall,
+    [switch]$DevelopmentBundle
+)
+
+$ErrorActionPreference = 'Stop'
+Set-StrictMode -Version Latest
+
+function Assert-Condition([bool]$Condition, [string]$Message) {
+    if (-not $Condition) { throw $Message }
+}
+
+function Full-Path([string]$Value) {
+    $path = [IO.Path]::GetFullPath([Environment]::ExpandEnvironmentVariables($Value))
+    # std::fs::canonicalize may record Windows extended-length paths, while
+    # installer destinations and Cargo's environment use ordinary paths.
+    if ($path.StartsWith('\\?\UNC\', [StringComparison]::OrdinalIgnoreCase)) {
+        return '\\' + $path.Substring(8)
+    }
+    if ($path.StartsWith('\\?\', [StringComparison]::OrdinalIgnoreCase)) {
+        return $path.Substring(4)
+    }
+    return $path
+}
+
+function Test-SamePath([string]$Left, [string]$Right) {
+    return [string]::Equals((Full-Path $Left), (Full-Path $Right), [StringComparison]::OrdinalIgnoreCase)
+}
+
+function Test-ChildPath([string]$Child, [string]$Parent) {
+    $prefix = (Full-Path $Parent).TrimEnd('\') + '\'
+    return (Full-Path $Child).StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)
+}
+
+function Invoke-Checked([string]$Program, [string[]]$Arguments) {
+    $result = (& $Program @Arguments 2>&1 | Out-String).Trim()
+    if ($LASTEXITCODE -ne 0) {
+        throw "$Program $($Arguments -join ' ') failed (exit $LASTEXITCODE): $result"
+    }
+    return $result
+}
+
+function Write-JsonAtomic([string]$Path, $Value) {
+    $temporary = "$Path.$([guid]::NewGuid().ToString('N')).tmp"
+    try {
+        [IO.File]::WriteAllText($temporary, ($Value | ConvertTo-Json -Depth 8), [System.Text.UTF8Encoding]::new($false))
+        if (Test-Path -LiteralPath $Path) { throw "refusing to overwrite $Path" }
+        [IO.File]::Move($temporary, $Path)
+    } finally {
+        if (Test-Path -LiteralPath $temporary) { Remove-Item -LiteralPath $temporary -Force }
+    }
+}
+
+function Replace-FileAtomic([string]$Source, [string]$Destination) {
+    # PowerShell's overload binder turns a null backup argument into an empty
+    # string, which File.Replace rejects. Reflection preserves the real null.
+    $method = [IO.File].GetMethod('Replace', [type[]]@([string], [string], [string]))
+    $method.Invoke($null, [object[]]@($Source, $Destination, $null)) | Out-Null
+}
+
+function Replace-JsonAtomic([string]$Path, $Value) {
+    $temporary = "$Path.$([guid]::NewGuid().ToString('N')).tmp"
+    try {
+        [IO.File]::WriteAllText($temporary, ($Value | ConvertTo-Json -Depth 8), [System.Text.UTF8Encoding]::new($false))
+        Assert-PlainFile $Path
+        Replace-FileAtomic $temporary $Path
+    } finally {
+        if (Test-Path -LiteralPath $temporary) { Remove-Item -LiteralPath $temporary -Force }
+    }
+}
+
+function Read-Json([string]$Path) {
+    return (Get-Content -LiteralPath $Path -Raw -Encoding UTF8 | ConvertFrom-Json)
+}
+
+function Assert-PlainDirectory([string]$Path) {
+    $item = Get-Item -LiteralPath $Path -Force
+    Assert-Condition ($item.PSIsContainer -and -not ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) "installation directory is not a plain directory: $Path"
+}
+
+function Assert-PlainFile([string]$Path) {
+    $item = Get-Item -LiteralPath $Path -Force
+    Assert-Condition (-not $item.PSIsContainer -and -not ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) "installation file is not a plain file: $Path"
+}
+
+function Download-Https([string]$Url, [string]$Destination) {
+    Add-Type -AssemblyName System.Net.Http
+    $handler = [System.Net.Http.HttpClientHandler]::new()
+    $handler.AllowAutoRedirect = $false
+    $client = [System.Net.Http.HttpClient]::new($handler)
+    $client.Timeout = [TimeSpan]::FromSeconds(45)
+    try {
+        $current = [Uri]$Url
+        for ($hop = 0; $hop -lt 6; $hop++) {
+            Assert-Condition ($current.Scheme -eq 'https') "release URL or redirect is not HTTPS: $current"
+            $response = $client.GetAsync($current, [System.Net.Http.HttpCompletionOption]::ResponseHeadersRead).GetAwaiter().GetResult()
+            try {
+                if ([int]$response.StatusCode -in @(301, 302, 303, 307, 308)) {
+                    Assert-Condition ($null -ne $response.Headers.Location) "release redirect has no Location: $current"
+                    $current = [Uri]::new($current, $response.Headers.Location)
+                    continue
+                }
+                $response.EnsureSuccessStatusCode() | Out-Null
+                $inputStream = $response.Content.ReadAsStreamAsync().GetAwaiter().GetResult()
+                $outputStream = [IO.File]::Open($Destination, [IO.FileMode]::CreateNew)
+                try {
+                    $buffer = New-Object byte[] (1024 * 1024)
+                    [long]$total = 0
+                    while (($read = $inputStream.Read($buffer, 0, $buffer.Length)) -gt 0) {
+                        $total += $read
+                        Assert-Condition ($total -le 209715200) 'release download exceeds 200 MiB'
+                        $outputStream.Write($buffer, 0, $read)
+                    }
+                } finally {
+                    $outputStream.Dispose()
+                    $inputStream.Dispose()
+                }
+                return
+            } finally {
+                $response.Dispose()
+            }
+        }
+        throw 'too many release redirects'
+    } finally {
+        $client.Dispose()
+        $handler.Dispose()
+    }
+}
+
+function Expected-Digest([string]$Manifest, [string]$Asset) {
+    $matchesForAsset = @()
+    foreach ($line in ($Manifest -split '\r?\n')) {
+        if ($line -match '^([0-9a-fA-F]{64})\s+\*?(.+?)\s*$' -and $Matches[2] -eq $Asset) {
+            $matchesForAsset += $Matches[1].ToLowerInvariant()
+        }
+    }
+    Assert-Condition ($matchesForAsset.Count -eq 1) "expected one SHA256SUMS entry for $Asset"
+    return $matchesForAsset[0]
+}
+
+function Extract-VerifiedZip([string]$ZipPath, [string]$Destination, [string]$Top) {
+    Add-Type -AssemblyName System.IO.Compression
+    $allowed = @('rgo.exe', 'rgo-rustc-wrapper.exe', 'README.md', 'doc.md', 'LICENSE-MIT', 'LICENSE-APACHE')
+    $seen = @{}
+    [long]$total = 0
+    $archiveStream = [IO.File]::OpenRead($ZipPath)
+    try {
+        $zip = [IO.Compression.ZipArchive]::new($archiveStream, [IO.Compression.ZipArchiveMode]::Read, $true)
+        try {
+            foreach ($entry in $zip.Entries) {
+                $name = $entry.FullName
+                if ($name -eq "$Top/") { continue }
+                Assert-Condition ($name -notmatch '\\' -and $name.StartsWith("$Top/", [StringComparison]::Ordinal)) "unsafe archive path: $name"
+                $leaf = $name.Substring($Top.Length + 1)
+                Assert-Condition ($allowed -ccontains $leaf -and -not $seen.ContainsKey($leaf)) "unexpected or duplicate archive member: $name"
+                $fileKind = ($entry.ExternalAttributes -shr 16) -band 0xF000
+                Assert-Condition ($fileKind -eq 0 -or $fileKind -eq 0x8000) "non-file archive member: $name"
+                $total += $entry.Length
+                Assert-Condition ($total -le 524288000) 'release bundle exceeds 500 MiB unpacked'
+                $seen[$leaf] = $true
+                $source = $entry.Open()
+                $destinationPath = Join-Path $Destination $leaf
+                try {
+                    $target = [IO.File]::Open($destinationPath, [IO.FileMode]::CreateNew)
+                    try { $source.CopyTo($target) } finally { $target.Dispose() }
+                } finally { $source.Dispose() }
+                Assert-Condition ((Get-Item -LiteralPath $destinationPath).Length -eq $entry.Length) "truncated archive member: $name"
+            }
+        } finally { $zip.Dispose() }
+    } finally { $archiveStream.Dispose() }
+    Assert-Condition ($seen.ContainsKey('rgo.exe') -and $seen.ContainsKey('rgo-rustc-wrapper.exe')) 'release bundle lacks one or both executables'
+}
+
+function File-Digest([string]$Path) {
+    return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
+}
+
+function Encoded-File([string]$Path) {
+    if (-not (Test-Path -LiteralPath $Path)) { return $null }
+    Assert-PlainFile $Path
+    $item = Get-Item -LiteralPath $Path -Force
+    Assert-Condition ($item.Length -le 4194304) "activation file is too large to journal: $Path"
+    return [Convert]::ToBase64String([IO.File]::ReadAllBytes($Path))
+}
+
+function Write-EncodedFile([string]$Path, [AllowNull()][string]$Encoded) {
+    if ($null -eq $Encoded) {
+        if (Test-Path -LiteralPath $Path) { Remove-Item -LiteralPath $Path -Force }
+        return
+    }
+    $temporary = "$Path.$([guid]::NewGuid().ToString('N')).tmp"
+    try {
+        [IO.File]::WriteAllBytes($temporary, [Convert]::FromBase64String($Encoded))
+        if (Test-Path -LiteralPath $Path) {
+            Assert-PlainFile $Path
+            Replace-FileAtomic $temporary $Path
+        } else { [IO.File]::Move($temporary, $Path) }
+    } finally {
+        if (Test-Path -LiteralPath $temporary) { Remove-Item -LiteralPath $temporary -Force }
+    }
+}
+
+function Publish-CommandCopy([string]$Source, [string]$Destination) {
+    $temporary = "$Destination.$([guid]::NewGuid().ToString('N')).tmp"
+    try {
+        Copy-Item -LiteralPath $Source -Destination $temporary
+        if (Test-Path -LiteralPath $Destination) {
+            Assert-PlainFile $Destination
+            Replace-FileAtomic $temporary $Destination
+        } else { [IO.File]::Move($temporary, $Destination) }
+    } finally {
+        if (Test-Path -LiteralPath $temporary) { Remove-Item -LiteralPath $temporary -Force }
+    }
+}
+
+function Stage-VerifiedVersion([string]$Extracted, [string]$VersionDir, [string]$CliDigest, [string]$WrapperDigest) {
+    if (-not (Test-Path -LiteralPath $VersionDir)) {
+        $staged = Join-Path $script:versions ".stage-$([guid]::NewGuid().ToString('N'))"
+        New-Item -ItemType Directory -Path $staged | Out-Null
+        try {
+            foreach ($name in @('rgo.exe', 'rgo-rustc-wrapper.exe', 'README.md', 'doc.md', 'LICENSE-MIT', 'LICENSE-APACHE')) {
+                $source = Join-Path $Extracted $name
+                if (Test-Path -LiteralPath $source) { Copy-Item -LiteralPath $source -Destination (Join-Path $staged $name) }
+            }
+            [IO.Directory]::Move($staged, $VersionDir)
+        } finally {
+            if (Test-Path -LiteralPath $staged) { Remove-Item -LiteralPath $staged -Recurse -Force }
+        }
+    }
+    Assert-PlainDirectory $VersionDir
+    $cli = Join-Path $VersionDir 'rgo.exe'
+    $wrapper = Join-Path $VersionDir 'rgo-rustc-wrapper.exe'
+    Assert-PlainFile $cli
+    Assert-PlainFile $wrapper
+    Assert-Condition ((File-Digest $cli) -eq $CliDigest -and (File-Digest $wrapper) -eq $WrapperDigest) 'versioned binaries differ from verified bundle'
+}
+
+function Assert-Record($State, [string]$Cli, [string]$Wrapper) {
+    $recordPath = Join-Path $script:resolvedCargoHome '.rgo-install.json'
+    Assert-Condition (Test-Path -LiteralPath $recordPath -PathType Leaf) "Cargo activation record is missing: $recordPath"
+    $record = Read-Json $recordPath
+    $wrapperOwned = if ($record.wrapper_binary) {
+        (Test-SamePath $record.wrapper_binary $Wrapper) -and
+        ($record.managed_keys -contains 'build.rustc-wrapper')
+    } else {
+        $record.managed_keys -notcontains 'build.rustc-wrapper'
+    }
+    Assert-Condition ($State.versionDirectory -match '^rgo-v(.+)-x86_64-pc-windows-msvc$') 'installer state has an invalid release directory'
+    $expectedVersion = $Matches[1]
+    Assert-Condition ((Test-SamePath $record.cargo_home $script:resolvedCargoHome) -and
+        (Test-SamePath $record.rgo_home $State.rgoHome) -and
+        (Test-SamePath $record.rgo_binary $Cli) -and
+        $wrapperOwned -and $record.binary_version -eq $expectedVersion -and
+        $record.schema_version -eq 2) 'Cargo activation record belongs to a different installation'
+}
+
+function Assert-PlainCargoActivation([string]$Cli) {
+    $previous = $env:RGO_HOME
+    Remove-Item Env:RGO_HOME -ErrorAction SilentlyContinue
+    try { Invoke-Checked $Cli @('doctor', '--verify') | Out-Null }
+    finally {
+        if ($null -eq $previous) { Remove-Item Env:RGO_HOME -ErrorAction SilentlyContinue }
+        else { $env:RGO_HOME = $previous }
+    }
+}
+
+function Test-ExactText([AllowNull()][string]$Left, [AllowNull()][string]$Right) {
+    return [string]::Equals($Left, $Right, [StringComparison]::Ordinal)
+}
+
+function Test-ActivationPath([string]$Path) {
+    $allowed = @(
+        (Join-Path $script:resolvedCargoHome '.rgo-home'),
+        (Join-Path $script:resolvedCargoHome '.rgo-install.json'),
+        (Join-Path $script:resolvedCargoHome 'config'),
+        (Join-Path $script:resolvedCargoHome 'config.toml'),
+        (Join-Path $script:resolvedRgoHome 'state/inner-wrapper'),
+        (Join-Path $script:resolvedRgoHome 'state/owner-cargo-home'),
+        (Join-Path $script:resolvedRgoHome 'state/storage-mode')
+    )
+    return @($allowed | Where-Object { Test-SamePath $_ $Path }).Count -eq 1
+}
+
+function Upgrade-Plan([string]$Cli, [bool]$NoWrapper) {
+    $arguments = @('setup', '--installer-plan-json', '--no-service')
+    if ($NoWrapper) { $arguments += '--no-wrapper' }
+    $output = Invoke-Checked $Cli $arguments
+    $plan = ($output -split '\r?\n')[-1] | ConvertFrom-Json
+    Assert-Condition ($plan.schema_version -eq 1 -and $plan.files) 'staged CLI returned an invalid installer plan'
+    $entries = @()
+    foreach ($property in $plan.files.PSObject.Properties) {
+        $path = $property.Name
+        Assert-Condition (Test-ActivationPath $path) "staged CLI plans an unexpected activation write: $path"
+        $contents = if ($null -eq $property.Value) { $null } else { $property.Value.contents }
+        Assert-Condition ($null -eq $contents -or $contents -is [string]) "invalid planned contents for $path"
+        $encoded = if ($null -eq $contents) { $null }
+            else { [Convert]::ToBase64String([System.Text.UTF8Encoding]::new($false).GetBytes($contents)) }
+        $entries += [ordered]@{ path = $path; before = (Encoded-File $path); after = $encoded }
+    }
+    Assert-Condition (@($entries | Where-Object { Test-SamePath $_.path (Join-Path $script:resolvedCargoHome '.rgo-install.json') }).Count -eq 1) 'staged CLI plan omitted the installation record'
+    return $entries
+}
+
+function Assert-UpgradeState($State, [string]$Role) {
+    Assert-Condition ($State.schemaVersion -eq 1 -and $State.noService -and
+        (Test-SamePath $State.cargoHome $script:resolvedCargoHome) -and
+        (Test-SamePath $State.rgoHome $script:resolvedRgoHome) -and
+        (Test-SamePath $State.installRoot $script:resolvedInstallRoot) -and
+        (Test-SamePath $State.binDir $script:resolvedBinDir) -and
+        $State.versionDirectory -match '^rgo-v[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?-x86_64-pc-windows-msvc$' -and
+        $State.archiveDigest -match '^[0-9a-f]{64}$' -and
+        $State.cliDigest -match '^[0-9a-f]{64}$' -and $State.wrapperDigest -match '^[0-9a-f]{64}$') "invalid $Role installer state"
+}
+
+function Invoke-WithSetupLocks([scriptblock]$Action) {
+    $paths = @(
+        (Join-Path $script:resolvedCargoHome '.rgo-setup.lock'),
+        (Join-Path $script:resolvedRgoHome 'state/.rgo-service.lock')
+    )
+    $handles = @()
+    try {
+        foreach ($path in $paths) {
+            if (Test-Path -LiteralPath $path) { Assert-PlainFile $path }
+            $handle = [IO.File]::Open($path, [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::ReadWrite)
+            $locked = $false
+            for ($attempt = 0; $attempt -lt 50; $attempt++) {
+                try { $handle.Lock(0, 1); $locked = $true; break }
+                catch [IO.IOException] { Start-Sleep -Milliseconds 100 }
+            }
+            if (-not $locked) { $handle.Dispose(); throw "could not acquire setup lock: $path" }
+            $handles += $handle
+        }
+        & $Action
+    } finally {
+        for ($index = $handles.Count - 1; $index -ge 0; $index--) {
+            try { $handles[$index].Unlock(0, 1) } finally { $handles[$index].Dispose() }
+        }
+    }
+}
+
+function Recover-Upgrade([string]$JournalPath) {
+    if (-not (Test-Path -LiteralPath $JournalPath)) { return }
+    Invoke-WithSetupLocks { Recover-UpgradeGuarded $JournalPath }
+}
+
+function Recover-UpgradeGuarded([string]$JournalPath) {
+    if (-not (Test-Path -LiteralPath $JournalPath)) { return }
+    Assert-PlainFile $JournalPath
+    Assert-Condition ((Get-Item -LiteralPath $JournalPath).Length -le 67108864) 'upgrade journal is too large'
+    $journal = Read-Json $JournalPath
+    Assert-Condition ($journal.schemaVersion -eq 1) 'unsupported upgrade journal'
+    Assert-UpgradeState $journal.oldState 'old'
+    Assert-UpgradeState $journal.newState 'new'
+    $seen = @{}
+    foreach ($entry in $journal.files) {
+        Assert-Condition (Test-ActivationPath $entry.path) "upgrade journal names an unexpected path: $($entry.path)"
+        Assert-Condition (-not $seen.ContainsKey($entry.path)) "duplicate upgrade journal path: $($entry.path)"
+        $seen[$entry.path] = $true
+    }
+    Assert-Condition ($seen.ContainsKey((Join-Path $script:resolvedCargoHome '.rgo-install.json'))) 'upgrade journal omitted the activation record'
+    $oldCli = Join-Path (Join-Path $script:versions $journal.oldState.versionDirectory) 'rgo.exe'
+    $oldWrapper = Join-Path (Join-Path $script:versions $journal.oldState.versionDirectory) 'rgo-rustc-wrapper.exe'
+    Assert-PlainFile $oldCli
+    Assert-PlainFile $oldWrapper
+    Assert-Condition ((File-Digest $oldCli) -eq $journal.oldState.cliDigest -and
+        (File-Digest $oldWrapper) -eq $journal.oldState.wrapperDigest) 'old rollback binaries changed'
+    $state = Read-Json $script:statePath
+    $currentStateJson = $state | ConvertTo-Json -Depth 8 -Compress
+    $committed = Test-ExactText $currentStateJson ($journal.newState | ConvertTo-Json -Depth 8 -Compress)
+    Assert-Condition ($committed -or
+        (Test-ExactText $currentStateJson ($journal.oldState | ConvertTo-Json -Depth 8 -Compress))) 'upgrade journal and installed state disagree'
+    foreach ($entry in $journal.files) {
+        Assert-Condition (Test-ActivationPath $entry.path) "upgrade journal names an unexpected path: $($entry.path)"
+        $current = Encoded-File $entry.path
+        if ($committed) {
+            Assert-Condition (Test-ExactText $current $entry.after) "committed activation file changed: $($entry.path)"
+        } else {
+            Assert-Condition ((Test-ExactText $current $entry.before) -or
+                (Test-ExactText $current $entry.after)) "activation file changed during upgrade: $($entry.path)"
+        }
+    }
+    $newCli = Join-Path (Join-Path $script:versions $journal.newState.versionDirectory) 'rgo.exe'
+    $newWrapper = Join-Path (Join-Path $script:versions $journal.newState.versionDirectory) 'rgo-rustc-wrapper.exe'
+    if ($committed) {
+        Assert-PlainFile $newCli
+        Assert-PlainFile $newWrapper
+        Assert-Condition ((File-Digest $newCli) -eq $journal.newState.cliDigest -and
+            (File-Digest $newWrapper) -eq $journal.newState.wrapperDigest) 'committed upgrade binaries changed'
+    }
+    $commands = @(
+        @((Join-Path $script:resolvedBinDir 'rgo.exe'), $oldCli, $newCli, $journal.oldState.cliDigest, $journal.newState.cliDigest),
+        @((Join-Path $script:resolvedBinDir 'rgo-rustc-wrapper.exe'), $oldWrapper, $newWrapper, $journal.oldState.wrapperDigest, $journal.newState.wrapperDigest)
+    )
+    foreach ($entry in $commands) {
+        Assert-PlainFile $entry[0]
+        $digest = File-Digest $entry[0]
+        Assert-Condition ($digest -eq $entry[3] -or $digest -eq $entry[4]) "command entrypoint changed during upgrade: $($entry[0])"
+        if ($committed) { Assert-Condition ($digest -eq $entry[4]) "committed command entrypoint is stale: $($entry[0])" }
+    }
+    if ($committed) {
+        Assert-Record $journal.newState $newCli $newWrapper
+    } else {
+        foreach ($entry in $journal.files) { Write-EncodedFile $entry.path $entry.before }
+        foreach ($entry in $commands) {
+            if ((File-Digest $entry[0]) -ne $entry[3]) { Publish-CommandCopy $entry[1] $entry[0] }
+        }
+        Assert-Record $journal.oldState $oldCli $oldWrapper
+    }
+    Remove-Item -LiteralPath $JournalPath -Force
+}
+
+function Invoke-NoServiceUpgrade($OldState, [string]$Top, [string]$ArchiveDigest,
+    [string]$CliDigest, [string]$WrapperDigest, [string]$Extracted, [bool]$NewNoWrapper) {
+    Assert-UpgradeState $OldState 'old'
+    Assert-Condition ($script:NoService -and -not $script:Repair) 'version upgrades currently require -NoService and cannot use -Repair'
+    $oldNoWrapper = [bool]($OldState.PSObject.Properties['noWrapper'] -and $OldState.noWrapper)
+    Assert-Condition ($NewNoWrapper -eq $oldNoWrapper) 'change wrapper mode separately from a version upgrade'
+    Assert-Condition ($OldState.versionDirectory -ne $Top) 'a release tag cannot be repacked with different bytes'
+    Assert-Condition (-not (Test-Path -LiteralPath $script:pendingPath)) 'finish the pending first installation before upgrading'
+    $oldDir = Join-Path $script:versions $OldState.versionDirectory
+    $oldCli = Join-Path $oldDir 'rgo.exe'
+    $oldWrapper = Join-Path $oldDir 'rgo-rustc-wrapper.exe'
+    Assert-PlainDirectory $oldDir
+    Assert-PlainFile $oldCli
+    Assert-PlainFile $oldWrapper
+    Assert-Condition ((File-Digest $oldCli) -eq $OldState.cliDigest -and
+        (File-Digest $oldWrapper) -eq $OldState.wrapperDigest) 'old release pair changed; repair it before upgrading'
+    Assert-Record $OldState $oldCli $oldWrapper
+    foreach ($entry in @(
+        @((Join-Path $script:resolvedBinDir 'rgo.exe'), $OldState.cliDigest),
+        @((Join-Path $script:resolvedBinDir 'rgo-rustc-wrapper.exe'), $OldState.wrapperDigest)
+    )) {
+        Assert-PlainFile $entry[0]
+        Assert-Condition ((File-Digest $entry[0]) -eq $entry[1]) "old command entrypoint changed: $($entry[0])"
+    }
+    $newDir = Join-Path $script:versions $Top
+    Stage-VerifiedVersion $Extracted $newDir $CliDigest $WrapperDigest
+    $newCli = Join-Path $newDir 'rgo.exe'
+    $newWrapper = Join-Path $newDir 'rgo-rustc-wrapper.exe'
+    $noUserPath = $OldState.PSObject.Properties['noUserPath'] -and $OldState.noUserPath
+    $newState = [ordered]@{
+        schemaVersion = 1; cargoHome = $script:resolvedCargoHome; rgoHome = $script:resolvedRgoHome
+        installRoot = $script:resolvedInstallRoot; binDir = $script:resolvedBinDir
+        versionDirectory = $Top; archiveDigest = $ArchiveDigest
+        cliDigest = $CliDigest; wrapperDigest = $WrapperDigest
+        noService = $true; noWrapper = $NewNoWrapper; noUserPath = [bool]$noUserPath
+        pathAdded = [bool]$OldState.pathAdded; priorUserPath = $OldState.priorUserPath
+    }
+    $files = @(Upgrade-Plan $newCli $NewNoWrapper)
+    $recordPath = Join-Path $script:resolvedCargoHome '.rgo-install.json'
+    $recordEntry = @($files | Where-Object { Test-SamePath $_.path $recordPath })[0]
+    Assert-Condition ($null -ne $recordEntry.after) 'staged CLI plans to remove the installation record'
+    $oldRecord = Read-Json $recordPath
+    $plannedRecord = [Text.Encoding]::UTF8.GetString(
+        [Convert]::FromBase64String($recordEntry.after)) | ConvertFrom-Json
+    Assert-Condition ([bool]$oldRecord.wrapper_binary -eq [bool]$plannedRecord.wrapper_binary) 'the effective compiler-wrapper mode changed; restore the previous Cargo configuration before upgrading'
+    Write-JsonAtomic $script:upgradeJournalPath ([ordered]@{
+        schemaVersion = 1; oldState = $OldState; newState = $newState; files = $files
+    })
+    try {
+        $setupArgs = @('setup', '--no-service')
+        if ($NewNoWrapper) { $setupArgs += '--no-wrapper' }
+        Invoke-Checked $newCli $setupArgs | Out-Null
+        foreach ($entry in $files) {
+            Assert-Condition (Test-ExactText (Encoded-File $entry.path) $entry.after) "setup differed from its installer plan: $($entry.path)"
+        }
+        Assert-Record $newState $newCli $newWrapper
+        Assert-PlainCargoActivation $newCli
+        Publish-CommandCopy $newWrapper (Join-Path $script:resolvedBinDir 'rgo-rustc-wrapper.exe')
+        Publish-CommandCopy $newCli (Join-Path $script:resolvedBinDir 'rgo.exe')
+        Replace-JsonAtomic $script:statePath $newState
+        Remove-Item -LiteralPath $script:upgradeJournalPath -Force
+    } catch {
+        $failure = $_
+        try { Recover-Upgrade $script:upgradeJournalPath }
+        catch { throw "upgrade failed ($failure); rollback also failed: $_" }
+        $current = Read-Json $script:statePath
+        if ($current.archiveDigest -eq $ArchiveDigest -and $current.versionDirectory -eq $Top) {
+            Write-Host "Upgrade to $Top committed; recovered its final journal cleanup"
+            return
+        }
+        throw $failure
+    }
+    Write-Host "Upgraded rgo to $Top; previous binaries remain available for running Cargo processes"
+}
+
+function Add-ProcessPath([string]$Directory) {
+    $processEntries = @($env:PATH -split ';' | Where-Object { $_ })
+    if (@($processEntries | Where-Object { Test-SamePath $_ $Directory }).Count -eq 0) {
+        $env:PATH = "$env:PATH;$Directory"
+    }
+}
+
+function Add-OwnedPath([string]$Directory) {
+    $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+    $entries = @($userPath -split ';' | Where-Object { $_ })
+    $hasEntry = @($entries | Where-Object { Test-SamePath $_ $Directory }).Count -gt 0
+    if (-not $hasEntry) {
+        [Environment]::SetEnvironmentVariable('Path', (($entries + $Directory) -join ';'), 'User')
+    }
+    Add-ProcessPath $Directory
+}
+
+function Remove-OwnedPath([string]$Directory, [string]$Previous) {
+    $current = [Environment]::GetEnvironmentVariable('Path', 'User')
+    $expected = if ($Previous) { "$Previous;$Directory" } else { $Directory }
+    if ($current -eq $Previous) { return }
+    Assert-Condition ($current -eq $expected) 'User PATH changed since activation; restore or remove the owned rgo entry before resuming uninstall'
+    [Environment]::SetEnvironmentVariable('Path', $Previous, 'User')
+}
+
+function Assert-Platform {
+    Assert-Condition ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) 'this installer requires Windows'
+    Assert-Condition ([Environment]::Is64BitOperatingSystem -and
+        [Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString() -eq 'X64') 'the prebuilt Windows bundle requires x86_64 Windows'
+}
+
+Assert-Platform
+if (-not $CargoHome) { $CargoHome = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { Join-Path $env:USERPROFILE '.cargo' } }
+$resolvedCargoHome = Full-Path $CargoHome
+if (-not $RgoHome) { $RgoHome = if ($env:RGO_HOME) { $env:RGO_HOME } else { Join-Path $env:USERPROFILE '.rgo' } }
+$resolvedRgoHome = Full-Path $RgoHome
+if (-not $InstallRoot) { $InstallRoot = Join-Path $resolvedCargoHome 'rgo' }
+if (-not $BinDir) { $BinDir = Join-Path $resolvedCargoHome 'bin' }
+$resolvedInstallRoot = Full-Path $InstallRoot
+$resolvedBinDir = Full-Path $BinDir
+Assert-Condition ((Test-ChildPath $resolvedInstallRoot $resolvedCargoHome) -and
+    (Test-ChildPath $resolvedBinDir $resolvedCargoHome)) 'install root and command directory must be inside Cargo home'
+$versions = Join-Path $resolvedInstallRoot 'versions'
+$statePath = Join-Path $resolvedInstallRoot 'installer-windows.json'
+$pendingPath = Join-Path $resolvedInstallRoot 'installer-windows-pending.json'
+$upgradeJournalPath = Join-Path $resolvedInstallRoot 'installer-windows-upgrade.json'
+$previousCargoHome = $env:CARGO_HOME
+$previousRgoHome = $env:RGO_HOME
+
+$lock = $null
+if (-not $VerifyOnly) {
+    New-Item -ItemType Directory -Force -Path $resolvedInstallRoot | Out-Null
+    Assert-PlainDirectory $resolvedCargoHome
+    Assert-PlainDirectory $resolvedInstallRoot
+    $lock = [IO.File]::Open((Join-Path $resolvedInstallRoot '.install-windows.lock'), [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+}
+$env:CARGO_HOME = $resolvedCargoHome
+$env:RGO_HOME = $resolvedRgoHome
+try {
+    if (-not $VerifyOnly) { Recover-Upgrade $upgradeJournalPath }
+    if ($Uninstall) {
+        Assert-Condition (-not ($VerifyOnly -or $Repair -or $ReleaseTag -or $Archive -or $Repository)) '-Uninstall cannot be combined with install inputs'
+        if (-not (Test-Path -LiteralPath $statePath) -and -not (Test-Path -LiteralPath $pendingPath)) {
+            throw 'no installer-owned Windows activation was found'
+        }
+        $state = if (Test-Path -LiteralPath $statePath) { Read-Json $statePath } else { Read-Json $pendingPath }
+        Assert-Condition ((Test-SamePath $state.cargoHome $resolvedCargoHome) -and
+            (Test-SamePath $state.installRoot $resolvedInstallRoot) -and
+            (Test-SamePath $state.binDir $resolvedBinDir) -and
+            (Test-SamePath $state.rgoHome $resolvedRgoHome)) 'installer state belongs to a different destination'
+        Assert-Condition ($state.schemaVersion -eq 1 -and $state.versionDirectory -match '^rgo-v[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?-x86_64-pc-windows-msvc$') 'installer state has an unsupported version or path'
+        $versionDir = Join-Path $versions $state.versionDirectory
+        $cli = Join-Path $versionDir 'rgo.exe'
+        $wrapper = Join-Path $versionDir 'rgo-rustc-wrapper.exe'
+        $ownedCli = Join-Path $resolvedBinDir 'rgo.exe'
+        $ownedWrapper = Join-Path $resolvedBinDir 'rgo-rustc-wrapper.exe'
+        foreach ($pair in @(@($ownedCli, $state.cliDigest), @($ownedWrapper, $state.wrapperDigest))) {
+            if (Test-Path -LiteralPath $pair[0]) {
+                Assert-PlainFile $pair[0]
+                Assert-Condition ((File-Digest $pair[0]) -eq $pair[1]) "command entrypoint changed: $($pair[0])"
+            }
+        }
+        if (Test-Path -LiteralPath (Join-Path $resolvedCargoHome '.rgo-install.json')) {
+            Assert-Record $state $cli $wrapper
+            $undoArgs = @('setup', '--undo')
+            if ($state.noService) { $undoArgs += '--no-service' }
+            Invoke-Checked $cli $undoArgs | Out-Null
+        }
+        Assert-Condition (-not (Test-Path -LiteralPath (Join-Path $resolvedCargoHome '.rgo-install.json'))) 'Cargo activation remains after undo'
+        foreach ($path in @($ownedCli, $ownedWrapper)) {
+            if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Force }
+        }
+        if ($state.pathAdded) { Remove-OwnedPath $resolvedBinDir $state.priorUserPath }
+        if (Test-Path -LiteralPath $statePath) { Remove-Item -LiteralPath $statePath -Force }
+        if (Test-Path -LiteralPath $pendingPath) { Remove-Item -LiteralPath $pendingPath -Force }
+        Write-Host "Removed owned Cargo activation and commands; retained versioned binaries and managed data at $resolvedRgoHome"
+        return
+    }
+
+    Assert-Condition ($ReleaseTag -match '^v[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?$') '-ReleaseTag must be an exact vMAJOR.MINOR.PATCH tag'
+    if ($Repository) {
+        Assert-Condition ($Repository -match '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$' -and
+            @('.', '..') -notcontains ($Repository -split '/')[0] -and
+            @('.', '..') -notcontains ($Repository -split '/')[1]) '-Repository must be OWNER/REPO'
+    }
+    Assert-Condition ($Repository -or $DevelopmentBundle) '-Repository is required for release provenance verification'
+    Assert-Condition (-not $DevelopmentBundle -or $Archive) '-DevelopmentBundle requires a local archive'
+    Assert-Condition (-not ($Sha256 -and $Sha256Sums)) 'use either -Sha256 or -Sha256Sums'
+    Assert-Condition (-not $Sha256 -or $Sha256 -match '^[0-9a-fA-F]{64}$') '-Sha256 must be 64 hex characters'
+    Assert-Condition (-not $Repair -or -not $VerifyOnly) '-Repair cannot be combined with -VerifyOnly'
+
+    $top = "rgo-$ReleaseTag-x86_64-pc-windows-msvc"
+    $asset = "$top.zip"
+    $scratch = Join-Path ([IO.Path]::GetTempPath()) "rgo-download-$([guid]::NewGuid().ToString('N'))"
+    New-Item -ItemType Directory -Path $scratch | Out-Null
+    try {
+        $zipPath = Join-Path $scratch $asset
+        if ($Archive) {
+            Assert-Condition ((Get-Item -LiteralPath $Archive).Length -le 209715200) 'release archive exceeds 200 MiB'
+            Copy-Item -LiteralPath $Archive -Destination $zipPath
+        } else {
+            Download-Https "https://github.com/$Repository/releases/download/$ReleaseTag/$asset" $zipPath
+        }
+        $manifest = if ($Sha256Sums) { Get-Content -LiteralPath $Sha256Sums -Raw }
+            elseif ($Sha256) { $null }
+            elseif (-not $Archive) {
+                $manifestPath = Join-Path $scratch 'SHA256SUMS.txt'
+                Download-Https "https://github.com/$Repository/releases/download/$ReleaseTag/SHA256SUMS.txt" $manifestPath
+                Get-Content -LiteralPath $manifestPath -Raw
+            } else { throw 'a local archive requires -Sha256Sums or -Sha256' }
+        $expected = if ($Sha256) { $Sha256.ToLowerInvariant() } else { Expected-Digest $manifest $asset }
+        $digest = File-Digest $zipPath
+        Assert-Condition ($digest -eq $expected) "archive SHA-256 mismatch: expected $expected, got $digest"
+        if (-not $DevelopmentBundle) {
+            $ghCommand = Get-Command gh -ErrorAction SilentlyContinue
+            $gh = if ($ghCommand) { $ghCommand.Source } else { $null }
+            Assert-Condition ($gh) 'GitHub CLI gh is required to verify the release attestation'
+            Invoke-Checked $gh @('attestation', 'verify', $zipPath, '--repo', $Repository,
+                '--signer-workflow', "$Repository/.github/workflows/release.yml", '--source-ref', "refs/tags/$ReleaseTag") | Out-Null
+        }
+        $extracted = Join-Path $scratch 'extracted'
+        New-Item -ItemType Directory -Path $extracted | Out-Null
+        Extract-VerifiedZip $zipPath $extracted $top
+        $candidateCli = Join-Path $extracted 'rgo.exe'
+        $candidateWrapper = Join-Path $extracted 'rgo-rustc-wrapper.exe'
+        $cliDigest = File-Digest $candidateCli
+        $wrapperDigest = File-Digest $candidateWrapper
+        $binaryVersion = $ReleaseTag.Substring(1)
+        Assert-Condition ((Invoke-Checked $candidateCli @('--version')) -eq "rgo $binaryVersion") 'archive CLI has the wrong version'
+        Assert-Condition ((Invoke-Checked $candidateWrapper @('--rgo-version')) -match "^rgo-rustc-wrapper $([regex]::Escape($binaryVersion)) protocol [0-9]+$") 'archive wrapper has the wrong version or protocol banner'
+        if ($VerifyOnly) { Write-Host "Verified $asset ($digest)"; return }
+
+        New-Item -ItemType Directory -Force -Path @($versions, $resolvedBinDir) | Out-Null
+        Assert-PlainDirectory $versions
+        Assert-PlainDirectory $resolvedBinDir
+        $versionDir = Join-Path $versions $top
+        $cli = Join-Path $versionDir 'rgo.exe'
+        $wrapper = Join-Path $versionDir 'rgo-rustc-wrapper.exe'
+        $commandCli = Join-Path $resolvedBinDir 'rgo.exe'
+        $commandWrapper = Join-Path $resolvedBinDir 'rgo-rustc-wrapper.exe'
+        if (Test-Path -LiteralPath $statePath) {
+            $state = Read-Json $statePath
+            Assert-Condition ((Test-SamePath $state.cargoHome $resolvedCargoHome) -and
+                (Test-SamePath $state.installRoot $resolvedInstallRoot) -and
+                (Test-SamePath $state.binDir $resolvedBinDir) -and
+                (Test-SamePath $state.rgoHome $resolvedRgoHome)) 'installer state belongs to another destination'
+            Assert-Condition ($state.schemaVersion -eq 1) 'unsupported installer state version'
+            if ($state.versionDirectory -ne $top) {
+                $oldNoWrapper = $state.PSObject.Properties['noWrapper'] -and $state.noWrapper
+                $nextNoWrapper = if ($PSBoundParameters.ContainsKey('NoWrapper')) { [bool]$NoWrapper }
+                    else { [bool]$oldNoWrapper }
+                Invoke-NoServiceUpgrade $state $top $digest $cliDigest $wrapperDigest $extracted $nextNoWrapper
+                return
+            }
+            Assert-Condition ($state.versionDirectory -eq $top -and $state.archiveDigest -eq $digest -and
+                $state.cliDigest -eq $cliDigest -and $state.wrapperDigest -eq $wrapperDigest) 'this release tag has different bytes from the installed archive; refusing a repack'
+            Assert-Record $state $cli $wrapper
+            if (-not (Test-Path -LiteralPath $versionDir)) {
+                Assert-Condition $Repair "owned version directory is missing: $versionDir"
+                New-Item -ItemType Directory -Path $versionDir | Out-Null
+            }
+            Assert-PlainDirectory $versionDir
+            foreach ($pair in @(@($cli, $cliDigest), @($wrapper, $wrapperDigest), @($commandCli, $cliDigest), @($commandWrapper, $wrapperDigest))) {
+                if (Test-Path -LiteralPath $pair[0]) { Assert-PlainFile $pair[0] }
+                if (-not (Test-Path -LiteralPath $pair[0]) -or (File-Digest $pair[0]) -ne $pair[1]) {
+                    Assert-Condition $Repair "owned binary is missing or changed: $($pair[0]); rerun with -Repair and the same verified bundle"
+                    if (Test-Path -LiteralPath $pair[0]) { throw "repair refuses to replace an in-use or modified executable: $($pair[0])" }
+                    $source = if ($pair[0] -like '*rgo-rustc-wrapper.exe') { $candidateWrapper } else { $candidateCli }
+                    Copy-Item -LiteralPath $source -Destination $pair[0]
+                }
+            }
+            Assert-PlainCargoActivation $cli
+            if (Test-Path -LiteralPath $pendingPath) {
+                $pending = Read-Json $pendingPath
+                Assert-Condition ($pending.archiveDigest -eq $digest -and $pending.versionDirectory -eq $top) 'stale pending activation conflicts with installed state'
+                Remove-Item -LiteralPath $pendingPath -Force
+            }
+            Write-Host "Verified active rgo $binaryVersion at $versionDir"
+            return
+        }
+
+        $state = [ordered]@{
+            schemaVersion = 1; cargoHome = $resolvedCargoHome; rgoHome = $resolvedRgoHome
+            installRoot = $resolvedInstallRoot; binDir = $resolvedBinDir
+            versionDirectory = $top; archiveDigest = $digest
+            cliDigest = $cliDigest; wrapperDigest = $wrapperDigest
+            noService = [bool]$NoService; noWrapper = [bool]$NoWrapper; noUserPath = [bool]$NoUserPath
+            pathAdded = $false; priorUserPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+        }
+        $resuming = Test-Path -LiteralPath $pendingPath
+        if ($resuming) {
+            $pending = Read-Json $pendingPath
+            Assert-Condition ($pending.archiveDigest -eq $digest -and $pending.versionDirectory -eq $top -and
+                $pending.cliDigest -eq $cliDigest -and $pending.wrapperDigest -eq $wrapperDigest -and
+                (Test-SamePath $pending.cargoHome $resolvedCargoHome) -and
+                (Test-SamePath $pending.rgoHome $resolvedRgoHome) -and
+                (Test-SamePath $pending.binDir $resolvedBinDir)) 'pending activation requires its original verified bundle and destinations'
+            if (-not $pending.PSObject.Properties['noWrapper']) {
+                $pending | Add-Member -NotePropertyName noWrapper -NotePropertyValue $false
+            }
+            $state = $pending
+        } else {
+            Assert-Condition (-not (Test-Path -LiteralPath (Join-Path $resolvedCargoHome '.rgo-install.json'))) 'Cargo is already activated outside this installer'
+            Assert-Condition (-not (Test-Path -LiteralPath $commandCli) -and -not (Test-Path -LiteralPath $commandWrapper)) 'rgo command entrypoint already exists outside this installer'
+            $priorCommand = Get-Command rgo -ErrorAction SilentlyContinue
+            Assert-Condition (-not $priorCommand) 'another rgo command already resolves on PATH; remove that conflict before activation'
+            $userEntries = @([Environment]::GetEnvironmentVariable('Path', 'User') -split ';' | Where-Object { $_ })
+            $state.pathAdded = -not $NoUserPath -and @($userEntries | Where-Object { Test-SamePath $_ $resolvedBinDir }).Count -eq 0
+            Write-JsonAtomic $pendingPath $state
+        }
+        Stage-VerifiedVersion $extracted $versionDir $cliDigest $wrapperDigest
+        if (Test-Path -LiteralPath (Join-Path $resolvedCargoHome '.rgo-install.json')) { Assert-Record $state $cli $wrapper }
+        $setupArgs = @('setup')
+        if ($state.noService) { $setupArgs += '--no-service' }
+        if ($state.noWrapper) { $setupArgs += '--no-wrapper' }
+        Invoke-Checked $cli $setupArgs | Out-Null
+        Assert-Record $state $cli $wrapper
+        Assert-PlainCargoActivation $cli
+        foreach ($pair in @(@($commandWrapper, $wrapper, $wrapperDigest), @($commandCli, $cli, $cliDigest))) {
+            if (Test-Path -LiteralPath $pair[0]) {
+                Assert-PlainFile $pair[0]
+                Assert-Condition ((File-Digest $pair[0]) -eq $pair[2]) "command entrypoint changed: $($pair[0])"
+            } else { Copy-Item -LiteralPath $pair[1] -Destination $pair[0] }
+        }
+        if ($state.noUserPath) { Add-ProcessPath $resolvedBinDir }
+        else { Add-OwnedPath $resolvedBinDir }
+        Write-JsonAtomic $statePath $state
+        Remove-Item -LiteralPath $pendingPath -Force
+        Write-Host "Activated rgo $binaryVersion. Open a new shell and use cargo normally."
+        if (-not $state.noService) { Write-Host 'Background service was verified during setup; automatic destructive GC remains disabled by default.' }
+    } finally {
+        Remove-Item -LiteralPath $scratch -Recurse -Force -ErrorAction SilentlyContinue
+    }
+} catch {
+    if (Test-Path -LiteralPath $pendingPath) {
+        Write-Warning 'Activation is pending. Retry with the same verified bundle and destinations, or run -Uninstall to undo owned changes.'
+    }
+    throw
+} finally {
+    if ($lock) { $lock.Dispose() }
+    if ($null -eq $previousCargoHome) { Remove-Item Env:CARGO_HOME -ErrorAction SilentlyContinue }
+    else { $env:CARGO_HOME = $previousCargoHome }
+    if ($null -eq $previousRgoHome) { Remove-Item Env:RGO_HOME -ErrorAction SilentlyContinue }
+    else { $env:RGO_HOME = $previousRgoHome }
+}

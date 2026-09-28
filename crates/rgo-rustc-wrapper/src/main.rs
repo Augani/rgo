@@ -17,14 +17,16 @@ use std::thread;
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use fs4::fs_std::FileExt;
 use rgo_cas::{MANIFEST_VERSION, Manifest, ManifestOutput, ObjectRef, Store};
 use rgo_key::{AllowedRoots, BypassReason, Candidate, Classification, classify};
 use rgo_materialize::materialize;
 use rgo_protocol::{
-    BYPASS_ENV, CLIENT_TIMEOUT_MILLIS, CacheEvent, CacheManifest, CacheObject, CacheOutput,
-    ContextSidecar, DEFAULT_HEARTBEAT_SECS, DEFAULT_LEASE_TTL_SECS, HOME_ENV, LEASE_ENV,
-    LeaseScope, MAX_FRAME_SIZE, PROTOCOL_VERSION, Request, Response, SIDECAR_FILE, decode_frame,
-    encode_frame,
+    BYPASS_ENV, CACHE_EVENT_LOG_FILE, CACHE_EVENT_LOG_LOCK, CACHE_EVENT_LOG_MAX_BYTES,
+    CACHE_EVENT_LOG_TRUNCATED, CLIENT_TIMEOUT_MILLIS, CacheEvent, CacheManifest, CacheObject,
+    CacheOutput, ContextSidecar, DEFAULT_HEARTBEAT_SECS, DEFAULT_LEASE_TTL_SECS, HOME_ENV,
+    LEASE_ENV, LeaseScope, MAX_FRAME_SIZE, PROTOCOL_VERSION, Request, Response, SIDECAR_FILE,
+    decode_frame, encode_frame,
 };
 
 mod platform {
@@ -72,6 +74,14 @@ fn main() {
         eprintln!("rgo-rustc-wrapper: usage: <rustc> <args...>");
         std::process::exit(2);
     };
+    if rustc == "--rgo-version" && args.len() == 0 {
+        println!(
+            "rgo-rustc-wrapper {} protocol {}",
+            env!("CARGO_PKG_VERSION"),
+            PROTOCOL_VERSION
+        );
+        return;
+    }
     let args: Vec<OsString> = args.collect();
 
     let mut context_lease_id = None;
@@ -110,16 +120,15 @@ fn main() {
         finish_passthrough(rustc, &args, context_lease_id);
     }
 
-    let Some(_build_dir) = attribute(&args) else {
+    let Some(build_dir) = attribute(&args) else {
         finish_passthrough(rustc, &args, context_lease_id);
     };
-    let Some(candidate) = classify_invocation(Path::new(&rustc), &args) else {
+    let Some(candidate) = classify_invocation(Path::new(&rustc), &args, &build_dir) else {
         finish_passthrough(rustc, &args, context_lease_id);
     };
-    if let Some(inner) = configured_inner_wrapper()
-        && (!is_sccache(Path::new(&inner))
-            || candidate.source_kind != rgo_key::SourceKind::Workspace)
-    {
+    if configured_inner_wrapper().is_some_and(|inner| {
+        !is_sccache(Path::new(&inner)) || candidate.source_kind != rgo_key::SourceKind::Workspace
+    }) {
         record_event(
             None,
             "bypass",
@@ -342,14 +351,30 @@ fn finish_success(lease_id: Option<u64>) -> ! {
 }
 
 fn rgo_home() -> Option<PathBuf> {
-    std::env::var_os(HOME_ENV).map(PathBuf::from).or_else(|| {
-        std::env::var_os("HOME")
-            .or_else(|| std::env::var_os("USERPROFILE"))
-            .map(|path| PathBuf::from(path).join(".rgo"))
-    })
+    std::env::var_os(HOME_ENV)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            let cargo_home = std::env::var_os("CARGO_HOME")
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from)
+                .or_else(|| {
+                    std::env::var_os("HOME")
+                        .or_else(|| std::env::var_os("USERPROFILE"))
+                        .map(|home| PathBuf::from(home).join(".cargo"))
+                })?;
+            let value = std::fs::read_to_string(cargo_home.join(".rgo-home")).ok()?;
+            let root = PathBuf::from(value.trim_end_matches(['\r', '\n']));
+            root.is_absolute().then_some(root)
+        })
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .or_else(|| std::env::var_os("USERPROFILE"))
+                .map(|path| PathBuf::from(path).join(".rgo"))
+        })
 }
 
-fn classify_invocation(rustc: &Path, args: &[OsString]) -> Option<Candidate> {
+fn classify_invocation(rustc: &Path, args: &[OsString], build_dir: &Path) -> Option<Candidate> {
     let home = rgo_home()?;
     let cargo_home = std::env::var_os("CARGO_HOME")
         .map(PathBuf::from)
@@ -360,7 +385,9 @@ fn classify_invocation(rustc: &Path, args: &[OsString]) -> Option<Candidate> {
         args,
         &env,
         &AllowedRoots {
-            build_root: home.join("builds"),
+            // Normalize paths relative to this invocation's validated context,
+            // preserving the remaining profile/artifact suffix in the key.
+            build_root: build_dir.to_path_buf(),
             source_roots: vec![
                 cargo_home.join("registry").join("src"),
                 cargo_home.join("git").join("checkouts"),
@@ -371,24 +398,26 @@ fn classify_invocation(rustc: &Path, args: &[OsString]) -> Option<Candidate> {
     ) {
         Classification::Cacheable(candidate) => {
             if std::env::var_os("RGO_KEY_DEBUG").is_some() {
-                let path = home.join("state/key-debug.log");
-                if let Ok(mut file) = std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(path)
-                {
-                    let _ = writeln!(
-                        file,
-                        "=== {} key={} src_digest={} out_dir_digest={:?}",
-                        candidate.crate_name,
-                        candidate.key,
-                        candidate.source_digest,
-                        candidate.out_dir_digest
-                    );
-                    for arg in &candidate.normalized_args {
-                        let _ = writeln!(file, "  {arg}");
-                    }
+                let mut entry = Vec::new();
+                let _ = writeln!(
+                    entry,
+                    "=== {} key={} src_digest={} out_dir_digest={:?}",
+                    candidate.crate_name,
+                    candidate.key,
+                    candidate.source_digest,
+                    candidate.out_dir_digest
+                );
+                for arg in &candidate.normalized_args {
+                    let _ = writeln!(entry, "  {arg}");
                 }
+                let _ = append_bounded_log(
+                    &home,
+                    "key-debug.log",
+                    "key-debug.lock",
+                    "key-debug.truncated",
+                    CACHE_EVENT_LOG_MAX_BYTES,
+                    &entry,
+                );
             }
             Some(*candidate)
         }
@@ -542,7 +571,9 @@ fn materialize_hit(
             &store.object_path(&object.digest),
             &destination,
             object.mode,
-            true,
+            // A hardlink shares a mutable inode with the CAS object. Clone or
+            // copy so edits to the build output cannot corrupt cached bytes.
+            false,
         )
         .map_err(|error| error.to_string())?;
     }
@@ -832,24 +863,54 @@ fn wire_manifest(manifest: &Manifest) -> CacheManifest {
 
 fn record_event(key: Option<String>, outcome: &str, bytes: u64, reason: Option<String>) {
     let Some(home) = rgo_home() else { return };
-    let path = home.join("state/cache-events.log");
     let event = CacheEvent {
         key,
         outcome: outcome.into(),
         bytes,
         reason,
     };
-    let Ok(mut file) = std::fs::OpenOptions::new()
+    if let Ok(mut entry) = serde_json::to_vec(&event) {
+        entry.push(b'\n');
+        let _ = append_bounded_log(
+            &home,
+            CACHE_EVENT_LOG_FILE,
+            CACHE_EVENT_LOG_LOCK,
+            CACHE_EVENT_LOG_TRUNCATED,
+            CACHE_EVENT_LOG_MAX_BYTES,
+            &entry,
+        );
+    }
+}
+
+/// A stable file lock serializes wrapper appends with daemon rotation. A full
+/// log stops accepting events and leaves a durable marker so stats are not
+/// presented as complete. The compiler path never fails because of logging.
+fn append_bounded_log(
+    home: &Path,
+    filename: &str,
+    lock_name: &str,
+    marker_name: &str,
+    max_bytes: u64,
+    entry: &[u8],
+) -> std::io::Result<bool> {
+    let state = home.join("state");
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(state.join(lock_name))?;
+    lock.lock_exclusive()?;
+    let mut log = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(path)
-    else {
-        return;
-    };
-    if let Ok(bytes) = serde_json::to_vec(&event) {
-        let _ = file.write_all(&bytes);
-        let _ = file.write_all(b"\n");
+        .open(state.join(filename))?;
+    if entry.len() as u64 > max_bytes.saturating_sub(log.metadata()?.len()) {
+        let _ = std::fs::write(state.join(marker_name), b"1\n");
+        return Ok(false);
     }
+    log.write_all(entry)?;
+    Ok(true)
 }
 
 fn exit_status(code: i32) -> ExitStatus {
@@ -920,6 +981,7 @@ fn attribute(args: &[OsString]) -> Option<PathBuf> {
         // Refresh at most once a day to avoid write churn on every rustc invocation.
         if now.saturating_sub(e.last_seen) < 86_400
             && e.manifest_path == manifest_path.to_string_lossy()
+            && (cfg!(not(unix)) || e.workspace_device.is_some())
         {
             return Some(build_dir);
         }
@@ -928,6 +990,32 @@ fn attribute(args: &[OsString]) -> Option<PathBuf> {
         version: PROTOCOL_VERSION,
         workspace_root: workspace_root.to_string_lossy().into_owned(),
         manifest_path: manifest_path.to_string_lossy().into_owned(),
+        workspace_device: {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                std::fs::metadata(&workspace_root).ok().map(|m| m.dev())
+            }
+            #[cfg(not(unix))]
+            {
+                None
+            }
+        },
+        workspace_mount_id: {
+            #[cfg(target_os = "linux")]
+            {
+                use rustix::fs::{AtFlags, CWD, StatxFlags, statx};
+                statx(CWD, &workspace_root, AtFlags::empty(), StatxFlags::MNT_ID)
+                    .ok()
+                    .and_then(|stat| {
+                        (stat.stx_mask & StatxFlags::MNT_ID.bits() != 0).then_some(stat.stx_mnt_id)
+                    })
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                None
+            }
+        },
         toolchain: std::env::var("RUSTUP_TOOLCHAIN").ok(),
         first_seen: existing.map(|e| e.first_seen).unwrap_or(now),
         last_seen: now,
@@ -948,15 +1036,7 @@ fn workspace_root() -> Option<String> {
 }
 
 fn request(message: Request) -> Result<Response, String> {
-    let home = std::env::var_os(HOME_ENV)
-        .map(PathBuf::from)
-        .or_else(|| {
-            std::env::var_os("HOME")
-                .or_else(|| std::env::var_os("USERPROFILE"))
-                .map(PathBuf::from)
-                .map(|p| p.join(".rgo"))
-        })
-        .ok_or_else(|| "cannot determine RGO_HOME".to_owned())?;
+    let home = rgo_home().ok_or_else(|| "cannot determine RGO_HOME".to_owned())?;
     let socket = home.join("state").join("daemon.sock");
     let mut stream = platform::connect(&socket, Duration::from_millis(CLIENT_TIMEOUT_MILLIS))
         .map_err(|e| e.to_string())?;
@@ -1048,12 +1128,7 @@ fn arg_value(args: &[OsString], flag: &str) -> Option<OsString> {
 /// Walk up from `--out-dir` until the grandparent is `$RGO_HOME/builds`
 /// (Cargo's `{workspace-path-hash}` expands to `xx/yyyy…`).
 fn find_managed_build_dir(out_dir: &Path) -> Option<PathBuf> {
-    let builds = match std::env::var_os(HOME_ENV) {
-        Some(h) if !h.is_empty() => PathBuf::from(h),
-        _ => PathBuf::from(std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))?)
-            .join(".rgo"),
-    }
-    .join("builds");
+    let builds = rgo_home()?.join("builds");
     let mut p = out_dir;
     while let Some(parent) = p.parent() {
         if parent.parent() == Some(builds.as_path()) {
@@ -1127,5 +1202,27 @@ fn strip_rgo_environment(command: &mut Command) {
         if key.to_string_lossy().starts_with("RGO_") {
             command.env_remove(key);
         }
+    }
+}
+
+#[cfg(test)]
+mod bounded_log_tests {
+    use super::append_bounded_log;
+
+    #[test]
+    fn full_log_stays_bounded_and_marks_observations_incomplete() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join("state")).unwrap();
+        assert!(
+            append_bounded_log(home.path(), "events", "lock", "truncated", 8, b"1234").unwrap()
+        );
+        assert!(
+            !append_bounded_log(home.path(), "events", "lock", "truncated", 8, b"56789").unwrap()
+        );
+        assert_eq!(
+            std::fs::read(home.path().join("state/events")).unwrap(),
+            b"1234"
+        );
+        assert!(home.path().join("state/truncated").is_file());
     }
 }

@@ -1,5 +1,6 @@
 pub mod adopt;
 pub mod cache;
+pub mod cargo_shim;
 pub mod clean;
 pub mod daemon;
 pub mod doctor;

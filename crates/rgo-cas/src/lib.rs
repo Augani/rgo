@@ -118,6 +118,9 @@ impl Store {
     }
 
     pub fn verify_object(&self, object: &ObjectRef) -> Result<()> {
+        if !valid_digest(&object.digest) {
+            bail!("invalid CAS object digest")
+        }
         let path = self.object_path(&object.digest);
         let metadata =
             fs::metadata(&path).with_context(|| format!("missing CAS object {}", object.digest))?;
@@ -146,6 +149,9 @@ impl Store {
     }
 
     pub fn write_manifest(&self, manifest: &Manifest) -> Result<()> {
+        if !valid_key(&manifest.key) {
+            bail!("invalid cache key")
+        }
         if manifest.version != MANIFEST_VERSION {
             bail!("unsupported manifest version {}", manifest.version)
         }
@@ -180,13 +186,19 @@ impl Store {
     }
 
     pub fn read_manifest(&self, key: &str) -> Result<Option<Manifest>> {
+        if !valid_key(key) {
+            bail!("invalid cache key")
+        }
         let path = self.manifest_path(key);
         if !path.is_file() {
             return Ok(None);
         }
         let manifest: Manifest = serde_json::from_slice(&fs::read(&path)?)
             .with_context(|| format!("parsing {}", path.display()))?;
-        if manifest.version != MANIFEST_VERSION || manifest.key != key {
+        if manifest.version != MANIFEST_VERSION
+            || manifest.key != key
+            || !valid_manifest_objects(&manifest)
+        {
             bail!("invalid manifest for cache key {key}")
         }
         let objects = manifest
@@ -212,7 +224,15 @@ impl Store {
                 continue;
             }
             match serde_json::from_slice::<Manifest>(&fs::read(&path)?) {
-                Ok(manifest) if manifest.version == MANIFEST_VERSION => result.push(manifest),
+                Ok(manifest)
+                    if manifest.version == MANIFEST_VERSION
+                        && valid_key(&manifest.key)
+                        && valid_manifest_objects(&manifest)
+                        && path.file_name().and_then(|v| v.to_str())
+                            == Some(format!("{}.json", manifest.key).as_str()) =>
+                {
+                    result.push(manifest)
+                }
                 Ok(_) | Err(_) => {}
             }
         }
@@ -237,6 +257,24 @@ impl Store {
         self.root
             .join(format!(".{kind}.{stamp}.{}.tmp", std::process::id()))
     }
+}
+
+fn valid_key(key: &str) -> bool {
+    key.len() == 64 && key.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn valid_digest(digest: &str) -> bool {
+    digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn valid_manifest_objects(manifest: &Manifest) -> bool {
+    manifest
+        .outputs
+        .iter()
+        .map(|output| &output.object)
+        .chain(manifest.stdout.iter())
+        .chain(manifest.stderr.iter())
+        .all(|object| valid_digest(&object.digest))
 }
 
 fn digest_file(path: &Path) -> Result<String> {
@@ -295,7 +333,7 @@ mod tests {
         );
         let manifest = Manifest {
             version: MANIFEST_VERSION,
-            key: "abc".into(),
+            key: "a".repeat(64),
             outputs: vec![ManifestOutput {
                 kind: "link".into(),
                 name: "libdemo.rlib".into(),
@@ -306,7 +344,14 @@ mod tests {
             created_at: 1,
         };
         store.write_manifest(&manifest).unwrap();
-        assert_eq!(store.read_manifest("abc").unwrap(), Some(manifest));
+        assert_eq!(
+            store.read_manifest(&"a".repeat(64)).unwrap(),
+            Some(manifest)
+        );
+        assert!(store.read_manifest("../../outside").is_err());
+        let mut unsafe_manifest = store.read_manifest(&"a".repeat(64)).unwrap().unwrap();
+        unsafe_manifest.key = "../../outside".into();
+        assert!(store.write_manifest(&unsafe_manifest).is_err());
     }
 
     #[test]
@@ -330,5 +375,37 @@ mod tests {
         fs::write(&path, b"bad").unwrap();
         assert!(store.verify_object(&object).is_err());
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn malformed_manifest_object_digest_is_never_used_as_a_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::new(temp.path().join("cas"), temp.path().join("quarantine")).unwrap();
+        let key = "a".repeat(64);
+        let object = ObjectRef {
+            digest: "../../outside".into(),
+            size: 1,
+            mode: 0o444,
+        };
+        let manifest = Manifest {
+            version: MANIFEST_VERSION,
+            key: key.clone(),
+            outputs: vec![ManifestOutput {
+                kind: "rlib".into(),
+                name: "libdemo.rlib".into(),
+                object: object.clone(),
+            }],
+            stdout: None,
+            stderr: None,
+            created_at: 1,
+        };
+        fs::write(
+            store.manifest_path(&key),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        assert!(store.verify_object(&object).is_err());
+        assert!(store.read_manifest(&key).is_err());
+        assert!(store.list_manifests().unwrap().is_empty());
     }
 }

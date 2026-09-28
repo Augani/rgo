@@ -19,5 +19,6 @@ pub mod ipc;
 pub mod paths;
 pub mod service;
 pub mod size;
+pub mod supervision;
 
 pub use rgo_protocol as protocol;

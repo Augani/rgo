@@ -6,17 +6,17 @@ members = ["crates/*"]
 version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/augustusotu/rgo"
+repository = "https://github.com/Augani/rgo"
 rust-version = "1.85"
 
 [workspace.dependencies]
-rgo-core = { path = "crates/rgo-core" }
-rgo-protocol = { path = "crates/rgo-protocol" }
+rgo-core = { path = "crates/rgo-core", version = "=0.1.0" }
+rgo-protocol = { path = "crates/rgo-protocol", version = "=0.1.0" }
 rgo-testkit = { path = "crates/rgo-testkit" }
-rgo-key = { path = "crates/rgo-key" }
-rgo-cas = { path = "crates/rgo-cas" }
-rgo-materialize = { path = "crates/rgo-materialize" }
-rgo-remote = { path = "crates/rgo-remote" }
+rgo-key = { path = "crates/rgo-key", version = "=0.1.0" }
+rgo-cas = { path = "crates/rgo-cas", version = "=0.1.0" }
+rgo-materialize = { path = "crates/rgo-materialize", version = "=0.1.0" }
+rgo-remote = { path = "crates/rgo-remote", version = "=0.1.0" }
 
 anyhow = "1"
 thiserror = "2"
@@ -34,7 +34,8 @@ bytesize = "2"
 directories = "6"
 walkdir = "2"
 fs4 = "0.13"
-sysinfo = "0.37"
+rustix = "1.1"
+libc = "0.2"
 interprocess = { version = "2.4.4", default-features = false }
 ureq = { version = "3.4", default-features = false, features = ["rustls"] }
 tempfile = "3"

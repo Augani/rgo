@@ -1,6 +1,6 @@
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 use rgo_protocol::HOME_ENV;
 
 /// Resolved locations of everything rgo owns.
@@ -10,14 +10,24 @@ pub struct RgoPaths {
 }
 
 impl RgoPaths {
-    /// `$RGO_HOME`, else `~/.rgo`.
+    /// `$RGO_HOME`, then the Cargo-home activation pointer, else `~/.rgo`.
+    /// The pointer lets a fresh Cargo process and an IDE find a custom root
+    /// without inheriting the environment of the setup shell.
     pub fn discover() -> Result<Self> {
         let root = match std::env::var_os(HOME_ENV) {
             Some(v) if !v.is_empty() => PathBuf::from(v),
-            _ => directories::UserDirs::new()
-                .context("cannot determine home directory")?
-                .home_dir()
-                .join(".rgo"),
+            _ => match activated_home()? {
+                Some(root) => root,
+                None => directories::UserDirs::new()
+                    .context("cannot determine home directory")?
+                    .home_dir()
+                    .join(".rgo"),
+            },
+        };
+        let root = if root.is_absolute() {
+            root
+        } else {
+            std::env::current_dir()?.join(root)
         };
         Ok(Self { root })
     }
@@ -27,6 +37,9 @@ impl RgoPaths {
     }
     pub fn state_dir(&self) -> PathBuf {
         self.root.join("state")
+    }
+    pub fn pin_records_dir(&self) -> PathBuf {
+        self.state_dir().join("pins")
     }
     pub fn db_file(&self) -> PathBuf {
         self.state_dir().join("meta.sqlite")
@@ -58,30 +71,77 @@ impl RgoPaths {
         format!("{}/{{workspace-path-hash}}", self.builds_dir().display())
     }
 
+    fn private_dirs(&self) -> [PathBuf; 7] {
+        [
+            self.state_dir(),
+            self.state_dir().join("locks"),
+            self.pin_records_dir(),
+            self.builds_dir(),
+            self.tmp_dir(),
+            self.quarantine_dir(),
+            self.logs_dir(),
+        ]
+    }
+
+    pub fn validate_root(&self) -> Result<()> {
+        let root_text = self
+            .root
+            .to_str()
+            .context("RGO_HOME must be UTF-8 to persist activation")?;
+        ensure!(
+            !root_text.contains(['\r', '\n']),
+            "RGO_HOME must not contain a newline"
+        );
+        ensure!(
+            !self
+                .root
+                .components()
+                .any(|part| part == Component::ParentDir),
+            "RGO_HOME must not contain `..` path components"
+        );
+        let resolved = self
+            .root
+            .canonicalize()
+            .unwrap_or_else(|_| self.root.clone());
+        ensure!(
+            resolved.parent().is_some(),
+            "RGO_HOME must not be a filesystem root"
+        );
+        #[cfg(unix)]
+        if self.root.exists() {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&self.root)?.permissions().mode();
+            ensure!(
+                mode & 0o022 == 0,
+                "RGO_HOME {} is writable by other users; choose a private storage directory",
+                self.root.display()
+            );
+        }
+        for directory in self.private_dirs() {
+            refuse_symlink(&directory)?;
+        }
+        Ok(())
+    }
+
     pub fn ensure_layout(&self) -> Result<()> {
-        for d in [
-            &self.root,
-            &self.state_dir(),
-            &self.state_dir().join("locks"),
-            &self.builds_dir(),
-            &self.tmp_dir(),
-            &self.quarantine_dir(),
-            &self.logs_dir(),
-        ] {
-            std::fs::create_dir_all(d).with_context(|| format!("creating {}", d.display()))?;
+        #[cfg(unix)]
+        let root_existed = self.root.exists();
+        self.validate_root()?;
+        std::fs::create_dir_all(&self.root)
+            .with_context(|| format!("creating {}", self.root.display()))?;
+        for directory in self.private_dirs() {
+            refuse_symlink(&directory)?;
+            std::fs::create_dir_all(&directory)
+                .with_context(|| format!("creating {}", directory.display()))?;
         }
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            for d in [
-                &self.root,
-                &self.state_dir(),
-                &self.state_dir().join("locks"),
-                &self.builds_dir(),
-                &self.tmp_dir(),
-                &self.quarantine_dir(),
-                &self.logs_dir(),
-            ] {
+            let mut owned = self.private_dirs().to_vec();
+            if !root_existed {
+                owned.push(self.root.clone());
+            }
+            for d in &owned {
                 let mut permissions = std::fs::metadata(d)?.permissions();
                 permissions.set_mode(0o700);
                 std::fs::set_permissions(d, permissions)
@@ -117,6 +177,77 @@ impl RgoPaths {
             .filter(|p| p.is_dir())
             .collect()
     }
+
+    /// Strict enumeration for budget and deletion decisions. A partial read
+    /// must not make a storage root appear smaller or hide a context.
+    pub fn checked_managed_build_dirs(&self) -> Result<Vec<PathBuf>> {
+        let root = self.builds_dir();
+        match std::fs::symlink_metadata(&root) {
+            Ok(metadata) => ensure!(
+                metadata.is_dir() && !metadata.file_type().is_symlink(),
+                "unsafe managed build root {}",
+                root.display()
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => {
+                return Err(error).with_context(|| format!("checking {}", root.display()));
+            }
+        }
+        let mut contexts = Vec::new();
+        for shard in std::fs::read_dir(&root)? {
+            let shard = shard?;
+            ensure!(
+                shard.file_type()?.is_dir(),
+                "unsafe managed build shard {}",
+                shard.path().display()
+            );
+            for context in std::fs::read_dir(shard.path())? {
+                let context = context?;
+                ensure!(
+                    context.file_type()?.is_dir(),
+                    "unsafe managed build context {}",
+                    context.path().display()
+                );
+                contexts.push(context.path());
+            }
+        }
+        Ok(contexts)
+    }
+}
+
+fn refuse_symlink(path: &Path) -> Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => ensure!(
+            !metadata.file_type().is_symlink(),
+            "refusing symlinked rgo storage directory {}",
+            path.display()
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error).with_context(|| format!("checking {}", path.display())),
+    }
+    Ok(())
+}
+
+/// This file is deliberately outside the managed storage tree: GC never
+/// removes it, and the dependency-light wrapper can read it as plain text.
+pub fn activation_pointer(cargo_home: &Path) -> PathBuf {
+    cargo_home.join(".rgo-home")
+}
+
+pub fn activated_home() -> Result<Option<PathBuf>> {
+    let pointer = activation_pointer(&cargo_home()?);
+    let value = match std::fs::read_to_string(&pointer) {
+        Ok(value) => value,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).with_context(|| format!("reading {}", pointer.display())),
+    };
+    let root = PathBuf::from(value.trim_end_matches(['\r', '\n']));
+    anyhow::ensure!(
+        root.is_absolute(),
+        "{} must contain an absolute RGO_HOME path",
+        pointer.display()
+    );
+    Ok(Some(root))
 }
 
 /// `$CARGO_HOME`, else `~/.cargo`.
@@ -128,4 +259,62 @@ pub fn cargo_home() -> Result<PathBuf> {
         .context("cannot determine home directory")?
         .home_dir()
         .join(".cargo"))
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn existing_storage_root_keeps_its_permissions() {
+        let private = tempfile::tempdir().unwrap();
+        let root = private.path().join("existing");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
+        RgoPaths { root: root.clone() }.ensure_layout().unwrap();
+        assert_eq!(
+            std::fs::metadata(root).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+    }
+
+    #[test]
+    fn shared_storage_root_is_rejected_without_chmod() {
+        let private = tempfile::tempdir().unwrap();
+        let root = private.path().join("shared");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(RgoPaths { root: root.clone() }.ensure_layout().is_err());
+        assert_eq!(
+            std::fs::metadata(root).unwrap().permissions().mode() & 0o777,
+            0o777
+        );
+    }
+
+    #[test]
+    fn nonexistent_parent_traversal_cannot_retarget_storage() {
+        let private = tempfile::tempdir().unwrap();
+        let root = private.path().join("not-created").join("..");
+        assert!(RgoPaths { root }.ensure_layout().is_err());
+        assert!(!private.path().join("not-created").exists());
+    }
+
+    #[test]
+    fn symlinked_state_directory_does_not_change_the_destination() {
+        let private = tempfile::tempdir().unwrap();
+        let root = private.path().join("rgo");
+        let outside = private.path().join("outside");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::set_permissions(&outside, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("state")).unwrap();
+
+        assert!(RgoPaths { root }.ensure_layout().is_err());
+        assert_eq!(
+            std::fs::metadata(&outside).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+        assert!(!outside.join("locks").exists());
+    }
 }
