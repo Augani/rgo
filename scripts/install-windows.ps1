@@ -544,9 +544,66 @@ function Prepend-ProcessPath([string]$Directory) {
     $env:PATH = (@($Directory) + $entries) -join ';'
 }
 
+function Get-UserPathSnapshot {
+    $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Environment')
+    if ($null -eq $key) { return @{ present = $false; value = $null; kind = $null } }
+    try {
+        if (@($key.GetValueNames()) -notcontains 'Path') {
+            return @{ present = $false; value = $null; kind = $null }
+        }
+        $kind = $key.GetValueKind('Path')
+        Assert-Condition ($kind -in @([Microsoft.Win32.RegistryValueKind]::String,
+            [Microsoft.Win32.RegistryValueKind]::ExpandString)) 'User PATH has an unsupported registry value type'
+        $value = $key.GetValue('Path', $null,
+            [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+        return @{ present = $true; value = [string]$value; kind = $kind.ToString() }
+    } finally { $key.Dispose() }
+}
+
+function Notify-UserPathChange {
+    if (-not ('RgoPathBroadcast' -as [type])) {
+        Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class RgoPathBroadcast {
+    [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    public static extern IntPtr SendMessageTimeout(IntPtr window, uint message,
+        IntPtr wParam, string lParam, uint flags, uint timeout, out IntPtr result);
+}
+'@
+    }
+    $result = [IntPtr]::Zero
+    $sent = [RgoPathBroadcast]::SendMessageTimeout([IntPtr]65535, [uint32]26,
+        [IntPtr]::Zero, 'Environment', [uint32]2, [uint32]1000, [ref]$result)
+    if ($sent -eq [IntPtr]::Zero) {
+        Write-Warning 'User PATH was saved, but the shell notification did not complete; sign out and back in if a fresh shell still finds the old Cargo'
+    }
+}
+
+function Set-UserPathRaw([bool]$Present, [AllowNull()][string]$Value, [AllowNull()][string]$Kind) {
+    $key = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey('Environment', $true)
+    Assert-Condition ($null -ne $key) 'cannot open the current user environment registry key for writing'
+    try {
+        if ($Present) {
+            $registryKind = [Microsoft.Win32.RegistryValueKind]$Kind
+            Assert-Condition ($registryKind -in @([Microsoft.Win32.RegistryValueKind]::String,
+                [Microsoft.Win32.RegistryValueKind]::ExpandString)) 'refusing an unsupported User PATH registry value type'
+            $key.SetValue('Path', $Value, $registryKind)
+        } else {
+            $key.DeleteValue('Path', $false)
+        }
+    } finally { $key.Dispose() }
+    Notify-UserPathChange
+}
+
 function Expected-OwnedUserPath($State) {
+    if (Test-SupervisedState $State) {
+        $parts = @($script:shimDir)
+        if ($State.priorUserPathPresent -and $State.priorUserPathRaw) { $parts += $State.priorUserPathRaw }
+        if ($State.pathAdded) { $parts += $script:resolvedBinDir }
+        return ($parts -join ';')
+    }
     $parts = @()
-    if (Test-SupervisedState $State) { $parts += $script:shimDir }
     if ($State.pathAdded) {
         # The earlier native installer normalized empty PATH entries before
         # appending its command directory. Accept that exact owned shape.
@@ -560,6 +617,17 @@ function Expected-OwnedUserPath($State) {
 
 function Assert-OwnedUserPath($State) {
     if ($State.noUserPath) { return }
+    if (Test-SupervisedState $State) {
+        $current = Get-UserPathSnapshot
+        $prior = ([bool]$current.present -eq [bool]$State.priorUserPathPresent) -and
+            ($current.value -ceq $State.priorUserPathRaw) -and
+            ($current.kind -eq $State.priorUserPathKind)
+        $activeKind = if ($State.priorUserPathPresent) { $State.priorUserPathKind } else { 'String' }
+        $active = $current.present -and ($current.kind -eq $activeKind) -and
+            ($current.value -ceq (Expected-OwnedUserPath $State))
+        Assert-Condition ($prior -or $active) 'User PATH changed since activation; preserve the owned rgo shim entry before retrying'
+        return
+    }
     $current = [Environment]::GetEnvironmentVariable('Path', 'User')
     $expected = Expected-OwnedUserPath $State
     Assert-Condition ($current -eq $State.priorUserPath -or $current -eq $expected) 'User PATH changed since activation; preserve the owned rgo entries before retrying'
@@ -569,9 +637,17 @@ function Publish-OwnedPath($State) {
     if (-not $State.noUserPath) {
         Assert-OwnedUserPath $State
         $expected = Expected-OwnedUserPath $State
-        $current = [Environment]::GetEnvironmentVariable('Path', 'User')
-        if ($current -ne $expected) {
-            [Environment]::SetEnvironmentVariable('Path', $expected, 'User')
+        if (Test-SupervisedState $State) {
+            $current = Get-UserPathSnapshot
+            if ($current.value -cne $expected) {
+                $kind = if ($State.priorUserPathPresent) { $State.priorUserPathKind } else { 'String' }
+                Set-UserPathRaw $true $expected $kind
+            }
+        } else {
+            $current = [Environment]::GetEnvironmentVariable('Path', 'User')
+            if ($current -ne $expected) {
+                [Environment]::SetEnvironmentVariable('Path', $expected, 'User')
+            }
         }
     }
     Add-ProcessPath $script:resolvedBinDir
@@ -581,6 +657,15 @@ function Publish-OwnedPath($State) {
 function Restore-OwnedPath($State) {
     if ($State.noUserPath) { return }
     Assert-OwnedUserPath $State
+    if (Test-SupervisedState $State) {
+        $current = Get-UserPathSnapshot
+        if ($current.present -ne $State.priorUserPathPresent -or
+            $current.value -cne $State.priorUserPathRaw -or
+            $current.kind -ne $State.priorUserPathKind) {
+            Set-UserPathRaw ([bool]$State.priorUserPathPresent) $State.priorUserPathRaw $State.priorUserPathKind
+        }
+        return
+    }
     $current = [Environment]::GetEnvironmentVariable('Path', 'User')
     if ($current -ne $State.priorUserPath) {
         [Environment]::SetEnvironmentVariable('Path', $State.priorUserPath, 'User')
@@ -816,6 +901,9 @@ try {
             return
         }
 
+        $rawUserPath = if ($Supervised -and -not $NoUserPath) { Get-UserPathSnapshot } else { $null }
+        $priorUserPathRaw = if ($rawUserPath) { $rawUserPath.value } else { $null }
+        $priorUserPathKind = if ($rawUserPath) { $rawUserPath.kind } else { $null }
         $state = [ordered]@{
             schemaVersion = 1; cargoHome = $resolvedCargoHome; rgoHome = $resolvedRgoHome
             installRoot = $resolvedInstallRoot; binDir = $resolvedBinDir
@@ -824,6 +912,8 @@ try {
             noService = [bool]$NoService; noWrapper = [bool]$NoWrapper; noUserPath = [bool]$NoUserPath
             supervised = [bool]$Supervised; realCargo = $null
             pathAdded = $false; priorUserPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+            priorUserPathPresent = [bool]($rawUserPath -and $rawUserPath.present)
+            priorUserPathRaw = $priorUserPathRaw; priorUserPathKind = $priorUserPathKind
         }
         $resuming = Test-Path -LiteralPath $pendingPath
         if ($resuming) {

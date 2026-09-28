@@ -36,6 +36,15 @@ function Get-RawUserPath {
     } finally { $key.Dispose() }
 }
 $expectedUserPath = Get-RawUserPath
+function Get-RawUserPathKind {
+    $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Environment')
+    if ($null -eq $key) { return $null }
+    try {
+        if (@($key.GetValueNames()) -notcontains 'Path') { return $null }
+        return $key.GetValueKind('Path').ToString()
+    } finally { $key.Dispose() }
+}
+$expectedUserPathKind = Get-RawUserPathKind
 function Get-ActivationBytes([string]$Cargo, [string]$Root) {
     $values = @{}
     foreach ($path in @(
@@ -239,7 +248,23 @@ try {
     if (-not (Test-Path (Join-Path $supervisedProject 'target/debug/deps'))) {
         throw 'ordinary Cargo did not build locally after supervised uninstall'
     }
-    Write-Host 'Windows installer: native upgrade, rollback, repair, storage-only uninstall, and supervised Cargo activation, repair, and uninstall passed'
+    $userPathArgs = $supervisedArgs.Clone()
+    $userPathArgs.Remove('NoUserPath') | Out-Null
+    & $installScript @userPathArgs -NoService
+    $installed = $true
+    $ownedUserPath = Get-RawUserPath
+    if (-not $ownedUserPath.StartsWith("$shim;", [StringComparison]::OrdinalIgnoreCase)) {
+        throw 'supervised installer did not prepend the shim to raw User PATH'
+    }
+    $ownedKind = if ($null -eq $expectedUserPathKind) { 'String' } else { $expectedUserPathKind }
+    if ((Get-RawUserPathKind) -ne $ownedKind) { throw 'supervised installer changed the User PATH registry type' }
+    & $installScript -Uninstall -CargoHome $cargoHome -RgoHome $rgoHome
+    $installed = $false
+    if ([string](Get-RawUserPath) -cne [string]$expectedUserPath -or
+        (Get-RawUserPathKind) -ne $expectedUserPathKind) {
+        throw 'supervised uninstall did not restore raw User PATH and its registry type'
+    }
+    Write-Host 'Windows installer: native upgrade/rollback, storage-only uninstall, supervised shim repair/undo, and exact User PATH restoration passed'
 } finally {
     if ($installed) {
         try { & $installScript -Uninstall -CargoHome $cargoHome -RgoHome $rgoHome | Out-Null }
