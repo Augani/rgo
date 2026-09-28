@@ -116,6 +116,18 @@ function Test-SupervisedState($State) {
     return [bool]($State.PSObject.Properties['supervised'] -and $State.supervised)
 }
 
+function Select-OwnedShim($State) {
+    $script:shimDir = $script:shimRoot
+    $script:shimPath = Join-Path $script:shimDir 'cargo.exe'
+    if (-not (Test-SupervisedState $State)) { return }
+    if (-not $State.PSObject.Properties['shimPath'] -or -not $State.shimPath) { return }
+    Assert-Condition ($State.versionDirectory -match '^rgo-(v[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?)-x86_64-pc-windows-msvc$') 'installer state has an invalid shim version'
+    $expected = Join-Path (Join-Path $script:shimRoot $Matches[1]) 'cargo.exe'
+    Assert-Condition (Test-SamePath $State.shimPath $expected) 'installer state names an unexpected Cargo shim'
+    $script:shimPath = $expected
+    $script:shimDir = Split-Path -Path $expected -Parent
+}
+
 function Download-Https([string]$Url, [string]$Destination) {
     Add-Type -AssemblyName System.Net.Http
     $handler = [System.Net.Http.HttpClientHandler]::new()
@@ -680,7 +692,7 @@ function Resolve-RealCargo([string]$Requested) {
         foreach ($command in @(Get-Command cargo.exe -All -ErrorAction SilentlyContinue)) {
             if ($command.CommandType -ne 'Application') { continue }
             $candidate = Full-Path $command.Source
-            if ($candidate -match '[\\/]rgo[\\/]shims[\\/]cargo\.exe$') { continue }
+            if ($candidate -match '[\\/]rgo[\\/]shims[\\/](?:[^\\/]+[\\/])?cargo\.exe$') { continue }
             $path = $candidate
             break
         }
@@ -711,7 +723,8 @@ if (-not $InstallRoot) { $InstallRoot = Join-Path $resolvedCargoHome 'rgo' }
 if (-not $BinDir) { $BinDir = Join-Path $resolvedCargoHome 'bin' }
 $resolvedInstallRoot = Full-Path $InstallRoot
 $resolvedBinDir = Full-Path $BinDir
-$shimDir = Join-Path $resolvedCargoHome 'rgo/shims'
+$shimRoot = Join-Path $resolvedCargoHome 'rgo/shims'
+$shimDir = $shimRoot
 $shimPath = Join-Path $shimDir 'cargo.exe'
 Assert-Condition ((Test-ChildPath $resolvedInstallRoot $resolvedCargoHome) -and
     (Test-ChildPath $resolvedBinDir $resolvedCargoHome)) 'install root and command directory must be inside Cargo home'
@@ -739,6 +752,7 @@ try {
             throw 'no installer-owned Windows activation was found'
         }
         $state = if (Test-Path -LiteralPath $statePath) { Read-Json $statePath } else { Read-Json $pendingPath }
+        Select-OwnedShim $state
         Assert-Condition ((Test-SamePath $state.cargoHome $resolvedCargoHome) -and
             (Test-SamePath $state.installRoot $resolvedInstallRoot) -and
             (Test-SamePath $state.binDir $resolvedBinDir) -and
@@ -839,6 +853,7 @@ try {
         $commandWrapper = Join-Path $resolvedBinDir 'rgo-rustc-wrapper.exe'
         if (Test-Path -LiteralPath $statePath) {
             $state = Read-Json $statePath
+            Select-OwnedShim $state
             Assert-Condition ((Test-SamePath $state.cargoHome $resolvedCargoHome) -and
                 (Test-SamePath $state.installRoot $resolvedInstallRoot) -and
                 (Test-SamePath $state.binDir $resolvedBinDir) -and
@@ -901,9 +916,14 @@ try {
             return
         }
 
+        if ($Supervised) {
+            $shimDir = Join-Path $shimRoot $ReleaseTag
+            $shimPath = Join-Path $shimDir 'cargo.exe'
+        }
         $rawUserPath = if ($Supervised -and -not $NoUserPath) { Get-UserPathSnapshot } else { $null }
         $priorUserPathRaw = if ($rawUserPath) { $rawUserPath.value } else { $null }
         $priorUserPathKind = if ($rawUserPath) { $rawUserPath.kind } else { $null }
+        $stateShimPath = if ($Supervised) { $shimPath } else { $null }
         $state = [ordered]@{
             schemaVersion = 1; cargoHome = $resolvedCargoHome; rgoHome = $resolvedRgoHome
             installRoot = $resolvedInstallRoot; binDir = $resolvedBinDir
@@ -911,6 +931,7 @@ try {
             cliDigest = $cliDigest; wrapperDigest = $wrapperDigest
             noService = [bool]$NoService; noWrapper = [bool]$NoWrapper; noUserPath = [bool]$NoUserPath
             supervised = [bool]$Supervised; realCargo = $null
+            shimPath = $stateShimPath
             pathAdded = $false; priorUserPath = [Environment]::GetEnvironmentVariable('Path', 'User')
             priorUserPathPresent = [bool]($rawUserPath -and $rawUserPath.present)
             priorUserPathRaw = $priorUserPathRaw; priorUserPathKind = $priorUserPathKind
@@ -933,6 +954,7 @@ try {
                 Assert-Condition (Test-SamePath (Full-Path $RealCargo) $pending.realCargo) '-RealCargo differs from the pending activation'
             }
             $state = $pending
+            Select-OwnedShim $state
         } else {
             if (Test-SupervisedState $state) { $state.realCargo = Resolve-RealCargo $RealCargo }
             Assert-Condition (-not (Test-Path -LiteralPath (Join-Path $resolvedCargoHome '.rgo-install.json'))) 'Cargo is already activated outside this installer'

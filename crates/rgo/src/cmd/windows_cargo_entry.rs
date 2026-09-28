@@ -32,9 +32,31 @@ pub fn is_shim_invocation() -> Result<bool> {
 
 pub fn run() -> Result<()> {
     let executable = std::env::current_exe().context("locating Cargo launcher")?;
-    let cargo_home = executable
+    let container = executable
         .parent()
-        .and_then(Path::parent)
+        .context("Cargo launcher has no parent")?;
+    let shims = if container
+        .file_name()
+        .is_some_and(|name| name.to_string_lossy().eq_ignore_ascii_case("shims"))
+    {
+        container
+    } else {
+        container
+            .parent()
+            .context("Cargo launcher is outside its Cargo home")?
+    };
+    if !shims
+        .file_name()
+        .is_some_and(|name| name.to_string_lossy().eq_ignore_ascii_case("shims"))
+        || !shims
+            .parent()
+            .and_then(Path::file_name)
+            .is_some_and(|name| name.to_string_lossy().eq_ignore_ascii_case("rgo"))
+    {
+        bail!("Cargo launcher is outside its Cargo home");
+    }
+    let cargo_home = shims
+        .parent()
         .and_then(Path::parent)
         .context("Cargo launcher is outside its Cargo home")?;
     let record_path = cargo_home.join(".rgo-install.json");

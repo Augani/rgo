@@ -207,7 +207,7 @@ try {
     $supervisedArgs['RealCargo'] = $realCargo
     & $installScript @supervisedArgs -NoService
     $installed = $true
-    $shim = Join-Path $cargoHome 'rgo/shims/cargo.exe'
+    $shim = Join-Path $cargoHome "rgo/shims/$tag/cargo.exe"
     if (-not (Test-Path $shim)) { throw 'supervised installer did not install the owned Cargo shim' }
     if (-not [string]::Equals((Get-Command cargo.exe).Source, $shim, [StringComparison]::OrdinalIgnoreCase)) {
         throw 'unchanged cargo does not resolve to the owned shim'

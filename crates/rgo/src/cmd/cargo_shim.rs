@@ -46,11 +46,7 @@ pub fn run(
         bail!("--real-cargo points back to rgo; refusing recursive launch");
     }
     let active_cargo_home = cargo_home()?;
-    let owned_shim =
-        active_cargo_home
-            .join("rgo/shims")
-            .join(if cfg!(windows) { "cargo.exe" } else { "cargo" });
-    if owned_shim.canonicalize().ok().as_ref() == Some(&resolved) {
+    if is_rgo_cargo_shim(&resolved) {
         bail!("--real-cargo points back to the owned Cargo launcher");
     }
     if expected_cargo_home.is_some_and(|expected| !same_directory(expected, &active_cargo_home)) {
@@ -151,6 +147,19 @@ fn same_directory(expected: &Path, active: &Path) -> bool {
             .canonicalize()
             .ok()
             .is_some_and(|expected| active.canonicalize().ok() == Some(expected))
+}
+
+#[cfg(any(unix, windows))]
+fn is_rgo_cargo_shim(path: &Path) -> bool {
+    path.ancestors().any(|directory| {
+        directory
+            .file_name()
+            .is_some_and(|name| name.to_string_lossy().eq_ignore_ascii_case("shims"))
+            && directory
+                .parent()
+                .and_then(Path::file_name)
+                .is_some_and(|name| name.to_string_lossy().eq_ignore_ascii_case("rgo"))
+    })
 }
 
 #[cfg(unix)]

@@ -219,9 +219,35 @@ pub fn run(
     let previous_shim = old_record
         .as_ref()
         .and_then(|r| r.supervised_cargo.as_ref());
+    #[cfg(windows)]
+    let shim_path = {
+        let flat = cargo_home.join("rgo/shims").join(shim_name());
+        let versioned = cargo_home
+            .join("rgo/shims")
+            .join(format!("v{}", env!("CARGO_PKG_VERSION")))
+            .join(shim_name());
+        if let Some(previous) = previous_shim {
+            let path = Path::new(&previous.shim_path);
+            if path != flat && path != versioned {
+                bail!("installation record names an unexpected Cargo shim path");
+            }
+            path.to_path_buf()
+        } else {
+            versioned
+        }
+    };
+    #[cfg(unix)]
     let shim_path = cargo_home.join("rgo/shims").join(shim_name());
-    let shim_dir = cargo_home.join("rgo/shims");
-    if shim_dir.is_symlink() || shim_dir.parent().is_some_and(Path::is_symlink) {
+    let shim_dir = shim_path.parent().context("Cargo shim has no parent")?;
+    if shim_dir.is_symlink()
+        || shim_dir.parent().is_some_and(Path::is_symlink)
+        || (cfg!(windows)
+            && shim_dir.file_name().is_some_and(|name| name != "shims")
+            && shim_dir
+                .parent()
+                .and_then(Path::parent)
+                .is_some_and(Path::is_symlink))
+    {
         bail!("refusing a symlinked Cargo shim directory");
     }
     if let Ok(metadata) = std::fs::symlink_metadata(&shim_path) {
@@ -255,6 +281,7 @@ pub fn run(
         Some(prepare_supervised_cargo(
             &cargo_home,
             &paths.root,
+            &shim_path,
             real_cargo.as_deref(),
         )?)
     } else {
@@ -898,9 +925,9 @@ fn wrapper_path() -> Result<String> {
 fn prepare_supervised_cargo(
     cargo_home: &Path,
     rgo_home: &Path,
+    shim: &Path,
     requested: Option<&Path>,
 ) -> Result<SupervisedCargo> {
-    let shim = cargo_home.join("rgo/shims").join(shim_name());
     let installed_shim = shim.canonicalize().ok();
     let real = if let Some(path) = requested {
         path.to_path_buf()
@@ -908,7 +935,7 @@ fn prepare_supervised_cargo(
         std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
             .map(|dir| dir.join(shim_name()))
             .find(|path| {
-                path != &shim
+                path != shim
                     && path.is_file()
                     && path.canonicalize().ok().is_some_and(|resolved| {
                         !is_rgo_cargo_shim(&resolved) && installed_shim.as_ref() != Some(&resolved)
@@ -947,7 +974,7 @@ fn prepare_supervised_cargo(
     }
     let executable = std::env::current_exe()?.canonicalize()?;
     #[cfg(windows)]
-    let _ = rgo_home;
+    let _ = (cargo_home, rgo_home);
     #[cfg(unix)]
     let contents = format!(
         "#!/bin/sh\nexec {} cargo-shim --real-cargo {} --cargo-home {} --rgo-home {} -- \"$@\"\n",
@@ -969,16 +996,16 @@ fn prepare_supervised_cargo(
 }
 
 fn is_rgo_cargo_shim(path: &Path) -> bool {
-    path.file_name().is_some_and(|name| name == shim_name())
-        && path
-            .parent()
-            .and_then(Path::file_name)
-            .is_some_and(|name| name == "shims")
-        && path
-            .parent()
-            .and_then(Path::parent)
-            .and_then(Path::file_name)
-            .is_some_and(|name| name == "rgo")
+    if !path.file_name().is_some_and(|name| name == shim_name()) {
+        return false;
+    }
+    path.ancestors().any(|directory| {
+        directory.file_name().is_some_and(|name| name == "shims")
+            && directory
+                .parent()
+                .and_then(Path::file_name)
+                .is_some_and(|name| name == "rgo")
+    })
 }
 
 #[cfg(unix)]
@@ -1079,7 +1106,14 @@ fn write_shim(path: &Path, contents: &str) -> Result<()> {
         bail!("the running rgo executable changed during supervised setup");
     }
     let parent = path.parent().context("Cargo shim has no parent")?;
-    if parent.is_symlink() || parent.parent().is_some_and(Path::is_symlink) {
+    if parent.is_symlink()
+        || parent.parent().is_some_and(Path::is_symlink)
+        || (parent.file_name().is_some_and(|name| name != "shims")
+            && parent
+                .parent()
+                .and_then(Path::parent)
+                .is_some_and(Path::is_symlink))
+    {
         bail!("refusing a symlinked Cargo shim directory");
     }
     std::fs::create_dir_all(parent)?;

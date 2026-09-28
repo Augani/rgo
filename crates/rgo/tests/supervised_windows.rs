@@ -34,7 +34,10 @@ fn setup_activates_unchanged_cargo_exe_and_undo_restores_direct_cargo() {
         "{}",
         String::from_utf8_lossy(&setup.stderr)
     );
-    let shim = sandbox.cargo_home.join("rgo/shims/cargo.exe");
+    let shim = sandbox.cargo_home.join(format!(
+        "rgo/shims/v{}/cargo.exe",
+        env!("CARGO_PKG_VERSION")
+    ));
     assert!(shim.is_file());
     let path = std::env::join_paths(std::iter::once(shim.parent().unwrap().to_path_buf()).chain(
         std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()),
@@ -164,6 +167,89 @@ fn setup_activates_unchanged_cargo_exe_and_undo_restores_direct_cargo() {
         String::from_utf8_lossy(&undo.stderr)
     );
     assert!(!shim.exists());
+}
+
+#[test]
+fn a_previously_owned_flat_shim_remains_repairable() {
+    let sandbox = Sandbox::new().unwrap();
+    let cli = PathBuf::from(env!("CARGO_BIN_EXE_rgo"));
+    let real_cargo = PathBuf::from(std::env::var_os("CARGO").unwrap());
+    let setup = sandbox
+        .cmd(&cli)
+        .args(["setup", "--supervised", "--no-service", "--real-cargo"])
+        .arg(&real_cargo)
+        .output()
+        .unwrap();
+    assert!(
+        setup.status.success(),
+        "{}",
+        String::from_utf8_lossy(&setup.stderr)
+    );
+    let versioned = sandbox.cargo_home.join(format!(
+        "rgo/shims/v{}/cargo.exe",
+        env!("CARGO_PKG_VERSION")
+    ));
+    let flat = sandbox.cargo_home.join("rgo/shims/cargo.exe");
+    let record_path = sandbox.cargo_home.join(".rgo-install.json");
+    let mut record: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&record_path).unwrap()).unwrap();
+    let outside = sandbox.home.join("outside/cargo.exe");
+    record["supervised_cargo"]["shim_path"] =
+        serde_json::Value::String(outside.display().to_string());
+    std::fs::write(&record_path, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
+    let rejected = sandbox
+        .cmd(&cli)
+        .args(["setup", "--supervised", "--no-service", "--real-cargo"])
+        .arg(&real_cargo)
+        .output()
+        .unwrap();
+    assert!(!rejected.status.success());
+    assert!(!outside.exists());
+
+    std::fs::copy(&versioned, &flat).unwrap();
+    record["supervised_cargo"]["shim_path"] = serde_json::Value::String(flat.display().to_string());
+    std::fs::write(&record_path, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
+    std::fs::remove_file(&versioned).unwrap();
+
+    let repeated = sandbox
+        .cmd(&cli)
+        .args(["setup", "--supervised", "--no-service", "--real-cargo"])
+        .arg(&real_cargo)
+        .output()
+        .unwrap();
+    assert!(
+        repeated.status.success(),
+        "{}",
+        String::from_utf8_lossy(&repeated.stderr)
+    );
+    assert!(flat.is_file());
+    assert!(!versioned.exists());
+    let path = std::env::join_paths(std::iter::once(flat.parent().unwrap().to_path_buf()).chain(
+        std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()),
+    ))
+    .unwrap();
+    let doctor = sandbox
+        .cmd(&cli)
+        .env("PATH", path)
+        .args(["doctor", "--verify"])
+        .output()
+        .unwrap();
+    assert!(
+        doctor.status.success(),
+        "{}",
+        String::from_utf8_lossy(&doctor.stderr)
+    );
+    let undo = sandbox
+        .cmd(&cli)
+        .args(["setup", "--undo", "--no-service"])
+        .output()
+        .unwrap();
+    assert!(
+        undo.status.success(),
+        "{}",
+        String::from_utf8_lossy(&undo.stderr)
+    );
+    assert!(!flat.exists());
 }
 
 #[test]
