@@ -162,7 +162,7 @@ fn exec_real_cargo(real_cargo: &Path, args: &[OsString]) -> Result<()> {
 }
 
 #[cfg(windows)]
-fn exec_real_cargo(real_cargo: &Path, args: &[OsString]) -> Result<()> {
+pub(super) fn exec_real_cargo(real_cargo: &Path, args: &[OsString]) -> Result<()> {
     let status = Command::new(real_cargo)
         .args(args)
         .status()

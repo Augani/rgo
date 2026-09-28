@@ -103,6 +103,34 @@ fn setup_activates_unchanged_cargo_exe_and_undo_restores_direct_cargo() {
         paths.checked_managed_build_dirs().unwrap().len(),
         managed_before_direct
     );
+    let record_path = sandbox.cargo_home.join(".rgo-install.json");
+    let original_record = std::fs::read(&record_path).unwrap();
+    let mut newer_record: serde_json::Value = serde_json::from_slice(&original_record).unwrap();
+    newer_record["binary_version"] = serde_json::Value::String("0.1.999".into());
+    std::fs::write(
+        &record_path,
+        serde_json::to_vec_pretty(&newer_record).unwrap(),
+    )
+    .unwrap();
+    let stale_project = sandbox.simple_bin("windows-stale-shim").unwrap();
+    let stale = sandbox
+        .cmd("cmd.exe")
+        .current_dir(&stale_project)
+        .env("PATH", &path)
+        .args(["/C", "cargo", "build", "--offline"])
+        .output()
+        .unwrap();
+    assert!(
+        stale.status.success(),
+        "{}",
+        String::from_utf8_lossy(&stale.stderr)
+    );
+    assert!(stale_project.join("target/debug/deps").is_dir());
+    assert_eq!(
+        paths.checked_managed_build_dirs().unwrap().len(),
+        managed_before_direct
+    );
+    std::fs::write(&record_path, original_record).unwrap();
     let other_home = sandbox.home.join("other-cargo-home");
     std::fs::create_dir_all(&other_home).unwrap();
     let wrong_home_project = sandbox.simple_bin("windows-wrong-home").unwrap();

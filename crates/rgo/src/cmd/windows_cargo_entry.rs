@@ -54,13 +54,32 @@ pub fn run() -> Result<()> {
     let shim = record
         .supervised_cargo
         .context("Cargo launcher has no supervised installation record")?;
-    if record.schema_version != 3
-        || record.binary_version != env!("CARGO_PKG_VERSION")
+    if record.schema_version != 3 || !same_path(&record.cargo_home, cargo_home) {
+        bail!("Cargo launcher does not match its installation record; repair or undo rgo setup");
+    }
+    let real_cargo = shim
+        .real_cargo
+        .canonicalize()
+        .context("locating the recorded real Cargo proxy")?;
+    if !shim.real_cargo.is_absolute()
+        || real_cargo == executable.canonicalize()?
+        || is_rgo_shim(&real_cargo)
+        || shim
+            .real_cargo
+            .file_name()
+            .is_none_or(|name| name != "cargo.exe")
+    {
+        bail!("Cargo launcher record does not name a safe real Cargo proxy");
+    }
+    if record.binary_version != env!("CARGO_PKG_VERSION")
         || record.protocol_version != rgo_protocol::PROTOCOL_VERSION
-        || !same_path(&record.cargo_home, cargo_home)
         || !same_path(&shim.shim_path, &executable)
     {
-        bail!("Cargo launcher does not match its installation record; repair or undo rgo setup");
+        eprintln!("rgo: this Cargo launcher is no longer active; using ordinary Cargo storage");
+        return super::cargo_shim::exec_real_cargo(
+            &shim.real_cargo,
+            &std::env::args_os().skip(1).collect::<Vec<_>>(),
+        );
     }
     super::cargo_shim::run(
         &shim.real_cargo,
@@ -74,4 +93,16 @@ fn same_path(left: &Path, right: &Path) -> bool {
     left.canonicalize()
         .ok()
         .is_some_and(|left| right.canonicalize().ok() == Some(left))
+}
+
+fn is_rgo_shim(path: &Path) -> bool {
+    path.ancestors().any(|directory| {
+        directory
+            .file_name()
+            .is_some_and(|name| name.to_string_lossy().eq_ignore_ascii_case("shims"))
+            && directory
+                .parent()
+                .and_then(Path::file_name)
+                .is_some_and(|name| name.to_string_lossy().eq_ignore_ascii_case("rgo"))
+    })
 }
