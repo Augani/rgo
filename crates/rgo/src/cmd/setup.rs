@@ -781,10 +781,14 @@ pub fn run(
     if dry_run {
         if let Some(shim) = previous_shim.filter(|_| undo) {
             #[cfg(windows)]
-            println!(
-                "would retain supervised Cargo shim as an ordinary Cargo fallback {}",
-                shim.shim_path
-            );
+            if retain_previous_shim {
+                println!(
+                    "would retain supervised Cargo shim as an ordinary Cargo fallback {}",
+                    shim.shim_path
+                );
+            } else {
+                println!("would remove supervised Cargo shim {}", shim.shim_path);
+            }
             #[cfg(not(windows))]
             println!("would remove supervised Cargo shim {}", shim.shim_path);
         } else if let Some(shim) = &supervised_cargo {
@@ -809,6 +813,11 @@ pub fn run(
                 if !retained {
                     std::fs::remove_file(path)
                         .with_context(|| format!("removing {}", path.display()))?;
+                } else {
+                    println!(
+                        "retained Cargo launcher for old shells; it now uses ordinary Cargo storage: {}",
+                        path.display()
+                    );
                 }
             }
         }

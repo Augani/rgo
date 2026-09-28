@@ -336,11 +336,25 @@ fn setup_composes_and_restores_an_existing_rustc_wrapper() {
     std::fs::copy(&rgo, &repair_rgo).unwrap();
     std::fs::set_permissions(&repair_rgo, std::fs::metadata(&rgo).unwrap().permissions()).unwrap();
 
-    let undo = sandbox
-        .cmd(&repair_rgo)
-        .args(["setup", "--undo", "--no-service"])
-        .output()
-        .unwrap();
+    let mut busy_retries = 0;
+    let undo = loop {
+        let attempt = sandbox
+            .cmd(&repair_rgo)
+            .args(["setup", "--undo", "--no-service"])
+            .output();
+        match attempt {
+            Ok(output) => break output,
+            Err(error)
+                if error.kind() == std::io::ErrorKind::ExecutableFileBusy && busy_retries < 10 =>
+            {
+                // A freshly copied executable can briefly be ETXTBSY on the
+                // Linux CI filesystem. Retry only this launch error.
+                busy_retries += 1;
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Err(error) => panic!("starting the repair binary: {error}"),
+        }
+    };
     assert!(
         undo.status.success(),
         "{}",

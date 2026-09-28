@@ -156,6 +156,25 @@ fn setup_activates_unchanged_cargo_exe_and_undo_restores_direct_cargo() {
         managed_before_direct
     );
 
+    let fallback_path = shim.parent().unwrap().join(".rgo-cargo-fallback.json");
+    let original_fallback = std::fs::read(&fallback_path).unwrap();
+    let mut changed_fallback: serde_json::Value =
+        serde_json::from_slice(&original_fallback).unwrap();
+    changed_fallback["real_cargo"] =
+        serde_json::Value::String(sandbox.home.join("other/cargo.exe").display().to_string());
+    std::fs::write(
+        &fallback_path,
+        serde_json::to_vec_pretty(&changed_fallback).unwrap(),
+    )
+    .unwrap();
+    let rejected_undo = sandbox
+        .cmd(&cli)
+        .args(["setup", "--undo", "--no-service"])
+        .output()
+        .unwrap();
+    assert!(!rejected_undo.status.success());
+    assert!(record_path.exists());
+    std::fs::write(&fallback_path, original_fallback).unwrap();
     let undo = sandbox
         .cmd(&cli)
         .args(["setup", "--undo", "--no-service"])
@@ -290,6 +309,117 @@ fn a_previously_owned_flat_shim_remains_repairable() {
         String::from_utf8_lossy(&undo.stderr)
     );
     assert!(!flat.exists());
+}
+
+#[test]
+fn undo_with_a_running_versioned_shim_keeps_old_shells_on_ordinary_cargo() {
+    let sandbox = Sandbox::new().unwrap();
+    let cli = PathBuf::from(env!("CARGO_BIN_EXE_rgo"));
+    let real_cargo = PathBuf::from(std::env::var_os("CARGO").unwrap());
+    let project = sandbox.simple_bin("windows-running-undo").unwrap();
+    std::fs::write(
+        project.join("src/main.rs"),
+        r#"
+fn main() {
+    let ready = std::path::PathBuf::from(std::env::var_os("RGO_TEST_READY").unwrap());
+    let release = std::path::PathBuf::from(std::env::var_os("RGO_TEST_RELEASE").unwrap());
+    std::fs::write(ready, b"ready").unwrap();
+    while !release.exists() {
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+}
+"#,
+    )
+    .unwrap();
+    let setup = sandbox
+        .cmd(&cli)
+        .args(["setup", "--supervised", "--no-service", "--real-cargo"])
+        .arg(&real_cargo)
+        .output()
+        .unwrap();
+    assert!(
+        setup.status.success(),
+        "{}",
+        String::from_utf8_lossy(&setup.stderr)
+    );
+    let shim = sandbox.cargo_home.join(format!(
+        "rgo/shims/v{}/cargo.exe",
+        env!("CARGO_PKG_VERSION")
+    ));
+    let path = std::env::join_paths(std::iter::once(shim.parent().unwrap().to_path_buf()).chain(
+        std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()),
+    ))
+    .unwrap();
+    let ready = sandbox.home.join("running-undo-ready");
+    let release = sandbox.home.join("running-undo-release");
+    let mut child = sandbox
+        .cmd("cmd.exe")
+        .current_dir(&project)
+        .env("PATH", &path)
+        .env("RGO_TEST_READY", &ready)
+        .env("RGO_TEST_RELEASE", &release)
+        .args(["/C", "cargo", "run", "--offline"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !ready.exists() && Instant::now() < deadline {
+        if child.try_wait().unwrap().is_some() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    if !ready.exists() {
+        let _ = child.kill();
+        let output = child.wait_with_output().unwrap();
+        panic!(
+            "Cargo did not start: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let undo = sandbox
+        .cmd(&cli)
+        .args(["setup", "--undo", "--no-service"])
+        .output()
+        .unwrap();
+    std::fs::write(&release, b"done").unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        undo.status.success(),
+        "{}",
+        String::from_utf8_lossy(&undo.stderr)
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(shim.is_file());
+    let paths = RgoPaths {
+        root: sandbox.rgo_home.clone(),
+    };
+    let managed_before = paths.checked_managed_build_dirs().unwrap().len();
+    let after = sandbox
+        .simple_bin("windows-stale-shell-after-undo")
+        .unwrap();
+    let stale = sandbox
+        .cmd("cmd.exe")
+        .current_dir(&after)
+        .env("PATH", &path)
+        .args(["/C", "cargo", "build", "--offline"])
+        .output()
+        .unwrap();
+    assert!(
+        stale.status.success(),
+        "{}",
+        String::from_utf8_lossy(&stale.stderr)
+    );
+    assert!(after.join("target/debug/deps").is_dir());
+    assert_eq!(
+        paths.checked_managed_build_dirs().unwrap().len(),
+        managed_before
+    );
 }
 
 #[test]

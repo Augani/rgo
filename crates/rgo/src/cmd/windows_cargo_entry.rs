@@ -136,7 +136,15 @@ pub fn run() -> Result<()> {
     }
     let real_cargo = fallback
         .map(|fallback| fallback.real_cargo)
-        .or_else(|| record.and_then(|record| record.supervised_cargo.map(|shim| shim.real_cargo)))
+        .or_else(|| {
+            record.and_then(|record| {
+                if record.schema_version == 3 && same_path(&record.cargo_home, cargo_home) {
+                    record.supervised_cargo.map(|shim| shim.real_cargo)
+                } else {
+                    None
+                }
+            })
+        })
         .context("Cargo launcher has no verified fallback Cargo proxy")?;
     validate_real_cargo(&real_cargo, &executable)?;
     eprintln!("rgo: this Cargo launcher is no longer active; using ordinary Cargo storage");
