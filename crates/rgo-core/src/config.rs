@@ -229,9 +229,16 @@ fn volume_stats_checked(path: &Path) -> Result<(u64, u64)> {
         // Query the filesystem containing the actual path rather than
         // inferring a mount from its spelling. This follows symlinked roots,
         // including a custom RGO_HOME on another volume. A not-yet-created
-        // root inherits the nearest existing ancestor's filesystem.
-        match fs4::statvfs(probe) {
-            Ok(stats) => return Ok((stats.total_space(), stats.available_space())),
+        // root inherits the nearest existing ancestor's filesystem. Windows
+        // can return drive-level stats for a path beneath a regular file, so
+        // check that the ancestor is a directory before asking fs4.
+        match std::fs::metadata(probe) {
+            Ok(metadata) if metadata.is_dir() => {
+                let stats = fs4::statvfs(probe)
+                    .with_context(|| format!("probing volume at {}", probe.display()))?;
+                return Ok((stats.total_space(), stats.available_space()));
+            }
+            Ok(_) => anyhow::bail!("probing volume at {}: not a directory", probe.display()),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 probe = probe.parent().with_context(|| {
                     format!("no existing volume ancestor for {}", path.display())

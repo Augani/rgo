@@ -2180,9 +2180,11 @@ mod tests {
         let shm = paths.state_dir().join("meta.sqlite-shm");
         assert!(wal.is_file());
         assert!(shm.is_file());
+        // SQLite owns these files while the connection is open. Corrupt a
+        // closed database; Windows correctly refuses writes to its live SHM.
+        drop(raw);
         std::fs::write(&wal, vec![0_u8; 32]).unwrap();
         std::fs::write(&shm, vec![0_u8; 32]).unwrap();
-        drop(raw);
 
         let reopened = StateDb::open(&paths).unwrap();
         assert!(

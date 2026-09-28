@@ -27,10 +27,15 @@ $priorHome = $env:HOME
 $priorProfile = $env:USERPROFILE
 $priorCargoHome = $env:CARGO_HOME
 $priorRgoHome = $env:RGO_HOME
+$priorRustupHome = $env:RUSTUP_HOME
+$priorToolchain = $env:RUSTUP_TOOLCHAIN
+$rustupHome = (& rustup show home).Trim()
 $env:HOME = $sandbox
 $env:USERPROFILE = $sandbox
 $env:CARGO_HOME = $cargoHome
 $env:RGO_HOME = $rgoHome
+$env:RUSTUP_HOME = $rustupHome
+$env:RUSTUP_TOOLCHAIN = 'stable'
 
 $cli = Join-Path (Get-Location) 'target/debug/rgo.exe'
 $wrapper = Join-Path (Get-Location) 'target/debug/rgo-rustc-wrapper.exe'
@@ -91,4 +96,6 @@ finally {
     $env:USERPROFILE = $priorProfile
     $env:CARGO_HOME = $priorCargoHome
     $env:RGO_HOME = $priorRgoHome
+    $env:RUSTUP_HOME = $priorRustupHome
+    $env:RUSTUP_TOOLCHAIN = $priorToolchain
 }

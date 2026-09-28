@@ -4,6 +4,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::OnceLock;
 
 use anyhow::{Context, Result};
 use tempfile::TempDir;
@@ -132,20 +133,31 @@ impl Sandbox {
 /// `cargo test -p rgo-storage` does not rebuild sibling bin packages, so integration tests that
 /// rely on `rgo-rustc-wrapper` must build it explicitly (in the real environment, not the sandbox).
 pub fn ensure_workspace_bins_built() -> Result<()> {
-    let status = Command::new(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()))
-        .args([
-            "build",
-            "--quiet",
-            "-p",
-            "rgo-rustc-wrapper",
-            "-p",
-            "rgo-storage",
-        ])
-        .current_dir(env!("CARGO_MANIFEST_DIR"))
-        .status()
-        .context("building workspace bins")?;
-    anyhow::ensure!(status.success(), "building workspace bins failed");
-    Ok(())
+    // Integration tests in one process run concurrently. Repeated builds can
+    // relink a binary just as another test starts it; build the pair once.
+    static BUILT: OnceLock<std::result::Result<(), String>> = OnceLock::new();
+    match BUILT.get_or_init(|| {
+        let status = Command::new(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()))
+            .args([
+                "build",
+                "--quiet",
+                "-p",
+                "rgo-rustc-wrapper",
+                "-p",
+                "rgo-storage",
+            ])
+            .current_dir(env!("CARGO_MANIFEST_DIR"))
+            .status()
+            .map_err(|error| format!("building workspace bins: {error}"))?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err("building workspace bins failed".into())
+        }
+    }) {
+        Ok(()) => Ok(()),
+        Err(error) => anyhow::bail!("{error}"),
+    }
 }
 
 fn real_home() -> PathBuf {

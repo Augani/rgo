@@ -868,7 +868,9 @@ mod tests {
         let stale = paths.tmp_dir().join("stale");
         std::fs::write(&stale, vec![0u8; 8192]).unwrap();
         let now = SystemTime::now();
-        std::fs::File::open(&stale)
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&stale)
             .unwrap()
             .set_modified(now - Duration::from_secs(7200))
             .unwrap();

@@ -7,6 +7,10 @@ use std::os::unix::fs::PermissionsExt;
 use assert_cmd::cargo::cargo_bin;
 use rgo_testkit::{Sandbox, ensure_workspace_bins_built};
 
+fn wrapper_bin() -> std::path::PathBuf {
+    cargo_bin("rgo").with_file_name(format!("rgo-rustc-wrapper{}", std::env::consts::EXE_SUFFIX))
+}
+
 #[test]
 fn bypass_passthrough_strips_rgo_environment_and_preserves_exit_status() {
     ensure_workspace_bins_built().unwrap();
@@ -45,7 +49,7 @@ fn rustc_wrapper_bypass_executes_the_inner_compiler_directly() {
     .unwrap();
     std::fs::set_permissions(&rustc, std::fs::Permissions::from_mode(0o755)).unwrap();
     let result = sandbox
-        .cmd(cargo_bin("rgo-rustc-wrapper"))
+        .cmd(wrapper_bin())
         .env("RGO_BYPASS", "1")
         .env("RGO_SENTINEL", "must-not-leak")
         .args([rustc.to_str().unwrap(), "--version"])

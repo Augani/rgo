@@ -22,6 +22,9 @@ $oldHome = $env:HOME
 $oldProfile = $env:USERPROFILE
 $oldCargoHome = $env:CARGO_HOME
 $oldRgoHome = $env:RGO_HOME
+$oldRustupHome = $env:RUSTUP_HOME
+$oldToolchain = $env:RUSTUP_TOOLCHAIN
+$rustupHome = (& rustup show home).Trim()
 $oldPath = $env:PATH
 $oldUserPath = [Environment]::GetEnvironmentVariable('Path', 'User')
 function Get-ActivationBytes([string]$Cargo, [string]$Root) {
@@ -81,6 +84,8 @@ $env:HOME = $sandbox
 $env:USERPROFILE = $sandbox
 $env:CARGO_HOME = $cargoHome
 $env:RGO_HOME = $rgoHome
+$env:RUSTUP_HOME = $rustupHome
+$env:RUSTUP_TOOLCHAIN = 'stable'
 $installArgs = @{ ReleaseTag = $tag; Archive = $archive; Sha256 = $sha
     DevelopmentBundle = $true; CargoHome = $cargoHome; RgoHome = $rgoHome; NoUserPath = $true }
 $installed = $false
@@ -175,5 +180,7 @@ try {
     $env:USERPROFILE = $oldProfile
     $env:CARGO_HOME = $oldCargoHome
     $env:RGO_HOME = $oldRgoHome
+    $env:RUSTUP_HOME = $oldRustupHome
+    $env:RUSTUP_TOOLCHAIN = $oldToolchain
     $env:PATH = $oldPath
 }

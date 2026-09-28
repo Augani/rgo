@@ -13,6 +13,11 @@ mod unix {
     use assert_cmd::cargo::cargo_bin;
     use rgo_testkit::{Sandbox, ensure_workspace_bins_built};
 
+    fn wrapper_bin() -> PathBuf {
+        cargo_bin("rgo")
+            .with_file_name(format!("rgo-rustc-wrapper{}", std::env::consts::EXE_SUFFIX))
+    }
+
     // These end-to-end cases each launch a daemon and compiler processes. Running
     // separate sandboxes simultaneously can starve the short IPC timeout and
     // turn a correct single-flight hit into a load-dependent fallback compile.
@@ -114,7 +119,7 @@ printf 'dep:%s\n' "$name" > "$out/$name.d"
     }
 
     fn command_for(sb: &Sandbox, fixture: &Fixture, context: &str, extra_args: &[&str]) -> Command {
-        let mut command = sb.cmd(cargo_bin("rgo-rustc-wrapper"));
+        let mut command = sb.cmd(wrapper_bin());
         command
             .env("FAKE_RUSTC_LOG", &fixture.log)
             .env("CARGO_MANIFEST_DIR", &fixture.workspace)
@@ -308,7 +313,7 @@ printf 'dep:%s\n' "$name" > "$out/$name.d"
         worktree: &std::path::Path,
         context: &str,
     ) -> Command {
-        let mut command = sb.cmd(cargo_bin("rgo-rustc-wrapper"));
+        let mut command = sb.cmd(wrapper_bin());
         command
             .env("FAKE_RUSTC_LOG", &fixture.log)
             .env("CARGO_MANIFEST_DIR", worktree)
@@ -840,7 +845,7 @@ printf 'dep:%s\n' "$name" > "$out/$name.d"
             .map(|_| {
                 let started = std::time::Instant::now();
                 let status = sb
-                    .cmd(cargo_bin("rgo-rustc-wrapper"))
+                    .cmd(wrapper_bin())
                     .env("RGO_BYPASS", "1")
                     .env("FAKE_RUSTC_LOG", &fixture.log)
                     .arg(&fixture.fake_rustc)
@@ -1730,7 +1735,7 @@ printf 'dep:%s\n' "$name" > "$out/$name.d"
         let mut daemon = start_daemon(&sb);
 
         let invoke = |context: &str, crate_type: &str, emit: &str| {
-            let mut command = sb.cmd(cargo_bin("rgo-rustc-wrapper"));
+            let mut command = sb.cmd(wrapper_bin());
             command
                 .env("FAKE_RUSTC_LOG", &fixture.log)
                 .env("CARGO_MANIFEST_DIR", &fixture.workspace)

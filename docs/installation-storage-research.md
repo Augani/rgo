@@ -206,8 +206,9 @@ preflight now reproduces this sequence. Actual crates.io resolution and public
 source installation still require publication in dependency order. The
 checkout initially had no Git remote and its declared repository URL was
 unavailable. On 2026-09-28 an owned public [Augani/rgo](https://github.com/Augani/rgo)
-repository was created and configured as `origin`; source publication and public
-installer verification remain future release steps.
+repository was created and configured as `origin`. The guarded implementation
+was subsequently pushed to `master`; public CI and release artifact verification
+remain open.
 
 Service ownership follow-up: the original fixed launchd/systemd/Task Scheduler
 name let distinct storage roots contend for one per-user registration. The

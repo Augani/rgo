@@ -22,8 +22,13 @@ fn setup_dry_run_includes_the_platform_service_without_mutating_the_sandbox() {
     );
     let output = String::from_utf8_lossy(&result.stdout);
     assert!(output.contains("would install service"), "{output}");
-    assert!(output.contains("<string>daemon</string>"), "{output}");
-    assert!(output.contains("<string>--foreground</string>"), "{output}");
+    #[cfg(target_os = "macos")]
+    assert!(
+        output.contains("<string>daemon</string><string>--foreground</string>"),
+        "{output}"
+    );
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    assert!(output.contains("daemon --foreground"), "{output}");
     assert!(!sandbox.cargo_home.join("config.toml").exists());
 
     let undo = sandbox
