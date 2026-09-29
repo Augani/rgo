@@ -89,6 +89,9 @@ process-level session guard.
   launch. Earlier [Windows job checks](https://github.com/Augani/rgo/actions/runs/36484591309)
   observed child termination before the guard became available. A live
   `cargo run` fixture protected its own context while another was reclaimed.
+- The [green lock-identity matrix](https://github.com/Augani/rgo/actions/runs/36535047318)
+  exercised Windows replacement detection and denial of direct lock-file
+  rename while an rgo handle is open, alongside the stable installer probe.
 - A private Cargo 1.98.0 probe showed full `cargo clean` removes the sidecar
   and in-context pin marker, while `clean -p` leaves the sidecar. The next
   supervised build restores it; durable pin intent survives outside the
