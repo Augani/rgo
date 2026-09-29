@@ -176,8 +176,23 @@ pub fn run(paths: RgoPaths, cfg: Resolved) -> Result<()> {
     let mut db = StateDb::open(&paths)?;
     db.recover_cache_builds()?;
     db.recover_remote_jobs()?;
-    db.reconcile(&paths)?;
-    reconcile_cache(&mut db, &cas)?;
+    // Explicit status/GC requests reconcile contexts before using them. In
+    // default manual mode there is no destructive background work, so avoid
+    // delaying daemon startup with a full build-tree walk.
+    if cfg.gc.auto {
+        db.reconcile(&paths)?;
+    } else {
+        // Keep the upgrade recovery contract for legacy in-context pins
+        // without measuring every file beneath each build directory.
+        for dir in paths.checked_managed_build_dirs()? {
+            if context::is_pinned_dir(&dir) {
+                context::migrate_legacy_pin(&paths, &dir)?;
+            }
+        }
+    }
+    if cfg.gc.auto || cfg.cache.enabled {
+        reconcile_cache(&mut db, &cas)?;
+    }
     let mut event_drainer = CacheEventDrainScanner::default();
     drain_cache_events(&paths, &db, &mut event_drainer)?;
     let mut batch_prune_cursor = 0;

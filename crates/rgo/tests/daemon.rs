@@ -99,6 +99,29 @@ fn start_daemon_with_poll(sb: &Sandbox, poll_secs: Option<&str>) -> Child {
 }
 
 #[test]
+fn manual_daemon_startup_preserves_legacy_pin_intent() {
+    let sb = Sandbox::new().unwrap();
+    let paths = rgo_core::paths::RgoPaths {
+        root: sb.rgo_home.clone(),
+    };
+    paths.ensure_layout().unwrap();
+    let context = paths.builds_dir().join("aa/pinned");
+    std::fs::create_dir_all(&context).unwrap();
+    let marker = context.join(rgo_core::context::PIN_MARKER);
+    std::fs::write(&marker, b"").unwrap();
+
+    let mut daemon = start_daemon(&sb);
+    assert_eq!(
+        std::fs::read(paths.pin_records_dir().join("aa/pinned.pin")).unwrap(),
+        b"pin\n"
+    );
+    std::fs::remove_file(marker).unwrap();
+    assert!(rgo_core::context::is_pinned(&paths, &context));
+    daemon.kill().unwrap();
+    daemon.wait().unwrap();
+}
+
+#[test]
 fn opted_in_maintenance_reclaims_idle_bytes_and_reports_pinned_excess() {
     struct StopDaemon(Child);
     impl Drop for StopDaemon {
