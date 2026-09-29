@@ -662,27 +662,6 @@ fn handle_request_result(state: &State, request: Request) -> Result<Response> {
             db.fail_cache_build(&key, lease_id, &reason)?;
             Ok(Response::Ok)
         }
-        Request::CachePublish { manifest } => {
-            if !state.cfg.cache.enabled {
-                return Ok(Response::CacheMiss {
-                    reason: "cache_disabled".into(),
-                });
-            }
-            if !cache_admission_allowed(state) {
-                return Ok(Response::CacheMiss {
-                    reason: "free_space_pressure".into(),
-                });
-            }
-            let _operation = state.operation_lock.lock().unwrap();
-            let manifest = native_manifest(&manifest)?;
-            state.cas.write_manifest(&manifest)?;
-            let db = state.db.lock().unwrap();
-            db.record_cache_manifest(
-                &wire_manifest(&manifest),
-                &state.cas.manifest_path(&manifest.key),
-            )?;
-            Ok(Response::Ok)
-        }
         Request::RecordCacheEvent { event } => {
             let db = state.db.lock().unwrap();
             db.record_cache_event(&event)?;

@@ -367,8 +367,8 @@ fn run_cache_producer(
                 Ok(manifest) => {
                     // Publication is outside the rustc hot path, and the daemon
                     // may be flushing the manifest under concurrent CI load.
-                    // A missed acknowledgement must not make the next build
-                    // silently recompile an otherwise published entry.
+                    // If the request does not reach the daemon, the next build
+                    // must recompile instead of seeing an uncommitted entry.
                     let commit = request_with_timeout(
                         Request::CacheCommit {
                             key: candidate.key.to_string(),

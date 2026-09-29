@@ -6,7 +6,7 @@ rebuild-over-migrate when the filesystem is the source of truth.
 
 | Surface | Version | Location | Policy |
 |---|---|---|---|
-| IPC protocol | `PROTOCOL_VERSION` = 5 | daemon.sock handshake | strict equality; mismatch → `protocol_mismatch` error → client falls back to plain cargo. Additive status/GC byte-breakdown fields default when absent; they do not change the handshake version. Never breaks builds. |
+| IPC protocol | `PROTOCOL_VERSION` = 6 | daemon.sock handshake | strict equality; mismatch → `protocol_mismatch` error → client falls back to plain cargo. Version 6 removes the unused lease-free `CachePublish` request; manifests are published through validated `CacheCommit`. Additive status/GC byte-breakdown fields default when absent; they do not change the handshake version. Never breaks builds. |
 | SQLite schema | `SCHEMA_VERSION` = 4 | `state/meta.sqlite` `schema_meta` | the DB is a *derived index*. Confirmed SQLite corruption causes the file set to be renamed aside and rebuilt. Lock contention, permissions, and unsupported newer schemas are reported rather than treated as corruption. Current additive schema changes migrate in place; an incompatible future change needs its own explicit policy. |
 | Cache key schema | `CACHE_SCHEMA_VERSION` = 3 | inside every `ArtifactKey` | a key-format change rotates *all* keys — stale entries become unreachable garbage reclaimed by CAS GC. Never reinterpret an old key under a new format. |
 | CAS manifest | `MANIFEST_VERSION` = 1 | `cas/manifests/`, remote store | fetched manifests must match the version and key exactly or the fetch fails closed to a local miss. Local manifests are verified object-by-object before publication. |

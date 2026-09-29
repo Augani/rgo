@@ -6,7 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u32 = 5;
+pub const PROTOCOL_VERSION: u32 = 6;
 pub const MAX_FRAME_SIZE: usize = 1024 * 1024;
 pub const DEFAULT_LEASE_TTL_SECS: u32 = 30;
 pub const DEFAULT_HEARTBEAT_SECS: u32 = 10;
@@ -116,9 +116,6 @@ pub enum Request {
         key: String,
         lease_id: u64,
         reason: String,
-    },
-    CachePublish {
-        manifest: CacheManifest,
     },
     RecordCacheEvent {
         event: CacheEvent,
