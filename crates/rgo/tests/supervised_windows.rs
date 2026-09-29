@@ -488,7 +488,15 @@ fn plain_cargo_starts_opted_in_maintenance_without_rgo_commands() {
         Request::QueryStatus,
         Duration::from_secs(5),
     )
-    .unwrap();
+    .unwrap_or_else(|error| {
+        panic!(
+            "plain Cargo did not start maintenance: {error:#}; build stderr: {}; daemon log: {}; managed builds: {:?}; pointer: {}",
+            String::from_utf8_lossy(&build.stderr),
+            std::fs::read_to_string(paths.logs_dir().join("daemon.log")).unwrap_or_default(),
+            paths.checked_managed_build_dirs().unwrap_or_default(),
+            std::fs::read_to_string(sandbox.cargo_home.join(".rgo-home")).unwrap_or_default(),
+        )
+    });
     let Response::Status(status) = response else {
         panic!("plain Cargo did not start a daemon: {response:?}");
     };
