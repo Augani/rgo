@@ -84,6 +84,11 @@ process-level session guard.
   rename-pause run](https://github.com/Augani/rgo/actions/runs/36513462716)
   checked that a new session waits at GC's locked and staged points and can
   recreate a fresh context only after removal.
+- A private-home Unix real-Cargo race pauses an explicit context clean after
+  GC takes its stable guard. A newly started unchanged `cargo build` reaches
+  its session lock but cannot enter Cargo until deletion finishes; it then
+  recreates the managed context while the old generation's marker stays gone.
+  This is one start/delete ordering case, not the full command and platform matrix.
 - The [Windows creation-time assignment run](https://github.com/Augani/rgo/actions/runs/36518298190)
   exercised a guardian kill before Cargo resumed and a real child after
   launch. Earlier [Windows job checks](https://github.com/Augani/rgo/actions/runs/36484591309)

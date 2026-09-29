@@ -243,6 +243,8 @@ pub(crate) fn verify_lock_identity(path: &Path, file: &File) -> Result<()> {
 pub fn lock_cargo_session(paths: &RgoPaths, context: Option<&Path>) -> Result<SessionGuard> {
     #[cfg(unix)]
     let local = open_local_guard(paths)?;
+    #[cfg(all(unix, debug_assertions))]
+    mark_session_lock_attempt_for_test()?;
     #[cfg(unix)]
     FileExt::lock_shared(&local)?;
     #[cfg(unix)]
@@ -264,6 +266,18 @@ pub fn lock_cargo_session(paths: &RgoPaths, context: Option<&Path>) -> Result<Se
         #[cfg(unix)]
         _descendants: descendants,
     })
+}
+
+#[cfg(all(unix, debug_assertions))]
+fn mark_session_lock_attempt_for_test() -> Result<()> {
+    let Some(marker) = std::env::var_os("RGO_TEST_SESSION_LOCK_MARKER") else {
+        return Ok(());
+    };
+    let marker = PathBuf::from(marker);
+    let staging = marker.with_extension("tmp");
+    std::fs::write(&staging, b"waiting")?;
+    std::fs::rename(staging, marker)?;
+    Ok(())
 }
 
 /// GC never waits behind a Cargo session: a queued writer could block a nested

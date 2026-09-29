@@ -387,6 +387,8 @@ fn stage_and_remove_with(
     };
     validate_deletion_path(paths, victim)?;
     after_phase(DeletePhase::Locked);
+    #[cfg(debug_assertions)]
+    pause_after_gc_lock_for_test()?;
     if context
         .as_ref()
         .is_some_and(|context| crate::context::is_pinned(paths, context))
@@ -430,6 +432,33 @@ fn stage_and_remove_with(
         warn!(path = %victim.display(), %error, "deferred unpin record pruning");
     }
     removed.with_context(|| format!("removing {}", staged.display()))
+}
+
+/// A debug-build fault point for a real-Cargo race fixture. GC holds the
+/// stable exclusion guard while the test starts another Cargo invocation.
+#[cfg(debug_assertions)]
+fn pause_after_gc_lock_for_test() -> Result<()> {
+    use std::time::Instant;
+
+    let Some(marker) = std::env::var_os("RGO_TEST_GC_LOCKED_MARKER") else {
+        return Ok(());
+    };
+    let marker = PathBuf::from(marker);
+    let release = PathBuf::from(
+        std::env::var_os("RGO_TEST_GC_LOCKED_RELEASE")
+            .context("RGO_TEST_GC_LOCKED_RELEASE is required with the marker")?,
+    );
+    let staging = marker.with_extension("tmp");
+    std::fs::write(&staging, b"locked")?;
+    std::fs::rename(&staging, &marker)?;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !release.is_file() {
+        if Instant::now() >= deadline {
+            anyhow::bail!("timed out at the GC lifecycle lock test point");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    Ok(())
 }
 
 /// Only rgo-owned child paths may enter the rename-before-delete sequence.
