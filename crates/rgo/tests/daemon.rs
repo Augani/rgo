@@ -85,6 +85,95 @@ fn start_daemon(sb: &Sandbox) -> Child {
     panic!("daemon did not answer IPC: {diagnostics}");
 }
 
+#[test]
+fn opted_in_maintenance_reclaims_idle_bytes_and_reports_pinned_excess() {
+    struct StopDaemon(Child);
+    impl Drop for StopDaemon {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    let sb = Sandbox::new().unwrap();
+    let paths = rgo_core::paths::RgoPaths {
+        root: sb.rgo_home.clone(),
+    };
+    paths.ensure_layout().unwrap();
+    let pinned_project = sb.simple_bin("budget-pinned").unwrap();
+    let idle_project = sb.simple_bin("budget-idle").unwrap();
+    let pinned = paths.builds_dir().join("aa/pinned");
+    let idle = paths.builds_dir().join("bb/idle");
+    for (dir, project) in [(&pinned, &pinned_project), (&idle, &idle_project)] {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(dir.join("intermediates"), vec![0u8; 2 * 1024 * 1024]).unwrap();
+        rgo_core::context::write_sidecar(dir, project, &project.join("Cargo.toml"), None).unwrap();
+    }
+    rgo_core::context::write_durable_pin(&paths, &pinned).unwrap();
+
+    // Establish the operational baseline before choosing a budget that even
+    // removing the entire idle context cannot satisfy because of the pin.
+    let baseline = StopDaemon(start_daemon(&sb));
+    drop(baseline);
+    let contexts = rgo_core::context::list(&paths).unwrap();
+    let pinned_bytes = contexts
+        .iter()
+        .find(|context| context.dir == pinned)
+        .unwrap()
+        .usage
+        .physical_bytes;
+    let other_bytes = rgo_core::size::auxiliary_usage(&paths)
+        .unwrap()
+        .physical_bytes
+        + rgo_core::size::Scanner::new()
+            .measure_optional(&paths.cas_dir())
+            .unwrap()
+            .physical_bytes;
+    let max_size = other_bytes + pinned_bytes / 2;
+    std::fs::write(
+        sb.rgo_home.join("config.toml"),
+        format!("[storage]\nmax_size = '{max_size}B'\nmin_free_space = '0B'\n[gc]\nauto = true\n"),
+    )
+    .unwrap();
+
+    let mut daemon = StopDaemon(
+        sb.cmd(cargo_bin("rgo"))
+            .args(["daemon", "--foreground"])
+            .env("RGO_DAEMON_POLL_SECS", "1")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    while idle.exists() && std::time::Instant::now() < deadline {
+        assert!(daemon.0.try_wait().unwrap().is_none());
+        thread::sleep(Duration::from_millis(100));
+    }
+    assert!(!idle.exists(), "automatic GC did not reclaim eligible data");
+    assert!(pinned.exists(), "automatic GC removed a pinned context");
+    let response = ipc::request_with_timeout(
+        &paths.socket_path(),
+        Request::QueryStatus,
+        Duration::from_secs(5),
+    )
+    .unwrap();
+    let Response::Status(status) = response else {
+        panic!("daemon did not return storage status: {response:?}");
+    };
+    assert_eq!(status.contexts, 1);
+    assert!(status.last_gc_at > 0);
+    assert!(status.protected_context_bytes >= pinned_bytes);
+    assert!(status.unmet_budget_bytes.unwrap() > 0);
+    assert!(
+        status
+            .unmet_budget_reason
+            .as_deref()
+            .unwrap()
+            .contains("protected build contexts")
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn status_surfaces_a_daemon_measurement_error_without_starting_another_daemon() {
