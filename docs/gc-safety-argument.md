@@ -124,8 +124,10 @@ process-level session guard.
 - The supervised launcher refreshes its owned sidecar before each admitted
   Cargo invocation. A private-home unchanged second `cargo build` confirms a
   no-op invocation updates `last_seen` without rustc running. It passed locally
-  on macOS arm64; platform CI remains open. Native direct-Cargo no-ops do not
-  provide this signal and are not admitted to destructive cleanup.
+  on macOS arm64 and in the [full Linux, macOS, and Windows CI
+  matrix](https://github.com/Augani/rgo/actions/runs/36635824970). Native
+  direct-Cargo no-ops do not provide this signal and are not admitted to
+  destructive cleanup.
 - That fixture now starts four manual GC clients during the held test process,
   pausing the first deletion while three more requests remain in flight. The
   [platform matrix](https://github.com/Augani/rgo/actions/runs/36594347437) passed on a Windows stable
