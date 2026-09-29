@@ -76,7 +76,7 @@ jobs:
           fi
           cat "SHA256SUMS-${{ matrix.target }}.txt"
       - name: Attest release bundle
-        if: github.event.repository.visibility == 'public' && startsWith(github.ref, 'refs/tags/')
+        if: github.event.repository.visibility == 'public'
         uses: actions/attest@v4
         with:
           subject-path: artifacts/rgo-${{ github.ref_name }}-${{ matrix.target }}.*
@@ -129,12 +129,12 @@ jobs:
               raise SystemExit(f'unexpected Windows ZIP entries: {actual}')
           PY
       - name: Attest Unix installer
-        if: startsWith(github.ref, 'refs/tags/')
+        if: github.event.repository.visibility == 'public'
         uses: actions/attest@v4
         with:
           subject-path: dist/rgo-install-unix.py
       - name: Attest Windows installer
-        if: startsWith(github.ref, 'refs/tags/')
+        if: github.event.repository.visibility == 'public'
         uses: actions/attest@v4
         with:
           subject-path: dist/rgo-install-windows.ps1
