@@ -1718,11 +1718,14 @@ fn maintenance(state: &State) -> Result<()> {
             let mut db = state.db.lock().unwrap();
             let age_due = crate::context::unix_now().saturating_sub(db.last_real_gc_at()?)
                 >= AGE_MAINTENANCE_INTERVAL.as_secs();
-            db.reconcile_contexts(&state.paths, &snapshot.contexts)?;
-            !migrated
+            let should_gc = !migrated
                 && (snapshot.total_bytes() > state.cfg.soft_watermark
                     || free_bytes < state.cfg.min_free_space
-                    || age_due)
+                    || age_due);
+            if !should_gc {
+                db.reconcile_contexts(&state.paths, &snapshot.contexts)?;
+            }
+            should_gc
         } else {
             false
         };
