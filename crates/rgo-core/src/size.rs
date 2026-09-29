@@ -191,6 +191,21 @@ pub(crate) fn windows_volume_serial(path: &Path) -> Option<u64> {
         .filter(|serial| *serial != 0)
 }
 #[cfg(windows)]
+#[allow(unsafe_code)]
+pub(crate) fn windows_open_file_id(file: &std::fs::File) -> Option<(u64, u64)> {
+    use std::os::windows::io::AsRawHandle;
+
+    let mut info = ByHandleFileInformation::default();
+    // SAFETY: `file` owns a live Win32 handle and `info` has the expected layout.
+    if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) } == 0 {
+        return None;
+    }
+    Some((
+        u64::from(info.volume_serial),
+        (u64::from(info.file_index_high) << 32) | u64::from(info.file_index_low),
+    ))
+}
+#[cfg(windows)]
 fn md_nlink(path: &Path, _md: &std::fs::Metadata) -> u64 {
     windows_file_info(path)
         .map(|info| u64::from(info.number_of_links))
@@ -233,6 +248,7 @@ unsafe extern "system" {
 
 #[cfg(windows)]
 #[repr(C)]
+#[derive(Default)]
 #[allow(dead_code)]
 struct ByHandleFileInformation {
     attributes: u32,
@@ -270,21 +286,7 @@ fn windows_file_info(path: &Path) -> Option<ByHandleFileInformation> {
     if handle as isize == -1 {
         return None;
     }
-    let mut info = ByHandleFileInformation {
-        attributes: 0,
-        creation_time_low: 0,
-        creation_time_high: 0,
-        last_access_time_low: 0,
-        last_access_time_high: 0,
-        last_write_time_low: 0,
-        last_write_time_high: 0,
-        volume_serial: 0,
-        file_size_high: 0,
-        file_size_low: 0,
-        number_of_links: 0,
-        file_index_high: 0,
-        file_index_low: 0,
-    };
+    let mut info = ByHandleFileInformation::default();
     let ok = unsafe { GetFileInformationByHandle(handle, &mut info) != 0 };
     let _ = unsafe { CloseHandle(handle) };
     ok.then_some(info)

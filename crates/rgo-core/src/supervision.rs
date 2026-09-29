@@ -207,6 +207,20 @@ pub(crate) fn verify_lock_identity(path: &Path, file: &File) -> Result<()> {
             bail!("lifecycle lock was replaced: {}", path.display());
         }
     }
+    #[cfg(windows)]
+    {
+        let named_file = OpenOptions::new()
+            .read(true)
+            .open(path)
+            .with_context(|| format!("opening named lifecycle lock {}", path.display()))?;
+        let opened_id = crate::size::windows_open_file_id(file)
+            .with_context(|| format!("identifying opened lifecycle lock {}", path.display()))?;
+        let named_id = crate::size::windows_open_file_id(&named_file)
+            .with_context(|| format!("identifying named lifecycle lock {}", path.display()))?;
+        if opened_id != named_id {
+            bail!("lifecycle lock was replaced: {}", path.display());
+        }
+    }
     Ok(())
 }
 
@@ -468,6 +482,20 @@ mod tests {
         let path = lock_path(&paths, None, true).unwrap();
         let old = open_lock(&paths, None, true).unwrap();
         std::fs::remove_file(&path).unwrap();
+        std::fs::write(&path, "replacement").unwrap();
+        assert!(verify_lock_identity(&path, &old).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn replaced_windows_lock_file_fails_identity_check() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = RgoPaths {
+            root: root.path().join("rgo"),
+        };
+        let path = lock_path(&paths, None, true).unwrap();
+        let old = open_lock(&paths, None, true).unwrap();
+        std::fs::rename(&path, root.path().join("old-lock")).unwrap();
         std::fs::write(&path, "replacement").unwrap();
         assert!(verify_lock_identity(&path, &old).is_err());
     }
