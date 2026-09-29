@@ -26,6 +26,7 @@ import tarfile
 import tempfile
 import urllib.parse
 import urllib.request
+import zipfile
 from pathlib import Path, PurePosixPath
 
 
@@ -43,6 +44,24 @@ ALLOWED_FILES = {
 }
 VERSION = re.compile(r"v[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?\Z")
 REPO = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\Z")
+GH_VERSION = "2.101.0"
+# Digests from cli/cli's verified v2.101.0 release checksum manifest. The
+# verifier is extracted only into the installer's disposable scratch directory.
+GH_VERIFIER_ASSETS = {
+    "aarch64-apple-darwin": (
+        "gh_2.101.0_macOS_arm64.zip",
+        "e4303e39d8f07141c4bad4b99b01079f05029c59b27076e8fbc825c985ecdd8b",
+    ),
+    "x86_64-apple-darwin": (
+        "gh_2.101.0_macOS_amd64.zip",
+        "a6fd66c88e2f07d6e4e058173db341d07dd74d58cf8f19ae668293d2bb614ca3",
+    ),
+    "x86_64-unknown-linux-gnu": (
+        "gh_2.101.0_linux_amd64.tar.gz",
+        "9bca2d1c16825f109907a23307628a2f0698fbf99662b73a5cf0b020293072b8",
+    ),
+}
+MAX_GH_BINARY = 100 * 1024 * 1024
 
 
 class InstallError(Exception):
@@ -96,6 +115,21 @@ def expected_sha256(manifest: str, filename: str) -> str:
 def download(url: str, destination: Path) -> None:
     if urllib.parse.urlparse(url).scheme != "https":
         raise InstallError("release downloads must use HTTPS")
+    curl = shutil.which("curl")
+    if curl:
+        command = [
+            curl, "--fail", "--silent", "--show-error", "--location",
+            "--proto", "=https", "--proto-redir", "=https",
+            "--max-redirs", "8", "--connect-timeout", "30",
+            "--max-time", "180", "--max-filesize", str(MAX_ARCHIVE),
+            "--output", str(destination), url,
+        ]
+        result = subprocess.run(command, capture_output=True, text=True, check=False)
+        if result.returncode != 0:
+            raise InstallError(f"HTTPS download failed: {result.stderr.strip() or result.returncode}")
+        if destination.stat().st_size > MAX_ARCHIVE:
+            raise InstallError("release asset exceeds the installer size limit")
+        return
     opener = urllib.request.build_opener(HTTPSOnly())
     request = urllib.request.Request(url, headers={"User-Agent": "rgo-installer/0.1"})
     with opener.open(request, timeout=30) as source, destination.open("xb") as output:
@@ -107,7 +141,63 @@ def download(url: str, destination: Path) -> None:
             output.write(block)
 
 
-def verify_attestation(archive: Path, args: argparse.Namespace) -> None:
+def verifier_binary(scratch: Path, target: str) -> Path:
+    installed = shutil.which("gh")
+    if installed:
+        try:
+            capability = subprocess.run(
+                [installed, "attestation", "verify", "--help"],
+                capture_output=True,
+                timeout=10,
+                check=False,
+            )
+            if capability.returncode == 0 and b"--source-ref" in capability.stdout:
+                return Path(installed)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+
+    asset, expected = GH_VERIFIER_ASSETS[target]
+    verifier_archive = scratch / asset
+    download(f"https://github.com/cli/cli/releases/download/v{GH_VERSION}/{asset}", verifier_archive)
+    if sha256(verifier_archive) != expected:
+        raise InstallError("GitHub CLI verifier SHA-256 mismatch")
+    member_name = f"{asset.removesuffix('.zip').removesuffix('.tar.gz')}/bin/gh"
+    binary = scratch / "gh"
+    if asset.endswith(".zip"):
+        with zipfile.ZipFile(verifier_archive) as bundle:
+            members = [item for item in bundle.infolist() if item.filename == member_name]
+            if len(members) != 1 or members[0].is_dir() or members[0].file_size > MAX_GH_BINARY:
+                raise InstallError("GitHub CLI verifier archive has an invalid binary")
+            with bundle.open(members[0]) as source:
+                copy_verifier(source, binary)
+    else:
+        with tarfile.open(verifier_archive, "r:gz") as bundle:
+            members = [item for item in bundle.getmembers() if item.name == member_name]
+            if len(members) != 1 or not members[0].isfile() or members[0].size > MAX_GH_BINARY:
+                raise InstallError("GitHub CLI verifier archive has an invalid binary")
+            source = bundle.extractfile(members[0])
+            if source is None:
+                raise InstallError("GitHub CLI verifier archive is truncated")
+            with source:
+                copy_verifier(source, binary)
+    binary.chmod(0o700)
+    version = subprocess.run([binary, "--version"], capture_output=True, text=True, check=True)
+    if not version.stdout.startswith(f"gh version {GH_VERSION} "):
+        raise InstallError("downloaded GitHub CLI verifier has the wrong version")
+    return binary
+
+
+def copy_verifier(source, destination: Path) -> None:
+    size = 0
+    with destination.open("xb") as output:
+        while block := source.read(1024 * 1024):
+            size += len(block)
+            if size > MAX_GH_BINARY:
+                raise InstallError("GitHub CLI verifier binary exceeds the size limit")
+            output.write(block)
+
+
+def verify_attestation(archive: Path, args: argparse.Namespace, scratch: Path, target: str) -> None:
     if args.development_bundle:
         if args.archive is None:
             raise InstallError("--development-bundle is only allowed with a local archive")
@@ -115,11 +205,9 @@ def verify_attestation(archive: Path, args: argparse.Namespace) -> None:
         return
     if not args.repo:
         raise InstallError("--repo OWNER/REPO is required to verify release provenance")
-    gh = shutil.which("gh")
-    if gh is None:
-        raise InstallError("GitHub CLI `gh` is required for release attestation verification")
+    gh = verifier_binary(scratch, target)
     command = [
-        gh,
+        str(gh),
         "attestation",
         "verify",
         str(archive),
@@ -1146,7 +1234,7 @@ def main() -> None:
         actual = sha256(archive)
         if actual != expected:
             raise InstallError(f"archive SHA-256 mismatch: expected {expected}, got {actual}")
-        verify_attestation(archive, args)
+        verify_attestation(archive, args, scratch, target)
 
         with tempfile.TemporaryDirectory(prefix="rgo-verify-") as verification:
             extracted = Path(verification)

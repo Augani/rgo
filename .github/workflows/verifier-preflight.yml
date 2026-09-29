@@ -1,0 +1,69 @@
+name: Installer verifier preflight
+
+# The installers can fetch a pinned GitHub CLI verifier when gh is absent.
+# Exercise that network bootstrap explicitly without running it on every push.
+on:
+  workflow_dispatch: {}
+
+jobs:
+  unix:
+    name: ${{ matrix.os }} pinned verifier
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, macos-14, macos-15-intel]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fetch and run pinned verifier without installed gh
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import importlib.util
+          import pathlib
+          import tempfile
+          from unittest import mock
+
+          source = pathlib.Path('scripts/install-unix.py')
+          spec = importlib.util.spec_from_file_location('rgo_installer', source)
+          installer = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(installer)
+          installed_which = installer.shutil.which
+          with tempfile.TemporaryDirectory(prefix='rgo-verifier-preflight-') as scratch:
+              with mock.patch.object(
+                  installer.shutil, 'which',
+                  side_effect=lambda name: None if name == 'gh' else installed_which(name),
+              ):
+                  binary = installer.verifier_binary(pathlib.Path(scratch), installer.target_triple())
+              assert binary.is_file() and binary.stat().st_size > 0
+          PY
+
+  windows:
+    name: windows-latest pinned verifier
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fetch and run pinned verifier without installed gh
+        shell: powershell
+        run: |
+          $source = Get-Content -LiteralPath scripts/install-windows.ps1 -Raw
+          $tokens = $null
+          $parseErrors = $null
+          $ast = [System.Management.Automation.Language.Parser]::ParseInput($source, [ref]$tokens, [ref]$parseErrors)
+          if ($parseErrors.Count -ne 0) { throw "installer has PowerShell parse errors: $parseErrors" }
+          foreach ($name in @('Assert-Condition', 'Invoke-Checked', 'Download-Https', 'File-Digest', 'Resolve-AttestationVerifier')) {
+              $definitions = @($ast.FindAll({ param($node)
+                  $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name
+              }, $true))
+              if ($definitions.Count -ne 1) { throw "expected one $name definition" }
+              Invoke-Expression $definitions[0].Extent.Text
+          }
+          $env:PATH = ''
+          $scratch = Join-Path $env:RUNNER_TEMP "rgo-verifier-$([guid]::NewGuid().ToString('N'))"
+          New-Item -ItemType Directory -Path $scratch | Out-Null
+          try {
+              $binary = Resolve-AttestationVerifier $scratch
+              if (-not (Test-Path -LiteralPath $binary)) { throw 'verifier was not extracted' }
+          } finally {
+              Remove-Item -LiteralPath $scratch -Recurse -Force -ErrorAction SilentlyContinue
+          }

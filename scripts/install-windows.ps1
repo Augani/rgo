@@ -220,6 +220,45 @@ function File-Digest([string]$Path) {
     return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
 }
 
+function Resolve-AttestationVerifier([string]$Scratch) {
+    $installed = Get-Command gh -CommandType Application -ErrorAction SilentlyContinue
+    if ($installed) {
+        try {
+            $helpText = (& $installed.Source attestation verify --help 2>&1 | Out-String)
+            if ($LASTEXITCODE -eq 0 -and $helpText.Contains('--source-ref')) {
+                return $installed.Source
+            }
+        } catch { }
+    }
+
+    # Pinned to cli/cli's verified v2.101.0 release. Keep the verifier only in
+    # this installation attempt's scratch directory; never modify the user's PATH.
+    $asset = 'gh_2.101.0_windows_amd64.zip'
+    $expected = 'bc6c814367b193cd8e713611d61e36013c0ef843b8f516458fe3eda039192794'
+    $archive = Join-Path $Scratch $asset
+    Download-Https "https://github.com/cli/cli/releases/download/v2.101.0/$asset" $archive
+    Assert-Condition ((File-Digest $archive) -eq $expected) 'GitHub CLI verifier SHA-256 mismatch'
+    $binary = Join-Path $Scratch 'gh.exe'
+    Add-Type -AssemblyName System.IO.Compression
+    $stream = [IO.File]::OpenRead($archive)
+    try {
+        $zip = [IO.Compression.ZipArchive]::new($stream, [IO.Compression.ZipArchiveMode]::Read, $true)
+        try {
+            $verifierEntries = @($zip.Entries | Where-Object { $_.FullName -ceq 'bin/gh.exe' })
+            Assert-Condition ($verifierEntries.Count -eq 1 -and $verifierEntries[0].Length -le 104857600) 'GitHub CLI verifier archive has an invalid binary'
+            $source = $verifierEntries[0].Open()
+            try {
+                $target = [IO.File]::Open($binary, [IO.FileMode]::CreateNew)
+                try { $source.CopyTo($target) } finally { $target.Dispose() }
+            } finally { $source.Dispose() }
+        } finally { $zip.Dispose() }
+    } finally { $stream.Dispose() }
+    Assert-Condition ((Get-Item -LiteralPath $binary).Length -le 104857600) 'GitHub CLI verifier binary exceeds the size limit'
+    $version = Invoke-Checked $binary @('--version')
+    Assert-Condition ($version.StartsWith('gh version 2.101.0 ', [StringComparison]::Ordinal)) 'downloaded GitHub CLI verifier has the wrong version'
+    return $binary
+}
+
 function Encoded-File([string]$Path) {
     if (-not (Test-Path -LiteralPath $Path)) { return $null }
     Assert-PlainFile $Path
@@ -1099,9 +1138,7 @@ try {
         $digest = File-Digest $zipPath
         Assert-Condition ($digest -eq $expected) "archive SHA-256 mismatch: expected $expected, got $digest"
         if (-not $DevelopmentBundle) {
-            $ghCommand = Get-Command gh -ErrorAction SilentlyContinue
-            $gh = if ($ghCommand) { $ghCommand.Source } else { $null }
-            Assert-Condition ($gh) 'GitHub CLI gh is required to verify the release attestation'
+            $gh = Resolve-AttestationVerifier $scratch
             Invoke-Checked $gh @('attestation', 'verify', $zipPath, '--repo', $Repository,
                 '--signer-workflow', "$Repository/.github/workflows/release.yml", '--source-ref', "refs/tags/$ReleaseTag") | Out-Null
         }
