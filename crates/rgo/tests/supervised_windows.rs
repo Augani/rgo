@@ -1399,3 +1399,167 @@ fn main() {
     gc::remove_atomically(&paths, &contexts[0]).unwrap();
     assert!(!contexts[0].exists());
 }
+
+#[cfg(debug_assertions)]
+#[test]
+#[allow(unsafe_code)] // Win32 Job Object handles and process liveness are checked directly.
+fn nested_parent_job_cannot_release_gc_guard_before_child_exits() {
+    use std::ffi::c_void;
+    use std::io::Read;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::HANDLE;
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_BREAKAWAY_OK,
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JobObjectExtendedLimitInformation, SetInformationJobObject,
+    };
+
+    struct ParentJob(HANDLE);
+    impl Drop for ParentJob {
+        fn drop(&mut self) {
+            unsafe { CloseHandle(self.0) };
+        }
+    }
+    struct StopLauncher(Child);
+    impl Drop for StopLauncher {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    let sandbox = Sandbox::new().unwrap();
+    let project = sandbox.simple_bin("windows-nested-job").unwrap();
+    std::fs::write(
+        project.join("src/main.rs"),
+        r#"
+fn main() {
+    let ready = std::path::PathBuf::from(std::env::var_os("RGO_TEST_READY").unwrap());
+    let staging = ready.with_extension("tmp");
+    std::fs::write(&staging, std::process::id().to_string()).unwrap();
+    std::fs::rename(staging, ready).unwrap();
+    loop { std::thread::sleep(std::time::Duration::from_millis(100)); }
+}
+"#,
+    )
+    .unwrap();
+    let parent = ParentJob(unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) });
+    assert!(!parent.0.is_null());
+    let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+    limits.BasicLimitInformation.LimitFlags =
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_BREAKAWAY_OK;
+    assert_ne!(
+        unsafe {
+            SetInformationJobObject(
+                parent.0,
+                JobObjectExtendedLimitInformation,
+                (&raw const limits).cast::<c_void>(),
+                std::mem::size_of_val(&limits) as u32,
+            )
+        },
+        0,
+        "cannot configure parent Job Object: {}",
+        std::io::Error::last_os_error()
+    );
+    let marker = sandbox.home.join("before-job");
+    let release = sandbox.home.join("release-job");
+    let ready = sandbox.home.join("nested-child-pid");
+    let real_cargo = PathBuf::from(std::env::var_os("CARGO").unwrap());
+    let mut launcher = StopLauncher(
+        sandbox
+            .cmd(env!("CARGO_BIN_EXE_rgo"))
+            .current_dir(&project)
+            .env("RGO_TEST_BEFORE_JOB_MARKER", &marker)
+            .env("RGO_TEST_BEFORE_JOB_RELEASE", &release)
+            .env("RGO_TEST_READY", &ready)
+            .args(["cargo-shim", "--real-cargo"])
+            .arg(&real_cargo)
+            .args(["--", "run", "--offline"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !marker.is_file() && Instant::now() < deadline {
+        if let Some(status) = launcher.0.try_wait().unwrap() {
+            let mut stderr = String::new();
+            launcher
+                .0
+                .stderr
+                .take()
+                .unwrap()
+                .read_to_string(&mut stderr)
+                .unwrap();
+            panic!("launcher exited before parent-job pause ({status}): {stderr}");
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    assert!(
+        marker.is_file(),
+        "launcher never reached the parent-job pause"
+    );
+    assert_ne!(
+        unsafe { AssignProcessToJobObject(parent.0, launcher.0.as_raw_handle().cast()) },
+        0,
+        "cannot place launcher in parent Job Object: {}",
+        std::io::Error::last_os_error()
+    );
+    std::fs::write(&release, b"go").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !ready.is_file() && Instant::now() < deadline {
+        if let Some(status) = launcher.0.try_wait().unwrap() {
+            let mut stderr = String::new();
+            launcher
+                .0
+                .stderr
+                .take()
+                .unwrap()
+                .read_to_string(&mut stderr)
+                .unwrap();
+            panic!("nested launcher exited before Cargo ran ({status}): {stderr}");
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    assert!(ready.is_file(), "nested Cargo did not start its program");
+    let pid: u32 = std::fs::read_to_string(&ready).unwrap().parse().unwrap();
+    let program = unsafe { OpenProcess(PROCESS_SYNCHRONIZE | PROCESS_TERMINATE, 0, pid) };
+    assert!(!program.is_null());
+    assert_eq!(unsafe { WaitForSingleObject(program, 0) }, WAIT_TIMEOUT);
+    let paths = RgoPaths {
+        root: sandbox.rgo_home.clone(),
+    };
+    let contexts = paths.checked_managed_build_dirs().unwrap();
+    assert_eq!(contexts.len(), 1);
+    assert!(
+        supervision::try_lock_gc(&paths, Some(&contexts[0]))
+            .unwrap()
+            .is_none()
+    );
+
+    launcher.0.kill().unwrap();
+    launcher.0.wait().unwrap();
+    let result = unsafe { WaitForSingleObject(program, 5_000) };
+    if result != WAIT_OBJECT_0 {
+        unsafe { TerminateProcess(program, 1) };
+        unsafe { WaitForSingleObject(program, 5_000) };
+    }
+    unsafe { CloseHandle(program) };
+    assert_eq!(
+        result, WAIT_OBJECT_0,
+        "nested Cargo child survived its guardian"
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if supervision::try_lock_gc(&paths, Some(&contexts[0]))
+            .unwrap()
+            .is_some()
+        {
+            break;
+        }
+        assert!(Instant::now() < deadline, "guardian retained its GC guard");
+        thread::sleep(Duration::from_millis(25));
+    }
+    gc::remove_atomically(&paths, &contexts[0]).unwrap();
+    assert!(!contexts[0].exists());
+}

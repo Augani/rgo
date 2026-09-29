@@ -108,6 +108,8 @@ pub(super) struct JobGuard {
 impl JobGuard {
     #[allow(unsafe_code)]
     pub(super) fn spawn(executable: &Path, args: &[OsString]) -> Result<Self> {
+        #[cfg(debug_assertions)]
+        pause_before_job_for_test()?;
         let application: Vec<u16> = executable
             .as_os_str()
             .encode_wide()
@@ -248,6 +250,31 @@ impl JobGuard {
             thread::sleep(Duration::from_millis(25));
         }
     }
+}
+
+/// Pause the guarded launcher before it creates its private job, allowing a
+/// test to place the launcher inside a separate parent job first.
+#[cfg(debug_assertions)]
+fn pause_before_job_for_test() -> Result<()> {
+    let Some(marker) = std::env::var_os("RGO_TEST_BEFORE_JOB_MARKER") else {
+        return Ok(());
+    };
+    let marker = PathBuf::from(marker);
+    let release = PathBuf::from(
+        std::env::var_os("RGO_TEST_BEFORE_JOB_RELEASE")
+            .context("RGO_TEST_BEFORE_JOB_RELEASE is required with the marker")?,
+    );
+    let staging = marker.with_extension("tmp");
+    std::fs::write(&staging, b"ready")?;
+    std::fs::rename(&staging, &marker)?;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !release.is_file() {
+        if Instant::now() >= deadline {
+            bail!("timed out before Windows Job Object creation test point");
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    Ok(())
 }
 
 /// A debug-build-only fault point for the live Windows interruption fixture.
