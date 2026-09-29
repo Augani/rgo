@@ -26,6 +26,7 @@ struct InstallationRecord {
     schema_version: u32,
     cargo_home: PathBuf,
     rgo_home: PathBuf,
+    rgo_binary: PathBuf,
     binary_version: String,
     protocol_version: u32,
     supervised_cargo: Option<SupervisedCargo>,
@@ -121,6 +122,15 @@ pub fn run() -> Result<()> {
     });
     if let Some((record, shim)) = active {
         validate_real_cargo(&shim.real_cargo, &executable)?;
+        if !record.rgo_binary.is_absolute()
+            || !record.rgo_binary.is_file()
+            || !record
+                .rgo_binary
+                .file_name()
+                .is_some_and(|name| name.to_string_lossy().eq_ignore_ascii_case("rgo.exe"))
+        {
+            bail!("Cargo launcher does not name an installed rgo daemon executable");
+        }
         if fallback
             .as_ref()
             .is_some_and(|fallback| !same_path(&fallback.real_cargo, &shim.real_cargo))
@@ -131,6 +141,7 @@ pub fn run() -> Result<()> {
             &shim.real_cargo,
             Some(&record.cargo_home),
             Some(&record.rgo_home),
+            Some(&record.rgo_binary),
             std::env::args_os().skip(1).collect(),
         );
     }

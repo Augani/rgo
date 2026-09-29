@@ -166,6 +166,7 @@ fn main() -> Result<()> {
             &real_cargo,
             cargo_home.as_deref(),
             rgo_home.as_deref(),
+            None,
             cargo_args,
         ),
         Some(Cmd::Cache { command }) => cmd::cache::run(command),

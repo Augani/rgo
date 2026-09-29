@@ -36,6 +36,7 @@ pub fn run(
     real_cargo: &Path,
     expected_cargo_home: Option<&Path>,
     expected_rgo_home: Option<&Path>,
+    daemon_exe: Option<&Path>,
     args: Vec<OsString>,
 ) -> Result<()> {
     if !real_cargo.is_absolute() {
@@ -78,7 +79,13 @@ pub fn run(
     // the build in ordinary Cargo storage instead of entering a GC domain
     // without known coordination.
     let maintenance_issue = match Config::load(&paths.config_file()) {
-        Ok(config) if config.gc.auto && !super::daemon::ensure_running(&paths) => {
+        Ok(config)
+            if config.gc.auto
+                && !daemon_exe.map_or_else(
+                    || super::daemon::ensure_running(&paths),
+                    |exe| super::daemon::ensure_running_from(&paths, exe),
+                ) =>
+        {
             Some("automatic maintenance is unavailable".to_owned())
         }
         Err(error) => Some(format!(

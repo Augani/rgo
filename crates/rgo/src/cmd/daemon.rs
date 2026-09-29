@@ -74,13 +74,19 @@ fn close_inherited_descriptors() -> Result<()> {
 /// deliberately reported as `false`: builds can continue without coordination, while GC and
 /// other destructive operations refuse to run.
 pub fn ensure_running(paths: &RgoPaths) -> bool {
-    if daemon_responds(paths) {
-        return true;
-    }
     let Ok(exe) = std::env::current_exe() else {
         return false;
     };
-    if spawn_background_daemon(&exe, &paths.root).is_err() {
+    ensure_running_from(paths, &exe)
+}
+
+/// The Windows PATH launcher runs as `cargo.exe`, so it must supply its
+/// recorded `rgo.exe` here rather than starting another Cargo launcher.
+pub fn ensure_running_from(paths: &RgoPaths, exe: &std::path::Path) -> bool {
+    if daemon_responds(paths) {
+        return true;
+    }
+    if spawn_background_daemon(exe, &paths.root).is_err() {
         return false;
     }
     // Spawning a Rust binary from a cold disk or an overloaded CI host can
