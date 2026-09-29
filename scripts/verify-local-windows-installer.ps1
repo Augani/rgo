@@ -295,27 +295,6 @@ fn main() {
     if (Test-Path -LiteralPath $plannedFallback) {
         throw 'read-only supervised plan or shim repair created the next-version fallback'
     }
-    try {
-        $env:RGO_SETUP_TEST_EXIT_AFTER_RECORD = '1'
-        try {
-            & $installScript @supervisedUpgradeArgs -NoService
-            throw 'forced supervised setup interruption unexpectedly succeeded'
-        } catch {
-            if ($_.Exception.Message -notmatch 'exit 88' -or
-                $_.Exception.Message -match 'rollback also failed') { throw }
-        }
-    } finally { Remove-Item Env:RGO_SETUP_TEST_EXIT_AFTER_RECORD -ErrorAction SilentlyContinue }
-    $rollbackJournal = Test-Path (Join-Path $cargoHome 'rgo/installer-windows-upgrade.json')
-    $rollbackState = [IO.File]::ReadAllText((Join-Path $cargoHome 'rgo/installer-windows.json')) -ceq $oldSupervisedState
-    $rollbackRecord = [IO.File]::ReadAllText($recordPath) -ceq $oldSupervisedRecord
-    $rollbackFallback = Test-Path -LiteralPath $plannedFallback
-    $rollbackShim = Test-Path -LiteralPath $newShim
-    $rollbackCargo = [string]::Equals((Get-Command cargo.exe).Source, $shim,
-        [StringComparison]::OrdinalIgnoreCase)
-    if ($rollbackJournal -or -not $rollbackState -or -not $rollbackRecord -or
-        $rollbackFallback -or $rollbackShim -or -not $rollbackCargo) {
-        throw "interrupted supervised upgrade rollback mismatch: journal=$rollbackJournal state=$rollbackState record=$rollbackRecord fallback=$rollbackFallback shim=$rollbackShim cargo=$rollbackCargo"
-    }
     $heldReady = Join-Path $sandbox 'old-cargo-running'
     $heldRelease = Join-Path $sandbox 'release-old-cargo'
     $env:RGO_INSTALLER_READY = $heldReady
@@ -337,6 +316,29 @@ fn main() {
         }
         Start-Sleep -Milliseconds 100
     }
+    try {
+        $env:RGO_SETUP_TEST_EXIT_AFTER_RECORD = '1'
+        try {
+            & $installScript @supervisedUpgradeArgs -NoService
+            throw 'forced supervised setup interruption unexpectedly succeeded'
+        } catch {
+            if ($_.Exception.Message -notmatch 'exit 88' -or
+                $_.Exception.Message -match 'rollback also failed') { throw }
+        }
+    } finally { Remove-Item Env:RGO_SETUP_TEST_EXIT_AFTER_RECORD -ErrorAction SilentlyContinue }
+    $rollbackJournal = Test-Path (Join-Path $cargoHome 'rgo/installer-windows-upgrade.json')
+    $rollbackState = [IO.File]::ReadAllText((Join-Path $cargoHome 'rgo/installer-windows.json')) -ceq $oldSupervisedState
+    $rollbackRecord = [IO.File]::ReadAllText($recordPath) -ceq $oldSupervisedRecord
+    $rollbackFallback = Test-Path -LiteralPath $plannedFallback
+    $rollbackShim = Test-Path -LiteralPath $newShim
+    $rollbackCargo = [string]::Equals((Get-Command cargo.exe).Source, $shim,
+        [StringComparison]::OrdinalIgnoreCase)
+    if ($rollbackJournal -or -not $rollbackState -or -not $rollbackRecord -or
+        $rollbackFallback -or $rollbackShim -or -not $rollbackCargo) {
+        throw "interrupted supervised upgrade rollback mismatch: journal=$rollbackJournal state=$rollbackState record=$rollbackRecord fallback=$rollbackFallback shim=$rollbackShim cargo=$rollbackCargo"
+    }
+    $heldCargo.Refresh()
+    if ($heldCargo.HasExited) { throw 'supervised rollback terminated the running old Cargo session' }
     & $installScript @supervisedUpgradeArgs -NoService
     $heldCargo.Refresh()
     if ($heldCargo.HasExited) { throw 'supervised upgrade terminated the running old Cargo session' }
@@ -378,8 +380,36 @@ fn main() {
             throw 'old-shell Cargo did not fall back to local storage after supervised upgrade'
         }
     } finally { Pop-Location }
+    $heldReady = Join-Path $sandbox 'new-cargo-running'
+    $heldRelease = Join-Path $sandbox 'release-new-cargo'
+    $env:RGO_INSTALLER_READY = $heldReady
+    $env:RGO_INSTALLER_RELEASE = $heldRelease
+    try {
+        $heldCargo = Start-Process -FilePath $upgradedShim -ArgumentList @('run', '--offline') `
+            -WorkingDirectory $supervisedProject -PassThru `
+            -RedirectStandardOutput (Join-Path $sandbox 'new-cargo.out') `
+            -RedirectStandardError (Join-Path $sandbox 'new-cargo.err')
+    } finally {
+        Remove-Item Env:RGO_INSTALLER_READY -ErrorAction SilentlyContinue
+        Remove-Item Env:RGO_INSTALLER_RELEASE -ErrorAction SilentlyContinue
+    }
+    $readyDeadline = [DateTime]::UtcNow.AddSeconds(15)
+    while (-not (Test-Path -LiteralPath $heldReady)) {
+        $heldCargo.Refresh()
+        if ($heldCargo.HasExited -or [DateTime]::UtcNow -gt $readyDeadline) {
+            throw 'new cargo run did not reach its live child before supervised uninstall'
+        }
+        Start-Sleep -Milliseconds 100
+    }
     & $installScript -Uninstall -CargoHome $cargoHome -RgoHome $rgoHome
     $installed = $false
+    $heldCargo.Refresh()
+    if ($heldCargo.HasExited) { throw 'supervised uninstall terminated the running new Cargo session' }
+    [IO.File]::WriteAllText($heldRelease, 'release')
+    if (-not $heldCargo.WaitForExit(15000) -or $heldCargo.ExitCode -ne 0) {
+        throw 'new Cargo session did not exit normally after supervised uninstall'
+    }
+    $heldCargo = $null
     if (-not (Test-Path $shim) -or -not (Test-Path $upgradedShim) -or
         -not (Test-Path (Join-Path (Split-Path $shim -Parent) '.rgo-cargo-fallback.json')) -or
         -not (Test-Path (Join-Path (Split-Path $upgradedShim -Parent) '.rgo-cargo-fallback.json'))) {
