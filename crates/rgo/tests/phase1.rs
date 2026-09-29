@@ -298,6 +298,8 @@ fn concurrent_builds_survive_aggressive_gc() {
                 .cmd(&shim)
                 .current_dir(project)
                 .args(["build", "--offline"])
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
                 .spawn()
                 .unwrap(),
         );
@@ -328,11 +330,19 @@ fn concurrent_builds_survive_aggressive_gc() {
         }
     });
 
-    for mut build in builds.drain(..) {
-        let status = build.wait().unwrap();
-        assert!(status.success(), "Cargo build failed under concurrent GC");
-    }
+    let outcomes: Vec<_> = builds
+        .drain(..)
+        .map(|build| build.wait_with_output().unwrap())
+        .collect();
     gc.join().unwrap();
     daemon.kill().unwrap();
     let _ = daemon.wait();
+    for (index, outcome) in outcomes.iter().enumerate() {
+        assert!(
+            outcome.status.success(),
+            "Cargo build {index} failed under concurrent GC: {}\ndaemon log:\n{}",
+            String::from_utf8_lossy(&outcome.stderr),
+            std::fs::read_to_string(sandbox.rgo_home.join("logs/daemon.log")).unwrap_or_default()
+        );
+    }
 }

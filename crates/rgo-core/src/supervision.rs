@@ -175,12 +175,31 @@ pub(crate) fn open_lock_file(path: &Path) -> Result<File> {
             Mode::empty(),
         )
         .with_context(|| format!("opening lifecycle lock directory {}", parent.display()))?;
-        File::from(openat(
-            &directory,
-            name,
-            OFlags::RDWR | OFlags::CREATE | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-            Mode::RUSR | Mode::WUSR,
-        )?)
+        // A heavily concurrent first launch has returned ENOENT here on macOS
+        // despite O_CREAT and an opened parent. Retry that one error briefly;
+        // the identity check below still rejects a replaced lock path.
+        let mut opened = None;
+        for attempt in 0..3 {
+            match openat(
+                &directory,
+                name,
+                OFlags::RDWR | OFlags::CREATE | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::RUSR | Mode::WUSR,
+            ) {
+                Ok(file) => {
+                    opened = Some(file);
+                    break;
+                }
+                Err(Errno::NOENT) if attempt < 2 => {
+                    std::thread::sleep(std::time::Duration::from_millis(1 << attempt));
+                }
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("creating lifecycle lock {}", path.display()));
+                }
+            }
+        }
+        File::from(opened.context("lifecycle lock retry exhausted")?)
     };
     #[cfg(windows)]
     let file = {
