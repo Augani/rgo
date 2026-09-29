@@ -168,8 +168,9 @@ fn pressure_gc_reclaims_idle_unpinned_only_contexts_in_private_home() {
         .unwrap();
     assert!(
         result.status.success(),
-        "{}",
-        String::from_utf8_lossy(&result.stderr)
+        "{}\ndaemon log:\n{}",
+        String::from_utf8_lossy(&result.stderr),
+        std::fs::read_to_string(paths.logs_dir().join("daemon.log")).unwrap_or_default()
     );
     assert!(
         paths.managed_build_dirs().is_empty(),
@@ -200,7 +201,12 @@ fn explicit_clean_reports_a_locked_context_instead_of_claiming_removal() {
         .output()
         .unwrap();
     assert!(!blocked.status.success());
-    assert!(String::from_utf8_lossy(&blocked.stderr).contains("supervised Cargo invocation"));
+    assert!(
+        String::from_utf8_lossy(&blocked.stderr).contains("supervised Cargo invocation"),
+        "{}\ndaemon log:\n{}",
+        String::from_utf8_lossy(&blocked.stderr),
+        std::fs::read_to_string(paths.logs_dir().join("daemon.log")).unwrap_or_default()
+    );
     assert!(context_dir.join("output").is_file());
 
     drop(guard);

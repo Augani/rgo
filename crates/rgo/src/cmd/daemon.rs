@@ -92,7 +92,7 @@ pub fn ensure_running_from(paths: &RgoPaths, exe: &std::path::Path) -> bool {
     // Spawning a Rust binary from a cold disk or an overloaded CI host can
     // exceed one second. This path is for explicit commands/opted-in
     // maintenance, never the compiler wrapper's 150 ms fail-open probe.
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < deadline {
         thread::sleep(Duration::from_millis(50));
         if daemon_responds_with_timeout(paths, Duration::from_millis(250)) {
