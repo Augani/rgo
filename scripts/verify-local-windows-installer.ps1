@@ -316,6 +316,13 @@ fn main() {
         }
         Start-Sleep -Milliseconds 100
     }
+    $ownedWrapperCommand = Join-Path $cargoHome 'bin/rgo-rustc-wrapper.exe'
+    Remove-Item -LiteralPath $ownedWrapperCommand
+    & $installScript @supervisedArgs -NoService -Repair
+    $heldCargo.Refresh()
+    if (-not (Test-Path -LiteralPath $ownedWrapperCommand) -or $heldCargo.HasExited) {
+        throw 'supervised repair disturbed a running old Cargo session'
+    }
     try {
         $env:RGO_SETUP_TEST_EXIT_AFTER_RECORD = '1'
         try {
