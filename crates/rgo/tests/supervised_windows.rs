@@ -1290,3 +1290,112 @@ fn main() {
     gc::remove_atomically(&paths, &contexts[0]).unwrap();
     assert!(!contexts[0].exists());
 }
+
+#[test]
+#[allow(unsafe_code)] // Process handles prove a breakaway attempt cannot outlive its guardian.
+fn cargo_child_cannot_break_away_from_guardian_job() {
+    struct StopLauncher(Child);
+    impl Drop for StopLauncher {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    let sandbox = Sandbox::new().unwrap();
+    let project = sandbox.simple_bin("windows-breakaway-attempt").unwrap();
+    std::fs::write(
+        project.join("src/main.rs"),
+        r#"
+use std::os::windows::process::CommandExt;
+
+fn main() {
+    if std::env::args().any(|arg| arg == "--child") {
+        loop { std::thread::sleep(std::time::Duration::from_millis(100)); }
+    }
+    let ready = std::path::PathBuf::from(std::env::var_os("RGO_TEST_READY").unwrap());
+    let result = std::process::Command::new(std::env::current_exe().unwrap())
+        .arg("--child")
+        .creation_flags(0x01000000) // CREATE_BREAKAWAY_FROM_JOB
+        .spawn();
+    let outcome = match result {
+        Ok(child) => format!("spawned:{}", child.id()),
+        Err(error) => format!("denied:{}", error.raw_os_error().unwrap_or_default()),
+    };
+    let staging = ready.with_extension("tmp");
+    std::fs::write(&staging, outcome).unwrap();
+    std::fs::rename(staging, ready).unwrap();
+    loop { std::thread::sleep(std::time::Duration::from_millis(100)); }
+}
+"#,
+    )
+    .unwrap();
+    let real_cargo = PathBuf::from(std::env::var_os("CARGO").unwrap());
+    let ready = sandbox.home.join("breakaway-result");
+    let mut launcher = StopLauncher(
+        sandbox
+            .cmd(env!("CARGO_BIN_EXE_rgo"))
+            .current_dir(&project)
+            .env("RGO_TEST_READY", &ready)
+            .args(["cargo-shim", "--real-cargo"])
+            .arg(&real_cargo)
+            .args(["--", "run", "--offline"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !ready.is_file() && Instant::now() < deadline {
+        assert!(
+            launcher.0.try_wait().unwrap().is_none(),
+            "supervised Cargo exited before the breakaway attempt"
+        );
+        thread::sleep(Duration::from_millis(25));
+    }
+    assert!(ready.is_file(), "program did not attempt to break away");
+    let outcome = std::fs::read_to_string(&ready).unwrap();
+    let child = outcome.strip_prefix("spawned:").map(|pid| {
+        let pid: u32 = pid.parse().unwrap();
+        let handle = unsafe { OpenProcess(PROCESS_SYNCHRONIZE | PROCESS_TERMINATE, 0, pid) };
+        assert!(!handle.is_null(), "cannot observe attempted breakaway");
+        assert_eq!(unsafe { WaitForSingleObject(handle, 0) }, WAIT_TIMEOUT);
+        handle
+    });
+    assert!(outcome == "denied:5" || child.is_some(), "{outcome}");
+    let paths = RgoPaths {
+        root: sandbox.rgo_home.clone(),
+    };
+    let contexts = paths.checked_managed_build_dirs().unwrap();
+    assert_eq!(contexts.len(), 1);
+    assert!(
+        supervision::try_lock_gc(&paths, Some(&contexts[0]))
+            .unwrap()
+            .is_none()
+    );
+
+    launcher.0.kill().unwrap();
+    launcher.0.wait().unwrap();
+    if let Some(handle) = child {
+        let result = unsafe { WaitForSingleObject(handle, 5_000) };
+        if result != WAIT_OBJECT_0 {
+            unsafe { TerminateProcess(handle, 1) };
+            unsafe { WaitForSingleObject(handle, 5_000) };
+        }
+        unsafe { CloseHandle(handle) };
+        assert_eq!(result, WAIT_OBJECT_0, "child escaped the guardian job");
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if supervision::try_lock_gc(&paths, Some(&contexts[0]))
+            .unwrap()
+            .is_some()
+        {
+            break;
+        }
+        assert!(Instant::now() < deadline, "guardian retained its GC guard");
+        thread::sleep(Duration::from_millis(25));
+    }
+    gc::remove_atomically(&paths, &contexts[0]).unwrap();
+    assert!(!contexts[0].exists());
+}
