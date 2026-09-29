@@ -1314,6 +1314,11 @@ fn main() {
         loop { std::thread::sleep(std::time::Duration::from_millis(100)); }
     }
     let ready = std::path::PathBuf::from(std::env::var_os("RGO_TEST_READY").unwrap());
+    let detached = std::process::Command::new(std::env::current_exe().unwrap())
+        .arg("--child")
+        .creation_flags(0x00000008) // DETACHED_PROCESS
+        .spawn()
+        .unwrap();
     let result = std::process::Command::new(std::env::current_exe().unwrap())
         .arg("--child")
         .creation_flags(0x01000000) // CREATE_BREAKAWAY_FROM_JOB
@@ -1323,7 +1328,7 @@ fn main() {
         Err(error) => format!("denied:{}", error.raw_os_error().unwrap_or_default()),
     };
     let staging = ready.with_extension("tmp");
-    std::fs::write(&staging, outcome).unwrap();
+    std::fs::write(&staging, format!("detached:{};{outcome}", detached.id())).unwrap();
     std::fs::rename(staging, ready).unwrap();
     loop { std::thread::sleep(std::time::Duration::from_millis(100)); }
 }
@@ -1354,7 +1359,12 @@ fn main() {
         thread::sleep(Duration::from_millis(25));
     }
     assert!(ready.is_file(), "program did not attempt to break away");
-    let outcome = std::fs::read_to_string(&ready).unwrap();
+    let report = std::fs::read_to_string(&ready).unwrap();
+    let (detached, outcome) = report.split_once(';').unwrap();
+    let detached_pid: u32 = detached.strip_prefix("detached:").unwrap().parse().unwrap();
+    let detached = unsafe { OpenProcess(PROCESS_SYNCHRONIZE | PROCESS_TERMINATE, 0, detached_pid) };
+    assert!(!detached.is_null(), "cannot observe detached Cargo child");
+    assert_eq!(unsafe { WaitForSingleObject(detached, 0) }, WAIT_TIMEOUT);
     let child = outcome.strip_prefix("spawned:").map(|pid| {
         let pid: u32 = pid.parse().unwrap();
         let handle = unsafe { OpenProcess(PROCESS_SYNCHRONIZE | PROCESS_TERMINATE, 0, pid) };
@@ -1376,7 +1386,7 @@ fn main() {
 
     launcher.0.kill().unwrap();
     launcher.0.wait().unwrap();
-    if let Some(handle) = child {
+    for handle in [Some(detached), child].into_iter().flatten() {
         let result = unsafe { WaitForSingleObject(handle, 5_000) };
         if result != WAIT_OBJECT_0 {
             unsafe { TerminateProcess(handle, 1) };
