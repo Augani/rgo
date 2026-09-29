@@ -228,11 +228,12 @@ function Encoded-File([string]$Path) {
     return [Convert]::ToBase64String([IO.File]::ReadAllBytes($Path))
 }
 
-function Write-EncodedFile([string]$Path, [AllowNull()][string]$Encoded) {
+function Write-EncodedFile([string]$Path, [AllowNull()][object]$Encoded) {
     if ($null -eq $Encoded) {
         if (Test-Path -LiteralPath $Path) { Remove-Item -LiteralPath $Path -Force }
         return
     }
+    Assert-Condition ($Encoded -is [string]) "invalid activation snapshot for $Path"
     $temporary = "$Path.$([guid]::NewGuid().ToString('N')).tmp"
     try {
         [IO.File]::WriteAllBytes($temporary, [Convert]::FromBase64String($Encoded))
@@ -332,7 +333,11 @@ function Assert-PlainCargoActivation([string]$Cli, $State) {
     }
 }
 
-function Test-ExactText([AllowNull()][string]$Left, [AllowNull()][string]$Right) {
+function Test-ExactText([AllowNull()][object]$Left, [AllowNull()][object]$Right) {
+    if ($null -eq $Left -or $null -eq $Right) {
+        return ($null -eq $Left -and $null -eq $Right)
+    }
+    Assert-Condition ($Left -is [string] -and $Right -is [string]) 'invalid activation snapshot text'
     return [string]::Equals($Left, $Right, [StringComparison]::Ordinal)
 }
 

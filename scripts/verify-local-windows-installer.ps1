@@ -293,14 +293,16 @@ try {
                 $_.Exception.Message -match 'rollback also failed') { throw }
         }
     } finally { Remove-Item Env:RGO_SETUP_TEST_EXIT_AFTER_RECORD -ErrorAction SilentlyContinue }
-    if ((Test-Path (Join-Path $cargoHome 'rgo/installer-windows-upgrade.json')) -or
-        [IO.File]::ReadAllText((Join-Path $cargoHome 'rgo/installer-windows.json')) -cne $oldSupervisedState -or
-        [IO.File]::ReadAllText($recordPath) -cne $oldSupervisedRecord -or
-        (Test-Path -LiteralPath $plannedFallback) -or
-        (Test-Path -LiteralPath $newShim) -or
-        -not [string]::Equals((Get-Command cargo.exe).Source, $shim,
-            [StringComparison]::OrdinalIgnoreCase)) {
-        throw 'interrupted supervised upgrade did not restore the old activation'
+    $rollbackJournal = Test-Path (Join-Path $cargoHome 'rgo/installer-windows-upgrade.json')
+    $rollbackState = [IO.File]::ReadAllText((Join-Path $cargoHome 'rgo/installer-windows.json')) -ceq $oldSupervisedState
+    $rollbackRecord = [IO.File]::ReadAllText($recordPath) -ceq $oldSupervisedRecord
+    $rollbackFallback = Test-Path -LiteralPath $plannedFallback
+    $rollbackShim = Test-Path -LiteralPath $newShim
+    $rollbackCargo = [string]::Equals((Get-Command cargo.exe).Source, $shim,
+        [StringComparison]::OrdinalIgnoreCase)
+    if ($rollbackJournal -or -not $rollbackState -or -not $rollbackRecord -or
+        $rollbackFallback -or $rollbackShim -or -not $rollbackCargo) {
+        throw "interrupted supervised upgrade rollback mismatch: journal=$rollbackJournal state=$rollbackState record=$rollbackRecord fallback=$rollbackFallback shim=$rollbackShim cargo=$rollbackCargo"
     }
     & $installScript @supervisedUpgradeArgs -NoService
     $upgradedRecord = Get-Content -LiteralPath $recordPath -Raw | ConvertFrom-Json
