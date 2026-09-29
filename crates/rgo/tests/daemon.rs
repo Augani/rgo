@@ -322,16 +322,20 @@ fn automatic_budget_reclaims_another_context_during_a_supervised_cargo_run() {
             .physical_bytes;
     let max_size = other_bytes + active_bytes / 2;
     let old = SystemTime::now() - Duration::from_secs(7200);
-    for profile in std::fs::read_dir(&idle).unwrap().flatten() {
-        if profile.path().is_dir() {
-            let lock = profile.path().join(".cargo-build-lock");
-            if lock.is_file() {
-                std::fs::OpenOptions::new()
-                    .write(true)
-                    .open(lock)
-                    .unwrap()
-                    .set_modified(old)
-                    .unwrap();
+    // Expire the profile-lock heuristic even for the running build. Its
+    // supervised session guard, not a recent mtime, must prevent deletion.
+    for context_dir in [&idle, &active] {
+        for profile in std::fs::read_dir(context_dir).unwrap().flatten() {
+            if profile.path().is_dir() {
+                let lock = profile.path().join(".cargo-build-lock");
+                if lock.is_file() {
+                    std::fs::OpenOptions::new()
+                        .write(true)
+                        .open(lock)
+                        .unwrap()
+                        .set_modified(old)
+                        .unwrap();
+                }
             }
         }
     }

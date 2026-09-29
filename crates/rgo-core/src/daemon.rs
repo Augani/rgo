@@ -740,12 +740,23 @@ fn status_report(state: &State) -> Result<StatusReport> {
     db.reconcile_contexts(&state.paths, &contexts)?;
     drain_cache_events(&state.paths, &db, &mut state.event_drainer.lock().unwrap())?;
     let pinned = db.pinned_paths()?;
-    let leased = db.protected_paths(&contexts)?;
+    let mut leased = db.protected_paths(&contexts)?;
     let stats = db.stats()?;
     let last_gc = db.last_gc()?.unwrap_or_default();
     let active_cache_keys = db.active_cache_keys()?;
     let cache_lru = db.cache_lru()?;
     drop(db);
+    // The profile-lock mtime is only a recency heuristic. A long-running
+    // supervised Cargo process can outlive it, so the status preview must
+    // observe the same nonblocking lifecycle guard that deletion uses.
+    for context in &contexts {
+        if !leased.iter().any(|path| path == &context.dir)
+            && !pinned.iter().any(|path| path == &context.dir)
+            && crate::supervision::try_lock_gc(&state.paths, Some(&context.dir))?.is_none()
+        {
+            leased.push(context.dir.clone());
+        }
+    }
     let cas_bytes = crate::size::Scanner::new()
         .measure_optional(&state.paths.cas_dir())?
         .physical_bytes;
