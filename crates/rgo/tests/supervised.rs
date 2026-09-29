@@ -398,6 +398,11 @@ fn opted_in_maintenance_reclaims_an_idle_real_cargo_build() {
     // Rebuild through the unchanged Cargo command and require maintenance to
     // recover the same budget again. The first successful pass must not be a
     // one-time effect of daemon initialization or a stale initial snapshot.
+    std::fs::write(
+        project.join("src/main.rs"),
+        "fn main() { println!(\"cycle 2\"); }\n",
+    )
+    .unwrap();
     let second_build = sandbox
         .cmd("cargo")
         .current_dir(&project)

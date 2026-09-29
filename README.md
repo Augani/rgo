@@ -61,8 +61,8 @@ lifecycle remains release work:
    `rgo daemon`, then checks that the service is running and its daemon answers
    IPC. Failed startup is reported as degraded maintenance. `--no-service`
    skips this. In native mode plain Cargo will not start background maintenance;
-   the opt-in Unix supervised launcher starts a daemon on Cargo use only when
-   `[gc].auto = true` is explicitly configured for evaluation.
+   the opt-in supervised launchers on Unix and Windows start a daemon on Cargo
+   use only when `[gc].auto = true` is explicitly configured for evaluation.
 
 For private Unix evaluation of full Cargo-session supervision, use
 `rgo setup --supervised --real-cargo /absolute/path/to/cargo --no-service` in
@@ -85,7 +85,9 @@ its current shell; custom startup layouts and GUI-launched IDEs still need
 explicit activation checks. Unattended GC remains off by default; enabling it
 is still experimental while the lifecycle safety gate is open.
 
-For a private Windows evaluation, `rgo setup --supervised --real-cargo C:\absolute\path\to\cargo.exe --no-service` installs an owned
+For a private Windows evaluation, run
+`rgo setup --supervised --real-cargo C:\absolute\path\to\cargo.exe --no-service`
+to install an owned
 `$CARGO_HOME\rgo\shims\v<version>\cargo.exe` copy of the matched `rgo.exe`. Put its
 directory first on `PATH` in the shell or tool launching Cargo, then run
 `rgo doctor --verify`. This leaves the rustup Cargo proxy in place; direct

@@ -438,6 +438,11 @@ fn opted_in_maintenance_reclaims_an_idle_real_cargo_build() {
         status.unmet_budget_reason
     );
 
+    std::fs::write(
+        project.join("src/main.rs"),
+        "fn main() { println!(\"cycle 2\"); }\n",
+    )
+    .unwrap();
     let second_build = sandbox
         .cmd("cmd.exe")
         .current_dir(&project)
