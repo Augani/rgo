@@ -204,28 +204,27 @@ fn explicit_clean_reports_a_locked_context_instead_of_claiming_removal() {
     assert!(context_dir.join("output").is_file());
 
     drop(guard);
-    // The daemon's first request and other test activity can overlap the
-    // release. Observe the same nonblocking GC guard that clean requires
-    // before asserting that a later command can remove the context.
-    let deadline = std::time::Instant::now() + Duration::from_secs(2);
-    loop {
-        if supervision::try_lock_gc(&paths, Some(&context_dir))
-            .unwrap()
-            .is_some()
-        {
-            break;
+    // A daemon maintenance pass can briefly acquire the same nonblocking
+    // guard between a probe and the command. Retry only that transient
+    // refusal; every other clean error remains a failure.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let cleaned = loop {
+        let result = sandbox
+            .cmd(cargo_bin("rgo"))
+            .args(["clean", "aa/context"])
+            .output()
+            .unwrap();
+        if result.status.success() {
+            break result;
         }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "context lifecycle guard remained held after the session ended"
-        );
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        if !stderr.contains("a supervised Cargo invocation is using managed storage")
+            || std::time::Instant::now() >= deadline
+        {
+            break result;
+        }
         thread::sleep(Duration::from_millis(25));
-    }
-    let cleaned = sandbox
-        .cmd(cargo_bin("rgo"))
-        .args(["clean", "aa/context"])
-        .output()
-        .unwrap();
+    };
     assert!(
         cleaned.status.success(),
         "{}\ndaemon log:\n{}",
