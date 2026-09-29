@@ -8,6 +8,7 @@ use std::path::Path;
 use anyhow::{Context, Result, ensure};
 use walkdir::WalkDir;
 
+use crate::context::{self, BuildContext};
 use crate::paths::RgoPaths;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -15,6 +16,39 @@ pub struct Usage {
     pub physical_bytes: u64,
     pub logical_bytes: u64,
     pub files: u64,
+}
+
+/// One accounting snapshot of all rgo-owned storage. Hard-linked inodes are
+/// attributed to the first domain scanned: builds, CAS, then auxiliary files.
+pub struct ManagedSnapshot {
+    pub contexts: Vec<BuildContext>,
+    pub build_bytes: u64,
+    pub cas_bytes: u64,
+    pub auxiliary_bytes: u64,
+}
+
+impl ManagedSnapshot {
+    pub fn total_bytes(&self) -> u64 {
+        self.build_bytes
+            .saturating_add(self.cas_bytes)
+            .saturating_add(self.auxiliary_bytes)
+    }
+}
+
+pub fn managed_snapshot(paths: &RgoPaths) -> Result<ManagedSnapshot> {
+    let mut scanner = Scanner::new();
+    let contexts = context::list_with_scanner(paths, &mut scanner)?;
+    let build_bytes = contexts.iter().fold(0u64, |total, context| {
+        total.saturating_add(context.usage.physical_bytes)
+    });
+    let cas_bytes = scanner.measure_optional(&paths.cas_dir())?.physical_bytes;
+    let auxiliary_bytes = auxiliary_usage_with_scanner(paths, &mut scanner)?.physical_bytes;
+    Ok(ManagedSnapshot {
+        contexts,
+        build_bytes,
+        cas_bytes,
+        auxiliary_bytes,
+    })
 }
 
 /// Accumulates across multiple `measure` calls so shared inodes are counted once per scan.
@@ -96,6 +130,10 @@ impl Scanner {
 /// includes temporary, quarantine, state, logs, and owned root-level files.
 /// Unknown entries are counted but never selected for deletion by this scan.
 pub fn auxiliary_usage(paths: &RgoPaths) -> Result<Usage> {
+    auxiliary_usage_with_scanner(paths, &mut Scanner::new())
+}
+
+fn auxiliary_usage_with_scanner(paths: &RgoPaths, scanner: &mut Scanner) -> Result<Usage> {
     let entries = match std::fs::read_dir(&paths.root) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Usage::default()),
@@ -103,7 +141,6 @@ pub fn auxiliary_usage(paths: &RgoPaths) -> Result<Usage> {
             return Err(error).with_context(|| format!("reading {}", paths.root.display()));
         }
     };
-    let mut scanner = Scanner::new();
     let mut total = Usage::default();
     for entry in entries {
         let path = entry?.path();
@@ -304,5 +341,32 @@ mod tests {
                 .unwrap();
             assert!(auxiliary_usage(&paths).is_err());
         }
+    }
+
+    #[test]
+    fn managed_snapshot_counts_cross_domain_hardlinks_once() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = RgoPaths {
+            root: root.path().join("rgo"),
+        };
+        paths.ensure_layout().unwrap();
+        let context = paths.builds_dir().join("aa/context");
+        std::fs::create_dir_all(&context).unwrap();
+        let original = context.join("artifact");
+        std::fs::write(&original, vec![b'x'; 8192]).unwrap();
+        std::fs::create_dir_all(paths.cas_dir()).unwrap();
+        std::fs::hard_link(&original, paths.cas_dir().join("linked-object")).unwrap();
+        std::fs::hard_link(&original, paths.tmp_dir().join("linked-temp")).unwrap();
+
+        let expected = Scanner::new()
+            .measure_checked(&original)
+            .unwrap()
+            .physical_bytes;
+        let snapshot = managed_snapshot(&paths).unwrap();
+        assert_eq!(snapshot.contexts.len(), 1);
+        assert_eq!(snapshot.build_bytes, expected);
+        assert_eq!(snapshot.cas_bytes, 0);
+        assert_eq!(snapshot.auxiliary_bytes, 0);
+        assert_eq!(snapshot.total_bytes(), expected);
     }
 }

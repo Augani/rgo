@@ -1,6 +1,5 @@
 use anyhow::{Context, Result, bail};
 use rgo_core::config::volume_free_bytes;
-use rgo_core::context;
 use rgo_core::ipc;
 use rgo_protocol::{Request, Response};
 
@@ -160,15 +159,12 @@ pub fn run() -> Result<()> {
         return Ok(());
     }
     println!("Daemon               unavailable (coordination disabled; filesystem fallback)");
-    let contexts = context::list(&e.paths)?;
-    let cas_bytes = rgo_core::size::Scanner::new()
-        .measure_optional(&e.paths.cas_dir())?
-        .physical_bytes;
-    let auxiliary_bytes = rgo_core::size::auxiliary_usage(&e.paths)?.physical_bytes;
-    let build_bytes: u64 = contexts.iter().map(|c| c.usage.physical_bytes).sum();
-    let managed: u64 = build_bytes
-        .saturating_add(cas_bytes)
-        .saturating_add(auxiliary_bytes);
+    let snapshot = rgo_core::size::managed_snapshot(&e.paths)?;
+    let managed = snapshot.total_bytes();
+    let contexts = snapshot.contexts;
+    let cas_bytes = snapshot.cas_bytes;
+    let auxiliary_bytes = snapshot.auxiliary_bytes;
+    let build_bytes = snapshot.build_bytes;
     let incremental: u64 = contexts
         .iter()
         .map(|c| c.incremental_usage.physical_bytes)

@@ -12,17 +12,7 @@ pub fn run(dry_run: bool, aggressive: bool, auto: bool, target: Option<String>) 
         return Ok(());
     }
     if auto {
-        let build_bytes: u64 = context::list(&e.paths)?
-            .iter()
-            .map(|context| context.usage.physical_bytes)
-            .sum();
-        let cas_bytes = rgo_core::size::Scanner::new()
-            .measure_optional(&e.paths.cas_dir())?
-            .physical_bytes;
-        let auxiliary_bytes = rgo_core::size::auxiliary_usage(&e.paths)?.physical_bytes;
-        let managed_bytes = build_bytes
-            .saturating_add(cas_bytes)
-            .saturating_add(auxiliary_bytes);
+        let managed_bytes = rgo_core::size::managed_snapshot(&e.paths)?.total_bytes();
         let free_bytes = config::volume_free_bytes_checked(&e.paths.root)?;
         let age_due = rgo_core::db::StateDb::open_read_only(&e.paths)
             .and_then(|db| db.last_real_gc_at())

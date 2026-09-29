@@ -764,7 +764,8 @@ fn handle_request_result(state: &State, request: Request) -> Result<Response> {
 
 fn status_report(state: &State) -> Result<StatusReport> {
     let _operation = state.operation_lock.lock().unwrap();
-    let contexts = context::list(&state.paths)?;
+    let snapshot = crate::size::managed_snapshot(&state.paths)?;
+    let contexts = snapshot.contexts;
     let mut db = state.db.lock().unwrap();
     db.expire_leases()?;
     db.prune_failed_cache_builds(Duration::from_secs(7 * 86_400))?;
@@ -788,14 +789,9 @@ fn status_report(state: &State) -> Result<StatusReport> {
             leased.push(context.dir.clone());
         }
     }
-    let cas_bytes = crate::size::Scanner::new()
-        .measure_optional(&state.paths.cas_dir())?
-        .physical_bytes;
-    let build_bytes = contexts
-        .iter()
-        .map(|context| context.usage.physical_bytes)
-        .sum();
-    let auxiliary_bytes = crate::size::auxiliary_usage(&state.paths)?.physical_bytes;
+    let cas_bytes = snapshot.cas_bytes;
+    let build_bytes = snapshot.build_bytes;
+    let auxiliary_bytes = snapshot.auxiliary_bytes;
     let budget_inputs = Inputs {
         paths: &state.paths,
         cfg: &state.cfg,
@@ -1140,18 +1136,12 @@ fn run_gc(
     target_bytes: Option<u64>,
 ) -> Result<GcReport> {
     let _operation = state.operation_lock.lock().unwrap();
-    let contexts = context::list(&state.paths)?;
-    let build_bytes: u64 = contexts
-        .iter()
-        .map(|context| context.usage.physical_bytes)
-        .sum();
-    let cas_bytes = crate::size::Scanner::new()
-        .measure_optional(&state.paths.cas_dir())?
-        .physical_bytes;
-    let auxiliary_bytes = crate::size::auxiliary_usage(&state.paths)?.physical_bytes;
-    let managed_bytes = build_bytes
-        .saturating_add(cas_bytes)
-        .saturating_add(auxiliary_bytes);
+    let snapshot = crate::size::managed_snapshot(&state.paths)?;
+    let managed_bytes = snapshot.total_bytes();
+    let contexts = snapshot.contexts;
+    let build_bytes = snapshot.build_bytes;
+    let cas_bytes = snapshot.cas_bytes;
+    let auxiliary_bytes = snapshot.auxiliary_bytes;
     let free_bytes = volume_free_bytes_checked(&state.paths.root)?;
     let trigger = managed_bytes > state.cfg.soft_watermark || free_bytes < state.cfg.min_free_space;
     let age_due = auto
@@ -1245,18 +1235,8 @@ fn run_gc(
             }
         }
         forget_removed_object_rows(state, &plan.actions)?;
-        let remaining_builds = context::list(&state.paths)?;
-        let remaining_build_bytes: u64 = remaining_builds
-            .iter()
-            .map(|context| context.usage.physical_bytes)
-            .sum();
-        let remaining_cas_bytes = crate::size::Scanner::new()
-            .measure_optional(&state.paths.cas_dir())?
-            .physical_bytes;
-        let remaining_auxiliary_bytes = crate::size::auxiliary_usage(&state.paths)?.physical_bytes;
-        let remaining_total = remaining_build_bytes
-            .saturating_add(remaining_cas_bytes)
-            .saturating_add(remaining_auxiliary_bytes);
+        let remaining = crate::size::managed_snapshot(&state.paths)?;
+        let remaining_total = remaining.total_bytes();
         let needed = remaining_total.saturating_sub(plan.target_bytes).max(
             state
                 .cfg
@@ -1304,18 +1284,11 @@ fn run_gc(
             execution.absorb(gc::execute(&state.paths, &post, false)?);
             forget_removed_object_rows(state, &post.actions)?;
         }
-        let contexts = context::list(&state.paths)?;
-        let remaining_build_bytes: u64 = contexts
-            .iter()
-            .map(|context| context.usage.physical_bytes)
-            .sum();
-        let remaining_cas_bytes = crate::size::Scanner::new()
-            .measure_optional(&state.paths.cas_dir())?
-            .physical_bytes;
-        let remaining_auxiliary_bytes = crate::size::auxiliary_usage(&state.paths)?.physical_bytes;
-        let remaining_total = remaining_build_bytes
-            .saturating_add(remaining_cas_bytes)
-            .saturating_add(remaining_auxiliary_bytes);
+        let remaining = crate::size::managed_snapshot(&state.paths)?;
+        let remaining_total = remaining.total_bytes();
+        let contexts = remaining.contexts;
+        let remaining_cas_bytes = remaining.cas_bytes;
+        let remaining_auxiliary_bytes = remaining.auxiliary_bytes;
         let needed = remaining_total.saturating_sub(plan.target_bytes).max(
             state
                 .cfg
@@ -1363,15 +1336,11 @@ fn run_gc(
                 .extend(pressure_plan.actions.iter().map(wire_gc_action));
             execution.absorb(gc::execute(&state.paths, &pressure_plan, false)?);
         }
-        let contexts = context::list(&state.paths)?;
-        let remaining_build_bytes: u64 = contexts
-            .iter()
-            .map(|context| context.usage.physical_bytes)
-            .sum();
-        let remaining_cas_bytes = crate::size::Scanner::new()
-            .measure_optional(&state.paths.cas_dir())?
-            .physical_bytes;
-        let remaining_auxiliary_bytes = crate::size::auxiliary_usage(&state.paths)?.physical_bytes;
+        let remaining = crate::size::managed_snapshot(&state.paths)?;
+        let contexts = remaining.contexts;
+        let remaining_build_bytes = remaining.build_bytes;
+        let remaining_cas_bytes = remaining.cas_bytes;
+        let remaining_auxiliary_bytes = remaining.auxiliary_bytes;
         report.remaining_managed_bytes = Some(
             remaining_build_bytes
                 .saturating_add(remaining_cas_bytes)
@@ -1677,18 +1646,9 @@ fn select_cas_manifests(
 fn maintenance(state: &State) -> Result<()> {
     let should_gc = {
         let _operation = state.operation_lock.lock().unwrap();
-        let contexts = context::list(&state.paths)?;
-        let build_bytes: u64 = contexts
-            .iter()
-            .map(|context| context.usage.physical_bytes)
-            .sum();
-        let cas_bytes = crate::size::Scanner::new()
-            .measure_optional(&state.paths.cas_dir())?
-            .physical_bytes;
-        let auxiliary_bytes = crate::size::auxiliary_usage(&state.paths)?.physical_bytes;
-        let managed_bytes = build_bytes
-            .saturating_add(cas_bytes)
-            .saturating_add(auxiliary_bytes);
+        let snapshot = crate::size::managed_snapshot(&state.paths)?;
+        let managed_bytes = snapshot.total_bytes();
+        let contexts = snapshot.contexts;
         let free_bytes = volume_free_bytes_checked(&state.paths.root)?;
         let mut db = state.db.lock().unwrap();
         let age_due = crate::context::unix_now().saturating_sub(db.last_real_gc_at()?)

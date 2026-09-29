@@ -661,8 +661,15 @@ pub fn git_common_dir(workspace_root: &Path) -> Option<PathBuf> {
 }
 
 pub fn list(paths: &RgoPaths) -> Result<Vec<BuildContext>> {
-    let mut out = Vec::new();
     let mut scanner = Scanner::new();
+    list_with_scanner(paths, &mut scanner)
+}
+
+/// Share the build scan's inode set with the other managed storage domains.
+/// The incremental subtotal still needs its own set because it overlaps the
+/// build total by design.
+pub fn list_with_scanner(paths: &RgoPaths, scanner: &mut Scanner) -> Result<Vec<BuildContext>> {
+    let mut out = Vec::new();
     let mut incremental_scanner = Scanner::new();
     for dir in paths.checked_managed_build_dirs()? {
         let sidecar = read_sidecar(&dir);
