@@ -376,6 +376,15 @@ fn stage_and_remove_with(
     }
     let _lifecycle = crate::supervision::try_lock_gc(paths, context.as_deref())?
         .context("a supervised Cargo invocation is using managed storage")?;
+    let _cas_staging = if victim.parent() == Some(paths.cas_dir().as_path()) && is_cas_stage(victim)
+    {
+        Some(
+            rgo_cas::try_lock_staging_cleanup(&paths.cas_dir())?
+                .context("a CAS producer is publishing staging data")?,
+        )
+    } else {
+        None
+    };
     validate_deletion_path(paths, victim)?;
     after_phase(DeletePhase::Locked);
     if context
@@ -527,7 +536,52 @@ fn temporary_actions(paths: &RgoPaths, now: SystemTime, pressure: bool) -> Resul
             });
         }
     }
+    // Store writers hold a shared lock before creating a staging file and
+    // through its final rename. Skip the whole CAS staging domain while a
+    // writer is active, then recheck the lock at deletion time.
+    let cas = paths.cas_dir();
+    if let Some(_staging_guard) = rgo_cas::try_lock_staging_cleanup(&cas)? {
+        for entry in std::fs::read_dir(&cas)? {
+            let path = entry?.path();
+            if !is_cas_stage(&path) {
+                continue;
+            }
+            let metadata = std::fs::symlink_metadata(&path)?;
+            anyhow::ensure!(
+                metadata.is_file() && !metadata.file_type().is_symlink(),
+                "unsafe CAS staging entry {}",
+                path.display()
+            );
+            let modified = metadata.modified()?;
+            let old = now.duration_since(modified).unwrap_or_default() > cutoff;
+            if !old && !pressure {
+                continue;
+            }
+            actions.push(Action {
+                tier: Tier::Tmp,
+                bytes: scanner.measure_checked(&path)?.physical_bytes,
+                path,
+                reason: "abandoned CAS publication staging file".into(),
+            });
+        }
+    }
     Ok(actions)
+}
+
+fn is_cas_stage(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    let rest = name
+        .strip_prefix(".object.")
+        .or_else(|| name.strip_prefix(".manifest."));
+    let Some(rest) = rest.and_then(|rest| rest.strip_suffix(".tmp")) else {
+        return false;
+    };
+    let Some((stamp, pid)) = rest.split_once('.') else {
+        return false;
+    };
+    stamp.parse::<u128>().is_ok() && pid.parse::<u32>().is_ok()
 }
 
 fn is_gc_stage(path: &Path) -> bool {
@@ -681,6 +735,52 @@ mod tests {
         execute(&paths, &pressured, false).unwrap();
         assert!(!staged.exists());
         assert!(!quarantined.exists());
+        assert!(unknown.exists());
+    }
+
+    #[test]
+    fn abandoned_cas_staging_waits_for_publication_lock() {
+        use fs4::fs_std::FileExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let paths = RgoPaths {
+            root: root.path().join("rgo"),
+        };
+        paths.ensure_layout().unwrap();
+        let _store = rgo_cas::Store::new(paths.cas_dir(), paths.quarantine_dir()).unwrap();
+        let staged = paths.cas_dir().join(".object.123.456.tmp");
+        let unknown = paths.cas_dir().join(".object.unknown.tmp");
+        std::fs::write(&staged, vec![b'x'; 8192]).unwrap();
+        std::fs::write(&unknown, vec![b'y'; 8192]).unwrap();
+        let now = SystemTime::now() + Duration::from_secs(7200);
+        let publication = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(paths.cas_dir().join(".staging.lock"))
+            .unwrap();
+        FileExt::lock_shared(&publication).unwrap();
+        assert!(temporary_actions(&paths, now, false).unwrap().is_empty());
+        drop(publication);
+
+        let actions = temporary_actions(&paths, now, false).unwrap();
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].path, staged);
+        let plan = Plan {
+            actions,
+            ..Default::default()
+        };
+        let publication = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(paths.cas_dir().join(".staging.lock"))
+            .unwrap();
+        FileExt::lock_shared(&publication).unwrap();
+        let blocked = execute(&paths, &plan, false).unwrap();
+        assert_eq!(blocked.skipped_actions, 1);
+        assert!(staged.exists());
+        drop(publication);
+        execute(&paths, &plan, false).unwrap();
+        assert!(!staged.exists());
         assert!(unknown.exists());
     }
 

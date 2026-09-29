@@ -1,11 +1,12 @@
 //! Immutable filesystem-backed content-addressed storage for compiler outputs.
 
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
+use fs4::fs_std::FileExt;
 use serde::{Deserialize, Serialize};
 
 pub const MANIFEST_VERSION: u32 = 1;
@@ -46,6 +47,8 @@ impl Store {
             root: root.into(),
             quarantine: quarantine.into(),
         };
+        fs::create_dir_all(&store.root)?;
+        open_staging_lock(&store.root)?;
         fs::create_dir_all(store.objects_dir())?;
         fs::create_dir_all(store.manifests_dir())?;
         fs::create_dir_all(&store.quarantine)?;
@@ -78,9 +81,13 @@ impl Store {
         }
         let parent = path.parent().context("object path has no parent")?;
         fs::create_dir_all(parent)?;
+        let _publication = self.lock_staging_publication()?;
         let temp = self.temp_path("object");
         {
-            let mut file = File::create(&temp)?;
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temp)?;
             file.write_all(bytes)?;
             file.sync_all()?;
         }
@@ -165,10 +172,14 @@ impl Store {
             self.verify_object(stderr)?;
         }
         let path = self.manifest_path(&manifest.key);
+        let _publication = self.lock_staging_publication()?;
         let temp = self.temp_path("manifest");
         let bytes = serde_json::to_vec_pretty(manifest)?;
         {
-            let mut file = File::create(&temp)?;
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temp)?;
             file.write_all(&bytes)?;
             file.sync_all()?;
         }
@@ -257,6 +268,54 @@ impl Store {
         self.root
             .join(format!(".{kind}.{stamp}.{}.tmp", std::process::id()))
     }
+
+    fn lock_staging_publication(&self) -> Result<File> {
+        let file = open_staging_lock(&self.root)?;
+        FileExt::lock_shared(&file).context("locking CAS publication staging")?;
+        Ok(file)
+    }
+}
+
+/// GC takes this lock before considering or removing abandoned CAS staging
+/// files. Every Store writer holds the shared side through its final rename.
+/// A busy lock means a producer may still own a staging path.
+pub fn try_lock_staging_cleanup(root: &Path) -> Result<Option<File>> {
+    match fs::symlink_metadata(root) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Ok(_) => bail!("unsafe CAS storage root {}", root.display()),
+        Err(error) => return Err(error).context("checking CAS storage root"),
+    }
+    let file = open_staging_lock(root)?;
+    if FileExt::try_lock_exclusive(&file).context("locking CAS staging cleanup")? {
+        Ok(Some(file))
+    } else {
+        Ok(None)
+    }
+}
+
+fn open_staging_lock(root: &Path) -> Result<File> {
+    let root_metadata = fs::symlink_metadata(root)?;
+    if !root_metadata.is_dir() || root_metadata.file_type().is_symlink() {
+        bail!("unsafe CAS storage root {}", root.display());
+    }
+    let path = root.join(".staging.lock");
+    match fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Ok(_) => bail!("unsafe CAS staging lock {}", path.display()),
+        Err(error) => return Err(error).context("checking CAS staging lock"),
+    }
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)?;
+    if !file.metadata()?.is_file() {
+        bail!("unsafe CAS staging lock {}", path.display());
+    }
+    Ok(file)
 }
 
 fn valid_key(key: &str) -> bool {

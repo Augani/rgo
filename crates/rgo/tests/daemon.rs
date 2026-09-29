@@ -1230,7 +1230,9 @@ fn maintenance_reclaims_orphans_via_auto_gc() {
     let context_dir = only_context_dir(&sb);
     age_context_into_orphan(&project, &context_dir);
 
-    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    // A best-effort IPC release can be missed under runner load. The 30-second
+    // lease TTL is the supported recovery path, followed by the 1-second poll.
+    let deadline = std::time::Instant::now() + Duration::from_secs(45);
     while context_dir.exists() && std::time::Instant::now() < deadline {
         thread::sleep(Duration::from_millis(250));
     }
