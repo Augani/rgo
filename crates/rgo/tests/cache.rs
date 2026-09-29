@@ -522,6 +522,65 @@ if [ -n "$FAKE_RUSTC_OLD_MTIME" ]; then touch -t 202001010000 "$out"/*; fi
     }
 
     #[test]
+    fn daemon_loss_before_commit_does_not_publish_a_cache_hit() {
+        let _serial = serial_e2e();
+        ensure_workspace_bins_built().unwrap();
+        let sb = Sandbox::new().unwrap();
+        let fixture = fixture(&sb);
+        let mut daemon = start_daemon(&sb);
+        let pause = sb.projects.join("uncommitted-pause");
+        fs::create_dir_all(&pause).unwrap();
+        let mut command = command_for(&sb, &fixture, "producer", &[]);
+        command
+            .env("RGO_TEST_CACHE_PUBLICATION_PAUSE", &pause)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let child = command.spawn().unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while !pause.join("ready").exists() && std::time::Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(25));
+        }
+        if !pause.join("ready").exists() {
+            fs::write(pause.join("release"), b"").unwrap();
+            let output = child.wait_with_output().unwrap();
+            panic!(
+                "wrapper never entered publication: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        daemon.kill().unwrap();
+        daemon.wait().unwrap();
+        fs::write(pause.join("release"), b"").unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(compile_count(&fixture), 1);
+        assert_eq!(
+            fs::read_dir(sb.rgo_home.join("cas/manifests"))
+                .unwrap()
+                .count(),
+            0,
+            "an unacknowledged producer must not expose a cache manifest"
+        );
+
+        let mut recovered = start_daemon(&sb);
+        let second = command_for(&sb, &fixture, "consumer", &[])
+            .output()
+            .unwrap();
+        let _ = recovered.kill();
+        let _ = recovered.wait();
+        assert!(
+            second.status.success(),
+            "{}",
+            String::from_utf8_lossy(&second.stderr)
+        );
+        assert_eq!(compile_count(&fixture), 2, "the second build must compile");
+    }
+
+    #[test]
     fn corrupt_cas_objects_quarantine_and_recover_by_recompiling() {
         let _serial = serial_e2e();
         ensure_workspace_bins_built().unwrap();

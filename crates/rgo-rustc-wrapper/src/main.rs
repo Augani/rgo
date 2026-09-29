@@ -864,7 +864,9 @@ fn publish_result(
             .unwrap_or_default()
             .as_secs(),
     };
-    store.write_manifest(&manifest)?;
+    // The daemon publishes the manifest only after validating our live
+    // producer lease. Writing it here would expose a cache hit even if
+    // CacheCommit is later rejected or never reaches the daemon.
     Ok(manifest)
 }
 
