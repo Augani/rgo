@@ -1130,7 +1130,24 @@ fn run_gc(
     target_bytes: Option<u64>,
 ) -> Result<GcReport> {
     let _operation = state.operation_lock.lock().unwrap();
-    let snapshot = crate::size::managed_snapshot(&state.paths)?;
+    run_gc_locked(state, dry_run, aggressive, auto, target_bytes, None)
+}
+
+/// The caller holds the operation lock. Automatic maintenance can reuse the
+/// checked snapshot it just took under that same lock; explicit requests take
+/// their own fresh snapshot here.
+fn run_gc_locked(
+    state: &State,
+    dry_run: bool,
+    aggressive: bool,
+    auto: bool,
+    target_bytes: Option<u64>,
+    measured: Option<crate::size::ManagedSnapshot>,
+) -> Result<GcReport> {
+    let snapshot = match measured {
+        Some(snapshot) => snapshot,
+        None => crate::size::managed_snapshot(&state.paths)?,
+    };
     let managed_bytes = snapshot.total_bytes();
     let contexts = snapshot.contexts;
     let build_bytes = snapshot.build_bytes;
@@ -1638,31 +1655,13 @@ fn select_cas_manifests(
 }
 
 fn maintenance(state: &State) -> Result<()> {
-    let should_gc = {
+    {
         let _operation = state.operation_lock.lock().unwrap();
-        // Explicit status/GC requests perform their own authoritative scan.
-        // In the default manual, cache-disabled mode, do not walk every build
-        // and manifest tree on each metadata-only maintenance tick.
-        let snapshot = state
-            .cfg
-            .gc
-            .auto
-            .then(|| crate::size::managed_snapshot(&state.paths))
-            .transpose()?;
         let free_bytes = volume_free_bytes_checked(&state.paths.root)?;
         let mut db = state.db.lock().unwrap();
         db.expire_leases()?;
         db.prune_failed_cache_builds(Duration::from_secs(7 * 86_400))?;
-        let mut should_gc = false;
-        if let Some(snapshot) = snapshot {
-            let age_due = crate::context::unix_now().saturating_sub(db.last_real_gc_at()?)
-                >= AGE_MAINTENANCE_INTERVAL.as_secs();
-            should_gc = snapshot.total_bytes() > state.cfg.soft_watermark
-                || free_bytes < state.cfg.min_free_space
-                || age_due;
-            db.reconcile_contexts(&state.paths, &snapshot.contexts)?;
-            reconcile_cache(&mut db, &state.cas)?;
-        } else if state.cfg.cache.enabled {
+        if state.cfg.gc.auto || state.cfg.cache.enabled {
             // Cache statistics must still notice manifests removed outside
             // daemon GC when optional caching is enabled in manual mode.
             reconcile_cache(&mut db, &state.cas)?;
@@ -1674,27 +1673,26 @@ fn maintenance(state: &State) -> Result<()> {
             MAX_EVENT_BATCH_PRUNE_PER_PASS,
         )?;
         db.prune_operational_history()?;
-        match db.migrate_legacy_auto_vacuum(&state.paths.db_file(), free_bytes) {
+        let migrated = match db.migrate_legacy_auto_vacuum(&state.paths.db_file(), free_bytes) {
             Ok(true) => {
                 // VACUUM may renumber implicit rowids used by this scan cursor.
                 *state.batch_prune_cursor.lock().unwrap() = 0;
                 // Re-measure the managed budget next cycle after the rebuild.
-                should_gc = false;
                 tracing::info!("converted legacy SQLite metadata for incremental reclamation");
+                true
             }
-            Ok(false) => {}
-            Err(error) => tracing::warn!(%error, "deferred legacy SQLite metadata conversion"),
-        }
+            Ok(false) => false,
+            Err(error) => {
+                tracing::warn!(%error, "deferred legacy SQLite metadata conversion");
+                false
+            }
+        };
         db.reclaim_unused_pages()?;
-        should_gc
-    };
-    // This metadata-only recovery runs even while automatic destructive GC is
-    // disabled. A nonblocking lifecycle guard defers active Cargo sessions.
-    {
-        // Pruning probes the same lifecycle guards as explicit clean. Keep it
-        // under the daemon's operation lock so maintenance cannot make a
-        // concurrent clean fail with a spurious busy-session error.
-        let _operation = state.operation_lock.lock().unwrap();
+        drop(db);
+        // This metadata-only recovery runs even while automatic destructive GC is
+        // disabled. A nonblocking lifecycle guard defers active Cargo sessions.
+        // Keep the probe under the operation lock so explicit clean cannot
+        // collide with it and report a spurious busy-session error.
         match state
             .pin_pruner
             .lock()
@@ -1705,9 +1703,32 @@ fn maintenance(state: &State) -> Result<()> {
             Ok(pruned) => tracing::debug!(pruned, "pruned stale unpin decisions"),
             Err(error) => tracing::warn!(%error, "pin decision recovery failed"),
         }
-    }
-    if should_gc {
-        let _ = run_gc(state, false, false, true, None)?;
+        // Explicit status/GC requests perform their own authoritative scan.
+        // In the default manual, cache-disabled mode, do not walk every build
+        // and manifest tree on each metadata-only maintenance tick. Measure
+        // after operational housekeeping so automatic GC can reuse this scan.
+        let snapshot = state
+            .cfg
+            .gc
+            .auto
+            .then(|| crate::size::managed_snapshot(&state.paths))
+            .transpose()?;
+        let should_gc = if let Some(snapshot) = snapshot.as_ref() {
+            let free_bytes = volume_free_bytes_checked(&state.paths.root)?;
+            let mut db = state.db.lock().unwrap();
+            let age_due = crate::context::unix_now().saturating_sub(db.last_real_gc_at()?)
+                >= AGE_MAINTENANCE_INTERVAL.as_secs();
+            db.reconcile_contexts(&state.paths, &snapshot.contexts)?;
+            !migrated
+                && (snapshot.total_bytes() > state.cfg.soft_watermark
+                    || free_bytes < state.cfg.min_free_space
+                    || age_due)
+        } else {
+            false
+        };
+        if should_gc {
+            let _ = run_gc_locked(state, false, false, true, None, snapshot)?;
+        }
     }
     process_remote_jobs(state)?;
     Ok(())
