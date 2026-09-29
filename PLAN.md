@@ -56,10 +56,11 @@ as unattended bounded storage until the P2 lifecycle and P3 budget gates pass.
   its ordinary checkout directory. It must pass the mixed-launch, PATH/rustup,
   signal, GC-race, and platform gates before becoming the default. Global-config
   relocation and `gc.auto = false` remain the current development behavior.
-  With explicit `gc.auto = true`, the Unix pilot now starts a daemon from an
-  unchanged Cargo invocation and falls back to local Cargo storage if startup
-  fails; a private macOS fixture observed an idle context reclaimed. This is
-  evaluation evidence, not completion of the P2/P3 release gates.
+  With explicit `gc.auto = true`, the supervised Unix and Windows pilots now
+  start a daemon from an unchanged Cargo invocation and fall back to local
+  Cargo storage if startup fails. Private macOS and Windows fixtures observed
+  idle contexts reclaimed without a separate rgo command. This is evaluation
+  evidence, not completion of the P2/P3 release gates.
 - **15 crates up front.** Collapse to 5 crates now; split when a boundary actually hurts.
 - **Repository identity via Git common dir for build roots.** Build-dirs are keyed by
   what Cargo keys them by (manifest path). Git/worktree identity is only needed for the
@@ -483,7 +484,7 @@ Work in this order. Items marked **release-blocking** must be complete before th
 
 **Phase 1 done when:** a fresh install followed by plain Cargo usage bounds intermediate storage automatically; overrides and bypass remain reliable; GC cannot remove active or pinned state; and release artifacts work on macOS, Linux, and Windows.
 
-**Current gate status:** implementation, automated validation, operator dogfooding, and release artifact automation are complete. Tagging the v0.1 release and Homebrew/cargo-dist publishing remain operator actions.
+**Current gate status:** the historical Phase 1 mechanisms and packaging workflow exist, but the current [installation and storage checklist](docs/installation-storage-plan.md) still blocks an unattended bounded-storage release on full Cargo-session safety, sustained budget recovery, installation lifecycle, and fresh-machine evidence. Do not tag or publish v0.1 as complete on the basis of the historical checked items above.
 
 #### B. Production-harden Phase 2 — daemon and leases (`v0.2`, release-blocking)
 
