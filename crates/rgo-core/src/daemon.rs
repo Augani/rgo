@@ -30,7 +30,9 @@ use rgo_cas::{MANIFEST_VERSION, Manifest, ManifestOutput, ObjectRef, Store};
 use rgo_remote::{Client as RemoteClient, Config as RemoteConfig, Fetch as RemoteFetch};
 
 const POLL_INTERVAL: Duration = Duration::from_secs(30);
+const AUTO_SCAN_INTERVAL: Duration = Duration::from_secs(120);
 const AGE_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(3600);
+const MAX_AUTO_SCAN_ENTRIES_PER_PASS: usize = 8192;
 const MAX_EVENT_DRAINS_PER_PASS: usize = 4;
 const MAX_EVENT_SCAN_ENTRIES_PER_PASS: usize = 256;
 const MAX_EVENT_BATCH_PRUNE_PER_PASS: usize = 64;
@@ -49,6 +51,14 @@ fn poll_interval() -> Duration {
         .filter(|v| (1..=3600).contains(v))
         .map(Duration::from_secs)
         .unwrap_or(POLL_INTERVAL)
+}
+
+fn auto_scan_interval() -> Duration {
+    if std::env::var_os("RGO_DAEMON_POLL_SECS").is_some() {
+        poll_interval()
+    } else {
+        AUTO_SCAN_INTERVAL
+    }
 }
 
 struct ConnectionPermit {
@@ -95,6 +105,7 @@ struct State {
     cas: Store,
     operation_lock: Arc<Mutex<()>>,
     pin_pruner: Arc<Mutex<context::PinPruneScanner>>,
+    trigger_scan: Arc<Mutex<crate::size::TriggerScan>>,
     event_drainer: Arc<Mutex<CacheEventDrainScanner>>,
     batch_prune_cursor: Arc<Mutex<i64>>,
     pid: u32,
@@ -231,6 +242,7 @@ pub fn run(paths: RgoPaths, cfg: Resolved) -> Result<()> {
         cas,
         operation_lock: Arc::new(Mutex::new(())),
         pin_pruner: Arc::new(Mutex::new(context::PinPruneScanner::default())),
+        trigger_scan: Arc::new(Mutex::new(crate::size::TriggerScan::default())),
         event_drainer: Arc::new(Mutex::new(event_drainer)),
         batch_prune_cursor: Arc::new(Mutex::new(batch_prune_cursor)),
         pid: std::process::id(),
@@ -764,6 +776,7 @@ fn status_report(state: &State) -> Result<StatusReport> {
     db.expire_leases()?;
     db.prune_failed_cache_builds(Duration::from_secs(7 * 86_400))?;
     db.reconcile_contexts(&state.paths, &contexts)?;
+    reconcile_cache(&mut db, &state.cas)?;
     drain_cache_events(&state.paths, &db, &mut state.event_drainer.lock().unwrap())?;
     let pinned = db.pinned_paths()?;
     let mut leased = db.protected_paths(&contexts)?;
@@ -1130,24 +1143,7 @@ fn run_gc(
     target_bytes: Option<u64>,
 ) -> Result<GcReport> {
     let _operation = state.operation_lock.lock().unwrap();
-    run_gc_locked(state, dry_run, aggressive, auto, target_bytes, None)
-}
-
-/// The caller holds the operation lock. Automatic maintenance can reuse the
-/// checked snapshot it just took under that same lock; explicit requests take
-/// their own fresh snapshot here.
-fn run_gc_locked(
-    state: &State,
-    dry_run: bool,
-    aggressive: bool,
-    auto: bool,
-    target_bytes: Option<u64>,
-    measured: Option<crate::size::ManagedSnapshot>,
-) -> Result<GcReport> {
-    let snapshot = match measured {
-        Some(snapshot) => snapshot,
-        None => crate::size::managed_snapshot(&state.paths)?,
-    };
+    let snapshot = crate::size::managed_snapshot(&state.paths)?;
     let managed_bytes = snapshot.total_bytes();
     let contexts = snapshot.contexts;
     let build_bytes = snapshot.build_bytes;
@@ -1176,6 +1172,7 @@ fn run_gc_locked(
     let mut db = state.db.lock().unwrap();
     db.expire_leases()?;
     db.reconcile_contexts(&state.paths, &contexts)?;
+    reconcile_cache(&mut db, &state.cas)?;
     let pinned = db.pinned_paths()?;
     let leased = db.protected_paths(&contexts)?;
     let active_cache_keys = db.active_cache_keys()?;
@@ -1655,17 +1652,12 @@ fn select_cas_manifests(
 }
 
 fn maintenance(state: &State) -> Result<()> {
-    {
+    let migrated = {
         let _operation = state.operation_lock.lock().unwrap();
         let free_bytes = volume_free_bytes_checked(&state.paths.root)?;
-        let mut db = state.db.lock().unwrap();
+        let db = state.db.lock().unwrap();
         db.expire_leases()?;
         db.prune_failed_cache_builds(Duration::from_secs(7 * 86_400))?;
-        if state.cfg.gc.auto || state.cfg.cache.enabled {
-            // Cache statistics must still notice manifests removed outside
-            // daemon GC when optional caching is enabled in manual mode.
-            reconcile_cache(&mut db, &state.cas)?;
-        }
         drain_cache_events(&state.paths, &db, &mut state.event_drainer.lock().unwrap())?;
         db.prune_missing_cache_event_batches(
             &state.paths.state_dir(),
@@ -1703,34 +1695,43 @@ fn maintenance(state: &State) -> Result<()> {
             Ok(pruned) => tracing::debug!(pruned, "pruned stale unpin decisions"),
             Err(error) => tracing::warn!(%error, "pin decision recovery failed"),
         }
-        // Explicit status/GC requests perform their own authoritative scan.
-        // In the default manual, cache-disabled mode, do not walk every build
-        // and manifest tree on each metadata-only maintenance tick. Measure
-        // after operational housekeeping so automatic GC can reuse this scan.
-        let snapshot = state
-            .cfg
-            .gc
-            .auto
-            .then(|| crate::size::managed_snapshot(&state.paths))
-            .transpose()?;
-        let should_gc = if let Some(snapshot) = snapshot.as_ref() {
-            let free_bytes = volume_free_bytes_checked(&state.paths.root)?;
-            let mut db = state.db.lock().unwrap();
-            let age_due = crate::context::unix_now().saturating_sub(db.last_real_gc_at()?)
-                >= AGE_MAINTENANCE_INTERVAL.as_secs();
-            let should_gc = !migrated
-                && (snapshot.total_bytes() > state.cfg.soft_watermark
-                    || free_bytes < state.cfg.min_free_space
-                    || age_due);
-            if !should_gc {
-                db.reconcile_contexts(&state.paths, &snapshot.contexts)?;
-            }
-            should_gc
+        migrated
+    };
+    if state.cfg.gc.auto {
+        if migrated {
+            // A legacy VACUUM changed the measured budget. Start a fresh
+            // trigger sweep on the next maintenance tick.
+            state.trigger_scan.lock().unwrap().invalidate();
         } else {
-            false
-        };
-        if should_gc {
-            let _ = run_gc_locked(state, false, false, true, None, snapshot)?;
+            let free_bytes = volume_free_bytes_checked(&state.paths.root)?;
+            let age_due = crate::context::unix_now()
+                .saturating_sub(state.db.lock().unwrap().last_real_gc_at()?)
+                >= AGE_MAINTENANCE_INTERVAL.as_secs();
+            let urgent = free_bytes < state.cfg.min_free_space || age_due;
+            // This advisory scan runs outside the operation lock. It visits a
+            // bounded number of entries per tick; the GC pass takes a fresh
+            // authoritative snapshot under the lock before selecting anything.
+            let pressure = if urgent {
+                false
+            } else {
+                let mut scan = state.trigger_scan.lock().unwrap();
+                let completed = scan.advance(
+                    &state.paths,
+                    MAX_AUTO_SCAN_ENTRIES_PER_PASS,
+                    auto_scan_interval(),
+                )?;
+                completed.is_some_and(|bytes| bytes > state.cfg.soft_watermark)
+                    || scan.observed_bytes() > state.cfg.soft_watermark
+            };
+            if urgent || pressure {
+                match run_gc(state, false, false, true, None) {
+                    Ok(_) => state.trigger_scan.lock().unwrap().mark_completed(),
+                    Err(error) => {
+                        state.trigger_scan.lock().unwrap().invalidate();
+                        return Err(error);
+                    }
+                }
+            }
         }
     }
     process_remote_jobs(state)?;
@@ -2266,6 +2267,7 @@ mod tests {
             cas,
             operation_lock: Arc::new(Mutex::new(())),
             pin_pruner: Arc::new(Mutex::new(context::PinPruneScanner::default())),
+            trigger_scan: Arc::new(Mutex::new(crate::size::TriggerScan::default())),
             event_drainer: Arc::new(Mutex::new(CacheEventDrainScanner::default())),
             batch_prune_cursor: Arc::new(Mutex::new(0)),
             pid: std::process::id(),

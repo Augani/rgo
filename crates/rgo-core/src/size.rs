@@ -4,6 +4,7 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, ensure};
 use walkdir::WalkDir;
@@ -180,6 +181,134 @@ impl Scanner {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Usage::default()),
             Err(error) => Err(error).with_context(|| format!("checking {}", path.display())),
         }
+    }
+}
+
+/// A bounded, advisory trigger scan for automatic maintenance. A completed
+/// result can request an authoritative GC pass, but it is never used to plan a
+/// deletion: Cargo may change files between chunks, and explicit GC takes its
+/// own checked snapshot under the operation lock.
+#[derive(Default)]
+pub(crate) struct TriggerScan {
+    walk: Option<walkdir::IntoIter>,
+    root: Option<PathBuf>,
+    scanner: Scanner,
+    usage: Usage,
+    last_completed: Option<Instant>,
+}
+
+impl TriggerScan {
+    /// Bytes observed so far in an incomplete sweep. This is enough to request
+    /// an authoritative pass once it exceeds the watermark, but never enough
+    /// to plan a deletion or conclude that storage is below budget.
+    pub(crate) fn observed_bytes(&self) -> u64 {
+        self.usage.physical_bytes
+    }
+
+    /// Visit at most `limit` filesystem entries. A quiet completed sweep waits
+    /// for `interval` before starting another; an incomplete sweep resumes on
+    /// the next call. Any scan error discards the partial total.
+    pub(crate) fn advance(
+        &mut self,
+        paths: &RgoPaths,
+        limit: usize,
+        interval: Duration,
+    ) -> Result<Option<u64>> {
+        ensure!(limit > 0, "trigger scan limit must be positive");
+        if self.walk.is_none() {
+            if self
+                .last_completed
+                .is_some_and(|completed| completed.elapsed() < interval)
+            {
+                return Ok(None);
+            }
+            // RGO_HOME itself may intentionally be a symlink. Canonicalize
+            // that one entry, then never follow links inside the owned tree.
+            let root = paths
+                .root
+                .canonicalize()
+                .with_context(|| format!("resolving {}", paths.root.display()))?;
+            ensure!(root.is_dir(), "storage root is not a directory");
+            self.walk = Some(WalkDir::new(&root).follow_links(false).into_iter());
+            self.root = Some(root);
+            self.scanner = Scanner::new();
+            self.usage = Usage::default();
+        }
+        for _ in 0..limit {
+            let next = self.walk.as_mut().unwrap().next();
+            let entry = match next {
+                Some(Ok(entry)) => entry,
+                Some(Err(error)) => {
+                    self.invalidate();
+                    return Err(error).context("walking managed storage for automatic trigger");
+                }
+                None => {
+                    let expected = self.root.as_ref().unwrap();
+                    let actual = paths.root.canonicalize();
+                    if !actual.as_ref().is_ok_and(|actual| actual == expected) {
+                        self.invalidate();
+                        anyhow::bail!("storage root changed during automatic trigger scan");
+                    }
+                    let total = self.usage.physical_bytes;
+                    self.mark_completed();
+                    return Ok(Some(total));
+                }
+            };
+            if entry.depth() == 1 && entry.file_type().is_symlink() {
+                let path = entry.path().to_path_buf();
+                self.invalidate();
+                anyhow::bail!("unsafe symlinked storage entry {}", path.display());
+            }
+            if matches!(entry.depth(), 2 | 3) {
+                let builds = self.root.as_ref().unwrap().join("builds");
+                let is_build_shard =
+                    entry.depth() == 2 && entry.path().parent() == Some(builds.as_path());
+                let is_build_context = entry.depth() == 3
+                    && entry.path().parent().and_then(Path::parent) == Some(builds.as_path());
+                if (is_build_shard || is_build_context) && !entry.file_type().is_dir() {
+                    let path = entry.path().to_path_buf();
+                    self.invalidate();
+                    anyhow::bail!("unsafe managed build entry {}", path.display());
+                }
+            }
+            let metadata = match entry.metadata() {
+                Ok(metadata) => metadata,
+                Err(error) => {
+                    let path = entry.path().to_path_buf();
+                    self.invalidate();
+                    return Err(error).with_context(|| format!("reading {}", path.display()));
+                }
+            };
+            if metadata.is_file()
+                && self.scanner.record_identity(
+                    &FileIdentity::read(entry.path(), &metadata),
+                    &mut self.usage,
+                )
+            {
+                self.usage.physical_bytes = self
+                    .usage
+                    .physical_bytes
+                    .saturating_add(physical_len(entry.path(), &metadata));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Finish a quiet sweep or supersede it after a successful full GC pass.
+    pub(crate) fn mark_completed(&mut self) {
+        self.walk = None;
+        self.root = None;
+        self.scanner = Scanner::new();
+        self.usage = Usage::default();
+        self.last_completed = Some(Instant::now());
+    }
+
+    pub(crate) fn invalidate(&mut self) {
+        self.walk = None;
+        self.root = None;
+        self.scanner = Scanner::new();
+        self.usage = Usage::default();
+        self.last_completed = None;
     }
 }
 
@@ -450,5 +579,41 @@ mod tests {
         assert_eq!(snapshot.cas_bytes, 0);
         assert_eq!(snapshot.auxiliary_bytes, 0);
         assert_eq!(snapshot.total_bytes(), expected);
+    }
+
+    #[test]
+    fn bounded_trigger_sweep_matches_checked_managed_total() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = RgoPaths {
+            root: root.path().join("rgo"),
+        };
+        paths.ensure_layout().unwrap();
+        let context = paths.builds_dir().join("aa/context");
+        std::fs::create_dir_all(context.join("debug/incremental")).unwrap();
+        let artifact = context.join("debug/incremental/artifact");
+        std::fs::write(&artifact, vec![b'x'; 8192]).unwrap();
+        std::fs::create_dir_all(paths.cas_dir()).unwrap();
+        std::fs::hard_link(&artifact, paths.cas_dir().join("linked-object")).unwrap();
+        std::fs::write(paths.state_dir().join("other-state"), vec![b'y'; 4096]).unwrap();
+
+        let expected = managed_snapshot(&paths).unwrap().total_bytes();
+        let mut scan = TriggerScan::default();
+        let mut chunks = 0;
+        let mut observed_partial_pressure = false;
+        let measured = loop {
+            chunks += 1;
+            if let Some(total) = scan.advance(&paths, 1, Duration::from_secs(3600)).unwrap() {
+                break total;
+            }
+            observed_partial_pressure |= scan.observed_bytes() > 0;
+            assert!(chunks < 100);
+        };
+        assert!(chunks > 1);
+        assert!(observed_partial_pressure);
+        assert_eq!(measured, expected);
+        assert_eq!(
+            scan.advance(&paths, 1, Duration::from_secs(3600)).unwrap(),
+            None
+        );
     }
 }
