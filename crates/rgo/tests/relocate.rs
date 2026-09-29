@@ -167,6 +167,11 @@ fn deleting_the_checkout_reports_its_workspace_state() {
             .unwrap()
             .success()
     );
+    #[cfg(windows)]
+    assert!(
+        rgo_core::context::workspace_device(&proj).is_some(),
+        "local Windows workspace should expose a volume serial"
+    );
     let orphan_supported = ((cfg!(target_os = "macos") || cfg!(windows))
         && rgo_core::context::workspace_device(&proj).is_some())
         || rgo_core::context::workspace_mount_id(&proj).is_some();
