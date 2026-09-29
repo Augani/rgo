@@ -438,6 +438,19 @@ pub fn run(
         effective_cfg_path
     };
     let config_existed = cfg_path.exists();
+    if supervised {
+        match std::fs::symlink_metadata(&cfg_path) {
+            Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {}
+            Ok(_) => bail!(
+                "supervised setup requires a regular Cargo config file: {}",
+                cfg_path.display()
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| format!("checking {}", cfg_path.display()));
+            }
+        }
+    }
     let current = cargo_config::read_or_empty(&cfg_path)?;
     let insp = cargo_config::inspect(&current)?;
     if insp.has_fence {
@@ -472,6 +485,12 @@ pub fn run(
     if supervised && insp.build_dir_outside_fence.is_some() {
         bail!(
             "supervised setup requires no global build.build-dir; remove the existing setting from {} before activation",
+            cfg_path.display()
+        );
+    }
+    if supervised && insp.has_include {
+        bail!(
+            "supervised setup cannot verify included Cargo configuration; remove the include from {} before activation",
             cfg_path.display()
         );
     }

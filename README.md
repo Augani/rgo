@@ -65,7 +65,8 @@ lifecycle remains release work:
    use only when `[gc].auto = true` is explicitly configured for evaluation.
    Native setup rejects `[gc].auto = true`, and destructive `rgo gc` and
    `rgo clean` require supervised mode: native relocation has no guard covering
-   an entire Cargo session.
+   an entire Cargo session. Supervised cleanup also stops if the Cargo-home
+   config later gains a build-directory setting or unresolved include.
 
 For private Unix evaluation of full Cargo-session supervision, use
 `rgo setup --supervised --real-cargo /absolute/path/to/cargo --no-service` in

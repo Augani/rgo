@@ -23,9 +23,15 @@ the Cargo-home `build.build-dir` setting also sends direct Cargo processes into
 rgo storage, but those processes have no rgo session guard. Therefore native
 mode does **not** satisfy the property for unattended whole-context deletion.
 Native setup and daemon startup now reject `[gc].auto = true`. Every destructive
-GC pass and explicit `rgo clean` recheck the recorded supervised mode; a dry-run
-can still inspect native storage. This admission check does not prove all
-supervised process trees or configuration-drift cases safe.
+GC pass and explicit `rgo clean` recheck the recorded supervised mode and its
+Cargo-home owner. They refuse cleanup if that home's effective config sets a
+global build directory or has an unresolved include. Supervised setup rejects
+those configs before activation; a dry-run can still inspect native storage.
+These admission checks do not cover project, environment, or CLI overrides by
+an unsupervised Cargo process, nor prove all supervised process trees safe.
+Undo removes the active owner record, so a retained storage root cannot be
+destructively cleaned through `rgo gc` after uninstall; a separately reviewed
+offline purge remains release work.
 No amount of recent-mtime grace or rustc-wrapper lease can cover a no-op build,
 build script, test process, or a Cargo process waiting on a lock. Cargo's
 documented [build-directory configuration](https://doc.rust-lang.org/cargo/reference/config.html#buildbuild-dir)
@@ -130,7 +136,7 @@ process-level session guard.
 
 | Condition | Current treatment | Release work |
 |---|---|---|
-| Native setup or an external Cargo/IDE launch with a managed build-dir override | The rgo lock does not cover it. `gc.auto` stays off. | Prevent managed-namespace bypass in the supported activation contract or obtain an upstream Cargo lifecycle hook. |
+| Native setup or an external Cargo/IDE launch with a managed build-dir override | The rgo lock does not cover it. `gc.auto` stays off. Supervised cleanup now refuses Cargo-home config drift, but cannot exclude project, environment, or CLI overrides from another process. | Prevent managed-namespace bypass in the supported activation contract or obtain an upstream Cargo lifecycle hook. |
 | A build-script or test descendant escapes the inherited Unix descriptor, or a Windows process starts through an external broker such as WMI | The parent can finish while an external writer remains. | Run real process-tree fixtures, define supported launch semantics, and refuse unattended deletion where exclusion cannot be guaranteed. |
 | Same-user replacement of the lock directory or, on Unix, a lock file after its final identity check | Existing holders could lock different file identities even though pre-acquisition checks passed. Windows now denies direct lock-file rename/delete while its handle is open; ancestor mutation remains unproven. | Define and enforce private lock-directory ownership/mutation rules; exercise replacement at every pause point. |
 | Unsupported filesystem locking, unreadable state, daemon outage, or failed Windows job creation | Error/guard contention skips GC; supervised launch should use ordinary Cargo storage if it cannot establish protection. | Prove fallback before any managed write on each platform and with service restart/interruption. |

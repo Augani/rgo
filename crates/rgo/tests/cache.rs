@@ -471,6 +471,11 @@ if [ -n "$FAKE_RUSTC_OLD_MTIME" ]; then touch -t 202001010000 "$out"/*; fi
         };
         paths.ensure_layout().unwrap();
         fs::write(paths.state_dir().join("storage-mode"), b"supervised\n").unwrap();
+        fs::write(
+            paths.state_dir().join("owner-cargo-home"),
+            format!("{}\n", sb.cargo_home.display()),
+        )
+        .unwrap();
         let mut daemon = start_daemon(&sb);
         let pause = sb.projects.join("publication-pause");
         fs::create_dir_all(&pause).unwrap();

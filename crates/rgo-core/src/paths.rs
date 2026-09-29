@@ -66,6 +66,61 @@ impl RgoPaths {
             mode == b"supervised\n",
             "destructive cleanup requires an activated supervised Cargo installation; use a fresh RGO_HOME with `rgo setup --supervised`"
         );
+        let owner_path = self.state_dir().join("owner-cargo-home");
+        let owner_metadata = match std::fs::symlink_metadata(&owner_path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                anyhow::bail!(
+                    "destructive cleanup requires an active supervised Cargo installation; supervised Cargo home owner is missing at {}",
+                    owner_path.display()
+                );
+            }
+            Err(error) => {
+                return Err(error).with_context(|| format!("checking {}", owner_path.display()));
+            }
+        };
+        ensure!(
+            owner_metadata.is_file() && !owner_metadata.file_type().is_symlink(),
+            "unsafe supervised Cargo home owner {}",
+            owner_path.display()
+        );
+        let owner = std::fs::read(&owner_path).with_context(|| {
+            format!(
+                "reading supervised Cargo home owner {}",
+                owner_path.display()
+            )
+        })?;
+        let home = std::str::from_utf8(&owner)
+            .with_context(|| format!("decoding {}", owner_path.display()))?;
+        let Some(home) = home.strip_suffix('\n') else {
+            anyhow::bail!(
+                "invalid supervised Cargo home owner {}",
+                owner_path.display()
+            );
+        };
+        let home = Path::new(home);
+        ensure!(
+            home.is_absolute() && !home.components().any(|part| part == Component::ParentDir),
+            "invalid supervised Cargo home owner {}",
+            owner_path.display()
+        );
+        let config_path = crate::cargo_config::effective_home_config(home);
+        match std::fs::symlink_metadata(&config_path) {
+            Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
+                let config = std::fs::read_to_string(&config_path)
+                    .with_context(|| format!("reading {}", config_path.display()))?;
+                ensure!(
+                    !crate::cargo_config::may_set_build_dir(&config)?,
+                    "destructive cleanup cannot verify that {} keeps direct Cargo outside managed storage; remove its build.build-dir/include override",
+                    config_path.display()
+                );
+            }
+            Ok(_) => anyhow::bail!("unsafe Cargo configuration {}", config_path.display()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| format!("checking {}", config_path.display()));
+            }
+        }
         Ok(())
     }
     /// Parent of every Cargo build-dir rgo manages. Cargo's `{workspace-path-hash}`

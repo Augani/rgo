@@ -572,6 +572,11 @@ fn concurrent_cargo_clean_protects_its_context_but_allows_other_gc() {
     };
     paths.ensure_layout().unwrap();
     std::fs::write(paths.state_dir().join("storage-mode"), b"supervised\n").unwrap();
+    std::fs::write(
+        paths.state_dir().join("owner-cargo-home"),
+        format!("{}\n", sandbox.cargo_home.display()),
+    )
+    .unwrap();
     let build = sandbox
         .cmd(rgo)
         .current_dir(&project)

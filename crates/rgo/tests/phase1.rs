@@ -139,6 +139,11 @@ fn pressure_gc_reclaims_idle_unpinned_only_contexts_in_private_home() {
     };
     paths.ensure_layout().unwrap();
     std::fs::write(paths.state_dir().join("storage-mode"), b"supervised\n").unwrap();
+    std::fs::write(
+        paths.state_dir().join("owner-cargo-home"),
+        format!("{}\n", sandbox.cargo_home.display()),
+    )
+    .unwrap();
     for index in 0..3 {
         let workspace = sandbox.projects.join(format!("pressure-{index}"));
         std::fs::create_dir_all(&workspace).unwrap();
@@ -190,6 +195,11 @@ fn explicit_clean_reports_a_locked_context_instead_of_claiming_removal() {
     };
     paths.ensure_layout().unwrap();
     std::fs::write(paths.state_dir().join("storage-mode"), b"supervised\n").unwrap();
+    std::fs::write(
+        paths.state_dir().join("owner-cargo-home"),
+        format!("{}\n", sandbox.cargo_home.display()),
+    )
+    .unwrap();
     let project = sandbox.simple_bin("clean-locked").unwrap();
     let context_dir = paths.builds_dir().join("aa/context");
     std::fs::create_dir_all(&context_dir).unwrap();

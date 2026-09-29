@@ -69,6 +69,91 @@ fn native_activation_refuses_unprotected_destructive_cleanup() {
 }
 
 #[test]
+fn supervised_cleanup_refuses_global_cargo_config_drift() {
+    ensure_workspace_bins_built().unwrap();
+    let sandbox = Sandbox::new().unwrap();
+    let rgo = cargo_bin("rgo");
+    let real_cargo = std::env::var_os("CARGO").unwrap();
+    let config_path = sandbox.cargo_home.join("config.toml");
+    std::fs::write(&config_path, "include = [\"other.toml\"]\n").unwrap();
+    let setup = sandbox
+        .cmd(&rgo)
+        .args(["setup", "--supervised", "--real-cargo"])
+        .arg(&real_cargo)
+        .arg("--no-service")
+        .output()
+        .unwrap();
+    assert!(!setup.status.success());
+    assert!(
+        String::from_utf8_lossy(&setup.stderr)
+            .contains("cannot verify included Cargo configuration")
+    );
+    assert!(!sandbox.cargo_home.join(".rgo-install.json").exists());
+
+    std::fs::remove_file(&config_path).unwrap();
+    let setup = sandbox
+        .cmd(&rgo)
+        .args(["setup", "--supervised", "--real-cargo"])
+        .arg(&real_cargo)
+        .arg("--no-service")
+        .output()
+        .unwrap();
+    assert!(
+        setup.status.success(),
+        "{}",
+        String::from_utf8_lossy(&setup.stderr)
+    );
+    let paths = rgo_core::paths::RgoPaths {
+        root: sandbox.rgo_home.clone(),
+    };
+    let project = sandbox.simple_bin("supervised-drift").unwrap();
+    let context_dir = paths.builds_dir().join("aa/context");
+    std::fs::create_dir_all(&context_dir).unwrap();
+    std::fs::write(context_dir.join("output"), b"keep").unwrap();
+    rgo_core::context::write_sidecar(&context_dir, &project, &project.join("Cargo.toml"), None)
+        .unwrap();
+    for config in [
+        format!("[build]\nbuild-dir = {:?}\n", paths.build_dir_template()),
+        "include = [\"other.toml\"]\n".to_owned(),
+    ] {
+        std::fs::write(&config_path, config).unwrap();
+        for args in [vec!["gc", "--target", "0"], vec!["clean", "aa/context"]] {
+            let result = sandbox.cmd(&rgo).args(args).output().unwrap();
+            assert!(!result.status.success());
+            assert!(
+                String::from_utf8_lossy(&result.stderr)
+                    .contains("keeps direct Cargo outside managed storage")
+            );
+            assert!(context_dir.join("output").is_file());
+        }
+    }
+    assert!(!paths.socket_path().exists());
+    std::fs::remove_file(&config_path).unwrap();
+    let undo = sandbox
+        .cmd(&rgo)
+        .args(["setup", "--undo", "--no-service"])
+        .output()
+        .unwrap();
+    assert!(
+        undo.status.success(),
+        "{}",
+        String::from_utf8_lossy(&undo.stderr)
+    );
+    let gc_after_undo = sandbox
+        .cmd(&rgo)
+        .args(["gc", "--target", "0"])
+        .output()
+        .unwrap();
+    assert!(!gc_after_undo.status.success());
+    assert!(
+        String::from_utf8_lossy(&gc_after_undo.stderr).contains("supervised Cargo home owner"),
+        "{}",
+        String::from_utf8_lossy(&gc_after_undo.stderr)
+    );
+    assert!(context_dir.join("output").is_file());
+}
+
+#[test]
 fn setup_migrates_legacy_pins_without_a_running_service() {
     ensure_workspace_bins_built().unwrap();
     let sandbox = Sandbox::new().unwrap();

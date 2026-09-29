@@ -2223,6 +2223,11 @@ mod tests {
         };
         paths.ensure_layout().unwrap();
         std::fs::write(paths.state_dir().join("storage-mode"), b"supervised\n").unwrap();
+        std::fs::write(
+            paths.state_dir().join("owner-cargo-home"),
+            format!("{}\n", temp.path().join("cargo").display()),
+        )
+        .unwrap();
         let cas = Store::new(paths.cas_dir(), paths.quarantine_dir()).unwrap();
         let now = crate::context::unix_now();
         let old_key = "a".repeat(64);
