@@ -12,6 +12,7 @@ pub fn run(dry_run: bool, aggressive: bool, auto: bool, target: Option<String>) 
         return Ok(());
     }
     if auto {
+        e.paths.require_supervised_auto_gc()?;
         let managed_bytes = rgo_core::size::managed_snapshot(&e.paths)?.total_bytes();
         let free_bytes = config::volume_free_bytes_checked(&e.paths.root)?;
         let age_due = rgo_core::db::StateDb::open_read_only(&e.paths)

@@ -47,6 +47,27 @@ impl RgoPaths {
     pub fn socket_path(&self) -> PathBuf {
         self.state_dir().join("daemon.sock")
     }
+    /// Automatic whole-context deletion needs the Cargo-session guard. Native
+    /// relocation and roots with no verified mode do not provide that guard.
+    pub fn require_supervised_auto_gc(&self) -> Result<()> {
+        let mode_path = self.state_dir().join("storage-mode");
+        let mode = match std::fs::symlink_metadata(&mode_path) {
+            Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
+                std::fs::read(&mode_path)
+                    .with_context(|| format!("reading {}", mode_path.display()))?
+            }
+            Ok(_) => anyhow::bail!("unsafe storage mode record {}", mode_path.display()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(error) => {
+                return Err(error).with_context(|| format!("checking {}", mode_path.display()));
+            }
+        };
+        ensure!(
+            mode == b"supervised\n",
+            "automatic GC requires an activated supervised Cargo installation; use a fresh RGO_HOME with `rgo setup --supervised` or set [gc].auto = false"
+        );
+        Ok(())
+    }
     /// Parent of every Cargo build-dir rgo manages. Cargo's `{workspace-path-hash}`
     /// template expands to **two** components (`<2hex>/<rest>`, observed on Cargo 1.98),
     /// so a managed build-dir is `builds/xx/yyyy…`.

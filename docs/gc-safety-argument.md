@@ -22,6 +22,9 @@ entry point with its effective build directory selected by rgo. In native mode,
 the Cargo-home `build.build-dir` setting also sends direct Cargo processes into
 rgo storage, but those processes have no rgo session guard. Therefore native
 mode does **not** satisfy the property for unattended whole-context deletion.
+Native setup and daemon startup now reject `[gc].auto = true`, and each
+automatic GC pass rechecks the recorded supervised mode. Manual GC remains a
+separate safety gate.
 No amount of recent-mtime grace or rustc-wrapper lease can cover a no-op build,
 build script, test process, or a Cargo process waiting on a lock. Cargo's
 documented [build-directory configuration](https://doc.rust-lang.org/cargo/reference/config.html#buildbuild-dir)

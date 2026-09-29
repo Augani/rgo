@@ -2,6 +2,51 @@ use assert_cmd::cargo::cargo_bin;
 use rgo_testkit::{Sandbox, ensure_workspace_bins_built};
 
 #[test]
+fn native_activation_cannot_enable_unprotected_automatic_gc() {
+    ensure_workspace_bins_built().unwrap();
+    let sandbox = Sandbox::new().unwrap();
+    let rgo = cargo_bin("rgo");
+    let config_path = sandbox.rgo_home.join("config.toml");
+    std::fs::write(&config_path, "[gc]\nauto = true\n").unwrap();
+    let setup = sandbox
+        .cmd(&rgo)
+        .args(["setup", "--no-service"])
+        .output()
+        .unwrap();
+    assert!(!setup.status.success());
+    assert!(String::from_utf8_lossy(&setup.stderr).contains("native Cargo setup cannot safely"));
+    assert!(!sandbox.cargo_home.join(".rgo-install.json").exists());
+
+    std::fs::write(&config_path, "[gc]\nauto = false\n").unwrap();
+    let setup = sandbox
+        .cmd(&rgo)
+        .args(["setup", "--no-service"])
+        .output()
+        .unwrap();
+    assert!(
+        setup.status.success(),
+        "{}",
+        String::from_utf8_lossy(&setup.stderr)
+    );
+    std::fs::write(&config_path, "[gc]\nauto = true\n").unwrap();
+    let daemon = sandbox
+        .cmd(&rgo)
+        .args(["daemon", "--foreground", "--home"])
+        .arg(&sandbox.rgo_home)
+        .output()
+        .unwrap();
+    assert!(!daemon.status.success());
+    let log = std::fs::read_to_string(sandbox.rgo_home.join("logs/daemon.log")).unwrap();
+    assert!(log.contains("automatic GC requires an activated supervised Cargo installation"));
+    let auto = sandbox.cmd(&rgo).args(["gc", "--auto"]).output().unwrap();
+    assert!(!auto.status.success());
+    assert!(
+        String::from_utf8_lossy(&auto.stderr)
+            .contains("automatic GC requires an activated supervised Cargo installation")
+    );
+}
+
+#[test]
 fn setup_migrates_legacy_pins_without_a_running_service() {
     ensure_workspace_bins_built().unwrap();
     let sandbox = Sandbox::new().unwrap();

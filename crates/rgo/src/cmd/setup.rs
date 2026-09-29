@@ -108,6 +108,16 @@ pub fn run(
     };
     let paths = RgoPaths::discover()?;
     paths.validate_root()?;
+    if !undo
+        && !supervised
+        && rgo_core::config::Config::load(&paths.config_file())?
+            .gc
+            .auto
+    {
+        bail!(
+            "native Cargo setup cannot safely run automatic GC; use `rgo setup --supervised` with a fresh RGO_HOME or set [gc].auto = false"
+        );
+    }
     let _root_setup_lock = if dry_run {
         None
     } else {

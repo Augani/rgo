@@ -166,6 +166,7 @@ fn opted_in_maintenance_reclaims_idle_bytes_and_reports_pinned_excess() {
             .unwrap()
             .physical_bytes;
     let max_size = other_bytes + pinned_bytes / 2;
+    std::fs::write(paths.state_dir().join("storage-mode"), b"supervised\n").unwrap();
     std::fs::write(
         sb.rgo_home.join("config.toml"),
         format!("[storage]\nmax_size = '{max_size}B'\nmin_free_space = '0B'\n[gc]\nauto = true\n"),
@@ -356,6 +357,7 @@ fn automatic_budget_reclaims_another_context_during_a_supervised_cargo_run() {
             .unwrap()
             .physical_bytes;
     let max_size = other_bytes + active_bytes / 2;
+    std::fs::write(paths.state_dir().join("storage-mode"), b"supervised\n").unwrap();
     let old = SystemTime::now() - Duration::from_secs(7200);
     // Expire the profile-lock heuristic even for the running build. Its
     // supervised session guard, not a recent mtime, must prevent deletion.
@@ -1200,9 +1202,12 @@ fn connection_flood_and_oversized_frames_cannot_starve_the_daemon() {
 fn maintenance_reclaims_orphans_via_auto_gc() {
     ensure_workspace_bins_built().unwrap();
     let sb = Sandbox::new().unwrap();
+    let real_cargo = PathBuf::from(std::env::var_os("CARGO").unwrap());
     assert!(
         sb.cmd(cargo_bin("rgo"))
-            .args(["setup", "--no-service"])
+            .args(["setup", "--supervised", "--real-cargo"])
+            .arg(&real_cargo)
+            .arg("--no-service")
             .status()
             .unwrap()
             .success()
@@ -1240,7 +1245,7 @@ fn maintenance_reclaims_orphans_via_auto_gc() {
     assert!(ready, "daemon did not answer IPC during startup");
     let project = sb.simple_bin("auto-gc-project").unwrap();
     let build = sb
-        .cmd(cargo_bin("rgo"))
+        .cmd(sb.cargo_home.join("rgo/shims/cargo"))
         .current_dir(&project)
         .args(["build", "--offline"])
         .output()

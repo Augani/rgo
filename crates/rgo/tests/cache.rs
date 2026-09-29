@@ -8,7 +8,7 @@ mod unix {
     use std::process::{Child, Command, Stdio};
     use std::sync::{Mutex, MutexGuard};
     use std::thread;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use assert_cmd::cargo::cargo_bin;
     use rgo_core::db::StateDb;
@@ -39,14 +39,15 @@ mod unix {
             .stderr(Stdio::null())
             .spawn()
             .unwrap();
-        for _ in 0..80 {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while Instant::now() < deadline {
             if matches!(
                 ipc::request_with_timeout(
                     &sb.rgo_home.join("state/daemon.sock"),
-                    Request::QueryStatus,
-                    Duration::from_millis(100),
+                    Request::QueryRemoteStatus,
+                    Duration::from_millis(250),
                 ),
-                Ok(Response::Status(_))
+                Ok(Response::RemoteStatus(_))
             ) {
                 return child;
             }
@@ -58,7 +59,9 @@ mod unix {
         }
         let _ = child.kill();
         let _ = child.wait();
-        panic!("daemon did not answer IPC");
+        let diagnostics = fs::read_to_string(sb.rgo_home.join("logs/daemon.log"))
+            .unwrap_or_else(|error| format!("daemon log unavailable: {error}"));
+        panic!("daemon did not answer IPC: {diagnostics}");
     }
 
     struct Fixture {

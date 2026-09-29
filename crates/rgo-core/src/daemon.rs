@@ -162,6 +162,9 @@ fn configured_remote(
 
 pub fn run(paths: RgoPaths, cfg: Resolved) -> Result<()> {
     paths.ensure_layout()?;
+    if cfg.gc.auto {
+        paths.require_supervised_auto_gc()?;
+    }
     restrict_state_permissions(&paths)?;
     let lock_path = paths.state_dir().join("daemon.lock");
     let file = OpenOptions::new()
@@ -1143,6 +1146,9 @@ fn run_gc(
     target_bytes: Option<u64>,
 ) -> Result<GcReport> {
     let _operation = state.operation_lock.lock().unwrap();
+    if auto {
+        state.paths.require_supervised_auto_gc()?;
+    }
     let snapshot = crate::size::managed_snapshot(&state.paths)?;
     let managed_bytes = snapshot.total_bytes();
     let contexts = snapshot.contexts;
@@ -2215,6 +2221,7 @@ mod tests {
             root: temp.path().join("rgo"),
         };
         paths.ensure_layout().unwrap();
+        std::fs::write(paths.state_dir().join("storage-mode"), b"supervised\n").unwrap();
         let cas = Store::new(paths.cas_dir(), paths.quarantine_dir()).unwrap();
         let now = crate::context::unix_now();
         let old_key = "a".repeat(64);
