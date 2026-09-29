@@ -104,6 +104,10 @@ process-level session guard.
   context, reclaimed another idle context, and removed the protected context
   after Cargo exited. It covers one ordinary test-process shape on Linux,
   macOS, and Windows; it does not cover an externally brokered process.
+- That fixture now starts four manual GC clients during the held test process,
+  pausing the first deletion while three more requests remain in flight. A local Unix run passed;
+  supported-platform execution is pending. This covers one contention shape,
+  not sustained client floods or arbitrary daemon stalls.
 - A private Cargo 1.98.0 probe showed full `cargo clean` removes the sidecar
   and in-context pin marker, while `clean -p` leaves the sidecar. The next
   supervised build restores it; durable pin intent survives outside the

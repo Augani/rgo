@@ -6,8 +6,12 @@ use std::process::{Child, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
+#[cfg(debug_assertions)]
+use rgo_core::ipc;
 use rgo_core::paths::RgoPaths;
 use rgo_core::{context, gc};
+#[cfg(debug_assertions)]
+use rgo_protocol::{Request, Response};
 use rgo_testkit::Sandbox;
 
 struct RunningCargo {
@@ -32,6 +36,28 @@ impl Drop for RunningCargo {
     }
 }
 
+#[cfg(debug_assertions)]
+struct RunningGcBatch {
+    release: PathBuf,
+    daemon: Child,
+    clients: Vec<Child>,
+}
+
+#[cfg(debug_assertions)]
+impl Drop for RunningGcBatch {
+    fn drop(&mut self) {
+        let _ = std::fs::write(&self.release, b"release");
+        for child in &mut self.clients {
+            if child.try_wait().ok().flatten().is_none() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+        let _ = self.daemon.kill();
+        let _ = self.daemon.wait();
+    }
+}
+
 fn wait_for_test(ready: &Path, child: &mut Child, output: &Path) {
     let deadline = Instant::now() + Duration::from_secs(60);
     while !ready.is_file() && Instant::now() < deadline {
@@ -51,7 +77,7 @@ fn wait_for_test(ready: &Path, child: &mut Child, output: &Path) {
 }
 
 #[test]
-fn unchanged_cargo_test_holds_gc_guard_through_test_execution() {
+fn concurrent_gc_clients_preserve_a_running_cargo_test() {
     let sandbox = Sandbox::new().unwrap();
     let project = sandbox.simple_bin("test-lifetime").unwrap();
     let other_workspace = sandbox.simple_bin("idle-test-lifetime").unwrap();
@@ -155,16 +181,115 @@ mod tests {
         blocked.to_string().contains("supervised Cargo"),
         "unexpected GC refusal: {blocked:#}"
     );
-    let pass = sandbox
-        .cmd(rgo)
-        .args(["gc", "--target", "0"])
-        .output()
-        .unwrap();
-    assert!(
-        pass.status.success(),
-        "{}",
-        String::from_utf8_lossy(&pass.stderr)
-    );
+    #[cfg(debug_assertions)]
+    {
+        let locked = sandbox.home.join("gc-batch-locked");
+        let release_gc = sandbox.home.join("gc-batch-release");
+        let daemon_log = sandbox.home.join("gc-batch-daemon.log");
+        let daemon = sandbox
+            .cmd(rgo)
+            .args(["daemon", "--foreground", "--home"])
+            .arg(&sandbox.rgo_home)
+            .env("RGO_TEST_GC_LOCKED_MARKER", &locked)
+            .env("RGO_TEST_GC_LOCKED_RELEASE", &release_gc)
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(File::create(&daemon_log).unwrap()))
+            .spawn()
+            .unwrap();
+        let mut batch = RunningGcBatch {
+            release: release_gc,
+            daemon,
+            clients: Vec::new(),
+        };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut daemon_ready = false;
+        while !daemon_ready && Instant::now() < deadline {
+            daemon_ready = matches!(
+                ipc::request_with_timeout(
+                    &paths.socket_path(),
+                    Request::QueryRemoteStatus,
+                    Duration::from_millis(250)
+                ),
+                Ok(Response::RemoteStatus(_))
+            );
+            assert!(batch.daemon.try_wait().unwrap().is_none());
+            if !daemon_ready {
+                thread::sleep(Duration::from_millis(25));
+            }
+        }
+        assert!(
+            daemon_ready,
+            "daemon did not become ready: {}",
+            std::fs::read_to_string(&daemon_log).unwrap_or_default()
+        );
+
+        let mut logs = Vec::new();
+        for index in 0..4 {
+            let log_path = sandbox.home.join(format!("gc-batch-{index}.log"));
+            let log = File::create(&log_path).unwrap();
+            batch.clients.push(
+                sandbox
+                    .cmd(rgo)
+                    .args(["gc", "--target", "0"])
+                    .stdout(Stdio::from(log.try_clone().unwrap()))
+                    .stderr(Stdio::from(log))
+                    .spawn()
+                    .unwrap(),
+            );
+            logs.push(log_path);
+            if index == 0 {
+                let deadline = Instant::now() + Duration::from_secs(15);
+                while !locked.is_file() && Instant::now() < deadline {
+                    assert!(batch.clients[0].try_wait().unwrap().is_none());
+                    thread::sleep(Duration::from_millis(25));
+                }
+                assert!(
+                    locked.is_file(),
+                    "first GC client did not reach the held-lock pause: {}",
+                    std::fs::read_to_string(&logs[0]).unwrap_or_default()
+                );
+            }
+        }
+        thread::sleep(Duration::from_millis(200));
+        assert!(
+            batch
+                .clients
+                .iter_mut()
+                .all(|child| child.try_wait().unwrap().is_none())
+        );
+        assert!(active.is_dir());
+        assert!(idle.is_dir());
+        std::fs::write(&batch.release, b"release").unwrap();
+        for (client, log) in batch.clients.iter_mut().zip(&logs) {
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while client.try_wait().unwrap().is_none() && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(25));
+            }
+            assert!(
+                client.try_wait().unwrap().is_some(),
+                "GC client timed out: {}",
+                std::fs::read_to_string(log).unwrap_or_default()
+            );
+            assert!(
+                client.wait().unwrap().success(),
+                "GC client failed: {}",
+                std::fs::read_to_string(log).unwrap_or_default()
+            );
+        }
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        let pass = sandbox
+            .cmd(rgo)
+            .args(["gc", "--target", "0"])
+            .output()
+            .unwrap();
+        assert!(
+            pass.status.success(),
+            "{}",
+            String::from_utf8_lossy(&pass.stderr)
+        );
+    }
     assert!(
         active.is_dir(),
         "GC removed a context during test execution"
