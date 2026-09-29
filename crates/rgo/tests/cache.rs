@@ -466,6 +466,11 @@ if [ -n "$FAKE_RUSTC_OLD_MTIME" ]; then touch -t 202001010000 "$out"/*; fi
         ensure_workspace_bins_built().unwrap();
         let sb = Sandbox::new().unwrap();
         let fixture = fixture(&sb);
+        let paths = RgoPaths {
+            root: sb.rgo_home.clone(),
+        };
+        paths.ensure_layout().unwrap();
+        fs::write(paths.state_dir().join("storage-mode"), b"supervised\n").unwrap();
         let mut daemon = start_daemon(&sb);
         let pause = sb.projects.join("publication-pause");
         fs::create_dir_all(&pause).unwrap();
@@ -488,9 +493,6 @@ if [ -n "$FAKE_RUSTC_OLD_MTIME" ]; then touch -t 202001010000 "$out"/*; fi
             );
         }
 
-        let paths = RgoPaths {
-            root: sb.rgo_home.clone(),
-        };
         let lease_count = || {
             StateDb::open_read_only(&paths)?
                 .stats()

@@ -13,6 +13,7 @@ pub fn run(id: &str) -> Result<()> {
     else {
         bail!("no managed context {id:?}; see `rgo ls`");
     };
+    e.paths.require_supervised_deletion()?;
     if !daemon::ensure_running(&e.paths) {
         bail!("rgo daemon is unavailable; refusing coordinated clean");
     }

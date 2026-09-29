@@ -12,7 +12,7 @@ pub fn run(dry_run: bool, aggressive: bool, auto: bool, target: Option<String>) 
         return Ok(());
     }
     if auto {
-        e.paths.require_supervised_auto_gc()?;
+        e.paths.require_supervised_deletion()?;
         let managed_bytes = rgo_core::size::managed_snapshot(&e.paths)?.total_bytes();
         let free_bytes = config::volume_free_bytes_checked(&e.paths.root)?;
         let age_due = rgo_core::db::StateDb::open_read_only(&e.paths)
@@ -34,6 +34,9 @@ pub fn run(dry_run: bool, aggressive: bool, auto: bool, target: Option<String>) 
             )),
         })
         .transpose()?;
+    if !auto && !dry_run {
+        e.paths.require_supervised_deletion()?;
+    }
     if !daemon::ensure_running(&e.paths) {
         bail!("rgo daemon is unavailable; refusing to run coordinated GC");
     }

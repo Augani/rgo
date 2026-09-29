@@ -371,12 +371,17 @@ pub fn run(json: bool, verify: bool) -> Result<()> {
         human(e.cfg.max_size),
         human(e.cfg.soft_watermark)
     ));
+    let supervised_deletion = e.paths.require_supervised_deletion().is_ok();
     check(
-        e.cfg.gc.auto,
-        if e.cfg.gc.auto {
+        e.cfg.gc.auto && supervised_deletion,
+        if e.cfg.gc.auto && supervised_deletion {
             "automatic GC enabled (experimental lifecycle safety; active builds and pins can delay reclamation)".into()
+        } else if e.cfg.gc.auto {
+            "automatic GC is configured but destructive cleanup requires supervised Cargo; use a fresh RGO_HOME with `rgo setup --supervised`".into()
+        } else if supervised_deletion {
+            "automatic GC disabled while the Cargo lifecycle safety gate remains open; manual `rgo gc` is available in supervised mode".into()
         } else {
-            "automatic GC disabled while the Cargo lifecycle safety gate remains open; run `rgo gc` for controlled cleanup".into()
+            "automatic GC disabled; native or unverified storage cannot safely run destructive `rgo gc` or `rgo clean`".into()
         },
     );
     check_toolchains(&mut check);

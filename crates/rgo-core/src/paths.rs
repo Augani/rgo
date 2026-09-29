@@ -47,9 +47,9 @@ impl RgoPaths {
     pub fn socket_path(&self) -> PathBuf {
         self.state_dir().join("daemon.sock")
     }
-    /// Automatic whole-context deletion needs the Cargo-session guard. Native
-    /// relocation and roots with no verified mode do not provide that guard.
-    pub fn require_supervised_auto_gc(&self) -> Result<()> {
+    /// Destructive cleanup needs the Cargo-session guard. Native relocation
+    /// and roots with no verified mode do not provide that guard.
+    pub fn require_supervised_deletion(&self) -> Result<()> {
         let mode_path = self.state_dir().join("storage-mode");
         let mode = match std::fs::symlink_metadata(&mode_path) {
             Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
@@ -64,7 +64,7 @@ impl RgoPaths {
         };
         ensure!(
             mode == b"supervised\n",
-            "automatic GC requires an activated supervised Cargo installation; use a fresh RGO_HOME with `rgo setup --supervised` or set [gc].auto = false"
+            "destructive cleanup requires an activated supervised Cargo installation; use a fresh RGO_HOME with `rgo setup --supervised`"
         );
         Ok(())
     }

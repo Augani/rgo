@@ -163,7 +163,7 @@ fn configured_remote(
 pub fn run(paths: RgoPaths, cfg: Resolved) -> Result<()> {
     paths.ensure_layout()?;
     if cfg.gc.auto {
-        paths.require_supervised_auto_gc()?;
+        paths.require_supervised_deletion()?;
     }
     restrict_state_permissions(&paths)?;
     let lock_path = paths.state_dir().join("daemon.lock");
@@ -471,6 +471,7 @@ fn handle_request_result(state: &State, request: Request) -> Result<Response> {
         Request::Clean { build_dir } => {
             validate_managed_path(&state.paths, Path::new(&build_dir))?;
             let _operation = state.operation_lock.lock().unwrap();
+            state.paths.require_supervised_deletion()?;
             let contexts = context::list(&state.paths)?;
             let db = state.db.lock().unwrap();
             db.expire_leases()?;
@@ -1146,8 +1147,8 @@ fn run_gc(
     target_bytes: Option<u64>,
 ) -> Result<GcReport> {
     let _operation = state.operation_lock.lock().unwrap();
-    if auto {
-        state.paths.require_supervised_auto_gc()?;
+    if !dry_run {
+        state.paths.require_supervised_deletion()?;
     }
     let snapshot = crate::size::managed_snapshot(&state.paths)?;
     let managed_bytes = snapshot.total_bytes();

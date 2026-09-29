@@ -63,9 +63,9 @@ lifecycle remains release work:
    skips this. In native mode plain Cargo will not start background maintenance;
    the opt-in supervised launchers on Unix and Windows start a daemon on Cargo
    use only when `[gc].auto = true` is explicitly configured for evaluation.
-   Native setup rejects `[gc].auto = true`, and an existing native installation
-   cannot start automatic GC after that setting is enabled: native relocation
-   has no guard covering an entire Cargo session.
+   Native setup rejects `[gc].auto = true`, and destructive `rgo gc` and
+   `rgo clean` require supervised mode: native relocation has no guard covering
+   an entire Cargo session.
 
 For private Unix evaluation of full Cargo-session supervision, use
 `rgo setup --supervised --real-cargo /absolute/path/to/cargo --no-service` in
@@ -131,9 +131,9 @@ been verified yet.
 ## Everyday commands
 
 ```bash
-rgo gc [--dry-run] [--aggressive] [--target 20GB]   # reclaim in tier order
+rgo gc [--dry-run] [--aggressive] [--target 20GB]   # preview in any mode; reclaim in supervised mode
 rgo pin <id> / rgo unpin <id>                      # protect a context from GC
-rgo clean <id>                                     # remove one context now
+rgo clean <id>                                     # remove one supervised context now
 rgo adopt [dirs...]                                # report legacy target/ storage; read-only
 rgo cache stats|explain <key>|verify               # inspect the opt-in cache
 ```

@@ -2,7 +2,7 @@ use assert_cmd::cargo::cargo_bin;
 use rgo_testkit::{Sandbox, ensure_workspace_bins_built};
 
 #[test]
-fn native_activation_cannot_enable_unprotected_automatic_gc() {
+fn native_activation_refuses_unprotected_destructive_cleanup() {
     ensure_workspace_bins_built().unwrap();
     let sandbox = Sandbox::new().unwrap();
     let rgo = cargo_bin("rgo");
@@ -28,6 +28,26 @@ fn native_activation_cannot_enable_unprotected_automatic_gc() {
         "{}",
         String::from_utf8_lossy(&setup.stderr)
     );
+    let paths = rgo_core::paths::RgoPaths {
+        root: sandbox.rgo_home.clone(),
+    };
+    let project = sandbox.simple_bin("native-clean-refusal").unwrap();
+    let context_dir = paths.builds_dir().join("aa/context");
+    std::fs::create_dir_all(&context_dir).unwrap();
+    std::fs::write(context_dir.join("output"), b"keep").unwrap();
+    rgo_core::context::write_sidecar(&context_dir, &project, &project.join("Cargo.toml"), None)
+        .unwrap();
+    for args in [vec!["gc", "--target", "0"], vec!["clean", "aa/context"]] {
+        let result = sandbox.cmd(&rgo).args(args).output().unwrap();
+        assert!(!result.status.success());
+        assert!(
+            String::from_utf8_lossy(&result.stderr).contains(
+                "destructive cleanup requires an activated supervised Cargo installation"
+            )
+        );
+        assert!(context_dir.join("output").is_file());
+    }
+    assert!(!paths.socket_path().exists());
     std::fs::write(&config_path, "[gc]\nauto = true\n").unwrap();
     let daemon = sandbox
         .cmd(&rgo)
@@ -37,12 +57,14 @@ fn native_activation_cannot_enable_unprotected_automatic_gc() {
         .unwrap();
     assert!(!daemon.status.success());
     let log = std::fs::read_to_string(sandbox.rgo_home.join("logs/daemon.log")).unwrap();
-    assert!(log.contains("automatic GC requires an activated supervised Cargo installation"));
+    assert!(
+        log.contains("destructive cleanup requires an activated supervised Cargo installation")
+    );
     let auto = sandbox.cmd(&rgo).args(["gc", "--auto"]).output().unwrap();
     assert!(!auto.status.success());
     assert!(
         String::from_utf8_lossy(&auto.stderr)
-            .contains("automatic GC requires an activated supervised Cargo installation")
+            .contains("destructive cleanup requires an activated supervised Cargo installation")
     );
 }
 

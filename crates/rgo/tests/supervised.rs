@@ -570,6 +570,8 @@ fn concurrent_cargo_clean_protects_its_context_but_allows_other_gc() {
     let paths = RgoPaths {
         root: sandbox.rgo_home.clone(),
     };
+    paths.ensure_layout().unwrap();
+    std::fs::write(paths.state_dir().join("storage-mode"), b"supervised\n").unwrap();
     let build = sandbox
         .cmd(rgo)
         .current_dir(&project)

@@ -530,6 +530,7 @@ fn gc_reclaims_fresh_staging_and_quarantine_within_one_pass() {
         root: sb.rgo_home.clone(),
     };
     paths.ensure_layout().unwrap();
+    std::fs::write(paths.state_dir().join("storage-mode"), b"supervised\n").unwrap();
     let staged = paths.tmp_dir().join("gc-123-456-abandoned");
     std::fs::create_dir(&staged).unwrap();
     std::fs::write(staged.join("data"), vec![b'a'; 1024 * 1024]).unwrap();
@@ -964,9 +965,12 @@ fn pin_survives_database_rebuild_and_protects_context_from_gc() {
         "[storage]\nmax_size = '1B'\nmin_free_space = '0B'\n",
     )
     .unwrap();
+    let real_cargo = PathBuf::from(std::env::var_os("CARGO").unwrap());
     assert!(
         sb.cmd(cargo_bin("rgo"))
-            .args(["setup", "--no-service"])
+            .args(["setup", "--supervised", "--real-cargo"])
+            .arg(&real_cargo)
+            .arg("--no-service")
             .status()
             .unwrap()
             .success()
@@ -974,7 +978,7 @@ fn pin_survives_database_rebuild_and_protects_context_from_gc() {
     let mut daemon = start_daemon(&sb);
     let project = sb.simple_bin("pinned-project").unwrap();
     let build = sb
-        .cmd(cargo_bin("rgo"))
+        .cmd(sb.cargo_home.join("rgo/shims/cargo"))
         .current_dir(&project)
         .args(["build", "--offline"])
         .output()

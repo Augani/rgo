@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::Duration;
@@ -137,6 +138,7 @@ fn pressure_gc_reclaims_idle_unpinned_only_contexts_in_private_home() {
         root: sandbox.rgo_home.clone(),
     };
     paths.ensure_layout().unwrap();
+    std::fs::write(paths.state_dir().join("storage-mode"), b"supervised\n").unwrap();
     for index in 0..3 {
         let workspace = sandbox.projects.join(format!("pressure-{index}"));
         std::fs::create_dir_all(&workspace).unwrap();
@@ -187,6 +189,7 @@ fn explicit_clean_reports_a_locked_context_instead_of_claiming_removal() {
         root: sandbox.rgo_home.clone(),
     };
     paths.ensure_layout().unwrap();
+    std::fs::write(paths.state_dir().join("storage-mode"), b"supervised\n").unwrap();
     let project = sandbox.simple_bin("clean-locked").unwrap();
     let context_dir = paths.builds_dir().join("aa/context");
     std::fs::create_dir_all(&context_dir).unwrap();
@@ -245,12 +248,20 @@ fn explicit_clean_reports_a_locked_context_instead_of_claiming_removal() {
 fn concurrent_builds_survive_aggressive_gc() {
     ensure_workspace_bins_built().unwrap();
     let sandbox = Sandbox::new().unwrap();
+    let real_cargo = PathBuf::from(std::env::var_os("CARGO").unwrap());
     let setup = sandbox
         .cmd(cargo_bin("rgo"))
-        .args(["setup", "--no-service"])
+        .args(["setup", "--supervised", "--real-cargo"])
+        .arg(&real_cargo)
+        .arg("--no-service")
         .status()
         .unwrap();
     assert!(setup.success());
+    let record: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(sandbox.cargo_home.join(".rgo-install.json")).unwrap(),
+    )
+    .unwrap();
+    let shim = PathBuf::from(record["supervised_cargo"]["shim_path"].as_str().unwrap());
     let mut daemon = sandbox
         .cmd(cargo_bin("rgo"))
         .args(["daemon", "--foreground"])
@@ -274,7 +285,7 @@ fn concurrent_builds_survive_aggressive_gc() {
         let project = &projects[index % projects.len()];
         builds.push(
             sandbox
-                .cargo()
+                .cmd(&shim)
                 .current_dir(project)
                 .args(["build", "--offline"])
                 .spawn()
