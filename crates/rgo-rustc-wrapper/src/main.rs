@@ -1091,7 +1091,11 @@ fn attribute(args: &[OsString]) -> Option<PathBuf> {
                 use std::os::unix::fs::MetadataExt;
                 std::fs::metadata(&workspace_root).ok().map(|m| m.dev())
             }
-            #[cfg(not(unix))]
+            #[cfg(windows)]
+            {
+                windows_volume_serial(&workspace_root)
+            }
+            #[cfg(not(any(unix, windows)))]
             {
                 None
             }
@@ -1119,6 +1123,41 @@ fn attribute(args: &[OsString]) -> Option<PathBuf> {
     std::fs::write(&tmp, serde_json::to_vec(&sc).ok()?).ok()?;
     std::fs::rename(tmp, sidecar_path).ok()?;
     Some(build_dir)
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn windows_volume_serial(path: &std::path::Path) -> Option<u64> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_READ_ATTRIBUTES,
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, GetFileInformationByHandle,
+        OPEN_EXISTING,
+    };
+
+    let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+    wide.push(0);
+    let handle = unsafe {
+        CreateFileW(
+            wide.as_ptr(),
+            FILE_READ_ATTRIBUTES,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS,
+            std::ptr::null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return None;
+    }
+    let mut info = std::mem::MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::uninit();
+    let success = unsafe { GetFileInformationByHandle(handle, info.as_mut_ptr()) != 0 };
+    let _ = unsafe { CloseHandle(handle) };
+    success
+        .then(|| u64::from(unsafe { info.assume_init().dwVolumeSerialNumber }))
+        .filter(|serial| *serial != 0)
 }
 
 fn workspace_root() -> Option<String> {

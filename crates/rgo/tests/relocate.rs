@@ -167,8 +167,9 @@ fn deleting_the_checkout_reports_its_workspace_state() {
             .unwrap()
             .success()
     );
-    let orphan_supported =
-        cfg!(target_os = "macos") || rgo_core::context::workspace_mount_id(&proj).is_some();
+    let orphan_supported = ((cfg!(target_os = "macos") || cfg!(windows))
+        && rgo_core::context::workspace_device(&proj).is_some())
+        || rgo_core::context::workspace_mount_id(&proj).is_some();
     std::fs::remove_dir_all(&proj).unwrap();
 
     let out = sb.cmd(cargo_bin("rgo")).arg("ls").output().unwrap();

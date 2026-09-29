@@ -537,7 +537,12 @@ pub fn workspace_device(root: &Path) -> Option<u64> {
         use std::os::unix::fs::MetadataExt;
         Some(metadata.dev())
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        let _ = metadata;
+        crate::size::windows_volume_serial(root)
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = metadata;
         None
@@ -563,7 +568,7 @@ fn workspace_identity_matches(
     metadata: &std::fs::Metadata,
     sidecar: &ContextSidecar,
 ) -> Option<bool> {
-    let device = workspace_device_matches(metadata, sidecar.workspace_device)?;
+    let device = workspace_device_matches(path, metadata, sidecar.workspace_device)?;
     if !device {
         return Some(false);
     }
@@ -578,15 +583,25 @@ fn workspace_identity_matches(
     }
 }
 
-fn workspace_device_matches(metadata: &std::fs::Metadata, recorded: Option<u64>) -> Option<bool> {
+fn workspace_device_matches(
+    path: &Path,
+    metadata: &std::fs::Metadata,
+    recorded: Option<u64>,
+) -> Option<bool> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
+        let _ = path;
         recorded.map(|device| device == metadata.dev())
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
     {
-        let _ = (metadata, recorded);
+        let _ = metadata;
+        Some(recorded? == crate::size::windows_volume_serial(path)?)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (path, metadata, recorded);
         None
     }
 }
@@ -1036,20 +1051,16 @@ mod tests {
         };
         assert_eq!(workspace_state(&sidecar), WorkspaceState::Present);
         std::fs::remove_file(&manifest).unwrap();
-        #[cfg(unix)]
-        let expected_deleted = if cfg!(target_os = "linux") && sidecar.workspace_mount_id.is_none()
+        let expected_deleted = if sidecar.workspace_device.is_some()
+            && (!cfg!(target_os = "linux") || sidecar.workspace_mount_id.is_some())
         {
-            WorkspaceState::Unavailable
-        } else {
             WorkspaceState::MissingManifest
+        } else {
+            WorkspaceState::Unavailable
         };
-        #[cfg(unix)]
         assert_eq!(workspace_state(&sidecar), expected_deleted);
         std::fs::remove_dir(&workspace).unwrap();
-        #[cfg(unix)]
         assert_eq!(workspace_state(&sidecar), expected_deleted);
-        #[cfg(not(unix))]
-        assert_eq!(workspace_state(&sidecar), WorkspaceState::Unavailable);
         std::fs::create_dir(&workspace).unwrap();
         let legacy = ContextSidecar {
             workspace_device: None,
@@ -1069,12 +1080,10 @@ mod tests {
             workspace_device: Some(u64::MAX),
             ..sidecar.clone()
         };
-        #[cfg(unix)]
         assert_eq!(
             workspace_state(&changed_volume),
             WorkspaceState::Unavailable
         );
-        let _ = changed_volume;
         #[cfg(target_os = "linux")]
         {
             let changed_mount = ContextSidecar {

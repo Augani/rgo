@@ -148,6 +148,12 @@ fn inode_key(path: &Path, _md: &std::fs::Metadata) -> Option<(u64, u64)> {
     ))
 }
 #[cfg(windows)]
+pub(crate) fn windows_volume_serial(path: &Path) -> Option<u64> {
+    windows_file_info(path)
+        .map(|info| u64::from(info.volume_serial))
+        .filter(|serial| *serial != 0)
+}
+#[cfg(windows)]
 fn md_nlink(path: &Path, _md: &std::fs::Metadata) -> u64 {
     windows_file_info(path)
         .map(|info| u64::from(info.number_of_links))
@@ -216,11 +222,11 @@ fn windows_file_info(path: &Path) -> Option<ByHandleFileInformation> {
     let handle = unsafe {
         CreateFileW(
             wide.as_ptr(),
-            0x8000_0000,
+            0x0000_0080, // FILE_READ_ATTRIBUTES
             0x0000_0001 | 0x0000_0002 | 0x0000_0004,
             std::ptr::null_mut(),
             3,
-            0x0000_0080,
+            0x0200_0000, // FILE_FLAG_BACKUP_SEMANTICS also opens directories
             std::ptr::null_mut(),
         )
     };

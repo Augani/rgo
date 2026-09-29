@@ -27,8 +27,8 @@ pub struct ContextSidecar {
     pub version: u32,
     pub workspace_root: String,
     pub manifest_path: String,
-    /// Unix device ID at attribution time. Older sidecars omit it and cannot
-    /// prove that a missing workspace is on an available volume.
+    /// Unix device ID or Windows volume serial at attribution time. Older
+    /// sidecars omit it and cannot prove a missing workspace volume is present.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_device: Option<u64>,
     /// Linux mount ID at attribution time. A device ID alone cannot
