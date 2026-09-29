@@ -580,7 +580,7 @@ fn plain_cargo_starts_opted_in_maintenance_without_rgo_commands() {
         )
     };
     assert!(!handle.is_null(), "cannot observe Cargo-started daemon");
-    let _stop = StopDaemon(handle);
+    let stop = StopDaemon(handle);
     let deadline = Instant::now() + Duration::from_secs(15);
     while idle.exists() && Instant::now() < deadline {
         thread::sleep(Duration::from_millis(100));
@@ -588,6 +588,60 @@ fn plain_cargo_starts_opted_in_maintenance_without_rgo_commands() {
     assert!(
         !idle.exists(),
         "Cargo-started maintenance did not reclaim the idle context"
+    );
+
+    drop(stop);
+    let second_idle = paths.builds_dir().join("bb/idle-after-outage");
+    std::fs::create_dir_all(&second_idle).unwrap();
+    std::fs::write(second_idle.join("unused"), vec![0u8; 8192]).unwrap();
+    context::write_sidecar(
+        &second_idle,
+        &idle_project,
+        &idle_project.join("Cargo.toml"),
+        None,
+    )
+    .unwrap();
+    let rebuild = sandbox
+        .cmd("cmd.exe")
+        .current_dir(&project)
+        .env("PATH", &path)
+        .env_remove("RGO_HOME")
+        .env("RGO_DAEMON_POLL_SECS", "1")
+        .args(["/C", "cargo", "build", "--offline"])
+        .output()
+        .unwrap();
+    assert!(
+        rebuild.status.success(),
+        "plain Cargo failed after daemon loss: {}",
+        String::from_utf8_lossy(&rebuild.stderr)
+    );
+    assert!(checkout_executable(&project).is_file());
+    let restarted = ipc::request_with_timeout(
+        &paths.socket_path(),
+        Request::QueryStatus,
+        Duration::from_secs(5),
+    )
+    .unwrap();
+    let Response::Status(restarted) = restarted else {
+        panic!("ordinary Cargo did not restart maintenance: {restarted:?}");
+    };
+    let restarted_handle = unsafe {
+        OpenProcess(
+            PROCESS_TERMINATE | PROCESS_SYNCHRONIZE,
+            0,
+            restarted.daemon_pid,
+        )
+    };
+    assert!(!restarted_handle.is_null());
+    let _stop_restarted = StopDaemon(restarted_handle);
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while second_idle.exists() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(100));
+    }
+    assert!(
+        !second_idle.exists(),
+        "Cargo-restarted maintenance did not reclaim the later idle context; daemon log: {}",
+        std::fs::read_to_string(paths.logs_dir().join("daemon.log")).unwrap_or_default()
     );
 }
 
