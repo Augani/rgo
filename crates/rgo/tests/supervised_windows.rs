@@ -339,7 +339,9 @@ fn opted_in_maintenance_reclaims_an_idle_real_cargo_build() {
         if profile.path().is_dir() {
             let lock = profile.path().join(".cargo-build-lock");
             if lock.is_file() {
-                std::fs::File::open(lock)
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(lock)
                     .unwrap()
                     .set_modified(old)
                     .unwrap();
