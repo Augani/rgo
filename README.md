@@ -97,6 +97,10 @@ shells. The installer can opt into this mode with `-Supervised -NoService` and
 `-RealCargo`; it places the shim ahead of Cargo on User PATH. Automatic
 destructive GC remains disabled by default.
 
+For a no-service activation, setup and undo stop a compatible daemon started
+by plain supervised Cargo before changing the installation. If that daemon
+cannot be stopped, the activation change fails without removing Cargo settings.
+
 For a private Windows evaluation, `scripts/install-windows.ps1` accepts an
 exact `-ReleaseTag`, a local `-Archive`, and its `-Sha256`, together with
 `-DevelopmentBundle -NoService` for locally built bundles. For a release

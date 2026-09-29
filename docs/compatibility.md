@@ -17,9 +17,16 @@ rebuild-over-migrate when the filesystem is the source of truth.
 
 ## Upgrade and downgrade rules
 
-- **Upgrade**: old daemon exits when its socket is replaced; the new daemon
-  rebuilds DB state from the filesystem on first start. Sidecars written by
-  older wrappers are read (not rewritten) until a new build refreshes them.
+- **Upgrade**: no-service setup asks the old daemon to exit and waits for its
+  singleton lock before changing activation; installer-managed service upgrades
+  remain disabled. A later daemon rebuilds derived DB state from the filesystem
+  on first start. Sidecars written by older wrappers are read (not rewritten)
+  until a new build refreshes them.
+- **No-service shutdown**: the additive `Shutdown` request lets setup wait for
+  a compatible daemon to finish before changing activation. A daemon that
+  lacks the request or does not release its singleton lock causes setup/undo
+  to stop without removing Cargo settings; it is never killed by an unchecked
+  PID from a state file.
 - **Downgrade**: a downgraded daemon reads the same filesystem truth. Cache
   entries keyed under a newer schema are simply never looked up (different
   keys), and CAS GC eventually reclaims them.
