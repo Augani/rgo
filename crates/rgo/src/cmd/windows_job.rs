@@ -23,14 +23,15 @@ use windows_sys::Win32::System::Console::{
     GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
 };
 use windows_sys::Win32::System::JobObjects::{
-    AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-    JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-    JobObjectBasicAccountingInformation, JobObjectExtendedLimitInformation,
-    QueryInformationJobObject, SetInformationJobObject,
+    CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOBOBJECT_BASIC_ACCOUNTING_INFORMATION,
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectBasicAccountingInformation,
+    JobObjectExtendedLimitInformation, QueryInformationJobObject, SetInformationJobObject,
 };
 use windows_sys::Win32::System::Threading::{
-    CREATE_SUSPENDED, CreateProcessW, GetExitCodeProcess, INFINITE, PROCESS_INFORMATION,
-    ResumeThread, STARTF_USESTDHANDLES, STARTUPINFOW, TerminateProcess, WaitForSingleObject,
+    CREATE_SUSPENDED, CreateProcessW, DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT,
+    GetExitCodeProcess, INFINITE, InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST,
+    PROC_THREAD_ATTRIBUTE_JOB_LIST, PROCESS_INFORMATION, ResumeThread, STARTF_USESTDHANDLES,
+    STARTUPINFOEXW, STARTUPINFOW, UpdateProcThreadAttribute, WaitForSingleObject,
 };
 
 struct Handle(HANDLE);
@@ -42,6 +43,58 @@ impl Drop for Handle {
             // SAFETY: this wrapper exclusively owns each returned Win32 handle.
             unsafe { CloseHandle(self.0) };
         }
+    }
+}
+
+struct JobAttributeList {
+    storage: Vec<u128>,
+}
+
+impl JobAttributeList {
+    #[allow(unsafe_code)]
+    fn new(job: &Handle) -> Result<Self> {
+        let mut bytes = 0;
+        // The first call is required to obtain the opaque list's size and
+        // intentionally fails with ERROR_INSUFFICIENT_BUFFER.
+        unsafe { InitializeProcThreadAttributeList(std::ptr::null_mut(), 1, 0, &mut bytes) };
+        if bytes == 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("sizing the Cargo process attribute list");
+        }
+        let mut storage = vec![0u128; bytes.div_ceil(std::mem::size_of::<u128>())];
+        let list = storage.as_mut_ptr().cast();
+        if unsafe { InitializeProcThreadAttributeList(list, 1, 0, &mut bytes) } == 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("initializing the Cargo process attribute list");
+        }
+        let attributes = Self { storage };
+        if unsafe {
+            UpdateProcThreadAttribute(
+                attributes.as_ptr(),
+                0,
+                PROC_THREAD_ATTRIBUTE_JOB_LIST as usize,
+                (&raw const job.0).cast::<c_void>(),
+                std::mem::size_of::<HANDLE>(),
+                std::ptr::null_mut(),
+                std::ptr::null(),
+            )
+        } == 0
+        {
+            return Err(std::io::Error::last_os_error())
+                .context("binding Cargo to its Job Object at process creation");
+        }
+        Ok(attributes)
+    }
+
+    fn as_ptr(&self) -> LPPROC_THREAD_ATTRIBUTE_LIST {
+        self.storage.as_ptr().cast_mut().cast()
+    }
+}
+
+#[allow(unsafe_code)]
+impl Drop for JobAttributeList {
+    fn drop(&mut self) {
+        unsafe { DeleteProcThreadAttributeList(self.as_ptr()) };
     }
 }
 
@@ -101,13 +154,19 @@ impl JobGuard {
         {
             bail!("Cargo launcher has no inheritable standard streams");
         }
-        let startup = STARTUPINFOW {
-            cb: std::mem::size_of::<STARTUPINFOW>() as u32,
-            dwFlags: STARTF_USESTDHANDLES,
-            hStdInput: stdin,
-            hStdOutput: stdout,
-            hStdError: stderr,
-            ..Default::default()
+        // Windows assigns this job during CreateProcessW. There is no child
+        // outside the kill-on-close job if the guardian dies after creation.
+        let attributes = JobAttributeList::new(&job)?;
+        let startup = STARTUPINFOEXW {
+            StartupInfo: STARTUPINFOW {
+                cb: std::mem::size_of::<STARTUPINFOEXW>() as u32,
+                dwFlags: STARTF_USESTDHANDLES,
+                hStdInput: stdin,
+                hStdOutput: stdout,
+                hStdError: stderr,
+                ..Default::default()
+            },
+            lpAttributeList: attributes.as_ptr(),
         };
         let mut info = PROCESS_INFORMATION::default();
         let created = unsafe {
@@ -117,10 +176,10 @@ impl JobGuard {
                 std::ptr::null(),
                 std::ptr::null(),
                 1,
-                CREATE_SUSPENDED,
+                CREATE_SUSPENDED | EXTENDED_STARTUPINFO_PRESENT,
                 std::ptr::null(),
                 std::ptr::null(),
-                &startup,
+                &startup.StartupInfo,
                 &mut info,
             )
         };
@@ -131,21 +190,15 @@ impl JobGuard {
         }
         let process = Handle(info.hProcess);
         let primary_thread = Handle(info.hThread);
-        if unsafe { AssignProcessToJobObject(job.0, process.0) } == 0 {
-            let error = std::io::Error::last_os_error();
-            // The child has never executed. Terminate it before the session
-            // guard can be dropped, since it has not joined the job.
-            if unsafe { TerminateProcess(process.0, 1) } != 0 {
-                unsafe { WaitForSingleObject(process.0, 5_000) };
-            }
-            return Err(error).context("assigning suspended Cargo to its Job Object");
-        }
         #[cfg(debug_assertions)]
         pause_after_assignment_for_test(info.dwProcessId)?;
         if unsafe { ResumeThread(primary_thread.0) } == u32::MAX {
             // Dropping the private job handle terminates its suspended child.
             return Err(std::io::Error::last_os_error()).context("resuming supervised Cargo");
         }
+        // The attribute list retains a pointer to job.0 until deletion, so
+        // release it before moving that handle into the returned guard.
+        drop(attributes);
         Ok(Self {
             job,
             process: Some(process),
