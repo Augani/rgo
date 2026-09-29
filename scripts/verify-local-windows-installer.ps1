@@ -425,13 +425,15 @@ fn main() {
     if ([string](Get-RawUserPath) -cne [string]$expectedUserPath) {
         throw 'supervised uninstall changed user PATH despite -NoUserPath'
     }
+    $postUninstallExecutable = Join-Path $supervisedProject 'target/debug/rgo_windows_supervised_installer_probe.exe'
+    Remove-Item -LiteralPath $postUninstallExecutable -Force
     Push-Location $supervisedProject
     try {
         & cmd.exe /C 'cargo build --offline' | Out-Null
         if ($LASTEXITCODE -ne 0) { throw 'ordinary Cargo build failed after supervised uninstall' }
     } finally { Pop-Location }
-    if (-not (Test-Path (Join-Path $supervisedProject 'target/debug/deps'))) {
-        throw 'ordinary Cargo did not build locally after supervised uninstall'
+    if (-not (Test-Path $postUninstallExecutable)) {
+        throw 'ordinary Cargo did not restore its requested executable after supervised uninstall'
     }
     $userPathArgs = $supervisedArgs.Clone()
     $userPathArgs.Remove('NoUserPath') | Out-Null

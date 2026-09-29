@@ -35,6 +35,13 @@ fn planned_file<'a>(entries: &'a serde_json::Value, path: &Path) -> &'a serde_js
         .unwrap_or_else(|| panic!("plan omitted {}", path.display()))
 }
 
+fn checkout_executable(project: &Path) -> PathBuf {
+    project.join("target/debug").join(format!(
+        "{}.exe",
+        project.file_name().unwrap().to_string_lossy()
+    ))
+}
+
 #[test]
 fn setup_activates_unchanged_cargo_exe_and_undo_restores_direct_cargo() {
     let sandbox = Sandbox::new().unwrap();
@@ -121,7 +128,7 @@ fn setup_activates_unchanged_cargo_exe_and_undo_restores_direct_cargo() {
         "{}",
         String::from_utf8_lossy(&direct.stderr)
     );
-    assert!(direct_project.join("target/debug/deps").exists());
+    assert!(checkout_executable(&direct_project).is_file());
     assert_eq!(
         paths.checked_managed_build_dirs().unwrap().len(),
         managed_before_direct
@@ -148,7 +155,7 @@ fn setup_activates_unchanged_cargo_exe_and_undo_restores_direct_cargo() {
         "{}",
         String::from_utf8_lossy(&stale.stderr)
     );
-    assert!(stale_project.join("target/debug/deps").is_dir());
+    assert!(checkout_executable(&stale_project).is_file());
     assert_eq!(
         paths.checked_managed_build_dirs().unwrap().len(),
         managed_before_direct
@@ -170,7 +177,7 @@ fn setup_activates_unchanged_cargo_exe_and_undo_restores_direct_cargo() {
         "{}",
         String::from_utf8_lossy(&wrong_home.stderr)
     );
-    assert!(wrong_home_project.join("target/debug/deps").exists());
+    assert!(checkout_executable(&wrong_home_project).is_file());
     assert_eq!(
         paths.checked_managed_build_dirs().unwrap().len(),
         managed_before_direct
@@ -220,7 +227,7 @@ fn setup_activates_unchanged_cargo_exe_and_undo_restores_direct_cargo() {
         "{}",
         String::from_utf8_lossy(&stale_shell.stderr)
     );
-    assert!(after_undo.join("target/debug/deps").is_dir());
+    assert!(checkout_executable(&after_undo).is_file());
     assert_eq!(
         paths.checked_managed_build_dirs().unwrap().len(),
         managed_before_direct
@@ -598,7 +605,7 @@ fn main() {
         "{}",
         String::from_utf8_lossy(&stale.stderr)
     );
-    assert!(after.join("target/debug/deps").is_dir());
+    assert!(checkout_executable(&after).is_file());
     assert_eq!(
         paths.checked_managed_build_dirs().unwrap().len(),
         managed_before
@@ -726,7 +733,7 @@ fn interrupted_versioned_setup_keeps_the_old_shim_usable_and_repairs_the_new_one
         "{}",
         String::from_utf8_lossy(&local.stderr)
     );
-    assert!(local_project.join("target/debug/deps").is_dir());
+    assert!(checkout_executable(&local_project).is_file());
     let paths = RgoPaths {
         root: sandbox.rgo_home.clone(),
     };
