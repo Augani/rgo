@@ -1,5 +1,6 @@
 #![cfg(unix)]
 
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Stdio};
 use std::thread;
@@ -45,7 +46,7 @@ fn wait_for_file(path: &Path, child: &mut Child) -> bool {
 
 #[test]
 #[allow(unsafe_code)]
-fn ctrl_c_keeps_a_surviving_cargo_descendant_protected() {
+fn terminal_ctrl_c_keeps_a_surviving_cargo_descendant_protected() {
     let sandbox = Sandbox::new().unwrap();
     let project = sandbox.simple_bin("interrupt-parent").unwrap();
     let other_project = sandbox.simple_bin("interrupt-idle").unwrap();
@@ -83,13 +84,14 @@ fn ctrl_c_keeps_a_surviving_cargo_descendant_protected() {
 "#,
     )
     .unwrap();
-    let child = sandbox
-        .cmd("cargo")
+    let mut command = sandbox.cmd("cargo");
+    let child = command
         .current_dir(&project)
         .env("PATH", &search_path)
         .env("RGO_INTERRUPT_READY", &ready)
         .env("RGO_INTERRUPT_RELEASE", &release)
         .args(["run", "--offline"])
+        .process_group(0)
         .stdout(Stdio::null())
         .stderr(std::fs::File::create(&log).unwrap())
         .spawn()
@@ -113,7 +115,9 @@ fn ctrl_c_keeps_a_surviving_cargo_descendant_protected() {
             .is_none()
     );
 
-    let interrupted = unsafe { libc::kill(running.child.id() as i32, libc::SIGINT) };
+    let cargo_pid = running.child.id() as i32;
+    assert_eq!(unsafe { libc::getpgid(child_pid) }, cargo_pid);
+    let interrupted = unsafe { libc::kill(-cargo_pid, libc::SIGINT) };
     assert_eq!(interrupted, 0);
     let deadline = Instant::now() + Duration::from_secs(10);
     while running.child.try_wait().unwrap().is_none() && Instant::now() < deadline {
