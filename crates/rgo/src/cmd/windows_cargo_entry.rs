@@ -129,7 +129,13 @@ pub fn run() -> Result<()> {
                 .file_name()
                 .is_some_and(|name| name.to_string_lossy().eq_ignore_ascii_case("rgo.exe"))
         {
-            bail!("Cargo launcher does not name an installed rgo daemon executable");
+            eprintln!(
+                "rgo: installed daemon executable is unavailable; using ordinary Cargo storage"
+            );
+            return super::cargo_shim::exec_real_cargo(
+                &shim.real_cargo,
+                &std::env::args_os().skip(1).collect::<Vec<_>>(),
+            );
         }
         if fallback
             .as_ref()
