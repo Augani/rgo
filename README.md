@@ -86,13 +86,14 @@ explicit activation checks. Unattended GC remains off by default; enabling it
 is still experimental while the lifecycle safety gate is open.
 
 For a private Windows evaluation, `rgo setup --supervised --real-cargo C:\absolute\path\to\cargo.exe --no-service` installs an owned
-`$CARGO_HOME\rgo\shims\cargo.exe` copy of the matched `rgo.exe`. Put its
+`$CARGO_HOME\rgo\shims\v<version>\cargo.exe` copy of the matched `rgo.exe`. Put its
 directory first on `PATH` in the shell or tool launching Cargo, then run
 `rgo doctor --verify`. This leaves the rustup Cargo proxy in place; direct
 invocations of that proxy use ordinary local storage. `rgo setup --undo --no-service`
-removes the owned shim. The Windows installer does not activate
-this pilot, and Windows supervised upgrades still require undo and a fresh
-storage root. Automatic destructive GC remains disabled by default.
+removes the activation but retains the versioned shim as a fallback for open
+shells. The installer can opt into this mode with `-Supervised -NoService` and
+`-RealCargo`; it places the shim ahead of Cargo on User PATH. Automatic
+destructive GC remains disabled by default.
 
 For a private Windows evaluation, `scripts/install-windows.ps1` accepts an
 exact `-ReleaseTag`, a local `-Archive`, and its `-Sha256`, together with
@@ -112,7 +113,9 @@ existing `-NoService` installation when the new verified bundle is installed
 with `-NoService`; the installer journals the Cargo activation files, retains
 the old binary pair, and can restore the old activation after a partial switch.
 The effective wrapper mode must remain the same during a version change.
-Service-managed upgrades remain refused. The local-bundle installer has passed
+Supervised version changes also switch the owned User PATH entry to the new
+versioned shim while retaining old shims for open shells. Service-managed
+upgrades remain refused. The local-bundle installer has passed
 private-home Windows CI, but no public release asset or tagged attestation has
 been verified yet.
 

@@ -280,18 +280,23 @@ try {
     $supervisedUpgradeArgs['Sha256'] = $upgradeSha
     $oldSupervisedState = [IO.File]::ReadAllText((Join-Path $cargoHome 'rgo/installer-windows.json'))
     $oldSupervisedRecord = [IO.File]::ReadAllText($recordPath)
+    if (Test-Path -LiteralPath $plannedFallback) {
+        throw 'read-only supervised plan or shim repair created the next-version fallback'
+    }
     try {
         $env:RGO_SETUP_TEST_EXIT_AFTER_RECORD = '1'
         try {
             & $installScript @supervisedUpgradeArgs -NoService
             throw 'forced supervised setup interruption unexpectedly succeeded'
         } catch {
-            if ($_.Exception.Message -notmatch 'exit 88') { throw }
+            if ($_.Exception.Message -notmatch 'exit 88' -or
+                $_.Exception.Message -match 'rollback also failed') { throw }
         }
     } finally { Remove-Item Env:RGO_SETUP_TEST_EXIT_AFTER_RECORD -ErrorAction SilentlyContinue }
     if ((Test-Path (Join-Path $cargoHome 'rgo/installer-windows-upgrade.json')) -or
         [IO.File]::ReadAllText((Join-Path $cargoHome 'rgo/installer-windows.json')) -cne $oldSupervisedState -or
         [IO.File]::ReadAllText($recordPath) -cne $oldSupervisedRecord -or
+        (Test-Path -LiteralPath $plannedFallback) -or
         (Test-Path -LiteralPath $newShim) -or
         -not [string]::Equals((Get-Command cargo.exe).Source, $shim,
             [StringComparison]::OrdinalIgnoreCase)) {
@@ -367,6 +372,26 @@ try {
         if (-not [string]::Equals((Get-Command cargo.exe -ErrorAction Stop).Source, $shim,
             [StringComparison]::OrdinalIgnoreCase)) {
             throw 'a newly composed Windows PATH would not resolve cargo.exe to the owned shim'
+        }
+    } finally { $env:PATH = $installedProcessPath }
+    $userPathUpgradeArgs = $userPathArgs.Clone()
+    $userPathUpgradeArgs['ReleaseTag'] = $upgradeTag
+    $userPathUpgradeArgs['Archive'] = $upgradeArchive
+    $userPathUpgradeArgs['Sha256'] = $upgradeSha
+    & $installScript @userPathUpgradeArgs -NoService
+    $upgradedUserPath = Get-RawUserPath
+    $upgradedShimDirectory = Split-Path -Path $upgradedShim -Parent
+    if (-not $upgradedUserPath.StartsWith("$upgradedShimDirectory;", [StringComparison]::OrdinalIgnoreCase) -or
+        (Get-RawUserPathKind) -ne $ownedKind) {
+        throw 'supervised upgrade did not switch raw User PATH to the new shim while preserving its type'
+    }
+    $installedProcessPath = $env:PATH
+    try {
+        $env:PATH = ([Environment]::GetEnvironmentVariable('Path', 'Machine'),
+            [Environment]::GetEnvironmentVariable('Path', 'User')) -join ';'
+        if (-not [string]::Equals((Get-Command cargo.exe -ErrorAction Stop).Source, $upgradedShim,
+            [StringComparison]::OrdinalIgnoreCase)) {
+            throw 'a newly composed Windows PATH would not resolve cargo.exe to the upgraded shim'
         }
     } finally { $env:PATH = $installedProcessPath }
     & $installScript -Uninstall -CargoHome $cargoHome -RgoHome $rgoHome
