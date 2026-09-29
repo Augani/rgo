@@ -114,6 +114,12 @@ process-level session guard.
   context, reclaimed another idle context, and removed the protected context
   after Cargo exited. It covers one ordinary test-process shape on Linux,
   macOS, and Windows; it does not cover an externally brokered process.
+- A private-home `cargo build` fixture now holds a real build script after its
+  compiler invocation, refuses removal of that active context, reclaims an
+  unrelated idle context, and requires the script to write into its `OUT_DIR`
+  before Cargo can finish. It passed locally on macOS arm64; platform CI is
+  still required. This covers one build-script shape without relying on an
+  active rustc-wrapper lease.
 - That fixture now starts four manual GC clients during the held test process,
   pausing the first deletion while three more requests remain in flight. The
   [platform matrix](https://github.com/Augani/rgo/actions/runs/36594347437) passed on a Windows stable

@@ -58,12 +58,12 @@ impl Drop for RunningGcBatch {
     }
 }
 
-fn wait_for_test(ready: &Path, child: &mut Child, output: &Path) {
+fn wait_for_marker(ready: &Path, child: &mut Child, output: &Path, stage: &str) {
     let deadline = Instant::now() + Duration::from_secs(60);
     while !ready.is_file() && Instant::now() < deadline {
         if let Some(status) = child.try_wait().unwrap() {
             panic!(
-                "cargo test exited before its test process started ({status}): {}",
+                "Cargo exited before {stage} started ({status}): {}",
                 std::fs::read_to_string(output).unwrap_or_default()
             );
         }
@@ -71,7 +71,7 @@ fn wait_for_test(ready: &Path, child: &mut Child, output: &Path) {
     }
     assert!(
         ready.is_file(),
-        "cargo test never reached its test process: {}",
+        "Cargo never reached {stage}: {}",
         std::fs::read_to_string(output).unwrap_or_default()
     );
 }
@@ -168,7 +168,12 @@ mod tests {
         child: Some(child),
         release: release.clone(),
     };
-    wait_for_test(&ready, running.child.as_mut().unwrap(), &output);
+    wait_for_marker(
+        &ready,
+        running.child.as_mut().unwrap(),
+        &output,
+        "test process",
+    );
 
     let active = paths
         .checked_managed_build_dirs()
@@ -305,6 +310,140 @@ mod tests {
     assert!(
         status.success(),
         "cargo test failed: {}",
+        std::fs::read_to_string(&output).unwrap_or_default()
+    );
+    gc::remove_atomically(&paths, &active).unwrap();
+}
+
+#[test]
+fn running_build_script_keeps_its_context_while_gc_reclaims_an_idle_one() {
+    let sandbox = Sandbox::new().unwrap();
+    let project = sandbox.simple_bin("build-script-lifetime").unwrap();
+    let idle_workspace = sandbox.simple_bin("idle-build-script-lifetime").unwrap();
+    std::fs::write(
+        project.join("build.rs"),
+        r#"fn main() {
+    let ready = std::env::var("RGO_BUILD_READY").unwrap();
+    let release = std::env::var("RGO_BUILD_RELEASE").unwrap();
+    let output = std::path::PathBuf::from(std::env::var_os("OUT_DIR").unwrap());
+    std::fs::write(ready, b"ready").unwrap();
+    for _ in 0..1200 {
+        if std::path::Path::new(&release).is_file() {
+            std::fs::write(output.join("after-gc"), b"survived").unwrap();
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    panic!("build script was never released");
+}
+"#,
+    )
+    .unwrap();
+
+    let rgo = env!("CARGO_BIN_EXE_rgo");
+    let real_cargo =
+        PathBuf::from(std::env::var_os("CARGO").expect("Cargo test runner sets CARGO"));
+    let setup = sandbox
+        .cmd(rgo)
+        .args(["setup", "--supervised", "--real-cargo"])
+        .arg(real_cargo)
+        .arg("--no-service")
+        .output()
+        .unwrap();
+    assert!(
+        setup.status.success(),
+        "{}",
+        String::from_utf8_lossy(&setup.stderr)
+    );
+    let record: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(sandbox.cargo_home.join(".rgo-install.json")).unwrap(),
+    )
+    .unwrap();
+    let shim = PathBuf::from(record["supervised_cargo"]["shim_path"].as_str().unwrap());
+    let path = std::env::join_paths(std::iter::once(shim.parent().unwrap().to_path_buf()).chain(
+        std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()),
+    ))
+    .unwrap();
+    let paths = RgoPaths {
+        root: sandbox.rgo_home.clone(),
+    };
+    let idle = paths.builds_dir().join("bb/idle-build-script");
+    std::fs::create_dir_all(&idle).unwrap();
+    std::fs::write(idle.join("unused"), vec![b'x'; 8192]).unwrap();
+    context::write_sidecar(
+        &idle,
+        &idle_workspace,
+        &idle_workspace.join("Cargo.toml"),
+        None,
+    )
+    .unwrap();
+
+    let ready = sandbox.home.join("build-ready");
+    let release = sandbox.home.join("build-release");
+    let output = sandbox.home.join("cargo-build.log");
+    let log = File::create(&output).unwrap();
+    #[cfg(unix)]
+    let mut command = sandbox.cmd("cargo");
+    #[cfg(windows)]
+    let mut command = {
+        let mut command = sandbox.cmd("cmd.exe");
+        command.args(["/C", "cargo"]);
+        command
+    };
+    let child = command
+        .current_dir(&project)
+        .env("PATH", path)
+        .env("RGO_BUILD_READY", &ready)
+        .env("RGO_BUILD_RELEASE", &release)
+        .args(["build", "--offline"])
+        .stdout(Stdio::from(log.try_clone().unwrap()))
+        .stderr(Stdio::from(log))
+        .spawn()
+        .unwrap();
+    let mut running = RunningCargo {
+        child: Some(child),
+        release: release.clone(),
+    };
+    wait_for_marker(
+        &ready,
+        running.child.as_mut().unwrap(),
+        &output,
+        "build script",
+    );
+
+    let active = paths
+        .checked_managed_build_dirs()
+        .unwrap()
+        .into_iter()
+        .find(|candidate| candidate != &idle)
+        .expect("supervised Cargo build has a managed context");
+    let blocked = gc::remove_atomically(&paths, &active).unwrap_err();
+    assert!(
+        blocked.to_string().contains("supervised Cargo"),
+        "unexpected GC refusal: {blocked:#}"
+    );
+    let pass = sandbox
+        .cmd(rgo)
+        .args(["gc", "--target", "0"])
+        .output()
+        .unwrap();
+    assert!(
+        pass.status.success(),
+        "{}",
+        String::from_utf8_lossy(&pass.stderr)
+    );
+    assert!(
+        active.is_dir(),
+        "GC removed a context during a build script"
+    );
+    assert!(!idle.exists(), "GC did not reclaim the idle context");
+
+    std::fs::write(&release, b"release").unwrap();
+    let status = running.child.as_mut().unwrap().wait().unwrap();
+    running.child.take();
+    assert!(
+        status.success(),
+        "cargo build failed: {}",
         std::fs::read_to_string(&output).unwrap_or_default()
     );
     gc::remove_atomically(&paths, &active).unwrap();
