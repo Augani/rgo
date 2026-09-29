@@ -350,10 +350,7 @@ fn config_directory_may_override(directory: &Path) -> bool {
         }
         Err(_) => return true,
     };
-    std::fs::read_to_string(path)
-        .ok()
-        .and_then(|text| cargo_config::may_set_build_dir(&text).ok())
-        .unwrap_or(true)
+    cargo_config::may_set_build_dir_in_file(&path).unwrap_or(true)
 }
 
 #[cfg(any(unix, windows))]

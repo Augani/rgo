@@ -107,10 +107,15 @@ impl RgoPaths {
         let config_path = crate::cargo_config::effective_home_config(home);
         match std::fs::symlink_metadata(&config_path) {
             Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
-                let config = std::fs::read_to_string(&config_path)
-                    .with_context(|| format!("reading {}", config_path.display()))?;
+                let may_override = crate::cargo_config::may_set_build_dir_in_file(&config_path)
+                    .with_context(|| {
+                        format!(
+                            "destructive cleanup cannot verify that {} keeps direct Cargo outside managed storage",
+                            config_path.display()
+                        )
+                    })?;
                 ensure!(
-                    !crate::cargo_config::may_set_build_dir(&config)?,
+                    !may_override,
                     "destructive cleanup cannot verify that {} keeps direct Cargo outside managed storage; remove its build.build-dir/include override",
                     config_path.display()
                 );

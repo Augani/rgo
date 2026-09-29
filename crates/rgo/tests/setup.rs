@@ -90,7 +90,8 @@ fn supervised_cleanup_refuses_global_cargo_config_drift() {
     );
     assert!(!sandbox.cargo_home.join(".rgo-install.json").exists());
 
-    std::fs::remove_file(&config_path).unwrap();
+    let included_path = sandbox.cargo_home.join("other.toml");
+    std::fs::write(&included_path, "[build]\njobs = 2\n").unwrap();
     let setup = sandbox
         .cmd(&rgo)
         .args(["setup", "--supervised", "--real-cargo"])
@@ -107,16 +108,41 @@ fn supervised_cleanup_refuses_global_cargo_config_drift() {
         root: sandbox.rgo_home.clone(),
     };
     let project = sandbox.simple_bin("supervised-drift").unwrap();
+    let record: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(sandbox.cargo_home.join(".rgo-install.json")).unwrap(),
+    )
+    .unwrap();
+    let shim = record["supervised_cargo"]["shim_path"].as_str().unwrap();
+    let build = sandbox
+        .cmd(shim)
+        .current_dir(&project)
+        .args(["build", "--offline"])
+        .output()
+        .unwrap();
+    assert!(
+        build.status.success(),
+        "{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    assert!(!paths.managed_build_dirs().is_empty());
     let context_dir = paths.builds_dir().join("aa/context");
     std::fs::create_dir_all(&context_dir).unwrap();
     std::fs::write(context_dir.join("output"), b"keep").unwrap();
     rgo_core::context::write_sidecar(&context_dir, &project, &project.join("Cargo.toml"), None)
         .unwrap();
-    for config in [
-        format!("[build]\nbuild-dir = {:?}\n", paths.build_dir_template()),
-        "include = [\"other.toml\"]\n".to_owned(),
+    paths.require_supervised_deletion().unwrap();
+    for (config, included) in [
+        (
+            format!("[build]\nbuild-dir = {:?}\n", paths.build_dir_template()),
+            "[build]\njobs = 2\n".to_owned(),
+        ),
+        (
+            "include = [\"other.toml\"]\n".to_owned(),
+            format!("[build]\nbuild-dir = {:?}\n", paths.build_dir_template()),
+        ),
     ] {
         std::fs::write(&config_path, config).unwrap();
+        std::fs::write(&included_path, included).unwrap();
         for args in [vec!["gc", "--target", "0"], vec!["clean", "aa/context"]] {
             let result = sandbox.cmd(&rgo).args(args).output().unwrap();
             assert!(!result.status.success());
@@ -141,6 +167,7 @@ fn supervised_cleanup_refuses_global_cargo_config_drift() {
     }
     assert!(!paths.socket_path().exists());
     std::fs::remove_file(&config_path).unwrap();
+    std::fs::remove_file(&included_path).unwrap();
     let undo = sandbox
         .cmd(&rgo)
         .args(["setup", "--undo", "--no-service"])

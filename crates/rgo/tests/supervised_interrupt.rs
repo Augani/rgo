@@ -33,15 +33,20 @@ impl Drop for RunningCargo {
     }
 }
 
-fn wait_for_file(path: &Path, child: &mut Child) -> bool {
+fn wait_for_pid(path: &Path, child: &mut Child) -> Option<i32> {
     let deadline = Instant::now() + Duration::from_secs(30);
-    while !path.is_file() && Instant::now() < deadline {
+    while Instant::now() < deadline {
+        if let Ok(contents) = std::fs::read_to_string(path) {
+            if let Ok(pid) = contents.trim().parse() {
+                return Some(pid);
+            }
+        }
         if child.try_wait().unwrap().is_some() {
             break;
         }
         thread::sleep(Duration::from_millis(25));
     }
-    path.is_file()
+    None
 }
 
 #[test]
@@ -97,12 +102,12 @@ fn terminal_ctrl_c_keeps_a_surviving_cargo_descendant_protected() {
         .spawn()
         .unwrap();
     let mut running = RunningCargo { child, release };
-    assert!(
-        wait_for_file(&ready, &mut running.child),
-        "Cargo child did not start: {}",
-        std::fs::read_to_string(&log).unwrap_or_default()
-    );
-    let child_pid: i32 = std::fs::read_to_string(&ready).unwrap().parse().unwrap();
+    let child_pid = wait_for_pid(&ready, &mut running.child).unwrap_or_else(|| {
+        panic!(
+            "Cargo child did not start: {}",
+            std::fs::read_to_string(&log).unwrap_or_default()
+        )
+    });
     let paths = RgoPaths {
         root: sandbox.rgo_home.clone(),
     };

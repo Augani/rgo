@@ -489,10 +489,36 @@ pub fn run(
         );
     }
     if supervised && insp.has_include {
-        bail!(
-            "supervised setup cannot verify included Cargo configuration; remove the include from {} before activation",
-            cfg_path.display()
-        );
+        let proxy = supervised_cargo
+            .as_ref()
+            .context("supervised Cargo proxy is missing")?;
+        let version = Command::new(&proxy.real_cargo)
+            .arg("--version")
+            .output()
+            .with_context(|| format!("checking {} for Cargo include support", proxy.real_cargo))?;
+        if !version.status.success()
+            || cargo_config::cargo_version(&String::from_utf8_lossy(&version.stdout))
+                .is_none_or(|version| version < (1, 93, 0))
+        {
+            bail!(
+                "supervised setup requires Cargo 1.93 or newer for config includes; {} reported {:?}",
+                proxy.real_cargo,
+                String::from_utf8_lossy(&version.stdout).trim()
+            );
+        }
+        let may_override =
+            cargo_config::may_set_build_dir_in_file(&cfg_path).with_context(|| {
+                format!(
+                    "supervised setup cannot verify included Cargo configuration in {}",
+                    cfg_path.display()
+                )
+            })?;
+        if may_override {
+            bail!(
+                "supervised setup cannot admit an included build.build-dir from {}; move it outside the managed namespace or remove the include",
+                cfg_path.display()
+            );
+        }
     }
     let inner_path = paths.state_dir().join("inner-wrapper");
     let old_inner = read_optional(&inner_path)?;

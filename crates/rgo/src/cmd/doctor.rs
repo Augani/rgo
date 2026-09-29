@@ -93,6 +93,36 @@ pub fn run(json: bool, verify: bool) -> Result<()> {
         info("Cargo home config includes other files; rgo leaves any included wrapper settings in place and cannot infer their effective chain from the home file alone".into());
     }
     if let Some(mode) = &supervised {
+        let included_build_dir = if insp.has_include {
+            match cargo_config::may_set_build_dir_in_file(&cfg_path) {
+                Ok(false) => {
+                    info("included Cargo configuration has no build.build-dir; supervised storage can remain active".into());
+                    false
+                }
+                Ok(true) => {
+                    check(
+                        false,
+                        format!(
+                            "included Cargo configuration from {} sets build.build-dir; direct Cargo may enter managed storage",
+                            cfg_path.display()
+                        ),
+                    );
+                    true
+                }
+                Err(error) => {
+                    check(
+                        false,
+                        format!(
+                            "cannot verify included Cargo configuration from {}: {error:#}",
+                            cfg_path.display()
+                        ),
+                    );
+                    true
+                }
+            }
+        } else {
+            false
+        };
         check(
             !insp.has_fence,
             format!(
@@ -124,7 +154,7 @@ pub fn run(json: bool, verify: bool) -> Result<()> {
         supervised_ready = owned
             && active
             && !insp.has_fence
-            && !insp.has_include
+            && !included_build_dir
             && insp.build_dir_outside_fence.is_none();
         check(
             active,
@@ -142,15 +172,6 @@ pub fn run(json: bool, verify: bool) -> Result<()> {
                 false,
                 format!(
                     "global build.build-dir = {build_dir:?} could let direct Cargo enter the managed namespace; remove it before supervised activation"
-                ),
-            );
-        }
-        if insp.has_include {
-            check(
-                false,
-                format!(
-                    "Cargo home config {} has an unresolved include; supervised cleanup cannot verify direct Cargo's build directory",
-                    cfg_path.display()
                 ),
             );
         }

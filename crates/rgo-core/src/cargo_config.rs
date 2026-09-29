@@ -7,9 +7,9 @@
 //! `CARGO_BUILD_BUILD_DIR` overrides the build directory. `CARGO_TARGET_DIR` and
 //! `--target-dir` select final-output locations without cancelling the build directory.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use toml_edit::{DocumentMut, Item, value};
 
 pub const FENCE_START: &str =
@@ -52,16 +52,113 @@ pub fn effective_home_config(cargo_home: &Path) -> std::path::PathBuf {
     }
 }
 
-/// A supervised launcher must not inject its command-line build directory if
-/// this config may choose one. Includes are treated as unknown because Cargo
-/// can resolve them recursively and with version-dependent rules.
-pub fn may_set_build_dir(text: &str) -> Result<bool> {
-    let doc: DocumentMut = text.parse().context("parsing Cargo configuration")?;
-    Ok(doc.get("include").is_some()
-        || doc
-            .get("build")
-            .and_then(|build| build.get("build-dir"))
-            .is_some())
+/// Inspect Cargo's documented `include` chain without evaluating unrelated
+/// settings. Any build-dir anywhere in the chain is treated as an override,
+/// even when a later file would win, so cleanup never depends on recreating
+/// Cargo's complete merge rules. Unknown or unreadable files fail closed;
+/// external edits after this check remain a separate lifecycle limitation.
+pub fn may_set_build_dir_in_file(path: &Path) -> Result<bool> {
+    fn inspect(path: &Path, stack: &mut Vec<PathBuf>, remaining: &mut usize) -> Result<bool> {
+        ensure!(*remaining > 0, "Cargo include chain exceeds 64 files");
+        *remaining -= 1;
+        let metadata = std::fs::symlink_metadata(path)
+            .with_context(|| format!("checking Cargo configuration {}", path.display()))?;
+        ensure!(
+            metadata.is_file() && !metadata.file_type().is_symlink(),
+            "Cargo configuration is not a regular file: {}",
+            path.display()
+        );
+        ensure!(
+            metadata.len() <= 1024 * 1024,
+            "Cargo configuration exceeds 1 MiB: {}",
+            path.display()
+        );
+        let identity = path
+            .canonicalize()
+            .with_context(|| format!("resolving Cargo configuration {}", path.display()))?;
+        ensure!(
+            !stack.contains(&identity),
+            "cyclic Cargo configuration include: {}",
+            path.display()
+        );
+        stack.push(identity);
+        let result = (|| {
+            let text = std::fs::read_to_string(path)
+                .with_context(|| format!("reading Cargo configuration {}", path.display()))?;
+            let doc: DocumentMut = text
+                .parse()
+                .with_context(|| format!("parsing Cargo configuration {}", path.display()))?;
+            if doc
+                .get("build")
+                .and_then(|build| build.get("build-dir"))
+                .is_some()
+            {
+                return Ok(true);
+            }
+            let Some(includes) = doc.get("include") else {
+                return Ok(false);
+            };
+            let includes = includes
+                .as_array()
+                .with_context(|| format!("invalid Cargo include list in {}", path.display()))?;
+            for value in includes.iter() {
+                let (name, optional) = if let Some(name) = value.as_str() {
+                    (name, false)
+                } else {
+                    let table = value.as_inline_table().with_context(|| {
+                        format!("invalid Cargo include entry in {}", path.display())
+                    })?;
+                    ensure!(
+                        table
+                            .iter()
+                            .all(|(key, _)| key == "path" || key == "optional"),
+                        "unknown Cargo include field in {}",
+                        path.display()
+                    );
+                    let name = table
+                        .get("path")
+                        .and_then(|value| value.as_str())
+                        .with_context(|| {
+                            format!("missing Cargo include path in {}", path.display())
+                        })?;
+                    let optional = match table.get("optional") {
+                        Some(value) => value.as_bool().with_context(|| {
+                            format!("invalid Cargo include optional in {}", path.display())
+                        })?,
+                        None => false,
+                    };
+                    (name, optional)
+                };
+                ensure!(
+                    Path::new(name).extension().is_some_and(|ext| ext == "toml"),
+                    "Cargo include must end in .toml: {name}"
+                );
+                let included = path
+                    .parent()
+                    .context("Cargo configuration has no parent")?
+                    .join(name);
+                if optional {
+                    match std::fs::symlink_metadata(&included) {
+                        Ok(_) => {}
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                        Err(error) => {
+                            return Err(error).with_context(|| {
+                                format!("checking Cargo include {}", included.display())
+                            });
+                        }
+                    }
+                }
+                if inspect(&included, stack, remaining)? {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        })();
+        stack.pop();
+        result
+    }
+
+    inspect(path, &mut Vec::new(), &mut 64)
 }
 
 /// What `rgo setup` wants Cargo to know.
@@ -474,11 +571,39 @@ mod tests {
     }
 
     #[test]
-    fn supervised_override_detection_accepts_only_known_non_build_dir_config() {
-        assert!(!may_set_build_dir("[build]\njobs = 2\n").unwrap());
-        assert!(may_set_build_dir("[build]\nbuild-dir = \"custom\"\n").unwrap());
-        assert!(may_set_build_dir("build.build-dir = \"custom\"\n").unwrap());
-        assert!(may_set_build_dir("include = [\"other.toml\"]\n").unwrap());
-        assert!(may_set_build_dir("[build]\nbuild-dir = 42\n").unwrap());
+    fn included_cargo_config_is_scanned_recursively_and_fails_closed() {
+        let home = tempfile::tempdir().unwrap();
+        let config = home.path().join("config.toml");
+        let wrapper = home.path().join("wrapper.toml");
+        let nested = home.path().join("nested.toml");
+        std::fs::write(
+            &config,
+            "include = [{ path = 'missing.toml', optional = true }, 'wrapper.toml']\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &wrapper,
+            "include = ['nested.toml']\n[build]\nrustc-wrapper = 'sccache'\n",
+        )
+        .unwrap();
+        std::fs::write(&nested, "[net]\noffline = true\n").unwrap();
+        assert!(!may_set_build_dir_in_file(&config).unwrap());
+
+        std::fs::write(&config, "build.build-dir = '/tmp/managed'\n").unwrap();
+        assert!(may_set_build_dir_in_file(&config).unwrap());
+        std::fs::write(
+            &config,
+            "include = [{ path = 'missing.toml', optional = true }, 'wrapper.toml']\n",
+        )
+        .unwrap();
+
+        std::fs::write(&nested, "[build]\nbuild-dir = '/tmp/managed'\n").unwrap();
+        assert!(may_set_build_dir_in_file(&config).unwrap());
+
+        std::fs::write(&nested, "include = ['config.toml']\n").unwrap();
+        assert!(may_set_build_dir_in_file(&config).is_err());
+
+        std::fs::remove_file(&nested).unwrap();
+        assert!(may_set_build_dir_in_file(&config).is_err());
     }
 }
