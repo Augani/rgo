@@ -1625,21 +1625,33 @@ fn select_cas_manifests(
 fn maintenance(state: &State) -> Result<()> {
     let should_gc = {
         let _operation = state.operation_lock.lock().unwrap();
-        let snapshot = crate::size::managed_snapshot(&state.paths)?;
-        let managed_bytes = snapshot.total_bytes();
-        let contexts = snapshot.contexts;
+        // Explicit status/GC requests perform their own authoritative scan.
+        // In the default manual, cache-disabled mode, do not walk every build
+        // and manifest tree on each metadata-only maintenance tick.
+        let snapshot = state
+            .cfg
+            .gc
+            .auto
+            .then(|| crate::size::managed_snapshot(&state.paths))
+            .transpose()?;
         let free_bytes = volume_free_bytes_checked(&state.paths.root)?;
         let mut db = state.db.lock().unwrap();
-        let age_due = crate::context::unix_now().saturating_sub(db.last_real_gc_at()?)
-            >= AGE_MAINTENANCE_INTERVAL.as_secs();
-        let mut should_gc = state.cfg.gc.auto
-            && (managed_bytes > state.cfg.soft_watermark
-                || free_bytes < state.cfg.min_free_space
-                || age_due);
         db.expire_leases()?;
         db.prune_failed_cache_builds(Duration::from_secs(7 * 86_400))?;
-        db.reconcile_contexts(&state.paths, &contexts)?;
-        reconcile_cache(&mut db, &state.cas)?;
+        let mut should_gc = false;
+        if let Some(snapshot) = snapshot {
+            let age_due = crate::context::unix_now().saturating_sub(db.last_real_gc_at()?)
+                >= AGE_MAINTENANCE_INTERVAL.as_secs();
+            should_gc = snapshot.total_bytes() > state.cfg.soft_watermark
+                || free_bytes < state.cfg.min_free_space
+                || age_due;
+            db.reconcile_contexts(&state.paths, &snapshot.contexts)?;
+            reconcile_cache(&mut db, &state.cas)?;
+        } else if state.cfg.cache.enabled {
+            // Cache statistics must still notice manifests removed outside
+            // daemon GC when optional caching is enabled in manual mode.
+            reconcile_cache(&mut db, &state.cas)?;
+        }
         drain_cache_events(&state.paths, &db, &mut state.event_drainer.lock().unwrap())?;
         db.prune_missing_cache_event_batches(
             &state.paths.state_dir(),
