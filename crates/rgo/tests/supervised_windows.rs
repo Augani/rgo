@@ -592,6 +592,66 @@ fn plain_cargo_starts_opted_in_maintenance_without_rgo_commands() {
 }
 
 #[test]
+fn unavailable_automatic_maintenance_uses_ordinary_cargo_storage() {
+    use fs4::fs_std::FileExt;
+    use std::fs::OpenOptions;
+
+    let sandbox = Sandbox::new().unwrap();
+    let project = sandbox
+        .simple_bin("windows-maintenance-unavailable")
+        .unwrap();
+    let cli = PathBuf::from(env!("CARGO_BIN_EXE_rgo"));
+    let real_cargo = PathBuf::from(std::env::var_os("CARGO").unwrap());
+    std::fs::write(sandbox.rgo_home.join("config.toml"), "[gc]\nauto = true\n").unwrap();
+    let setup = sandbox
+        .cmd(&cli)
+        .args(["setup", "--supervised", "--no-service", "--real-cargo"])
+        .arg(&real_cargo)
+        .output()
+        .unwrap();
+    assert!(
+        setup.status.success(),
+        "{}",
+        String::from_utf8_lossy(&setup.stderr)
+    );
+    let paths = RgoPaths {
+        root: sandbox.rgo_home.clone(),
+    };
+    let daemon_lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(paths.state_dir().join("daemon.lock"))
+        .unwrap();
+    daemon_lock.lock_exclusive().unwrap();
+    let shim = sandbox.cargo_home.join(format!(
+        "rgo/shims/v{}/cargo.exe",
+        env!("CARGO_PKG_VERSION")
+    ));
+    let path = std::env::join_paths(std::iter::once(shim.parent().unwrap().to_path_buf()).chain(
+        std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()),
+    ))
+    .unwrap();
+    let build = sandbox
+        .cmd("cmd.exe")
+        .current_dir(&project)
+        .env("PATH", &path)
+        .env_remove("RGO_HOME")
+        .args(["/C", "cargo", "build", "--offline"])
+        .output()
+        .unwrap();
+    assert!(
+        build.status.success(),
+        "{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    assert!(String::from_utf8_lossy(&build.stderr).contains("using ordinary Cargo storage"));
+    assert!(checkout_executable(&project).is_file());
+    assert!(paths.managed_build_dirs().is_empty());
+}
+
+#[test]
 fn a_previously_owned_flat_shim_remains_repairable() {
     let sandbox = Sandbox::new().unwrap();
     let cli = PathBuf::from(env!("CARGO_BIN_EXE_rgo"));
