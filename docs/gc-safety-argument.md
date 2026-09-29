@@ -100,7 +100,10 @@ process-level session guard.
 - A private Cargo 1.98.0 probe showed full `cargo clean` removes the sidecar
   and in-context pin marker, while `clean -p` leaves the sidecar. The next
   supervised build restores it; durable pin intent survives outside the
-  context. This is version-specific evidence only.
+  context. The [Cargo 1.91 boundary matrix](https://github.com/Augani/rgo/actions/runs/36537118268)
+  also found that package clean preserved the sidecar, full clean removed the
+  context, and the next native build restored attribution on Linux, macOS, and
+  Windows. Interrupted clean and cross-version pin semantics remain open.
 - The current required [CI matrix](https://github.com/Augani/rgo/actions/runs/36531530596)
   passes across Linux, macOS, and Windows. It is a regression signal for
   existing fixtures, not a full lifecycle proof.

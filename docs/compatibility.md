@@ -36,8 +36,11 @@ rebuild-over-migrate when the filesystem is the source of truth.
   do not enable destructive GC with an older daemon until that case is resolved.
 - **Emergency rollback**: `rgo setup --undo` removes rgo-owned Cargo settings;
   `RGO_BYPASS=1` bypasses compiler interception but leaves Cargo's configured
-  build directory in effect. Deleting
-  `$RGO_HOME` entirely is always safe — it contains only derived state.
+  build directory in effect. Do not delete `$RGO_HOME` while Cargo, the daemon,
+  or an owned activation may still use it. It contains the user's storage
+  policy and durable pin decisions as well as rebuildable indexes and build
+  outputs. Quiesce and undo the installation first, then inspect retained
+  data before explicitly removing it.
 
 ## What is NOT stable
 
