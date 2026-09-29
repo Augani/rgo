@@ -606,11 +606,11 @@ pub fn run(
         }
     }
 
-    // A no-service supervised launcher may have started the daemon on plain
-    // Cargo use. Keep its singleton lock through activation changes, so a live
-    // daemon blocks them and another Cargo invocation cannot start one midway.
-    let _no_service_daemon_guard = if no_service && !dry_run {
-        Some(lock_no_service_daemon(&paths)?)
+    // A supervised launcher can restart the daemon on plain Cargo use even
+    // after a service manager has stopped it. Hold the singleton lock through
+    // removal (or through any no-service activation change) to close that gap.
+    let _activation_daemon_guard = if !dry_run && (no_service || undo) {
+        Some(lock_daemon_for_activation(&paths)?)
     } else {
         None
     };
@@ -1369,7 +1369,7 @@ fn lock_root_setup(paths: &RgoPaths) -> Result<File> {
     lock_named(&paths.state_dir(), ".rgo-service.lock")
 }
 
-fn lock_no_service_daemon(paths: &RgoPaths) -> Result<File> {
+fn lock_daemon_for_activation(paths: &RgoPaths) -> Result<File> {
     let path = paths.state_dir().join("daemon.lock");
     match std::fs::symlink_metadata(&path) {
         Ok(metadata) if !metadata.is_file() || metadata.file_type().is_symlink() => {
@@ -1395,11 +1395,11 @@ fn lock_no_service_daemon(paths: &RgoPaths) -> Result<File> {
         ) {
             Ok(Response::Ok) => {}
             Ok(response) => bail!(
-                "a no-service daemon is still running for {}; shutdown was refused: {response:?}",
+                "a daemon is still running for {}; shutdown was refused: {response:?}",
                 paths.root.display()
             ),
             Err(error) => bail!(
-                "a no-service daemon is still running for {}; could not request shutdown: {error:#}",
+                "a daemon is still running for {}; could not request shutdown: {error:#}",
                 paths.root.display()
             ),
         }
@@ -1411,7 +1411,7 @@ fn lock_no_service_daemon(paths: &RgoPaths) -> Result<File> {
             std::thread::sleep(Duration::from_millis(25));
         }
         bail!(
-            "a no-service daemon is still running for {} after shutdown; activation is unchanged",
+            "a daemon is still running for {} after shutdown; activation is unchanged",
             paths.root.display()
         );
     }
