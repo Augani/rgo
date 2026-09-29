@@ -671,7 +671,9 @@ pub fn list(paths: &RgoPaths) -> Result<Vec<BuildContext>> {
 pub fn list_with_scanner(paths: &RgoPaths, scanner: &mut Scanner) -> Result<Vec<BuildContext>> {
     let mut out = Vec::new();
     let mut incremental_scanner = Scanner::new();
-    for dir in paths.checked_managed_build_dirs()? {
+    let mut dirs = paths.checked_managed_build_dirs()?;
+    dirs.sort();
+    for dir in dirs {
         let sidecar = read_sidecar(&dir);
         let usage = scanner.measure_checked(&dir)?;
         let mut incremental_usage = Usage::default();

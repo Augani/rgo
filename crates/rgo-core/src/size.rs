@@ -350,10 +350,13 @@ mod tests {
             root: root.path().join("rgo"),
         };
         paths.ensure_layout().unwrap();
-        let context = paths.builds_dir().join("aa/context");
-        std::fs::create_dir_all(&context).unwrap();
-        let original = context.join("artifact");
+        let later_context = paths.builds_dir().join("aa/context-z");
+        let first_context = paths.builds_dir().join("aa/context-a");
+        std::fs::create_dir_all(&later_context).unwrap();
+        std::fs::create_dir_all(&first_context).unwrap();
+        let original = later_context.join("artifact");
         std::fs::write(&original, vec![b'x'; 8192]).unwrap();
+        std::fs::hard_link(&original, first_context.join("linked-artifact")).unwrap();
         std::fs::create_dir_all(paths.cas_dir()).unwrap();
         std::fs::hard_link(&original, paths.cas_dir().join("linked-object")).unwrap();
         std::fs::hard_link(&original, paths.tmp_dir().join("linked-temp")).unwrap();
@@ -363,7 +366,27 @@ mod tests {
             .unwrap()
             .physical_bytes;
         let snapshot = managed_snapshot(&paths).unwrap();
-        assert_eq!(snapshot.contexts.len(), 1);
+        assert_eq!(snapshot.contexts.len(), 2);
+        assert_eq!(
+            snapshot
+                .contexts
+                .iter()
+                .find(|context| context.dir == first_context)
+                .unwrap()
+                .usage
+                .physical_bytes,
+            expected
+        );
+        assert_eq!(
+            snapshot
+                .contexts
+                .iter()
+                .find(|context| context.dir == later_context)
+                .unwrap()
+                .usage
+                .physical_bytes,
+            0
+        );
         assert_eq!(snapshot.build_bytes, expected);
         assert_eq!(snapshot.cas_bytes, 0);
         assert_eq!(snapshot.auxiliary_bytes, 0);

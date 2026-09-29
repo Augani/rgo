@@ -456,6 +456,72 @@ if [ -n "$FAKE_RUSTC_OLD_MTIME" ]; then touch -t 202001010000 "$out"/*; fi
     }
 
     #[test]
+    fn publication_keeps_cache_and_context_leases_past_the_ttl() {
+        let _serial = serial_e2e();
+        ensure_workspace_bins_built().unwrap();
+        let sb = Sandbox::new().unwrap();
+        let fixture = fixture(&sb);
+        let mut daemon = start_daemon(&sb);
+        let pause = sb.projects.join("publication-pause");
+        fs::create_dir_all(&pause).unwrap();
+        let mut command = command_for(&sb, &fixture, "producer", &[]);
+        command
+            .env("RGO_TEST_CACHE_PUBLICATION_PAUSE", &pause)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let child = command.spawn().unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while !pause.join("ready").exists() && std::time::Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(25));
+        }
+        if !pause.join("ready").exists() {
+            fs::write(pause.join("release"), b"").unwrap();
+            let output = child.wait_with_output().unwrap();
+            panic!(
+                "wrapper never entered publication: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        thread::sleep(Duration::from_secs(35));
+        let socket = sb.rgo_home.join("state/daemon.sock");
+        let status =
+            ipc::request_with_timeout(&socket, Request::QueryStatus, Duration::from_secs(5));
+        let gc = sb
+            .cmd(cargo_bin("rgo"))
+            .args(["gc", "--target", "0"])
+            .output()
+            .unwrap();
+        let context_survived = sb.rgo_home.join("builds/aa/producer").is_dir();
+        fs::write(pause.join("release"), b"").unwrap();
+        let output = child.wait_with_output().unwrap();
+        let _ = daemon.kill();
+        let _ = daemon.wait();
+
+        let Response::Status(status) = status.unwrap() else {
+            panic!("daemon did not return status during publication");
+        };
+        assert!(status.active_leases >= 2, "status: {status:?}");
+        assert!(
+            gc.status.success(),
+            "{}",
+            String::from_utf8_lossy(&gc.stderr)
+        );
+        assert!(context_survived, "GC removed an active compiler context");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            fs::read_dir(sb.rgo_home.join("cas/manifests"))
+                .unwrap()
+                .count(),
+            1
+        );
+    }
+
+    #[test]
     fn corrupt_cas_objects_quarantine_and_recover_by_recompiling() {
         let _serial = serial_e2e();
         ensure_workspace_bins_built().unwrap();

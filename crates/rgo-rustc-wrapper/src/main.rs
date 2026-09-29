@@ -345,6 +345,22 @@ fn run_cache_producer(
         configured_inner_wrapper().is_some()
             && candidate.source_kind != rgo_key::SourceKind::Workspace,
     );
+    // rustc has exited, but collecting its output and publishing the CAS
+    // objects can still take longer than a lease TTL. Keep both protections
+    // alive until publication and commit have finished.
+    let publication_leases = if result.status.success() && cache_lease_id.is_some() {
+        [context_lease_id, cache_lease_id]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    let (publication_stop, publication_heartbeat) = start_lease_heartbeats(publication_leases);
+    #[cfg(debug_assertions)]
+    if result.status.success() && cache_lease_id.is_some() {
+        pause_before_cache_publication();
+    }
     if let Some(lease_id) = cache_lease_id {
         if result.status.success() {
             match before.and_then(|before| publish_result(store, candidate, &result, &before)) {
@@ -406,6 +422,10 @@ fn run_cache_producer(
             result.stdout.len() as u64 + result.stderr.len() as u64,
             None,
         );
+    }
+    stop_lease_heartbeats(publication_stop, publication_heartbeat);
+    if let Some(lease_id) = context_lease_id {
+        let _ = request(Request::ReleaseLease { lease_id });
     }
     exit_with_status(result.status);
 }
@@ -732,52 +752,70 @@ fn run_captured_with_leases(
         .into_iter()
         .flatten()
         .collect::<Vec<_>>();
-    let (stop, heartbeat) = if lease_ids.is_empty() {
-        (None, None)
-    } else {
-        let (stop, stop_thread) = mpsc::channel();
-        let heartbeat = thread::spawn(move || {
-            loop {
-                match stop_thread
-                    .recv_timeout(Duration::from_secs(u64::from(DEFAULT_HEARTBEAT_SECS)))
-                {
-                    Ok(()) | Err(RecvTimeoutError::Disconnected) => break,
-                    Err(RecvTimeoutError::Timeout) => {
-                        for lease_id in &lease_ids {
-                            if request(Request::Heartbeat {
-                                lease_id: *lease_id,
-                            })
-                            .is_err()
-                            {
-                                return;
-                            }
-                        }
+    let (stop, heartbeat) = start_lease_heartbeats(lease_ids);
+    let status = child.wait().unwrap_or_else(|_| exit_status(127));
+    let stdout_bytes = stdout_thread.join().unwrap_or_default();
+    let stderr_bytes = stderr_thread.join().unwrap_or_default();
+    stop_lease_heartbeats(stop, heartbeat);
+    let _ = std::io::stdout().write_all(&stdout_bytes);
+    let _ = std::io::stdout().flush();
+    let _ = std::io::stderr().write_all(&stderr_bytes);
+    let _ = std::io::stderr().flush();
+    Captured {
+        status,
+        stdout: stdout_bytes,
+        stderr: stderr_bytes,
+    }
+}
+
+type LeaseHeartbeat = (Option<mpsc::Sender<()>>, Option<thread::JoinHandle<()>>);
+
+fn start_lease_heartbeats(lease_ids: Vec<u64>) -> LeaseHeartbeat {
+    if lease_ids.is_empty() {
+        return (None, None);
+    }
+    let (stop, stop_thread) = mpsc::channel();
+    let heartbeat = thread::spawn(move || {
+        loop {
+            match stop_thread.recv_timeout(Duration::from_secs(u64::from(DEFAULT_HEARTBEAT_SECS))) {
+                Ok(()) | Err(RecvTimeoutError::Disconnected) => break,
+                Err(RecvTimeoutError::Timeout) => {
+                    for lease_id in &lease_ids {
+                        // A busy daemon can miss one short IPC deadline. Keep
+                        // refreshing the other lease and retry on the next tick.
+                        let _ = request(Request::Heartbeat {
+                            lease_id: *lease_id,
+                        });
                     }
                 }
             }
-        });
-        (Some(stop), Some(heartbeat))
-    };
-    let status = child.wait().unwrap_or_else(|_| exit_status(127));
+        }
+    });
+    (Some(stop), Some(heartbeat))
+}
+
+fn stop_lease_heartbeats(
+    stop: Option<mpsc::Sender<()>>,
+    heartbeat: Option<thread::JoinHandle<()>>,
+) {
     if let Some(stop) = stop {
         let _ = stop.send(());
     }
     if let Some(heartbeat) = heartbeat {
         let _ = heartbeat.join();
     }
-    let stdout_bytes = stdout_thread.join().unwrap_or_default();
-    let stderr_bytes = stderr_thread.join().unwrap_or_default();
-    let _ = std::io::stdout().write_all(&stdout_bytes);
-    let _ = std::io::stdout().flush();
-    let _ = std::io::stderr().write_all(&stderr_bytes);
-    let _ = std::io::stderr().flush();
-    if let Some(lease_id) = context_lease_id {
-        let _ = request(Request::ReleaseLease { lease_id });
-    }
-    Captured {
-        status,
-        stdout: stdout_bytes,
-        stderr: stderr_bytes,
+}
+
+#[cfg(debug_assertions)]
+fn pause_before_cache_publication() {
+    let Some(dir) = std::env::var_os("RGO_TEST_CACHE_PUBLICATION_PAUSE") else {
+        return;
+    };
+    let dir = PathBuf::from(dir);
+    let _ = std::fs::write(dir.join("ready"), b"");
+    let deadline = std::time::Instant::now() + Duration::from_secs(90);
+    while !dir.join("release").exists() && std::time::Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(25));
     }
 }
 
