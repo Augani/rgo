@@ -125,6 +125,8 @@ $env:RUSTUP_TOOLCHAIN = 'stable'
 $installArgs = @{ ReleaseTag = $tag; Archive = $archive; Sha256 = $sha
     DevelopmentBundle = $true; CargoHome = $cargoHome; RgoHome = $rgoHome; NoUserPath = $true }
 $installed = $false
+$heldCargo = $null
+$heldRelease = $null
 try {
     $plan = (& $cli setup --installer-plan-json --no-service | Out-String).Trim() | ConvertFrom-Json
     if ($LASTEXITCODE -ne 0 -or $plan.schema_version -ne 1) { throw 'Windows setup did not provide an installer activation plan' }
@@ -214,7 +216,17 @@ try {
     New-Item -ItemType Directory -Force -Path (Join-Path $supervisedProject 'src') | Out-Null
     $supervisedManifest = Join-Path $supervisedProject 'Cargo.toml'
     [IO.File]::WriteAllText($supervisedManifest, "[package]`nname = 'rgo_windows_supervised_installer_probe'`nversion = '0.1.0'`nedition = '2021'`n")
-    [IO.File]::WriteAllText((Join-Path $supervisedProject 'src/main.rs'), 'fn main() { println!("rgo"); }')
+    [IO.File]::WriteAllText((Join-Path $supervisedProject 'src/main.rs'), @'
+fn main() {
+    if let Some(ready) = std::env::var_os("RGO_INSTALLER_READY") {
+        std::fs::write(ready, b"ready").unwrap();
+        let release = std::env::var_os("RGO_INSTALLER_RELEASE").unwrap();
+        while !std::path::Path::new(&release).exists() {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+}
+'@)
     $supervisedArgs = $installArgs.Clone()
     # Native build data has a persistent mode marker. Use a fresh storage root
     # so this probe never mixes native and supervised GC domains.
@@ -304,7 +316,35 @@ try {
         $rollbackFallback -or $rollbackShim -or -not $rollbackCargo) {
         throw "interrupted supervised upgrade rollback mismatch: journal=$rollbackJournal state=$rollbackState record=$rollbackRecord fallback=$rollbackFallback shim=$rollbackShim cargo=$rollbackCargo"
     }
+    $heldReady = Join-Path $sandbox 'old-cargo-running'
+    $heldRelease = Join-Path $sandbox 'release-old-cargo'
+    $env:RGO_INSTALLER_READY = $heldReady
+    $env:RGO_INSTALLER_RELEASE = $heldRelease
+    try {
+        $heldCargo = Start-Process -FilePath $shim -ArgumentList @('run', '--offline') `
+            -WorkingDirectory $supervisedProject -PassThru `
+            -RedirectStandardOutput (Join-Path $sandbox 'old-cargo.out') `
+            -RedirectStandardError (Join-Path $sandbox 'old-cargo.err')
+    } finally {
+        Remove-Item Env:RGO_INSTALLER_READY -ErrorAction SilentlyContinue
+        Remove-Item Env:RGO_INSTALLER_RELEASE -ErrorAction SilentlyContinue
+    }
+    $readyDeadline = [DateTime]::UtcNow.AddSeconds(15)
+    while (-not (Test-Path -LiteralPath $heldReady)) {
+        $heldCargo.Refresh()
+        if ($heldCargo.HasExited -or [DateTime]::UtcNow -gt $readyDeadline) {
+            throw 'old cargo run did not reach its live child before supervised upgrade'
+        }
+        Start-Sleep -Milliseconds 100
+    }
     & $installScript @supervisedUpgradeArgs -NoService
+    $heldCargo.Refresh()
+    if ($heldCargo.HasExited) { throw 'supervised upgrade terminated the running old Cargo session' }
+    [IO.File]::WriteAllText($heldRelease, 'release')
+    if (-not $heldCargo.WaitForExit(15000) -or $heldCargo.ExitCode -ne 0) {
+        throw 'old Cargo session did not exit normally after supervised upgrade'
+    }
+    $heldCargo = $null
     $upgradedRecord = Get-Content -LiteralPath $recordPath -Raw | ConvertFrom-Json
     $upgradedShim = Join-Path $cargoHome "rgo/shims/$upgradeTag/cargo.exe"
     if ($upgradedRecord.binary_version -ne $upgradeVersion -or
@@ -404,6 +444,10 @@ try {
     }
     Write-Host 'Windows installer: native upgrade/rollback, storage-only uninstall, supervised shim repair/undo, and exact User PATH restoration passed'
 } finally {
+    if ($heldCargo -and -not $heldCargo.HasExited) {
+        if ($heldRelease) { [IO.File]::WriteAllText($heldRelease, 'release') }
+        if (-not $heldCargo.WaitForExit(10000)) { $heldCargo.Kill() }
+    }
     if ($installed) {
         try { & $installScript -Uninstall -CargoHome $cargoHome -RgoHome $rgoHome | Out-Null }
         catch { Write-Warning "Best-effort sandbox uninstall failed: $_" }
