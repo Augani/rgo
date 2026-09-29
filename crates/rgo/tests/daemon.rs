@@ -1,8 +1,9 @@
 //! Daemon/lease integration tests run real Cargo in a private Sandbox.
 
-use std::process::{Child, Stdio};
+use std::path::{Path, PathBuf};
+use std::process::{Child, Output, Stdio};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime};
 
 use assert_cmd::cargo::cargo_bin;
 use rgo_core::ipc;
@@ -171,6 +172,256 @@ fn opted_in_maintenance_reclaims_idle_bytes_and_reports_pinned_excess() {
             .as_deref()
             .unwrap()
             .contains("protected build contexts")
+    );
+}
+
+#[test]
+fn automatic_budget_reclaims_another_context_during_a_supervised_cargo_run() {
+    struct StopDaemon(Child);
+    impl Drop for StopDaemon {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    struct RunningCargo {
+        child: Option<Child>,
+        release: PathBuf,
+    }
+    impl RunningCargo {
+        fn finish(mut self) -> Output {
+            std::fs::write(&self.release, b"done").unwrap();
+            self.child.take().unwrap().wait_with_output().unwrap()
+        }
+    }
+    impl Drop for RunningCargo {
+        fn drop(&mut self) {
+            if let Some(mut child) = self.child.take() {
+                let _ = std::fs::write(&self.release, b"done");
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+
+    let sb = Sandbox::new().unwrap();
+    let rgo = cargo_bin("rgo");
+    let real_cargo = std::env::var_os("CARGO")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .or_else(|| {
+            std::env::split_paths(&std::env::var_os("PATH")?)
+                .map(|dir| dir.join(if cfg!(windows) { "cargo.exe" } else { "cargo" }))
+                .find(|path| path.is_file())
+        })
+        .expect("absolute Cargo executable for integration tests");
+    let idle_project = sb.simple_bin("auto-running-idle").unwrap();
+    let active_project = sb.simple_bin("auto-running-active").unwrap();
+    std::fs::write(
+        active_project.join("src/main.rs"),
+        r#"fn main() {
+    let ready = std::path::PathBuf::from(std::env::var_os("RGO_TEST_READY").unwrap());
+    let release = std::path::PathBuf::from(std::env::var_os("RGO_TEST_RELEASE").unwrap());
+    std::fs::write(ready, b"ready").unwrap();
+    for _ in 0..600 {
+        if release.exists() { return; }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    panic!("test did not release cargo run");
+}
+"#,
+    )
+    .unwrap();
+    for project in [&idle_project, &active_project] {
+        let build = sb
+            .cmd(&rgo)
+            .current_dir(project)
+            .args(["cargo-shim", "--real-cargo"])
+            .arg(&real_cargo)
+            .args(["--", "build", "--offline"])
+            .output()
+            .unwrap();
+        assert!(
+            build.status.success(),
+            "{}",
+            String::from_utf8_lossy(&build.stderr)
+        );
+    }
+    let paths = rgo_core::paths::RgoPaths {
+        root: sb.rgo_home.clone(),
+    };
+    let contexts = rgo_core::context::list(&paths).unwrap();
+    assert_eq!(contexts.len(), 2);
+    let context_for = |project: &Path| {
+        let root = project.canonicalize().unwrap();
+        contexts
+            .iter()
+            .find(|context| {
+                context.sidecar.as_ref().is_some_and(|sidecar| {
+                    Path::new(&sidecar.workspace_root).canonicalize().ok() == Some(root.clone())
+                })
+            })
+            .unwrap()
+            .dir
+            .clone()
+    };
+    let idle = context_for(&idle_project);
+    let active = context_for(&active_project);
+    let baseline = StopDaemon(start_daemon(&sb));
+    drop(baseline);
+
+    let ready = sb.home.join("active-run-ready");
+    let release = sb.home.join("active-run-release");
+    let mut running = RunningCargo {
+        child: Some(
+            sb.cmd(&rgo)
+                .current_dir(&active_project)
+                .env("RGO_TEST_READY", &ready)
+                .env("RGO_TEST_RELEASE", &release)
+                .args(["cargo-shim", "--real-cargo"])
+                .arg(&real_cargo)
+                .args(["--", "run", "--offline"])
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap(),
+        ),
+        release,
+    };
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !ready.exists() && Instant::now() < deadline {
+        assert!(
+            running
+                .child
+                .as_mut()
+                .unwrap()
+                .try_wait()
+                .unwrap()
+                .is_none()
+        );
+        thread::sleep(Duration::from_millis(25));
+    }
+    assert!(
+        ready.exists(),
+        "supervised cargo run never reached its program"
+    );
+
+    let active_bytes = rgo_core::context::list(&paths)
+        .unwrap()
+        .into_iter()
+        .find(|context| context.dir == active)
+        .unwrap()
+        .usage
+        .physical_bytes;
+    let other_bytes = rgo_core::size::auxiliary_usage(&paths)
+        .unwrap()
+        .physical_bytes
+        + rgo_core::size::Scanner::new()
+            .measure_optional(&paths.cas_dir())
+            .unwrap()
+            .physical_bytes;
+    let max_size = other_bytes + active_bytes / 2;
+    let old = SystemTime::now() - Duration::from_secs(7200);
+    for profile in std::fs::read_dir(&idle).unwrap().flatten() {
+        if profile.path().is_dir() {
+            let lock = profile.path().join(".cargo-build-lock");
+            if lock.is_file() {
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(lock)
+                    .unwrap()
+                    .set_modified(old)
+                    .unwrap();
+            }
+        }
+    }
+    std::fs::write(
+        sb.rgo_home.join("config.toml"),
+        format!("[storage]\nmax_size = '{max_size}B'\nmin_free_space = '0B'\n[gc]\nauto = true\n"),
+    )
+    .unwrap();
+    let mut daemon = StopDaemon(
+        sb.cmd(&rgo)
+            .args(["daemon", "--foreground"])
+            .env("RGO_DAEMON_POLL_SECS", "1")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while idle.exists() && Instant::now() < deadline {
+        assert!(daemon.0.try_wait().unwrap().is_none());
+        assert!(
+            running
+                .child
+                .as_mut()
+                .unwrap()
+                .try_wait()
+                .unwrap()
+                .is_none()
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
+    assert!(!idle.exists(), "maintenance did not reclaim the idle build");
+    assert!(
+        active.exists(),
+        "maintenance removed a running Cargo context"
+    );
+    let response = ipc::request_with_timeout(
+        &paths.socket_path(),
+        Request::QueryStatus,
+        Duration::from_secs(5),
+    )
+    .unwrap();
+    let Response::Status(status) = response else {
+        panic!("daemon did not return storage status: {response:?}");
+    };
+    assert_eq!(status.contexts, 1);
+    assert!(status.unmet_budget_bytes.unwrap() > 0);
+    assert!(
+        status
+            .unmet_budget_reason
+            .as_deref()
+            .unwrap()
+            .contains("protected build contexts")
+    );
+
+    let output = running.finish();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    for profile in std::fs::read_dir(&active).unwrap().flatten() {
+        if profile.path().is_dir() {
+            let lock = profile.path().join(".cargo-build-lock");
+            if lock.is_file() {
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(lock)
+                    .unwrap()
+                    .set_modified(old)
+                    .unwrap();
+            }
+        }
+    }
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while active.exists() && Instant::now() < deadline {
+        assert!(daemon.0.try_wait().unwrap().is_none());
+        thread::sleep(Duration::from_millis(100));
+    }
+    assert!(
+        !active.exists(),
+        "maintenance did not reclaim the exited build"
+    );
+    assert!(
+        active_project
+            .join(format!(
+                "target/debug/auto-running-active{}",
+                std::env::consts::EXE_SUFFIX
+            ))
+            .exists()
     );
 }
 
