@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Install an attested rgo release bundle without replacing a live binary.
 
-This is the Unix entry point while the public release location is unresolved.
-It accepts an already downloaded archive or an explicit GitHub repository/tag.
+It accepts an already downloaded archive, an exact GitHub release tag, or the
+latest stable release from the owned repository.
 The development-bundle switch exists only for private, locally built probes.
 """
 
@@ -24,6 +24,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import urllib.error
 import urllib.parse
 import urllib.request
 import zipfile
@@ -43,7 +44,9 @@ ALLOWED_FILES = {
     "LICENSE-APACHE",
 }
 VERSION = re.compile(r"v[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?\Z")
+STABLE_VERSION = re.compile(r"v[0-9]+\.[0-9]+\.[0-9]+\Z")
 REPO = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\Z")
+DEFAULT_REPO = "Augani/rgo"
 GH_VERSION = "2.101.0"
 # Digests from cli/cli's verified v2.101.0 release checksum manifest. The
 # verifier is extracted only into the installer's disposable scratch directory.
@@ -139,6 +142,40 @@ def download(url: str, destination: Path) -> None:
             if size > MAX_ARCHIVE:
                 raise InstallError("release asset exceeds the installer size limit")
             output.write(block)
+
+
+def latest_release_tag(repo: str) -> str:
+    url = f"https://api.github.com/repos/{repo}/releases/latest"
+    request = urllib.request.Request(
+        url,
+        headers={
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "rgo-installer/0.1",
+        },
+    )
+    opener = urllib.request.build_opener(HTTPSOnly())
+    try:
+        with opener.open(request, timeout=30) as response:
+            payload = response.read(64 * 1024 + 1)
+    except (OSError, urllib.error.URLError) as error:
+        raise InstallError(f"cannot resolve the latest {repo} release: {error}") from error
+    if len(payload) > 64 * 1024:
+        raise InstallError("latest release metadata exceeds the installer size limit")
+    try:
+        release = json.loads(payload)
+    except (ValueError, UnicodeDecodeError) as error:
+        raise InstallError("latest release metadata is invalid JSON") from error
+    if not isinstance(release, dict):
+        raise InstallError("latest release metadata is not an object")
+    tag = release.get("tag_name")
+    if (
+        not isinstance(tag, str)
+        or not STABLE_VERSION.fullmatch(tag)
+        or release.get("draft") is not False
+        or release.get("prerelease") is not False
+    ):
+        raise InstallError("latest release is not a published stable rgo version")
+    return tag
 
 
 def verifier_binary(scratch: Path, target: str) -> Path:
@@ -1131,8 +1168,9 @@ def uninstall_owned(
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--archive", type=Path, help="downloaded release .tar.gz")
-    parser.add_argument("--repo", help="GitHub OWNER/REPO for download and provenance verification")
+    parser.add_argument("--repo", help=f"GitHub OWNER/REPO (default: {DEFAULT_REPO})")
     parser.add_argument("--version", help="exact release tag, such as v0.1.0")
+    parser.add_argument("--latest", action="store_true", help="install the latest published stable release")
     parser.add_argument("--sha256sums", type=Path, help="local SHA256SUMS.txt")
     parser.add_argument("--sha256", help="expected archive digest for a local bundle")
     parser.add_argument("--attestation-bundle", type=Path)
@@ -1150,7 +1188,7 @@ def main() -> None:
     parser.add_argument("--uninstall", action="store_true", help="undo an owned no-service install and remove its command links")
     args = parser.parse_args()
     if args.uninstall and (
-        args.repair or args.verify_only or args.archive or args.repo or args.version
+        args.repair or args.verify_only or args.archive or args.repo or args.version or args.latest
         or args.sha256 or args.sha256sums or args.attestation_bundle or args.trusted_root
         or args.supervised or args.real_cargo
     ):
@@ -1164,15 +1202,20 @@ def main() -> None:
 
     if os.name != "posix" or platform.system() not in {"Darwin", "Linux"}:
         raise InstallError("this installer supports macOS and glibc Linux; Windows uses a separate installer")
-    if not args.uninstall and (not args.version or not VERSION.fullmatch(args.version)):
-        raise InstallError("--version must be an exact vMAJOR.MINOR.PATCH tag")
+    if args.latest and (args.version or args.archive or args.development_bundle or args.repair):
+        raise InstallError("--latest cannot be combined with --version, --archive, --development-bundle, or --repair")
     if args.repo and (
         not REPO.fullmatch(args.repo)
         or any(part in {".", ".."} for part in args.repo.split("/"))
     ):
         raise InstallError("--repo must be OWNER/REPO")
-    if not args.uninstall and not args.repo and not args.development_bundle:
-        raise InstallError("--repo OWNER/REPO is required to download or verify a release")
+    if not args.uninstall and not args.development_bundle and not args.repo:
+        args.repo = DEFAULT_REPO
+    if args.latest:
+        args.version = latest_release_tag(args.repo)
+        print(f"selected {args.repo} {args.version}")
+    if not args.uninstall and (not args.version or not VERSION.fullmatch(args.version)):
+        raise InstallError("use --latest or --version with an exact vMAJOR.MINOR.PATCH tag")
     if args.development_bundle and not args.archive and not args.uninstall:
         raise InstallError("--development-bundle is only allowed with a local archive")
     if args.sha256 and not re.fullmatch(r"[0-9a-fA-F]{64}", args.sha256):

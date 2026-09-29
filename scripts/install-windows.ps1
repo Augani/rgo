@@ -10,6 +10,7 @@
 #>
 param(
     [string]$ReleaseTag,
+    [switch]$Latest,
     [string]$Repository,
     [string]$Archive,
     [string]$Sha256Sums,
@@ -134,6 +135,7 @@ function Download-Https([string]$Url, [string]$Destination) {
     $handler.AllowAutoRedirect = $false
     $client = [System.Net.Http.HttpClient]::new($handler)
     $client.Timeout = [TimeSpan]::FromSeconds(45)
+    $client.DefaultRequestHeaders.UserAgent.ParseAdd('rgo-installer/0.1')
     try {
         $current = [Uri]$Url
         for ($hop = 0; $hop -lt 6; $hop++) {
@@ -169,6 +171,24 @@ function Download-Https([string]$Url, [string]$Destination) {
     } finally {
         $client.Dispose()
         $handler.Dispose()
+    }
+}
+
+function Get-LatestReleaseTag([string]$Repo) {
+    $metadataPath = Join-Path ([IO.Path]::GetTempPath()) "rgo-release-$([guid]::NewGuid().ToString('N')).json"
+    try {
+        Download-Https "https://api.github.com/repos/$Repo/releases/latest" $metadataPath
+        Assert-Condition ((Get-Item -LiteralPath $metadataPath).Length -le 65536) 'latest release metadata exceeds 64 KiB'
+        $release = Read-Json $metadataPath
+        Assert-Condition ($release.PSObject.Properties['tag_name'] -and
+            $release.PSObject.Properties['draft'] -and
+            $release.PSObject.Properties['prerelease']) 'latest release metadata is incomplete'
+        $tag = [string]$release.tag_name
+        Assert-Condition ($tag -match '^v[0-9]+\.[0-9]+\.[0-9]+$' -and
+            $release.draft -eq $false -and $release.prerelease -eq $false) 'latest release is not a published stable rgo version'
+        return $tag
+    } finally {
+        if (Test-Path -LiteralPath $metadataPath) { Remove-Item -LiteralPath $metadataPath -Force }
     }
 }
 
@@ -1052,7 +1072,7 @@ $env:RGO_HOME = $resolvedRgoHome
 try {
     if (-not $VerifyOnly) { Recover-Upgrade $upgradeJournalPath }
     if ($Uninstall) {
-        Assert-Condition (-not ($VerifyOnly -or $Repair -or $ReleaseTag -or $Archive -or $Repository)) '-Uninstall cannot be combined with install inputs'
+        Assert-Condition (-not ($VerifyOnly -or $Repair -or $ReleaseTag -or $Latest -or $Archive -or $Repository)) '-Uninstall cannot be combined with install inputs'
         if (-not (Test-Path -LiteralPath $statePath) -and -not (Test-Path -LiteralPath $pendingPath)) {
             throw 'no installer-owned Windows activation was found'
         }
@@ -1103,13 +1123,18 @@ try {
         return
     }
 
-    Assert-Condition ($ReleaseTag -match '^v[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?$') '-ReleaseTag must be an exact vMAJOR.MINOR.PATCH tag'
+    Assert-Condition (-not $Latest -or -not ($ReleaseTag -or $Archive -or $DevelopmentBundle -or $Repair)) '-Latest cannot be combined with -ReleaseTag, -Archive, -DevelopmentBundle, or -Repair'
     if ($Repository) {
         Assert-Condition ($Repository -match '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$' -and
             @('.', '..') -notcontains ($Repository -split '/')[0] -and
             @('.', '..') -notcontains ($Repository -split '/')[1]) '-Repository must be OWNER/REPO'
     }
-    Assert-Condition ($Repository -or $DevelopmentBundle) '-Repository is required for release provenance verification'
+    if (-not $Repository -and -not $DevelopmentBundle) { $Repository = 'Augani/rgo' }
+    if ($Latest) {
+        $ReleaseTag = Get-LatestReleaseTag $Repository
+        Write-Host "Selected $Repository $ReleaseTag"
+    }
+    Assert-Condition ($ReleaseTag -match '^v[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?$') 'use -Latest or -ReleaseTag with an exact vMAJOR.MINOR.PATCH tag'
     Assert-Condition (-not $DevelopmentBundle -or $Archive) '-DevelopmentBundle requires a local archive'
     Assert-Condition (-not ($Sha256 -and $Sha256Sums)) 'use either -Sha256 or -Sha256Sums'
     Assert-Condition (-not $Sha256 -or $Sha256 -match '^[0-9a-fA-F]{64}$') '-Sha256 must be 64 hex characters'
