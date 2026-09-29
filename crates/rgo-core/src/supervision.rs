@@ -243,7 +243,7 @@ pub(crate) fn verify_lock_identity(path: &Path, file: &File) -> Result<()> {
 pub fn lock_cargo_session(paths: &RgoPaths, context: Option<&Path>) -> Result<SessionGuard> {
     #[cfg(unix)]
     let local = open_local_guard(paths)?;
-    #[cfg(all(unix, debug_assertions))]
+    #[cfg(debug_assertions)]
     mark_session_lock_attempt_for_test()?;
     #[cfg(unix)]
     FileExt::lock_shared(&local)?;
@@ -268,7 +268,9 @@ pub fn lock_cargo_session(paths: &RgoPaths, context: Option<&Path>) -> Result<Se
     })
 }
 
-#[cfg(all(unix, debug_assertions))]
+/// A debug-build marker for a real-Cargo fixture that starts a launcher while
+/// GC holds its exclusion guard. It fires immediately before the first wait.
+#[cfg(debug_assertions)]
 fn mark_session_lock_attempt_for_test() -> Result<()> {
     let Some(marker) = std::env::var_os("RGO_TEST_SESSION_LOCK_MARKER") else {
         return Ok(());

@@ -11,7 +11,9 @@ mod unix {
     use std::time::Duration;
 
     use assert_cmd::cargo::cargo_bin;
+    use rgo_core::db::StateDb;
     use rgo_core::ipc;
+    use rgo_core::paths::RgoPaths;
     use rgo_protocol::{Request, Response};
     use rgo_testkit::{Sandbox, ensure_workspace_bins_built};
 
@@ -483,7 +485,20 @@ if [ -n "$FAKE_RUSTC_OLD_MTIME" ]; then touch -t 202001010000 "$out"/*; fi
             );
         }
 
-        thread::sleep(Duration::from_secs(35));
+        let paths = RgoPaths {
+            root: sb.rgo_home.clone(),
+        };
+        let lease_count = || {
+            StateDb::open_read_only(&paths)?
+                .stats()
+                .map(|s| s.active_leases)
+        };
+        let mut lease_samples = vec![(0, lease_count())];
+        for second in [12, 24, 35] {
+            let previous = lease_samples.last().unwrap().0;
+            thread::sleep(Duration::from_secs(second - previous));
+            lease_samples.push((second, lease_count()));
+        }
         let socket = sb.rgo_home.join("state/daemon.sock");
         let status =
             ipc::request_with_timeout(&socket, Request::QueryStatus, Duration::from_secs(5));
@@ -501,7 +516,11 @@ if [ -n "$FAKE_RUSTC_OLD_MTIME" ]; then touch -t 202001010000 "$out"/*; fi
         let Response::Status(status) = status.unwrap() else {
             panic!("daemon did not return status during publication");
         };
-        assert!(status.active_leases >= 2, "status: {status:?}");
+        assert!(
+            status.active_leases >= 2,
+            "lease samples: {lease_samples:?}; status: {status:?}; wrapper stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
         assert!(
             gc.status.success(),
             "{}",

@@ -88,7 +88,9 @@ process-level session guard.
   GC takes its stable guard. A newly started unchanged `cargo build` reaches
   its session lock but cannot enter Cargo until deletion finishes; it then
   recreates the managed context while the old generation's marker stays gone.
-  This is one start/delete ordering case, not the full command and platform matrix.
+  A Windows counterpart is prepared using its Job Object assignment marker;
+  its live execution is a required CI check. This is one start/delete ordering case,
+  not the full command and platform matrix.
 - The [Windows creation-time assignment run](https://github.com/Augani/rgo/actions/runs/36518298190)
   exercised a guardian kill before Cargo resumed and a real child after
   launch. Earlier [Windows job checks](https://github.com/Augani/rgo/actions/runs/36484591309)
