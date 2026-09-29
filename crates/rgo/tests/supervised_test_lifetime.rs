@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 use rgo_core::ipc;
 use rgo_core::paths::RgoPaths;
 use rgo_core::{context, gc};
+use rgo_protocol::SIDECAR_FILE;
 #[cfg(debug_assertions)]
 use rgo_protocol::{Request, Response};
 use rgo_testkit::Sandbox;
@@ -447,4 +448,85 @@ fn running_build_script_keeps_its_context_while_gc_reclaims_an_idle_one() {
         std::fs::read_to_string(&output).unwrap_or_default()
     );
     gc::remove_atomically(&paths, &active).unwrap();
+}
+
+#[test]
+fn unchanged_cargo_build_refreshes_context_use_without_rustc() {
+    let sandbox = Sandbox::new().unwrap();
+    let project = sandbox.simple_bin("no-op-use").unwrap();
+    let rgo = env!("CARGO_BIN_EXE_rgo");
+    let real_cargo =
+        PathBuf::from(std::env::var_os("CARGO").expect("Cargo test runner sets CARGO"));
+    let setup = sandbox
+        .cmd(rgo)
+        .args(["setup", "--supervised", "--real-cargo"])
+        .arg(real_cargo)
+        .arg("--no-service")
+        .output()
+        .unwrap();
+    assert!(
+        setup.status.success(),
+        "{}",
+        String::from_utf8_lossy(&setup.stderr)
+    );
+    let record: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(sandbox.cargo_home.join(".rgo-install.json")).unwrap(),
+    )
+    .unwrap();
+    let shim = PathBuf::from(record["supervised_cargo"]["shim_path"].as_str().unwrap());
+    let path = std::env::join_paths(std::iter::once(shim.parent().unwrap().to_path_buf()).chain(
+        std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()),
+    ))
+    .unwrap();
+    let build = || {
+        #[cfg(unix)]
+        let mut command = sandbox.cmd("cargo");
+        #[cfg(windows)]
+        let mut command = {
+            let mut command = sandbox.cmd("cmd.exe");
+            command.args(["/C", "cargo"]);
+            command
+        };
+        command
+            .current_dir(&project)
+            .env("PATH", &path)
+            .args(["build", "--offline"])
+            .output()
+            .unwrap()
+    };
+    let first = build();
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let paths = RgoPaths {
+        root: sandbox.rgo_home.clone(),
+    };
+    let contexts = paths.checked_managed_build_dirs().unwrap();
+    assert_eq!(contexts.len(), 1);
+    let dir = &contexts[0];
+    let mut sidecar = context::read_sidecar(dir).unwrap();
+    let first_seen = sidecar.first_seen;
+    sidecar.last_seen = 1;
+    std::fs::write(
+        dir.join(SIDECAR_FILE),
+        serde_json::to_vec(&sidecar).unwrap(),
+    )
+    .unwrap();
+
+    let second = build();
+    assert!(
+        second.status.success(),
+        "{}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    assert!(
+        !String::from_utf8_lossy(&second.stderr).contains("Compiling"),
+        "second build unexpectedly compiled: {}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    let refreshed = context::read_sidecar(dir).unwrap();
+    assert_eq!(refreshed.first_seen, first_seen);
+    assert!(refreshed.last_seen > 1, "no-op use was not recorded");
 }

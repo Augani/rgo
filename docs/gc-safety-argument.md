@@ -117,9 +117,15 @@ process-level session guard.
 - A private-home `cargo build` fixture now holds a real build script after its
   compiler invocation, refuses removal of that active context, reclaims an
   unrelated idle context, and requires the script to write into its `OUT_DIR`
-  before Cargo can finish. It passed locally on macOS arm64; platform CI is
-  still required. This covers one build-script shape without relying on an
+  before Cargo can finish. It passed locally on macOS arm64 and in the [full
+  Linux, macOS, and Windows CI matrix](https://github.com/Augani/rgo/actions/runs/36634010013).
+  This covers one build-script shape without relying on an
   active rustc-wrapper lease.
+- The supervised launcher refreshes its owned sidecar before each admitted
+  Cargo invocation. A private-home unchanged second `cargo build` confirms a
+  no-op invocation updates `last_seen` without rustc running. It passed locally
+  on macOS arm64; platform CI remains open. Native direct-Cargo no-ops do not
+  provide this signal and are not admitted to destructive cleanup.
 - That fixture now starts four manual GC clients during the held test process,
   pausing the first deletion while three more requests remain in flight. The
   [platform matrix](https://github.com/Augani/rgo/actions/runs/36594347437) passed on a Windows stable
