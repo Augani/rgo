@@ -56,7 +56,9 @@ liveness heuristic.
    the job reports zero active processes. A failed query closes the job and
    kills its remaining members. The Windows lock opener compares the opened
    handle's volume and file ID with the current named file before admitting
-   the session or GC pass. Microsoft documents [job assignment at process
+   the session or GC pass, and excludes `FILE_SHARE_DELETE` while the handle
+   is open so direct rename/delete cannot replace that file. Microsoft
+   documents [job assignment at process
    creation](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-updateprocthreadattribute),
    [kill-on-close](https://learn.microsoft.com/en-us/windows/win32/api/winnt/ns-winnt-jobobject_extended_limit_information),
    and the [active-process count](https://learn.microsoft.com/en-us/windows/win32/api/winnt/ns-winnt-jobobject_basic_accounting_information).
@@ -101,7 +103,7 @@ process-level session guard.
 |---|---|---|
 | Native setup or an external Cargo/IDE launch with a managed build-dir override | The rgo lock does not cover it. `gc.auto` stays off. | Prevent managed-namespace bypass in the supported activation contract or obtain an upstream Cargo lifecycle hook. |
 | A build-script or test descendant escapes the inherited Unix descriptor, or a Windows process starts through an external broker such as WMI | The parent can finish while an external writer remains. | Run real process-tree fixtures, define supported launch semantics, and refuse unattended deletion where exclusion cannot be guaranteed. |
-| Same-user replacement of a lock file after its final identity check | Existing holders could lock different file identities even though pre-acquisition checks passed. | Define and enforce private lock-directory ownership/mutation rules; exercise replacement at every pause point. |
+| Same-user replacement of the lock directory or, on Unix, a lock file after its final identity check | Existing holders could lock different file identities even though pre-acquisition checks passed. Windows now denies direct lock-file rename/delete while its handle is open; ancestor mutation remains unproven. | Define and enforce private lock-directory ownership/mutation rules; exercise replacement at every pause point. |
 | Unsupported filesystem locking, unreadable state, daemon outage, or failed Windows job creation | Error/guard contention skips GC; supervised launch should use ordinary Cargo storage if it cannot establish protection. | Prove fallback before any managed write on each platform and with service restart/interruption. |
 | Concurrent `cargo clean`, no-op/use without rustc, nested Cargo, long `cargo run`, Ctrl-C/crash, multiple GC clients | Only selected mechanism and live-command fixtures exist. | Deterministic real-Cargo race matrix with a positive deletion control in another context. |
 | Cargo version changes its build-directory or lock behavior | The current exact-version probes cover relocation, not the full lifecycle. | Version/OS capability table and re-probe before each supported release. |

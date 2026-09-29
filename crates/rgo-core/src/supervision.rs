@@ -182,7 +182,21 @@ pub(crate) fn open_lock_file(path: &Path) -> Result<File> {
             Mode::RUSR | Mode::WUSR,
         )?)
     };
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    let file = {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        // Other sessions may read/write and lock the same file, but no caller
+        // may rename or delete its name while any rgo guard is open.
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .share_mode(0x0000_0001 | 0x0000_0002) // FILE_SHARE_READ | FILE_SHARE_WRITE
+            .open(path)?
+    };
+    #[cfg(not(any(unix, windows)))]
     let file = OpenOptions::new()
         .read(true)
         .write(true)
@@ -493,10 +507,33 @@ mod tests {
         let paths = RgoPaths {
             root: root.path().join("rgo"),
         };
+        paths.ensure_layout().unwrap();
         let path = lock_path(&paths, None, true).unwrap();
-        let old = open_lock(&paths, None, true).unwrap();
+        // An external default-share handle can still see replacement; rgo's
+        // own opener below denies this once it has taken a guard.
+        let old = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(&path)
+            .unwrap();
         std::fs::rename(&path, root.path().join("old-lock")).unwrap();
         std::fs::write(&path, "replacement").unwrap();
         assert!(verify_lock_identity(&path, &old).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn active_windows_lock_file_cannot_be_replaced() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = RgoPaths {
+            root: root.path().join("rgo"),
+        };
+        let path = lock_path(&paths, None, true).unwrap();
+        let old = open_lock(&paths, None, true).unwrap();
+        let moved = root.path().join("moved-lock");
+        assert!(std::fs::rename(&path, &moved).is_err());
+        drop(old);
+        std::fs::rename(&path, &moved).unwrap();
     }
 }
