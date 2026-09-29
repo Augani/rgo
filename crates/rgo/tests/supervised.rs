@@ -1520,37 +1520,11 @@ fn shimmed_cargo_isolated_from_direct_cargo_and_holds_gc_lock_through_run() {
             .unwrap(),
     )
     .unwrap();
-    let daemon_status = ipc::request_with_timeout(
-        &paths.socket_path(),
-        Request::QueryStatus,
-        Duration::from_secs(5),
-    )
-    .unwrap();
-    let Response::Status(daemon_status) = daemon_status else {
-        panic!("daemon did not return status before undo: {daemon_status:?}");
-    };
-    assert_eq!(
-        unsafe { libc::kill(daemon_status.daemon_pid as i32, libc::SIGTERM) },
-        0
-    );
-    let undo_deadline = Instant::now() + Duration::from_secs(5);
-    let undone = loop {
-        let output = sandbox
-            .cmd(rgo)
-            .args(["setup", "--undo", "--no-service"])
-            .output()
-            .unwrap();
-        if output.status.success() {
-            break output;
-        }
-        assert!(
-            Instant::now() < undo_deadline
-                && String::from_utf8_lossy(&output.stderr).contains("daemon is still running"),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        thread::sleep(Duration::from_millis(50));
-    };
+    let undone = sandbox
+        .cmd(rgo)
+        .args(["setup", "--undo", "--no-service"])
+        .output()
+        .unwrap();
     assert!(
         undone.status.success(),
         "{}",

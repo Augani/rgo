@@ -130,6 +130,8 @@ pub enum Request {
     VerifyCache,
     QueryRemoteStatus,
     ProbeRemote,
+    /// Ask a private daemon to finish active work and release its singleton lock.
+    Shutdown,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

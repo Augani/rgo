@@ -6,6 +6,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -100,6 +101,7 @@ struct State {
     remote: Option<RemoteClient>,
     remote_error: Arc<Mutex<Option<String>>>,
     connection_count: Arc<std::sync::atomic::AtomicUsize>,
+    shutting_down: Arc<AtomicBool>,
 }
 
 struct InstanceLock {
@@ -220,13 +222,17 @@ pub fn run(paths: RgoPaths, cfg: Resolved) -> Result<()> {
         remote,
         remote_error,
         connection_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        shutting_down: Arc::new(AtomicBool::new(false)),
     };
 
     tracing::info!(socket = %paths.socket_path().display(), "rgo daemon listening");
     let maintenance_state = state.clone();
-    thread::spawn(move || {
+    let maintenance_thread = thread::spawn(move || {
         loop {
-            thread::sleep(poll_interval());
+            thread::park_timeout(poll_interval());
+            if maintenance_state.shutting_down.load(Ordering::Acquire) {
+                break;
+            }
             if let Err(error) = maintenance(&maintenance_state) {
                 tracing::warn!(%error, "daemon maintenance failed");
             }
@@ -235,6 +241,9 @@ pub fn run(paths: RgoPaths, cfg: Resolved) -> Result<()> {
     loop {
         match listener.accept() {
             Ok(connection) => {
+                if state.shutting_down.load(Ordering::Acquire) {
+                    break;
+                }
                 let state = state.clone();
                 let Some(permit) = ConnectionPermit::try_acquire(&state.connection_count) else {
                     continue;
@@ -249,6 +258,14 @@ pub fn run(paths: RgoPaths, cfg: Resolved) -> Result<()> {
             Err(error) => return Err(error).context("accepting daemon client"),
         }
     }
+    while state.connection_count.load(Ordering::Acquire) > 0 {
+        thread::sleep(Duration::from_millis(25));
+    }
+    maintenance_thread.thread().unpark();
+    maintenance_thread
+        .join()
+        .map_err(|_| anyhow::anyhow!("daemon maintenance thread panicked during shutdown"))?;
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -300,8 +317,15 @@ fn serve_connection(mut connection: Connection, state: &State) -> Result<()> {
     }
 
     let request: Request = ipc::read_message(&mut connection)?;
+    let shutdown = matches!(request, Request::Shutdown);
     let response = handle_request(state, request);
-    ipc::write_message(&mut connection, &response)
+    let written = ipc::write_message(&mut connection, &response);
+    if shutdown && matches!(response, Response::Ok) {
+        // Wake the blocking accept loop after the acknowledgement is sent.
+        // The connection is dropped there without another request handler.
+        let _ = ipc::connect(&state.paths.socket_path(), Duration::from_millis(500));
+    }
+    written
 }
 
 fn handle_request(state: &State, request: Request) -> Response {
@@ -315,7 +339,14 @@ fn handle_request(state: &State, request: Request) -> Response {
 }
 
 fn handle_request_result(state: &State, request: Request) -> Result<Response> {
+    if state.shutting_down.load(Ordering::Acquire) && !matches!(request, Request::Shutdown) {
+        bail!("daemon is shutting down");
+    }
     match request {
+        Request::Shutdown => {
+            state.shutting_down.store(true, Ordering::Release);
+            Ok(Response::Ok)
+        }
         Request::AcquireLease {
             scope,
             pid,
@@ -2251,6 +2282,7 @@ mod tests {
             remote: None,
             remote_error: Arc::new(Mutex::new(None)),
             connection_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            shutting_down: Arc::new(AtomicBool::new(false)),
         };
         let lease = state
             .db
