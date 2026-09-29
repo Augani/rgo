@@ -7,8 +7,12 @@
 use std::ffi::{OsStr, OsString, c_void};
 use std::os::windows::ffi::OsStrExt;
 use std::path::Path;
+#[cfg(debug_assertions)]
+use std::path::PathBuf;
 use std::thread;
 use std::time::Duration;
+#[cfg(debug_assertions)]
+use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
 use windows_sys::Win32::Foundation::{
@@ -136,6 +140,8 @@ impl JobGuard {
             }
             return Err(error).context("assigning suspended Cargo to its Job Object");
         }
+        #[cfg(debug_assertions)]
+        pause_after_assignment_for_test(info.dwProcessId)?;
         if unsafe { ResumeThread(primary_thread.0) } == u32::MAX {
             // Dropping the private job handle terminates its suspended child.
             return Err(std::io::Error::last_os_error()).context("resuming supervised Cargo");
@@ -189,6 +195,31 @@ impl JobGuard {
             thread::sleep(Duration::from_millis(25));
         }
     }
+}
+
+/// A debug-build-only fault point for the live Windows interruption fixture.
+/// The child is still suspended and already belongs to the private job.
+#[cfg(debug_assertions)]
+fn pause_after_assignment_for_test(child_pid: u32) -> Result<()> {
+    let Some(marker) = std::env::var_os("RGO_TEST_JOB_ASSIGNED_MARKER") else {
+        return Ok(());
+    };
+    let marker = PathBuf::from(marker);
+    let release = PathBuf::from(
+        std::env::var_os("RGO_TEST_JOB_ASSIGNED_RELEASE")
+            .context("RGO_TEST_JOB_ASSIGNED_RELEASE is required with the assignment marker")?,
+    );
+    let staging = marker.with_extension("tmp");
+    std::fs::write(&staging, child_pid.to_string())?;
+    std::fs::rename(&staging, &marker)?;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !release.is_file() {
+        if Instant::now() >= deadline {
+            bail!("timed out at the Windows Job Object assignment test point");
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    Ok(())
 }
 
 pub(super) fn quote_windows_arg(value: &OsStr) -> Vec<u16> {

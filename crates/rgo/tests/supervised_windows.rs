@@ -1116,6 +1116,91 @@ fn main() {
     );
 }
 
+#[cfg(debug_assertions)]
+#[test]
+#[allow(unsafe_code)]
+fn killing_launcher_after_job_assignment_terminates_suspended_cargo() {
+    struct StopLauncher(Child);
+    impl Drop for StopLauncher {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    let sandbox = Sandbox::new().unwrap();
+    let project = sandbox.simple_bin("windows-assigned-suspended").unwrap();
+    let real_cargo = PathBuf::from(std::env::var_os("CARGO").unwrap());
+    let marker = sandbox.home.join("job-assigned");
+    let release = sandbox.home.join("job-release");
+    let mut launcher = StopLauncher(
+        sandbox
+            .cmd(env!("CARGO_BIN_EXE_rgo"))
+            .current_dir(&project)
+            .env("RGO_TEST_JOB_ASSIGNED_MARKER", &marker)
+            .env("RGO_TEST_JOB_ASSIGNED_RELEASE", &release)
+            .args(["cargo-shim", "--real-cargo"])
+            .arg(&real_cargo)
+            .args(["--", "build", "--offline"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !marker.is_file() && Instant::now() < deadline {
+        assert!(
+            launcher.0.try_wait().unwrap().is_none(),
+            "launcher exited before assigning suspended Cargo"
+        );
+        thread::sleep(Duration::from_millis(25));
+    }
+    assert!(
+        marker.is_file(),
+        "launcher never reached the assignment point"
+    );
+    let cargo_pid: u32 = std::fs::read_to_string(&marker).unwrap().parse().unwrap();
+    let cargo_handle = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, cargo_pid) };
+    assert!(!cargo_handle.is_null(), "cannot observe suspended Cargo");
+    assert_eq!(
+        unsafe { WaitForSingleObject(cargo_handle, 0) },
+        WAIT_TIMEOUT
+    );
+
+    let paths = RgoPaths {
+        root: sandbox.rgo_home.clone(),
+    };
+    let contexts = paths.checked_managed_build_dirs().unwrap();
+    assert_eq!(contexts.len(), 1);
+    assert!(
+        supervision::try_lock_gc(&paths, Some(&contexts[0]))
+            .unwrap()
+            .is_none(),
+        "GC entered while the suspended Cargo child belonged to its guardian"
+    );
+    launcher.0.kill().unwrap();
+    launcher.0.wait().unwrap();
+    assert_eq!(
+        unsafe { WaitForSingleObject(cargo_handle, 5_000) },
+        WAIT_OBJECT_0,
+        "guardian death did not terminate the assigned child"
+    );
+    unsafe { CloseHandle(cargo_handle) };
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if supervision::try_lock_gc(&paths, Some(&contexts[0]))
+            .unwrap()
+            .is_some()
+        {
+            break;
+        }
+        assert!(Instant::now() < deadline, "guardian retained its GC guard");
+        thread::sleep(Duration::from_millis(25));
+    }
+    gc::remove_atomically(&paths, &contexts[0]).unwrap();
+    assert!(!contexts[0].exists());
+}
+
 #[test]
 #[allow(unsafe_code)] // Process wait proves Job Object teardown killed the child.
 fn killing_launcher_terminates_cargo_run_child_before_gc_guard_releases() {
