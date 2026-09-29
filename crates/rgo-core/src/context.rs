@@ -675,18 +675,12 @@ pub fn list_with_scanner(paths: &RgoPaths, scanner: &mut Scanner) -> Result<Vec<
     dirs.sort();
     for dir in dirs {
         let sidecar = read_sidecar(&dir);
-        let usage = scanner.measure_checked(&dir)?;
-        let mut incremental_usage = Usage::default();
-        for directory in incremental_dirs_checked(&dir)? {
-            let measured = incremental_scanner.measure_checked(&directory)?;
-            incremental_usage.physical_bytes = incremental_usage
-                .physical_bytes
-                .saturating_add(measured.physical_bytes);
-            incremental_usage.logical_bytes = incremental_usage
-                .logical_bytes
-                .saturating_add(measured.logical_bytes);
-            incremental_usage.files = incremental_usage.files.saturating_add(measured.files);
-        }
+        let incremental_dirs = incremental_dirs_checked(&dir)?;
+        let (usage, incremental_usage) = scanner.measure_checked_with_subtotal(
+            &dir,
+            &incremental_dirs,
+            &mut incremental_scanner,
+        )?;
         let last_used = last_used(&dir, sidecar.as_ref());
         out.push(BuildContext {
             dir,
@@ -958,6 +952,38 @@ mod tests {
             contexts[0].incremental_usage.physical_bytes
         );
         assert!(contexts[0].incremental_usage.physical_bytes > 0);
+    }
+
+    #[test]
+    fn incremental_subtotal_is_independent_of_earlier_context_totals() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = RgoPaths {
+            root: root.path().join("rgo"),
+        };
+        let first = paths.builds_dir().join("aa/first");
+        let second = paths.builds_dir().join("aa/second");
+        let incremental = second.join("debug/incremental");
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&incremental).unwrap();
+        let artifact = first.join("artifact");
+        std::fs::write(&artifact, vec![0u8; 8192]).unwrap();
+        std::fs::hard_link(&artifact, incremental.join("cache")).unwrap();
+
+        let contexts = list(&paths).unwrap();
+        let first = contexts
+            .iter()
+            .find(|context| context.dir == first)
+            .unwrap();
+        let second = contexts
+            .iter()
+            .find(|context| context.dir == second)
+            .unwrap();
+        assert!(first.usage.physical_bytes > 0);
+        assert_eq!(second.usage.physical_bytes, 0);
+        assert_eq!(
+            second.incremental_usage.physical_bytes,
+            first.usage.physical_bytes
+        );
     }
 
     #[test]

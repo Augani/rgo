@@ -3,7 +3,7 @@
 //! build-dir and target-dir, so logical sums overstate reality.
 
 use std::collections::HashSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, ensure};
 use walkdir::WalkDir;
@@ -57,6 +57,22 @@ pub struct Scanner {
     seen: HashSet<(u64, u64)>,
 }
 
+struct FileIdentity {
+    inode: Option<(u64, u64)>,
+    links: u64,
+    logical_bytes: u64,
+}
+
+impl FileIdentity {
+    fn read(path: &Path, metadata: &std::fs::Metadata) -> Self {
+        Self {
+            inode: inode_key(path, metadata),
+            links: md_nlink(path, metadata),
+            logical_bytes: metadata.len(),
+        }
+    }
+}
+
 impl Scanner {
     pub fn new() -> Self {
         Self::default()
@@ -73,14 +89,11 @@ impl Scanner {
             if !md.is_file() {
                 continue;
             }
-            if let Some(key) = inode_key(entry.path(), &md) {
-                if md_nlink(entry.path(), &md) > 1 && !self.seen.insert(key) {
-                    continue;
-                }
+            if self.record_identity(&FileIdentity::read(entry.path(), &md), &mut u) {
+                u.physical_bytes = u
+                    .physical_bytes
+                    .saturating_add(physical_len(entry.path(), &md));
             }
-            u.files += 1;
-            u.logical_bytes += md.len();
-            u.physical_bytes += physical_len(entry.path(), &md);
         }
         u
     }
@@ -95,21 +108,65 @@ impl Scanner {
             let metadata = entry
                 .metadata()
                 .with_context(|| format!("reading metadata for {}", entry.path().display()))?;
+            if metadata.is_file()
+                && self.record_identity(&FileIdentity::read(entry.path(), &metadata), &mut usage)
+            {
+                usage.physical_bytes = usage
+                    .physical_bytes
+                    .saturating_add(physical_len(entry.path(), &metadata));
+            }
+        }
+        Ok(usage)
+    }
+
+    /// Measure a context and its already-validated incremental directories in
+    /// one filesystem walk. The subtotal has its own inode set because a hard
+    /// link already charged to the overall total outside incremental state
+    /// must still appear when it is present under an incremental directory.
+    pub(crate) fn measure_checked_with_subtotal(
+        &mut self,
+        path: &Path,
+        subpaths: &[PathBuf],
+        subtotal_scanner: &mut Scanner,
+    ) -> Result<(Usage, Usage)> {
+        let mut usage = Usage::default();
+        let mut subtotal = Usage::default();
+        for entry in WalkDir::new(path).follow_links(false) {
+            let entry = entry.with_context(|| format!("walking {}", path.display()))?;
+            let metadata = entry
+                .metadata()
+                .with_context(|| format!("reading metadata for {}", entry.path().display()))?;
             if !metadata.is_file() {
                 continue;
             }
-            if let Some(key) = inode_key(entry.path(), &metadata) {
-                if md_nlink(entry.path(), &metadata) > 1 && !self.seen.insert(key) {
-                    continue;
+            let identity = FileIdentity::read(entry.path(), &metadata);
+            let subtotal_counted = subpaths
+                .iter()
+                .any(|subpath| entry.path().starts_with(subpath))
+                && subtotal_scanner.record_identity(&identity, &mut subtotal);
+            let total_counted = self.record_identity(&identity, &mut usage);
+            if total_counted || subtotal_counted {
+                let bytes = physical_len(entry.path(), &metadata);
+                if total_counted {
+                    usage.physical_bytes = usage.physical_bytes.saturating_add(bytes);
+                }
+                if subtotal_counted {
+                    subtotal.physical_bytes = subtotal.physical_bytes.saturating_add(bytes);
                 }
             }
-            usage.files = usage.files.saturating_add(1);
-            usage.logical_bytes = usage.logical_bytes.saturating_add(metadata.len());
-            usage.physical_bytes = usage
-                .physical_bytes
-                .saturating_add(physical_len(entry.path(), &metadata));
         }
-        Ok(usage)
+        Ok((usage, subtotal))
+    }
+
+    fn record_identity(&mut self, identity: &FileIdentity, usage: &mut Usage) -> bool {
+        if let Some(key) = identity.inode {
+            if identity.links > 1 && !self.seen.insert(key) {
+                return false;
+            }
+        }
+        usage.files = usage.files.saturating_add(1);
+        usage.logical_bytes = usage.logical_bytes.saturating_add(identity.logical_bytes);
+        true
     }
 
     /// Missing optional domains count as empty before initial setup. Once a
