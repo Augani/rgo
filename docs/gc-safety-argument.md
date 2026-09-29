@@ -92,6 +92,11 @@ process-level session guard.
 - The [green lock-identity matrix](https://github.com/Augani/rgo/actions/runs/36535047318)
   exercised Windows replacement detection and denial of direct lock-file
   rename while an rgo handle is open, alongside the stable installer probe.
+- The [green supervised `cargo test` matrix](https://github.com/Augani/rgo/actions/runs/36536240212)
+  held a real test executable after rustc finished, refused deletion of its
+  context, reclaimed another idle context, and removed the protected context
+  after Cargo exited. It covers one ordinary test-process shape on Linux,
+  macOS, and Windows; it does not cover an externally brokered process.
 - A private Cargo 1.98.0 probe showed full `cargo clean` removes the sidecar
   and in-context pin marker, while `clean -p` leaves the sidecar. The next
   supervised build restores it; durable pin intent survives outside the

@@ -12,10 +12,14 @@ tokio(full), rand, anyhow — ~60 crates. Full data: `docs/dogfood-2026-09-18.md
 | Storage reclaimed by orphan GC | — | 181.2 MiB of 482.1 | contexts orphaned by checkout deletion are collected |
 | Cross-volume (APFS image) `target/` | — | 11.1 MiB | uplifted outputs are copied, not hardlinked |
 
-Key numbers: a managed checkout keeps only uplifted final outputs (~5% of the
-plain footprint); the balance lives in `$RGO_HOME/builds` where tiered GC
-bounds it. Same-volume hardlinks make uplifted outputs ~free on the checkout
-volume; cross-volume copies cost one binary per target.
+These are historical, single-fixture measurements. Relocation reduced the
+checkout's `target/` size; it did not reduce total machine storage by 95.5%.
+The balance moved to `$RGO_HOME/builds`. A manual orphan-GC pass reclaimed one
+context, but unattended cleanup remains disabled by default until the
+[lifecycle and budget gates](installation-storage-plan.md) pass. Same-volume
+hardlinks can make uplifted outputs cheap on the checkout volume; cross-volume
+copies add another copy of each final binary. These runs did not establish a
+compiler RAM reduction.
 
 ## How to reproduce
 
@@ -30,12 +34,16 @@ du -sm $PROJECT/target $RGO_HOME/builds   # managed vs. a plain-cargo baseline
 
 1. **Storage growth**: `du -s` the checkout `target/` and `builds/` after
    build, rebuild, `--release`, and a second checkout (worktree).
-2. **GC effectiveness**: delete a checkout, age/orphan its context, run
-   `rgo gc` and `rgo gc --aggressive`; compare `rgo status` reclaimable vs.
-   reclaimed bytes. Live contexts must never be touched.
-3. **Cache reuse**: `[cache] enabled = true`, build two checkouts of the same
-   workspace with `remap_workspace_paths`; `rgo status` reports hits/misses
-   and single-flight stats; `state/cache-events.log` explains each decision.
+2. **GC effectiveness**: in a private home with no active Cargo process,
+   delete a checkout, age/orphan its context, run `rgo gc` and
+   `rgo gc --aggressive`, then compare status estimates with measured allocated
+   bytes and volume free space. This manual scenario does not prove safe
+   unattended deletion during concurrent builds.
+3. **Experimental cache reuse**: in disposable homes only, opt into
+   `[cache] enabled = true`, build two checkouts of the same workspace with
+   `remap_workspace_paths`, and compare byte-for-byte outputs with uncached
+   controls. The cache remains off by default while its P6 correctness and
+   useful-reuse gates are open.
 4. **Added build latency**: wall-clock `cargo build` before/after setup on a
    warm checkout. The wrapper adds a classify + daemon round-trip (~150 ms
    client timeout worst case) per rustc invocation; a hit returns in
@@ -47,11 +55,12 @@ du -sm $PROJECT/target $RGO_HOME/builds   # managed vs. a plain-cargo baseline
   tests by a 3 s producer vs. <2 s hit on the same key.
 - Wrapper overhead per rustc invocation should stay in the low-millisecond
   range on a warm daemon; measure `rgo status` daemon round-trip under load.
-- GC must never delete a context with a live build lock, a valid lease, or a
-  pin — enforced by `gc.rs` unit tests and the concurrent-build torture test.
+- GC must never delete a context in use by Cargo, a valid lease, or a pin.
+  Current fixtures cover selected cases; the full process-lifetime race matrix
+  remains a P2 release gate.
 - No rgo-attributable build failure is acceptable under daemon loss, CAS
-  corruption, remote outage, or storage pressure — each is covered by a
-  fault-injection test.
+  corruption, remote outage, or storage pressure. Existing fault-injection
+  fixtures are partial evidence, not a complete failure matrix.
 
 ## Known measurement gaps (operator gates)
 
