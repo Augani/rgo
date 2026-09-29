@@ -160,6 +160,33 @@ fn setup_activates_unchanged_cargo_exe_and_undo_restores_direct_cargo() {
         paths.checked_managed_build_dirs().unwrap().len(),
         managed_before_direct
     );
+    let mut missing_daemon_record: serde_json::Value =
+        serde_json::from_slice(&original_record).unwrap();
+    missing_daemon_record["rgo_binary"] =
+        serde_json::Value::String(sandbox.home.join("missing/rgo.exe").display().to_string());
+    std::fs::write(
+        &record_path,
+        serde_json::to_vec_pretty(&missing_daemon_record).unwrap(),
+    )
+    .unwrap();
+    let missing_daemon_project = sandbox.simple_bin("windows-missing-daemon").unwrap();
+    let missing_daemon = sandbox
+        .cmd("cmd.exe")
+        .current_dir(&missing_daemon_project)
+        .env("PATH", &path)
+        .args(["/C", "cargo", "build", "--offline"])
+        .output()
+        .unwrap();
+    assert!(
+        missing_daemon.status.success(),
+        "{}",
+        String::from_utf8_lossy(&missing_daemon.stderr)
+    );
+    assert!(checkout_executable(&missing_daemon_project).is_file());
+    assert_eq!(
+        paths.checked_managed_build_dirs().unwrap().len(),
+        managed_before_direct
+    );
     std::fs::write(&record_path, original_record).unwrap();
     let other_home = sandbox.home.join("other-cargo-home");
     std::fs::create_dir_all(&other_home).unwrap();
