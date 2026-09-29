@@ -1154,6 +1154,79 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn gc_keeps_its_windows_guard_through_rename_and_removal() {
+        use fs4::fs_std::FileExt;
+        use std::fs::OpenOptions;
+
+        let root = tempfile::tempdir().unwrap();
+        let paths = RgoPaths {
+            root: root.path().join("rgo"),
+        };
+        paths.ensure_layout().unwrap();
+        let context = paths.builds_dir().join("aa/context");
+        std::fs::create_dir_all(&context).unwrap();
+        std::fs::write(context.join("output"), b"unused").unwrap();
+        attribute_context(root.path(), &context);
+
+        let mut phases = Vec::new();
+        let mut waiting_session = None;
+        let mut acquired = None;
+        stage_and_remove_with(&paths, &context, |phase| {
+            phases.push(phase);
+            assert_eq!(context.exists(), phase == DeletePhase::Locked);
+            // Windows byte-range locks apply to a second handle in this same
+            // process too. Probe the stable context lock directly at both
+            // phases, then also check a queued session below.
+            let lock_path = std::fs::read_dir(paths.state_dir().join("locks"))
+                .unwrap()
+                .map(|entry| entry.unwrap())
+                .find(|entry| entry.file_name().to_string_lossy().starts_with("context-"))
+                .unwrap()
+                .path();
+            let probe = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(lock_path)
+                .unwrap();
+            assert!(!FileExt::try_lock_shared(&probe).unwrap());
+            if phase == DeletePhase::Locked {
+                let paths = paths.clone();
+                let context = context.clone();
+                let (started_tx, started_rx) = std::sync::mpsc::channel();
+                let (acquired_tx, acquired_rx) = std::sync::mpsc::channel();
+                waiting_session = Some(std::thread::spawn(move || {
+                    started_tx.send(()).unwrap();
+                    let _session =
+                        crate::supervision::lock_cargo_session(&paths, Some(&context)).unwrap();
+                    let removed_before_admission = !context.exists();
+                    std::fs::create_dir_all(&context).unwrap();
+                    std::fs::write(context.join("new-session"), b"new build").unwrap();
+                    acquired_tx.send(()).unwrap();
+                    removed_before_admission
+                }));
+                started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+                acquired = Some(acquired_rx);
+            }
+            assert!(
+                acquired
+                    .as_ref()
+                    .unwrap()
+                    .recv_timeout(Duration::from_millis(100))
+                    .is_err(),
+                "a Windows Cargo session entered while GC held the context guard"
+            );
+        })
+        .unwrap();
+        assert_eq!(phases, [DeletePhase::Locked, DeletePhase::Staged]);
+        assert!(waiting_session.unwrap().join().unwrap());
+        assert_eq!(
+            std::fs::read(context.join("new-session")).unwrap(),
+            b"new build"
+        );
+    }
+
     #[test]
     fn tiers_are_ordered_and_stale_incremental_state_is_selected_before_contexts() {
         let root = tempfile::tempdir().unwrap();
