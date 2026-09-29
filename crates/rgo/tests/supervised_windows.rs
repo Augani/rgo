@@ -1,14 +1,17 @@
 #![cfg(windows)]
 
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
+use std::process::{Child, Stdio};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use rgo_core::context;
 use rgo_core::gc;
+use rgo_core::ipc;
 use rgo_core::paths::RgoPaths;
+use rgo_core::size;
 use rgo_core::supervision;
+use rgo_protocol::{Request, Response};
 use rgo_testkit::Sandbox;
 use windows_sys::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0, WAIT_TIMEOUT};
 use windows_sys::Win32::System::Threading::{
@@ -232,6 +235,167 @@ fn setup_activates_unchanged_cargo_exe_and_undo_restores_direct_cargo() {
         reinstall.status.success(),
         "{}",
         String::from_utf8_lossy(&reinstall.stderr)
+    );
+}
+
+#[test]
+fn opted_in_maintenance_reclaims_an_idle_real_cargo_build() {
+    struct StopDaemon(Child);
+    impl Drop for StopDaemon {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    let sandbox = Sandbox::new().unwrap();
+    let project = sandbox.simple_bin("windows-supervised-budget").unwrap();
+    let cli = PathBuf::from(env!("CARGO_BIN_EXE_rgo"));
+    let real_cargo = PathBuf::from(std::env::var_os("CARGO").unwrap());
+    let setup = sandbox
+        .cmd(&cli)
+        .args(["setup", "--supervised", "--no-service", "--real-cargo"])
+        .arg(&real_cargo)
+        .output()
+        .unwrap();
+    assert!(
+        setup.status.success(),
+        "{}",
+        String::from_utf8_lossy(&setup.stderr)
+    );
+    let shim = sandbox.cargo_home.join(format!(
+        "rgo/shims/v{}/cargo.exe",
+        env!("CARGO_PKG_VERSION")
+    ));
+    let path = std::env::join_paths(std::iter::once(shim.parent().unwrap().to_path_buf()).chain(
+        std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()),
+    ))
+    .unwrap();
+    let build = sandbox
+        .cmd("cmd.exe")
+        .current_dir(&project)
+        .env("PATH", &path)
+        .args(["/C", "cargo", "build", "--offline"])
+        .output()
+        .unwrap();
+    assert!(
+        build.status.success(),
+        "{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let final_binary = project.join("target/debug/windows-supervised-budget.exe");
+    assert!(final_binary.is_file());
+    let paths = RgoPaths {
+        root: sandbox.rgo_home.clone(),
+    };
+    let contexts = paths.checked_managed_build_dirs().unwrap();
+    assert_eq!(contexts.len(), 1);
+    let context = &contexts[0];
+    let listed = context::list(&paths).unwrap();
+    assert_eq!(listed.len(), 1);
+    let context_bytes = listed[0].usage.physical_bytes;
+    assert!(context_bytes > 0);
+
+    // Account for the daemon's own persistent files before setting the limit.
+    let mut baseline_daemon = StopDaemon(
+        sandbox
+            .cmd(&cli)
+            .args(["daemon", "--foreground"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let startup_deadline = Instant::now() + Duration::from_secs(10);
+    let mut ready = false;
+    while Instant::now() < startup_deadline {
+        if matches!(
+            ipc::request_with_timeout(
+                &paths.socket_path(),
+                Request::QueryRemoteStatus,
+                Duration::from_millis(100)
+            ),
+            Ok(Response::RemoteStatus(_))
+        ) {
+            ready = true;
+            break;
+        }
+        assert!(baseline_daemon.0.try_wait().unwrap().is_none());
+        thread::sleep(Duration::from_millis(25));
+    }
+    assert!(ready, "baseline daemon did not start");
+    drop(baseline_daemon);
+    assert!(context.exists());
+    let other_bytes = size::auxiliary_usage(&paths).unwrap().physical_bytes
+        + size::Scanner::new()
+            .measure_optional(&paths.cas_dir())
+            .unwrap()
+            .physical_bytes;
+    let max_size = other_bytes + context_bytes / 2;
+
+    // Only age Cargo's documented profile lock after its process has exited.
+    let old = SystemTime::now() - Duration::from_secs(7200);
+    for profile in std::fs::read_dir(context).unwrap().flatten() {
+        if profile.path().is_dir() {
+            let lock = profile.path().join(".cargo-build-lock");
+            if lock.is_file() {
+                std::fs::File::open(lock)
+                    .unwrap()
+                    .set_modified(old)
+                    .unwrap();
+            }
+        }
+    }
+    std::fs::write(
+        sandbox.rgo_home.join("config.toml"),
+        format!("[storage]\nmax_size = '{max_size}B'\nmin_free_space = '0B'\n[gc]\nauto = true\n"),
+    )
+    .unwrap();
+    let mut daemon = StopDaemon(
+        sandbox
+            .cmd(&cli)
+            .args(["daemon", "--foreground"])
+            .env("RGO_DAEMON_POLL_SECS", "1")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while context.exists() && Instant::now() < deadline {
+        assert!(
+            daemon.0.try_wait().unwrap().is_none(),
+            "daemon exited during maintenance"
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
+    assert!(
+        !context.exists(),
+        "automatic maintenance did not reclaim the idle build; daemon: {}",
+        std::fs::read_to_string(paths.logs_dir().join("daemon.log")).unwrap_or_default()
+    );
+    assert!(
+        final_binary.is_file(),
+        "maintenance removed Cargo's final output"
+    );
+    let response = ipc::request_with_timeout(
+        &paths.socket_path(),
+        Request::QueryStatus,
+        Duration::from_secs(5),
+    )
+    .unwrap();
+    let Response::Status(status) = response else {
+        panic!("daemon did not return storage status: {response:?}");
+    };
+    assert_eq!(status.contexts, 0);
+    assert!(status.last_gc_at > 0);
+    assert!(
+        status.managed_bytes <= status.hard_limit_bytes,
+        "maintenance removed the build but stayed above its budget: managed={} limit={} unmet={:?} reason={:?}",
+        status.managed_bytes,
+        status.hard_limit_bytes,
+        status.unmet_budget_bytes,
+        status.unmet_budget_reason
     );
 }
 
