@@ -42,6 +42,23 @@ fn checkout_executable(project: &Path) -> PathBuf {
     ))
 }
 
+fn age_finished_cargo_profile_locks(context: &Path) {
+    let old = SystemTime::now() - Duration::from_secs(7200);
+    for profile in std::fs::read_dir(context).unwrap().flatten() {
+        if profile.path().is_dir() {
+            let lock = profile.path().join(".cargo-build-lock");
+            if lock.is_file() {
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(lock)
+                    .unwrap()
+                    .set_modified(old)
+                    .unwrap();
+            }
+        }
+    }
+}
+
 #[test]
 fn setup_activates_unchanged_cargo_exe_and_undo_restores_direct_cargo() {
     let sandbox = Sandbox::new().unwrap();
@@ -368,20 +385,7 @@ fn opted_in_maintenance_reclaims_an_idle_real_cargo_build() {
     let max_size = other_bytes + context_bytes / 2;
 
     // Only age Cargo's documented profile lock after its process has exited.
-    let old = SystemTime::now() - Duration::from_secs(7200);
-    for profile in std::fs::read_dir(context).unwrap().flatten() {
-        if profile.path().is_dir() {
-            let lock = profile.path().join(".cargo-build-lock");
-            if lock.is_file() {
-                std::fs::OpenOptions::new()
-                    .write(true)
-                    .open(lock)
-                    .unwrap()
-                    .set_modified(old)
-                    .unwrap();
-            }
-        }
-    }
+    age_finished_cargo_profile_locks(context);
     std::fs::write(
         sandbox.rgo_home.join("config.toml"),
         format!("[storage]\nmax_size = '{max_size}B'\nmin_free_space = '0B'\n[gc]\nauto = true\n"),
@@ -433,6 +437,42 @@ fn opted_in_maintenance_reclaims_an_idle_real_cargo_build() {
         status.unmet_budget_bytes,
         status.unmet_budget_reason
     );
+
+    let second_build = sandbox
+        .cmd("cmd.exe")
+        .current_dir(&project)
+        .env("PATH", &path)
+        .args(["/C", "cargo", "build", "--offline"])
+        .output()
+        .unwrap();
+    assert!(
+        second_build.status.success(),
+        "{}",
+        String::from_utf8_lossy(&second_build.stderr)
+    );
+    assert!(context.exists());
+    age_finished_cargo_profile_locks(context);
+    let second_deadline = Instant::now() + Duration::from_secs(15);
+    while context.exists() && Instant::now() < second_deadline {
+        assert!(daemon.0.try_wait().unwrap().is_none());
+        thread::sleep(Duration::from_millis(100));
+    }
+    assert!(
+        !context.exists(),
+        "maintenance did not reclaim the rebuilt context"
+    );
+    assert!(final_binary.is_file());
+    let second_response = ipc::request_with_timeout(
+        &paths.socket_path(),
+        Request::QueryStatus,
+        Duration::from_secs(5),
+    )
+    .unwrap();
+    let Response::Status(second_status) = second_response else {
+        panic!("daemon did not return status after the second cycle: {second_response:?}");
+    };
+    assert_eq!(second_status.contexts, 0);
+    assert!(second_status.managed_bytes <= second_status.hard_limit_bytes);
 }
 
 #[test]
