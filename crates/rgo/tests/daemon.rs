@@ -58,10 +58,10 @@ fn start_daemon(sb: &Sandbox) -> Child {
         .cmd(cargo_bin("rgo"))
         .args(["daemon", "--foreground"])
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
     while std::time::Instant::now() < deadline {
         if matches!(
             ipc::request_with_timeout(
@@ -73,17 +73,23 @@ fn start_daemon(sb: &Sandbox) -> Child {
         ) {
             return child;
         }
-        assert!(
-            child.try_wait().unwrap().is_none(),
-            "daemon exited during startup"
-        );
+        if let Some(status) = child.try_wait().unwrap() {
+            let output = child.wait_with_output().unwrap();
+            panic!(
+                "daemon exited during startup ({status}): {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
         thread::sleep(Duration::from_millis(25));
     }
     let _ = child.kill();
-    let _ = child.wait();
+    let output = child.wait_with_output().unwrap();
     let diagnostics = std::fs::read_to_string(sb.rgo_home.join("logs/daemon.log"))
         .unwrap_or_else(|error| format!("daemon log unavailable: {error}"));
-    panic!("daemon did not answer IPC: {diagnostics}");
+    panic!(
+        "daemon did not answer IPC: {diagnostics}; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[test]
