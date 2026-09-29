@@ -1215,7 +1215,9 @@ fn prepare_supervised_cargo(
     let _ = (cargo_home, rgo_home);
     #[cfg(unix)]
     let contents = format!(
-        "#!/bin/sh\nexec {} cargo-shim --real-cargo {} --cargo-home {} --rgo-home {} -- \"$@\"\n",
+        "#!/bin/sh\nif [ ! -x {} ]; then\n  printf '%s\\n' 'rgo: launcher unavailable; using recorded Cargo' >&2\n  exec {} \"$@\"\nfi\nexec {} cargo-shim --real-cargo {} --cargo-home {} --rgo-home {} -- \"$@\"\n",
+        shell_quote(&executable)?,
+        shell_quote(&real)?,
         shell_quote(&executable)?,
         shell_quote(&real)?,
         shell_quote(cargo_home)?,

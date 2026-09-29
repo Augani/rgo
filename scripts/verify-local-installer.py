@@ -215,6 +215,10 @@ def main() -> None:
         missing_name = "rgo" if supervised else "rgo-rustc-wrapper"
         missing_binary = Path(active["rgo_binary"]).parent / missing_name
         missing_binary.unlink()
+        if supervised:
+            fallback = fresh_shell("cargo --version", login=True)
+            assert fallback.returncode == 0, fallback.stderr
+            assert "rgo: launcher unavailable; using recorded Cargo" in fallback.stderr
         refused = subprocess.run(installer, env=environment, text=True, capture_output=True)
         assert refused.returncode != 0, "ordinary reinstall replaced a damaged owned version"
         assert "differs from the verified archive" in refused.stderr or "unexpected contents" in refused.stderr

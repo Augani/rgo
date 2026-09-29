@@ -167,6 +167,7 @@ GC guard for that command's lifetime.
 |---|---|
 | Compiler wrapper misbehaves | `RGO_BYPASS=1 cargo build` bypasses wrapper/cache behavior; Cargo relocation remains active |
 | Wrapper executable missing | for an installer-owned Unix `--no-service` install, rerun its verified same-version bundle with `--repair --no-service`; for a Windows installer pilot, rerun the same verified archive with `-Repair`; otherwise run `rgo setup --undo` with a working `rgo` executable before reinstalling the matched pair |
+| Unix supervised `rgo` executable missing | the owned PATH launcher forwards `cargo` to the recorded real Cargo proxy until the verified same-version installer is rerun with `--repair --no-service` |
 | One project misbehaves | set `build.build-dir`/`target-dir` in its `.cargo/config.toml` |
 | Daemon unavailable | inspect `rgo doctor` and the service logs, then rerun `rgo setup` for this installation; native `--no-service` provides no automatic maintenance |
 | Metadata database corrupt | confirmed SQLite corruption is moved to `state/meta.sqlite.corrupt-*` and the index is rebuilt; other open errors are reported |
