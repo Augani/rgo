@@ -121,8 +121,11 @@ pub fn run(json: bool, verify: bool) -> Result<()> {
                 .find(|path| path.is_file())
                 .is_some_and(|path| path == *shim)
         });
-        supervised_ready =
-            owned && active && !insp.has_fence && insp.build_dir_outside_fence.is_none();
+        supervised_ready = owned
+            && active
+            && !insp.has_fence
+            && !insp.has_include
+            && insp.build_dir_outside_fence.is_none();
         check(
             active,
             format!(
@@ -139,6 +142,15 @@ pub fn run(json: bool, verify: bool) -> Result<()> {
                 false,
                 format!(
                     "global build.build-dir = {build_dir:?} could let direct Cargo enter the managed namespace; remove it before supervised activation"
+                ),
+            );
+        }
+        if insp.has_include {
+            check(
+                false,
+                format!(
+                    "Cargo home config {} has an unresolved include; supervised cleanup cannot verify direct Cargo's build directory",
+                    cfg_path.display()
                 ),
             );
         }
@@ -371,17 +383,28 @@ pub fn run(json: bool, verify: bool) -> Result<()> {
         human(e.cfg.max_size),
         human(e.cfg.soft_watermark)
     ));
-    let supervised_deletion = e.paths.require_supervised_deletion().is_ok();
+    let deletion_problem = e
+        .paths
+        .require_supervised_deletion()
+        .err()
+        .map(|error| format!("{error:#}"));
+    let supervised_deletion = deletion_problem.is_none();
     check(
         e.cfg.gc.auto && supervised_deletion,
         if e.cfg.gc.auto && supervised_deletion {
             "automatic GC enabled (experimental lifecycle safety; active builds and pins can delay reclamation)".into()
         } else if e.cfg.gc.auto {
-            "automatic GC is configured but destructive cleanup requires supervised Cargo; use a fresh RGO_HOME with `rgo setup --supervised`".into()
+            format!(
+                "automatic GC is configured but destructive cleanup is unavailable: {}",
+                deletion_problem.as_deref().unwrap_or("unknown cause")
+            )
         } else if supervised_deletion {
             "automatic GC disabled while the Cargo lifecycle safety gate remains open; manual `rgo gc` is available in supervised mode".into()
         } else {
-            "automatic GC disabled; native or unverified storage cannot safely run destructive `rgo gc` or `rgo clean`".into()
+            format!(
+                "automatic GC disabled; destructive `rgo gc` and `rgo clean` are unavailable: {}",
+                deletion_problem.as_deref().unwrap_or("unknown cause")
+            )
         },
     );
     check_toolchains(&mut check);

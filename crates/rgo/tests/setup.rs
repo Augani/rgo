@@ -126,6 +126,18 @@ fn supervised_cleanup_refuses_global_cargo_config_drift() {
             );
             assert!(context_dir.join("output").is_file());
         }
+        let doctor = sandbox
+            .cmd(&rgo)
+            .args(["doctor", "--json"])
+            .output()
+            .unwrap();
+        assert!(doctor.status.success());
+        let report: serde_json::Value = serde_json::from_slice(&doctor.stdout).unwrap();
+        assert!(report["entries"].as_array().unwrap().iter().any(|entry| {
+            entry["message"].as_str().is_some_and(|message| {
+                message.contains("keeps direct Cargo outside managed storage")
+            })
+        }));
     }
     assert!(!paths.socket_path().exists());
     std::fs::remove_file(&config_path).unwrap();
