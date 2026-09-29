@@ -150,6 +150,110 @@ fn setup_is_atomic_idempotent_and_preserves_user_config() {
 }
 
 #[test]
+fn no_service_undo_waits_for_daemon_quiescence_before_removing_activation() {
+    use std::process::{Child, Stdio};
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    use rgo_core::ipc;
+    use rgo_protocol::{Request, Response};
+
+    struct StopDaemon(Child);
+    impl Drop for StopDaemon {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    ensure_workspace_bins_built().unwrap();
+    let sandbox = Sandbox::new().unwrap();
+    let cli = cargo_bin("rgo");
+    let setup = sandbox
+        .cmd(&cli)
+        .args(["setup", "--no-service"])
+        .output()
+        .unwrap();
+    assert!(
+        setup.status.success(),
+        "{}",
+        String::from_utf8_lossy(&setup.stderr)
+    );
+    let paths = rgo_core::paths::RgoPaths {
+        root: sandbox.rgo_home.clone(),
+    };
+    let daemon = StopDaemon(
+        sandbox
+            .cmd(&cli)
+            .args(["daemon", "--foreground"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut ready = false;
+    while Instant::now() < deadline {
+        if matches!(
+            ipc::request_with_timeout(
+                &paths.socket_path(),
+                Request::QueryRemoteStatus,
+                Duration::from_millis(100)
+            ),
+            Ok(Response::RemoteStatus(_))
+        ) {
+            ready = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    assert!(ready, "private daemon did not become ready");
+
+    let refused_setup = sandbox
+        .cmd(&cli)
+        .args(["setup", "--no-service"])
+        .output()
+        .unwrap();
+    assert!(!refused_setup.status.success());
+    assert!(String::from_utf8_lossy(&refused_setup.stderr).contains("daemon is still running"));
+
+    let refused = sandbox
+        .cmd(&cli)
+        .args(["setup", "--undo", "--no-service"])
+        .output()
+        .unwrap();
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("daemon is still running"));
+    assert!(sandbox.cargo_home.join(".rgo-install.json").is_file());
+    assert!(
+        std::fs::read_to_string(sandbox.cargo_home.join("config.toml"))
+            .unwrap()
+            .contains("rgo managed")
+    );
+
+    drop(daemon);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let undo = sandbox
+            .cmd(&cli)
+            .args(["setup", "--undo", "--no-service"])
+            .output()
+            .unwrap();
+        if undo.status.success() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline
+                && String::from_utf8_lossy(&undo.stderr).contains("daemon is still running"),
+            "{}",
+            String::from_utf8_lossy(&undo.stderr)
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(!sandbox.cargo_home.join(".rgo-install.json").exists());
+}
+
+#[test]
 fn setup_and_undo_refuse_unowned_or_edited_cargo_fences() {
     ensure_workspace_bins_built().unwrap();
     let sandbox = Sandbox::new().unwrap();

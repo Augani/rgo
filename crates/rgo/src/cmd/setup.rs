@@ -606,6 +606,15 @@ pub fn run(
         }
     }
 
+    // A no-service supervised launcher may have started the daemon on plain
+    // Cargo use. Keep its singleton lock through activation changes, so a live
+    // daemon blocks them and another Cargo invocation cannot start one midway.
+    let _no_service_daemon_guard = if no_service && !dry_run {
+        Some(lock_no_service_daemon(&paths)?)
+    } else {
+        None
+    };
+
     let next_inner = if !supervised
         && insp.rustc_workspace_wrapper_outside_fence.is_none()
         && !insp.has_include
@@ -1358,6 +1367,33 @@ fn lock_setup(cargo_home: &Path) -> Result<File> {
 fn lock_root_setup(paths: &RgoPaths) -> Result<File> {
     paths.ensure_layout()?;
     lock_named(&paths.state_dir(), ".rgo-service.lock")
+}
+
+fn lock_no_service_daemon(paths: &RgoPaths) -> Result<File> {
+    let path = paths.state_dir().join("daemon.lock");
+    match std::fs::symlink_metadata(&path) {
+        Ok(metadata) if !metadata.is_file() || metadata.file_type().is_symlink() => {
+            bail!("daemon lock is not a regular file: {}", path.display());
+        }
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+            return Err(error).with_context(|| format!("checking {}", path.display()));
+        }
+        _ => {}
+    }
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&path)
+        .with_context(|| format!("opening {}", path.display()))?;
+    if !file.try_lock_exclusive()? {
+        bail!(
+            "a no-service daemon is still running for {}; stop it before changing activation so maintenance is quiescent",
+            paths.root.display()
+        );
+    }
+    Ok(file)
 }
 
 fn lock_named(directory: &Path, name: &str) -> Result<File> {
