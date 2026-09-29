@@ -515,6 +515,7 @@ mod tests {
             .read(true)
             .write(true)
             .create(true)
+            .truncate(false)
             .open(&path)
             .unwrap();
         std::fs::rename(&path, root.path().join("old-lock")).unwrap();
