@@ -1,7 +1,7 @@
 #![cfg(unix)]
 
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
+use std::process::{Child, Stdio};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -9,6 +9,7 @@ use rgo_core::context;
 use rgo_core::gc;
 use rgo_core::ipc;
 use rgo_core::paths::RgoPaths;
+use rgo_core::size;
 use rgo_core::supervision;
 use rgo_protocol::{Request, Response};
 use rgo_testkit::Sandbox;
@@ -226,6 +227,166 @@ fn plain_cargo_starts_opted_in_maintenance_without_rgo_commands() {
     assert!(
         !idle.exists(),
         "Cargo-started maintenance did not reclaim idle storage"
+    );
+}
+
+#[test]
+fn opted_in_maintenance_reclaims_an_idle_real_cargo_build() {
+    struct StopDaemon(Child);
+    impl Drop for StopDaemon {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    let sandbox = Sandbox::new().unwrap();
+    let project = sandbox.simple_bin("supervised-budget").unwrap();
+    let rgo = env!("CARGO_BIN_EXE_rgo");
+    let setup = sandbox
+        .cmd(rgo)
+        .args(["setup", "--supervised", "--real-cargo"])
+        .arg(cargo_proxy())
+        .arg("--no-service")
+        .output()
+        .unwrap();
+    assert!(
+        setup.status.success(),
+        "{}",
+        String::from_utf8_lossy(&setup.stderr)
+    );
+    let path = std::env::join_paths(
+        std::iter::once(sandbox.cargo_home.join("rgo/shims"))
+            .chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
+    )
+    .unwrap();
+    let build = sandbox
+        .cmd("cargo")
+        .current_dir(&project)
+        .env("PATH", &path)
+        .env_remove("RGO_HOME")
+        .args(["build", "--offline"])
+        .output()
+        .unwrap();
+    assert!(
+        build.status.success(),
+        "{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let final_binary = project.join("target/debug/supervised-budget");
+    assert!(final_binary.is_file());
+    let paths = RgoPaths {
+        root: sandbox.rgo_home.clone(),
+    };
+    let contexts = paths.checked_managed_build_dirs().unwrap();
+    assert_eq!(contexts.len(), 1);
+    let context = &contexts[0];
+    let listed = context::list(&paths).unwrap();
+    assert_eq!(listed.len(), 1);
+    let context_bytes = listed[0].usage.physical_bytes;
+    assert!(context_bytes > 0);
+    // Initialize the daemon's SQLite and operational files with automatic GC
+    // still disabled. The configured budget must include this real baseline.
+    let mut baseline_daemon = StopDaemon(
+        sandbox
+            .cmd(rgo)
+            .args(["daemon", "--foreground"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let startup_deadline = Instant::now() + Duration::from_secs(10);
+    let mut ready = false;
+    while Instant::now() < startup_deadline {
+        if matches!(
+            ipc::request_with_timeout(
+                &paths.socket_path(),
+                Request::QueryRemoteStatus,
+                Duration::from_millis(100)
+            ),
+            Ok(Response::RemoteStatus(_))
+        ) {
+            ready = true;
+            break;
+        }
+        assert!(baseline_daemon.0.try_wait().unwrap().is_none());
+        thread::sleep(Duration::from_millis(25));
+    }
+    assert!(ready, "baseline daemon did not start");
+    drop(baseline_daemon);
+    assert!(context.exists());
+    let other_bytes = size::auxiliary_usage(&paths).unwrap().physical_bytes
+        + size::Scanner::new()
+            .measure_optional(&paths.cas_dir())
+            .unwrap()
+            .physical_bytes;
+    let max_size = other_bytes + context_bytes / 2;
+
+    // The Cargo session has exited. Age only its documented profile-lock
+    // heuristic; the external supervised lifecycle guard remains authoritative.
+    let old = SystemTime::now() - Duration::from_secs(7200);
+    for profile in std::fs::read_dir(context).unwrap().flatten() {
+        if profile.path().is_dir() {
+            let lock = profile.path().join(".cargo-build-lock");
+            if lock.is_file() {
+                std::fs::File::open(lock)
+                    .unwrap()
+                    .set_modified(old)
+                    .unwrap();
+            }
+        }
+    }
+    std::fs::write(
+        sandbox.rgo_home.join("config.toml"),
+        format!("[storage]\nmax_size = '{max_size}B'\nmin_free_space = '0B'\n[gc]\nauto = true\n"),
+    )
+    .unwrap();
+    let mut daemon = StopDaemon(
+        sandbox
+            .cmd(rgo)
+            .args(["daemon", "--foreground"])
+            .env("RGO_DAEMON_POLL_SECS", "1")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while context.exists() && Instant::now() < deadline {
+        assert!(
+            daemon.0.try_wait().unwrap().is_none(),
+            "daemon exited during maintenance"
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
+    assert!(
+        !context.exists(),
+        "automatic maintenance did not reclaim the idle build; daemon: {}",
+        std::fs::read_to_string(paths.logs_dir().join("daemon.log")).unwrap_or_default()
+    );
+    assert!(
+        final_binary.is_file(),
+        "maintenance removed Cargo's final output"
+    );
+    let response = ipc::request_with_timeout(
+        &paths.socket_path(),
+        Request::QueryStatus,
+        Duration::from_secs(5),
+    )
+    .unwrap();
+    let Response::Status(status) = response else {
+        panic!("daemon did not return storage status: {response:?}");
+    };
+    assert_eq!(status.contexts, 0);
+    assert!(status.last_gc_at > 0);
+    assert!(
+        status.managed_bytes <= status.hard_limit_bytes,
+        "maintenance removed the build but stayed above its budget: managed={} limit={} unmet={:?} reason={:?}",
+        status.managed_bytes,
+        status.hard_limit_bytes,
+        status.unmet_budget_bytes,
+        status.unmet_budget_reason
     );
 }
 
