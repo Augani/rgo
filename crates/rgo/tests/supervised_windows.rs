@@ -15,7 +15,7 @@ use rgo_protocol::{Request, Response};
 use rgo_testkit::Sandbox;
 use windows_sys::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0, WAIT_TIMEOUT};
 use windows_sys::Win32::System::Threading::{
-    OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject,
+    OpenProcess, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE, TerminateProcess, WaitForSingleObject,
 };
 
 fn planned_file<'a>(entries: &'a serde_json::Value, path: &Path) -> &'a serde_json::Value {
@@ -405,6 +405,109 @@ fn opted_in_maintenance_reclaims_an_idle_real_cargo_build() {
         status.hard_limit_bytes,
         status.unmet_budget_bytes,
         status.unmet_budget_reason
+    );
+}
+
+#[test]
+#[allow(unsafe_code)]
+fn plain_cargo_starts_opted_in_maintenance_without_rgo_commands() {
+    struct StopDaemon(windows_sys::Win32::Foundation::HANDLE);
+    impl Drop for StopDaemon {
+        fn drop(&mut self) {
+            unsafe {
+                TerminateProcess(self.0, 1);
+                WaitForSingleObject(self.0, 5_000);
+                CloseHandle(self.0);
+            }
+        }
+    }
+
+    let sandbox = Sandbox::new().unwrap();
+    let project = sandbox.simple_bin("windows-lazy-maintenance").unwrap();
+    let idle_project = sandbox.simple_bin("windows-lazy-idle").unwrap();
+    let cli = PathBuf::from(env!("CARGO_BIN_EXE_rgo"));
+    let real_cargo = PathBuf::from(std::env::var_os("CARGO").unwrap());
+    std::fs::write(
+        sandbox.rgo_home.join("config.toml"),
+        "[storage]\nmax_size = '1B'\nmin_free_space = '0B'\n[gc]\nauto = true\n",
+    )
+    .unwrap();
+    let setup = sandbox
+        .cmd(&cli)
+        .args(["setup", "--supervised", "--no-service", "--real-cargo"])
+        .arg(&real_cargo)
+        .output()
+        .unwrap();
+    assert!(
+        setup.status.success(),
+        "{}",
+        String::from_utf8_lossy(&setup.stderr)
+    );
+    let paths = RgoPaths {
+        root: sandbox.rgo_home.clone(),
+    };
+    let idle = paths.builds_dir().join("aa/idle");
+    std::fs::create_dir_all(&idle).unwrap();
+    std::fs::write(idle.join("unused"), vec![0u8; 8192]).unwrap();
+    context::write_sidecar(&idle, &idle_project, &idle_project.join("Cargo.toml"), None).unwrap();
+    assert!(
+        ipc::request_with_timeout(
+            &paths.socket_path(),
+            Request::QueryRemoteStatus,
+            Duration::from_millis(100)
+        )
+        .is_err(),
+        "setup unexpectedly started a daemon in no-service mode"
+    );
+
+    let shim = sandbox.cargo_home.join(format!(
+        "rgo/shims/v{}/cargo.exe",
+        env!("CARGO_PKG_VERSION")
+    ));
+    let path = std::env::join_paths(std::iter::once(shim.parent().unwrap().to_path_buf()).chain(
+        std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()),
+    ))
+    .unwrap();
+    let build = sandbox
+        .cmd("cmd.exe")
+        .current_dir(&project)
+        .env("PATH", &path)
+        .env_remove("RGO_HOME")
+        .env("RGO_DAEMON_POLL_SECS", "1")
+        .args(["/C", "cargo", "build", "--offline"])
+        .output()
+        .unwrap();
+    assert!(
+        build.status.success(),
+        "{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    assert!(checkout_executable(&project).is_file());
+    let response = ipc::request_with_timeout(
+        &paths.socket_path(),
+        Request::QueryStatus,
+        Duration::from_secs(5),
+    )
+    .unwrap();
+    let Response::Status(status) = response else {
+        panic!("plain Cargo did not start a daemon: {response:?}");
+    };
+    let handle = unsafe {
+        OpenProcess(
+            PROCESS_TERMINATE | PROCESS_SYNCHRONIZE,
+            0,
+            status.daemon_pid,
+        )
+    };
+    assert!(!handle.is_null(), "cannot observe Cargo-started daemon");
+    let _stop = StopDaemon(handle);
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while idle.exists() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(100));
+    }
+    assert!(
+        !idle.exists(),
+        "Cargo-started maintenance did not reclaim the idle context"
     );
 }
 
