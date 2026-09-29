@@ -54,13 +54,19 @@ fn daemon_closes_inherited_nonstdio_descriptors() {
 }
 
 fn start_daemon(sb: &Sandbox) -> Child {
-    let mut child = sb
-        .cmd(cargo_bin("rgo"))
+    start_daemon_with_poll(sb, None)
+}
+
+fn start_daemon_with_poll(sb: &Sandbox, poll_secs: Option<&str>) -> Child {
+    let mut command = sb.cmd(cargo_bin("rgo"));
+    command
         .args(["daemon", "--foreground"])
         .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
+        .stderr(Stdio::piped());
+    if let Some(poll_secs) = poll_secs {
+        command.env("RGO_DAEMON_POLL_SECS", poll_secs);
+    }
+    let mut child = command.spawn().unwrap();
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
     while std::time::Instant::now() < deadline {
         if matches!(
@@ -395,6 +401,38 @@ fn automatic_budget_reclaims_another_context_during_a_supervised_cargo_run() {
             .as_deref()
             .unwrap()
             .contains("protected build contexts")
+    );
+
+    // Crash the daemon while the real Cargo program is still running. A new
+    // daemon must inherit the same external lifecycle protection, including
+    // when its first pass is an explicit zero-byte GC request.
+    drop(daemon);
+    let mut daemon = StopDaemon(start_daemon_with_poll(&sb, Some("1")));
+    let restarted_gc = ipc::request_with_timeout(
+        &paths.socket_path(),
+        Request::TriggerGc {
+            dry_run: false,
+            aggressive: false,
+            auto: false,
+            target_bytes: Some(0),
+        },
+        Duration::from_secs(30),
+    )
+    .unwrap();
+    assert!(matches!(restarted_gc, Response::Gc(_)), "{restarted_gc:?}");
+    assert!(
+        active.exists(),
+        "restarted daemon removed a running Cargo context"
+    );
+    assert!(
+        running
+            .child
+            .as_mut()
+            .unwrap()
+            .try_wait()
+            .unwrap()
+            .is_none(),
+        "running Cargo exited during daemon restart"
     );
 
     let output = running.finish();
