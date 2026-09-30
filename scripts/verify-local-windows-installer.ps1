@@ -518,7 +518,47 @@ fn main() {
         (Get-RawUserPathKind) -ne $expectedUserPathKind) {
         throw 'supervised uninstall did not restore raw User PATH and its registry type'
     }
-    Write-Host 'Windows installer: native upgrade/rollback, storage-only uninstall, supervised shim repair/undo, and exact User PATH restoration passed'
+
+    $serviceHome = Join-Path $sandbox 'supervised service ü'
+    $serviceCargoHome = Join-Path $serviceHome '.cargo'
+    $serviceRgoHome = Join-Path $serviceHome '.rgo'
+    $serviceProject = Join-Path $serviceHome 'plain-cargo'
+    New-Item -ItemType Directory -Force -Path @($serviceCargoHome, $serviceRgoHome, (Join-Path $serviceProject 'src')) | Out-Null
+    [IO.File]::WriteAllText((Join-Path $serviceProject 'Cargo.toml'),
+        "[package]`nname = 'rgo_windows_installer_service_probe'`nversion = '0.1.0'`nedition = '2021'`n")
+    [IO.File]::WriteAllText((Join-Path $serviceProject 'src/main.rs'), 'fn main() {}')
+    $env:HOME = $serviceHome
+    $env:USERPROFILE = $serviceHome
+    $env:CARGO_HOME = $serviceCargoHome
+    $env:RGO_HOME = $serviceRgoHome
+    $serviceArgs = $supervisedArgs.Clone()
+    $serviceArgs['CargoHome'] = $serviceCargoHome
+    $serviceArgs['RgoHome'] = $serviceRgoHome
+    $servicePlan = (& $cli setup --supervised --real-cargo $realCargo --installer-plan-json | Out-String).Trim() | ConvertFrom-Json
+    if ($LASTEXITCODE -ne 0 -or -not $servicePlan.service.label) {
+        throw 'supervised installer service plan is missing its task label'
+    }
+    & $installScript @serviceArgs
+    $installed = $true
+    & schtasks.exe /Query /TN $servicePlan.service.label /XML /HRESULT | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw 'supervised installer did not register its scheduled task' }
+    $serviceRecord = Get-Content -LiteralPath (Join-Path $serviceCargoHome '.rgo-install.json') -Raw | ConvertFrom-Json
+    $env:PATH = "$(Split-Path -Path $serviceRecord.supervised_cargo.shim_path -Parent);$oldPath"
+    Remove-Item Env:RGO_HOME
+    & cargo build --offline --manifest-path (Join-Path $serviceProject 'Cargo.toml') | Out-Null
+    if ($LASTEXITCODE -ne 0 -or
+        -not (Test-Path (Join-Path $serviceProject 'target/debug/rgo_windows_installer_service_probe.exe'))) {
+        throw 'unchanged Cargo did not build through the service-managed supervised installer'
+    }
+    & $installScript -Uninstall -CargoHome $serviceCargoHome -RgoHome $serviceRgoHome
+    $installed = $false
+    $null = & schtasks.exe /Query /TN $servicePlan.service.label /HRESULT 2>&1
+    if ($LASTEXITCODE -eq 0) { throw 'supervised installer uninstall left its scheduled task registered' }
+    if ([string](Get-RawUserPath) -cne [string]$expectedUserPath -or
+        (Get-RawUserPathKind) -ne $expectedUserPathKind) {
+        throw 'service-managed supervised uninstall changed User PATH despite -NoUserPath'
+    }
+    Write-Host 'Windows installer: native upgrade/rollback, supervised upgrade, service activation, and exact User PATH restoration passed'
 } finally {
     if ($heldCargo -and -not $heldCargo.HasExited) {
         if ($heldRelease) { [IO.File]::WriteAllText($heldRelease, 'release') }

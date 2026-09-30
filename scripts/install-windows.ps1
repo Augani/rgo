@@ -1038,7 +1038,7 @@ function Assert-Platform {
 
 Assert-Platform
 if ($Supervised -and -not ($Uninstall -or $VerifyOnly)) {
-    Assert-Condition ($NoService -and -not $NoWrapper) '-Supervised currently requires -NoService and cannot be combined with -NoWrapper'
+    Assert-Condition (-not $NoWrapper) '-Supervised cannot be combined with -NoWrapper'
 }
 if (-not $CargoHome) { $CargoHome = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { Join-Path $env:USERPROFILE '.cargo' } }
 $resolvedCargoHome = Full-Path $CargoHome
@@ -1200,7 +1200,7 @@ try {
                 Assert-Condition ([bool]$Supervised -eq $installedSupervised) 'installation mode differs from the owned installer state'
             }
             if ($installedSupervised) {
-                Assert-Condition ($state.noService -and -not $NoWrapper) 'supervised Windows installation requires -NoService and cannot use -NoWrapper'
+                Assert-Condition (-not $NoWrapper) 'supervised Windows installation cannot use -NoWrapper'
                 if ($RealCargo) {
                     Assert-Condition (Test-SamePath (Full-Path $RealCargo) $state.realCargo) '-RealCargo differs from the owned installation'
                 }
