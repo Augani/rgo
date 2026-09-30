@@ -450,6 +450,130 @@ fn running_build_script_keeps_its_context_while_gc_reclaims_an_idle_one() {
     gc::remove_atomically(&paths, &active).unwrap();
 }
 
+#[cfg(unix)]
+#[test]
+fn running_rustdoc_keeps_its_context_while_gc_reclaims_an_idle_one() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let sandbox = Sandbox::new().unwrap();
+    let project = sandbox.simple_bin("rustdoc-lifetime").unwrap();
+    let idle_workspace = sandbox.simple_bin("idle-rustdoc-lifetime").unwrap();
+    let rgo = env!("CARGO_BIN_EXE_rgo");
+    let real_cargo =
+        PathBuf::from(std::env::var_os("CARGO").expect("Cargo test runner sets CARGO"));
+    let setup = sandbox
+        .cmd(rgo)
+        .args(["setup", "--supervised", "--real-cargo"])
+        .arg(real_cargo)
+        .arg("--no-service")
+        .output()
+        .unwrap();
+    assert!(
+        setup.status.success(),
+        "{}",
+        String::from_utf8_lossy(&setup.stderr)
+    );
+    let record: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(sandbox.cargo_home.join(".rgo-install.json")).unwrap(),
+    )
+    .unwrap();
+    let shim = PathBuf::from(record["supervised_cargo"]["shim_path"].as_str().unwrap());
+    let path = std::env::join_paths(std::iter::once(shim.parent().unwrap().to_path_buf()).chain(
+        std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()),
+    ))
+    .unwrap();
+    let rustdoc = sandbox
+        .cmd("rustup")
+        .args(["which", "rustdoc"])
+        .output()
+        .unwrap();
+    assert!(rustdoc.status.success());
+    let real_rustdoc = PathBuf::from(String::from_utf8(rustdoc.stdout).unwrap().trim());
+    let rustdoc_wrapper = sandbox.home.join("held-rustdoc");
+    std::fs::write(
+        &rustdoc_wrapper,
+        b"#!/bin/sh\n: > \"$RGO_RUSTDOC_READY\"\nwhile [ ! -f \"$RGO_RUSTDOC_RELEASE\" ]; do sleep 0.05; done\nexec \"$RGO_REAL_RUSTDOC\" \"$@\"\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&rustdoc_wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let paths = RgoPaths {
+        root: sandbox.rgo_home.clone(),
+    };
+    let idle = paths.builds_dir().join("bb/idle-rustdoc");
+    std::fs::create_dir_all(&idle).unwrap();
+    std::fs::write(idle.join("unused"), vec![b'x'; 8192]).unwrap();
+    context::write_sidecar(
+        &idle,
+        &idle_workspace,
+        &idle_workspace.join("Cargo.toml"),
+        None,
+    )
+    .unwrap();
+
+    let ready = sandbox.home.join("rustdoc-ready");
+    let release = sandbox.home.join("rustdoc-release");
+    let output = sandbox.home.join("cargo-doc.log");
+    let log = File::create(&output).unwrap();
+    let child = sandbox
+        .cmd("cargo")
+        .current_dir(&project)
+        .env("PATH", path)
+        .env("RUSTDOC", &rustdoc_wrapper)
+        .env("RGO_REAL_RUSTDOC", real_rustdoc)
+        .env("RGO_RUSTDOC_READY", &ready)
+        .env("RGO_RUSTDOC_RELEASE", &release)
+        .args(["doc", "--offline", "--no-deps"])
+        .stdout(Stdio::from(log.try_clone().unwrap()))
+        .stderr(Stdio::from(log))
+        .spawn()
+        .unwrap();
+    let mut running = RunningCargo {
+        child: Some(child),
+        release: release.clone(),
+    };
+    wait_for_marker(&ready, running.child.as_mut().unwrap(), &output, "rustdoc");
+
+    let active = paths
+        .checked_managed_build_dirs()
+        .unwrap()
+        .into_iter()
+        .find(|candidate| candidate != &idle)
+        .expect("supervised cargo doc has a managed context");
+    let blocked = gc::remove_atomically(&paths, &active).unwrap_err();
+    assert!(
+        blocked.to_string().contains("supervised Cargo"),
+        "unexpected GC refusal: {blocked:#}"
+    );
+    let pass = sandbox
+        .cmd(rgo)
+        .args(["gc", "--target", "0"])
+        .output()
+        .unwrap();
+    assert!(
+        pass.status.success(),
+        "{}",
+        String::from_utf8_lossy(&pass.stderr)
+    );
+    assert!(active.is_dir(), "GC removed a context during rustdoc");
+    assert!(!idle.exists(), "GC did not reclaim the idle context");
+
+    std::fs::write(&release, b"release").unwrap();
+    let status = running.child.as_mut().unwrap().wait().unwrap();
+    running.child.take();
+    assert!(
+        status.success(),
+        "cargo doc failed: {}",
+        std::fs::read_to_string(&output).unwrap_or_default()
+    );
+    assert!(
+        project
+            .join("target/doc/rustdoc_lifetime/index.html")
+            .is_file()
+    );
+    gc::remove_atomically(&paths, &active).unwrap();
+}
+
 #[test]
 fn unchanged_cargo_build_refreshes_context_use_without_rustc() {
     let sandbox = Sandbox::new().unwrap();

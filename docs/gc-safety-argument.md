@@ -127,6 +127,11 @@ process-level session guard.
   Linux, macOS, and Windows CI matrix](https://github.com/Augani/rgo/actions/runs/36634010013).
   This covers one build-script shape without relying on an
   active rustc-wrapper lease.
+- A private-home `cargo doc` fixture holds rustdoc before it writes output,
+  refuses removal of the active context, and reclaims an unrelated idle one.
+  After release, the requested documentation appears in the checkout and the
+  context becomes reclaimable. It passed locally on macOS arm64; supported
+  platform and other rustdoc-command coverage remain open.
 - The supervised launcher refreshes its owned sidecar before each admitted
   Cargo invocation. A private-home unchanged second `cargo build` confirms a
   no-op invocation updates `last_seen` without rustc running. It passed locally
