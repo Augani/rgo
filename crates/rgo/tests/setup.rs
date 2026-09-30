@@ -806,6 +806,25 @@ fn storage_only_activation_is_verified_from_cargos_build_script_location() {
     let report: serde_json::Value = serde_json::from_slice(&verify.stdout).unwrap();
     assert_eq!(report["activation_verified"], true);
 
+    // Still under the managed root, but one level deeper than rgo can safely
+    // enumerate. Verification must reject this even without a rustc wrapper.
+    let unfamiliar_layout = sandbox
+        .cmd(&rgo)
+        .env(
+            "CARGO_BUILD_BUILD_DIR",
+            format!(
+                "{}/{{workspace-path-hash}}/extra",
+                sandbox.rgo_home.join("builds").display()
+            ),
+        )
+        .args(["doctor", "--verify", "--json"])
+        .output()
+        .unwrap();
+    assert!(!unfamiliar_layout.status.success());
+    assert!(String::from_utf8_lossy(&unfamiliar_layout.stderr).contains("build-directory layout"));
+    let report: serde_json::Value = serde_json::from_slice(&unfamiliar_layout.stdout).unwrap();
+    assert_eq!(report["activation_verified"], false);
+
     let overridden = sandbox
         .cmd(&rgo)
         .env(

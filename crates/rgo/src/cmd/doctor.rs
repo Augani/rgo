@@ -511,7 +511,7 @@ pub fn run(json: bool, verify: bool) -> Result<()> {
         match &result {
             Ok(()) => report.check(
                 true,
-                "plain Cargo build placed build-script output in the managed root; configured wrapper attribution was also verified when present".into(),
+                "plain Cargo debug/release builds use one discoverable managed context; configured wrapper attribution was also verified when present".into(),
             ),
             Err(error) => report.check(
                 false,
@@ -543,40 +543,62 @@ fn verify_plain_cargo(paths: &rgo_core::paths::RgoPaths, wrapper: Option<&str>) 
     )?;
     std::fs::write(root.join("src/main.rs"), "fn main() {}\n")?;
     std::fs::write(root.join("build.rs"), "fn main() {}\n")?;
-    let output = Command::new("cargo")
-        .args(["build", "--offline", "--message-format=json"])
-        .current_dir(root)
-        .output()?;
-    anyhow::ensure!(
-        output.status.success(),
-        "cargo build failed: {}",
-        String::from_utf8_lossy(&output.stderr).trim()
-    );
-    let build_script_out = output
-        .stdout
-        .split(|byte| *byte == b'\n')
-        .filter_map(|line| serde_json::from_slice::<serde_json::Value>(line).ok())
-        .find_map(|event| {
-            (event["reason"] == "build-script-executed")
-                .then(|| event["out_dir"].as_str().map(str::to_owned))
-                .flatten()
-        })
-        .ok_or_else(|| anyhow::anyhow!("Cargo emitted no build-script output location"))?;
-    let actual = std::fs::canonicalize(&build_script_out)?;
+    let build_script_out = |release: bool| -> Result<std::path::PathBuf> {
+        let mut command = Command::new("cargo");
+        command.args(["build", "--offline", "--message-format=json"]);
+        if release {
+            command.arg("--release");
+        }
+        let output = command.current_dir(root).output()?;
+        anyhow::ensure!(
+            output.status.success(),
+            "cargo build{} failed: {}",
+            if release { " --release" } else { "" },
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+        let out_dir = output
+            .stdout
+            .split(|byte| *byte == b'\n')
+            .filter_map(|line| serde_json::from_slice::<serde_json::Value>(line).ok())
+            .find_map(|event| {
+                (event["reason"] == "build-script-executed")
+                    .then(|| event["out_dir"].as_str().map(str::to_owned))
+                    .flatten()
+            })
+            .ok_or_else(|| anyhow::anyhow!("Cargo emitted no build-script output location"))?;
+        Ok(std::fs::canonicalize(out_dir)?)
+    };
+    let debug_out = build_script_out(false)?;
+    let release_out = build_script_out(true)?;
     let expected = std::fs::canonicalize(paths.builds_dir())?;
     anyhow::ensure!(
-        actual.starts_with(&expected),
-        "Cargo placed build-script output at {} rather than under {}",
-        actual.display(),
+        debug_out.starts_with(&expected) && release_out.starts_with(&expected),
+        "Cargo placed build-script output outside managed storage: debug={}, release={}, expected root={}",
+        debug_out.display(),
+        release_out.display(),
         expected.display()
+    );
+    // Two profiles must meet at the same build-dir. This uses Cargo's
+    // documented profile split and emitted paths, without parsing Cargo's
+    // private build/ or deps/ subdirectories or reimplementing its hash.
+    let context = debug_out
+        .ancestors()
+        .find(|ancestor| release_out.starts_with(ancestor))
+        .ok_or_else(|| anyhow::anyhow!("Cargo debug/release outputs have no common directory"))?;
+    anyhow::ensure!(
+        context != expected
+            && paths
+                .checked_managed_build_dirs()?
+                .iter()
+                .any(|dir| dir.canonicalize().is_ok_and(|dir| dir == context)),
+        "Cargo's build-directory layout is not a discoverable rgo context: {}",
+        context.display()
     );
     if wrapper.is_some() {
         let manifest = std::fs::canonicalize(root.join("Cargo.toml"))?;
         anyhow::ensure!(
-            paths.checked_managed_build_dirs()?.iter().any(|dir| {
-                rgo_core::context::read_sidecar(dir).is_some_and(|sidecar| {
-                    std::fs::canonicalize(&sidecar.manifest_path).is_ok_and(|path| path == manifest)
-                })
+            rgo_core::context::read_sidecar(context).is_some_and(|sidecar| {
+                std::fs::canonicalize(&sidecar.manifest_path).is_ok_and(|path| path == manifest)
             }),
             "Cargo reached the managed build root but rgo's configured wrapper did not attribute this context"
         );
