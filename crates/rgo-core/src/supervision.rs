@@ -18,6 +18,7 @@ use fs4::fs_std::FileExt;
 use rustix::fs::{CWD, FlockOperation, Mode, OFlags, fcntl_lock, openat};
 #[cfg(unix)]
 use rustix::io::Errno;
+use serde::{Deserialize, Serialize};
 
 use crate::paths::RgoPaths;
 
@@ -33,6 +34,112 @@ pub fn context_for_workspace(paths: &RgoPaths, workspace_root: &Path) -> Result<
     let digest = hash_path(workspace_root);
     let hex = digest.to_hex().to_string();
     Ok(paths.builds_dir().join(&hex[..2]).join(&hex[2..]))
+}
+
+/// A supervised launch leaves this small record outside the evictable build
+/// tree. The daemon retries maintenance after the context becomes idle, even
+/// if a bounded byte sweep has not reached its new files yet.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct PendingMaintenance {
+    pub context: PathBuf,
+    pub generation: u64,
+}
+
+fn pending_path(paths: &RgoPaths, context: &Path) -> Result<PathBuf> {
+    let relative = context.strip_prefix(paths.builds_dir())?;
+    let mut parts = relative.components();
+    if !matches!(parts.next(), Some(std::path::Component::Normal(_)))
+        || !matches!(parts.next(), Some(std::path::Component::Normal(_)))
+        || parts.next().is_some()
+    {
+        bail!("invalid managed context path {}", context.display());
+    }
+    Ok(paths
+        .pending_maintenance_dir()
+        .join(hash_path(relative).to_hex().to_string()))
+}
+
+fn pending_lock(paths: &RgoPaths) -> Result<File> {
+    paths.ensure_layout()?;
+    let path = paths.state_dir().join("locks/pending-maintenance.lock");
+    let file = open_lock_file(&path)?;
+    FileExt::lock_exclusive(&file)?;
+    verify_lock_identity(&path, &file)?;
+    Ok(file)
+}
+
+/// Call after attribution and before Cargo enters the managed directory.
+/// The generation prevents a completed pass from erasing a newer launch.
+pub fn mark_pending_maintenance(paths: &RgoPaths, context: &Path) -> Result<()> {
+    let path = pending_path(paths, context)?;
+    let _lock = pending_lock(paths)?;
+    let generation = match std::fs::read(&path) {
+        Ok(bytes) => match serde_json::from_slice::<PendingMaintenance>(&bytes) {
+            Ok(record) if record.context == context => record
+                .generation
+                .checked_add(1)
+                .context("pending maintenance generation exhausted")?,
+            _ => 1,
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => 1,
+        Err(error) => return Err(error).with_context(|| format!("reading {}", path.display())),
+    };
+    let record = PendingMaintenance {
+        context: context.to_path_buf(),
+        generation,
+    };
+    let file = open_lock_file(&path)?;
+    file.set_len(0)?;
+    let mut file = file;
+    use std::io::Write;
+    file.write_all(&serde_json::to_vec(&record)?)?;
+    file.sync_data()?;
+    Ok(())
+}
+
+/// Read only the shallow pending-record directory; no Cargo-owned build
+/// contents are visited. Invalid records remain visible in the daemon log.
+pub fn pending_maintenance(paths: &RgoPaths) -> Result<Vec<PendingMaintenance>> {
+    let _lock = pending_lock(paths)?;
+    let mut pending = Vec::new();
+    for entry in std::fs::read_dir(paths.pending_maintenance_dir())? {
+        let entry = entry?;
+        let path = entry.path();
+        let result = (|| -> Result<PendingMaintenance> {
+            let metadata = std::fs::symlink_metadata(&path)?;
+            anyhow::ensure!(metadata.is_file() && !metadata.file_type().is_symlink());
+            let record: PendingMaintenance = serde_json::from_slice(&std::fs::read(&path)?)?;
+            anyhow::ensure!(pending_path(paths, &record.context)? == path);
+            Ok(record)
+        })();
+        match result {
+            Ok(record) => pending.push(record),
+            Err(error) => {
+                tracing::warn!(path = %path.display(), %error, "invalid pending maintenance record")
+            }
+        }
+    }
+    Ok(pending)
+}
+
+/// The context guard makes the final comparison/removal atomic with respect
+/// to admitted launches. A new launch that starts during GC retains its record.
+pub fn clear_pending_maintenance(paths: &RgoPaths, record: &PendingMaintenance) -> Result<bool> {
+    let Some(_context_guard) = try_lock_gc(paths, Some(&record.context))? else {
+        return Ok(false);
+    };
+    let _lock = pending_lock(paths)?;
+    let path = pending_path(paths, &record.context)?;
+    let current = match std::fs::read(&path) {
+        Ok(bytes) => serde_json::from_slice::<PendingMaintenance>(&bytes)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+        Err(error) => return Err(error).with_context(|| format!("reading {}", path.display())),
+    };
+    if current.context != record.context || current.generation != record.generation {
+        return Ok(false);
+    }
+    std::fs::remove_file(path)?;
+    Ok(true)
 }
 
 pub struct SessionGuard {
@@ -393,6 +500,26 @@ fn try_lock_exclusive(file: &File) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn completed_maintenance_cannot_erase_a_newer_or_active_launch() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = RgoPaths {
+            root: root.path().join("rgo"),
+        };
+        let context = paths.builds_dir().join("aa/context");
+        let session = lock_cargo_session(&paths, Some(&context)).unwrap();
+        mark_pending_maintenance(&paths, &context).unwrap();
+        let original = pending_maintenance(&paths).unwrap().pop().unwrap();
+        assert!(!clear_pending_maintenance(&paths, &original).unwrap());
+        mark_pending_maintenance(&paths, &context).unwrap();
+        drop(session);
+        assert!(!clear_pending_maintenance(&paths, &original).unwrap());
+        let newer = pending_maintenance(&paths).unwrap().pop().unwrap();
+        assert!(newer.generation > original.generation);
+        assert!(clear_pending_maintenance(&paths, &newer).unwrap());
+        assert!(pending_maintenance(&paths).unwrap().is_empty());
+    }
 
     #[cfg(unix)]
     #[test]

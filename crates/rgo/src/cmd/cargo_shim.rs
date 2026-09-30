@@ -78,15 +78,15 @@ pub fn run(
     // invocation to managed storage. A missing or incompatible daemon leaves
     // the build in ordinary Cargo storage instead of entering a GC domain
     // without known coordination.
+    let mut auto_gc_enabled = false;
     let maintenance_issue = match Config::load(&paths.config_file()) {
-        Ok(config)
-            if config.gc.auto
-                && !daemon_exe.map_or_else(
-                    || super::daemon::ensure_running(&paths),
-                    |exe| super::daemon::ensure_running_from(&paths, exe),
-                ) =>
-        {
-            Some("automatic maintenance is unavailable".to_owned())
+        Ok(config) if config.gc.auto => {
+            auto_gc_enabled = true;
+            (!daemon_exe.map_or_else(
+                || super::daemon::ensure_running(&paths),
+                |exe| super::daemon::ensure_running_from(&paths, exe),
+            ))
+            .then(|| "automatic maintenance is unavailable".to_owned())
         }
         Err(error) => Some(format!(
             "cannot read automatic maintenance configuration: {error:#}"
@@ -108,7 +108,11 @@ pub fn run(
             if context::is_pinned(&paths, dir) && !context::is_pinned_dir(dir) {
                 context::write_pin_marker(dir)?;
             }
-            context::write_sidecar(dir, root, &root.join("Cargo.toml"), None)
+            context::write_sidecar(dir, root, &root.join("Cargo.toml"), None)?;
+            if auto_gc_enabled {
+                supervision::mark_pending_maintenance(&paths, dir)?;
+            }
+            Ok(())
         })();
         if let Err(error) = activate {
             tracing::warn!(%error, "managed context unavailable; using ordinary Cargo storage");

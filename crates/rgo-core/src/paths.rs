@@ -146,16 +146,20 @@ impl RgoPaths {
     pub fn logs_dir(&self) -> PathBuf {
         self.root.join("logs")
     }
+    pub fn pending_maintenance_dir(&self) -> PathBuf {
+        self.state_dir().join("pending-maintenance")
+    }
 
     /// The exact string written into Cargo's `build.build-dir`.
     pub fn build_dir_template(&self) -> String {
         format!("{}/{{workspace-path-hash}}", self.builds_dir().display())
     }
 
-    fn private_dirs(&self) -> [PathBuf; 7] {
+    fn private_dirs(&self) -> [PathBuf; 8] {
         [
             self.state_dir(),
             self.state_dir().join("locks"),
+            self.pending_maintenance_dir(),
             self.pin_records_dir(),
             self.builds_dir(),
             self.tmp_dir(),

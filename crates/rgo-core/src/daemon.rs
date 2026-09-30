@@ -1784,6 +1784,19 @@ fn maintenance(state: &State) -> Result<()> {
             // trigger sweep on the next maintenance tick.
             state.trigger_scan.lock().unwrap().invalidate();
         } else {
+            let pending = crate::supervision::pending_maintenance(&state.paths)?;
+            let idle_launch = pending
+                .iter()
+                .try_fold(false, |found, record| -> Result<bool> {
+                    if found {
+                        Ok(true)
+                    } else {
+                        Ok(
+                            crate::supervision::try_lock_gc(&state.paths, Some(&record.context))?
+                                .is_some(),
+                        )
+                    }
+                })?;
             let free_bytes = volume_free_bytes_checked(&state.paths.root)?;
             let age_due = crate::context::unix_now()
                 .saturating_sub(state.db.lock().unwrap().last_real_gc_at()?)
@@ -1792,7 +1805,7 @@ fn maintenance(state: &State) -> Result<()> {
             // This advisory scan runs outside the operation lock. It visits a
             // bounded number of entries per tick; the GC pass takes a fresh
             // authoritative snapshot under the lock before selecting anything.
-            let pressure = if urgent {
+            let pressure = if urgent || idle_launch {
                 false
             } else {
                 let mut scan = state.trigger_scan.lock().unwrap();
@@ -1804,9 +1817,18 @@ fn maintenance(state: &State) -> Result<()> {
                 completed.is_some_and(|bytes| bytes > state.cfg.soft_watermark)
                     || scan.observed_bytes() > state.cfg.soft_watermark
             };
-            if urgent || pressure {
+            if urgent || pressure || idle_launch {
                 match run_gc(state, false, false, true, None) {
-                    Ok(_) => state.trigger_scan.lock().unwrap().mark_completed(),
+                    Ok(_) => {
+                        state.trigger_scan.lock().unwrap().mark_completed();
+                        for record in &pending {
+                            if let Err(error) =
+                                crate::supervision::clear_pending_maintenance(&state.paths, record)
+                            {
+                                tracing::warn!(%error, context = %record.context.display(), "could not clear pending maintenance");
+                            }
+                        }
+                    }
                     Err(error) => {
                         state.trigger_scan.lock().unwrap().invalidate();
                         return Err(error);
