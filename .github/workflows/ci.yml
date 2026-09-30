@@ -52,6 +52,7 @@ jobs:
       - name: Verify local Unix installer
         if: matrix.toolchain == 'stable' && (matrix.os == 'ubuntu-latest' || matrix.os == 'macos-14')
         run: |
+          if [ "$RUNNER_OS" = "macOS" ]; then export RGO_INSTALLER_TEST_ZDOTDIR=1; fi
           python3 scripts/verify-local-installer.py
           python3 scripts/verify-local-installer.py --supervised
       - name: Probe nightly build-dir layouts

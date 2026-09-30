@@ -545,12 +545,28 @@ def restore_file(path: Path, previous: tuple[bytes, int] | None) -> None:
         temporary.unlink(missing_ok=True)
 
 
+def checked_shell_directory(path: Path) -> None:
+    if path.is_symlink() or not path.is_dir():
+        raise InstallError(f"shell startup directory is not a directory: {path}")
+    details = path.stat()
+    if details.st_uid != os.getuid() or details.st_mode & 0o022:
+        raise InstallError(
+            f"shell startup directory must be user-owned and not group/world writable: {path}"
+        )
+
+
 def shell_profiles(home: Path, shell: str) -> tuple[Path, ...]:
     name = Path(shell).name
     if name == "zsh":
-        if os.environ.get("ZDOTDIR") and Path(os.environ["ZDOTDIR"]).expanduser().absolute() != home:
-            return ()
-        return home / ".zprofile", home / ".zshrc"
+        configured = os.environ.get("ZDOTDIR")
+        if configured:
+            dotdir = Path(configured).expanduser()
+            if not dotdir.is_absolute():
+                raise InstallError("ZDOTDIR must be absolute for persistent shell activation")
+            checked_shell_directory(dotdir)
+        else:
+            dotdir = home
+        return dotdir / ".zprofile", dotdir / ".zshrc"
     if name == "bash":
         login = next(
             (home / name for name in (".bash_profile", ".bash_login", ".profile") if (home / name).exists() or (home / name).is_symlink()),
@@ -595,11 +611,23 @@ def shell_activation_state(install_root: Path, cargo_home: Path, home: Path) -> 
     if not isinstance(state, dict) or state.get("schema_version") != 1 or state.get("cargo_home") != str(cargo_home) or state.get("home") != str(home):
         raise InstallError("shell activation state belongs to a different installation or home")
     profiles = state.get("profiles")
-    allowed = {str(home / name) for name in (".zprofile", ".zshrc", ".bash_profile", ".bash_login", ".profile", ".bashrc")}
+    zdotdir = state.get("zdotdir")
+    if zdotdir is not None:
+        if not isinstance(zdotdir, str) or not Path(zdotdir).is_absolute():
+            raise InstallError("shell activation state has an invalid ZDOTDIR")
+        checked_shell_directory(Path(zdotdir))
+        allowed = {str(Path(zdotdir) / name) for name in (".zprofile", ".zshrc")}
+    else:
+        allowed = {
+            str(home / name)
+            for name in (".zprofile", ".zshrc", ".bash_profile", ".bash_login", ".profile", ".bashrc")
+        }
     if not isinstance(profiles, list) or not profiles or len(profiles) != len(set(str(item.get("path")) for item in profiles if isinstance(item, dict))):
         raise InstallError("invalid shell activation profile list")
     if any(not isinstance(item, dict) or item.get("path") not in allowed or not isinstance(item.get("existed"), bool) for item in profiles):
         raise InstallError("shell activation state names an unexpected profile")
+    if zdotdir is not None and {item["path"] for item in profiles} != allowed:
+        raise InstallError("shell activation state is missing a ZDOTDIR profile")
     return state
 
 
@@ -631,8 +659,7 @@ def ensure_shell_activation(
     if state is None:
         if not profiles:
             return False
-        if home.is_symlink() or not home.is_dir() or home.stat().st_uid != os.getuid() or home.stat().st_mode & 0o022:
-            raise InstallError(f"shell home must be user-owned and not group/world writable: {home}")
+        checked_shell_directory(home)
         entries = []
         for path in profiles:
             snapshot = check_shell_block(path, block, legacy_block)
@@ -640,7 +667,16 @@ def ensure_shell_activation(
                 raise InstallError(f"untracked shell activation exists in {path}")
             entries.append({"path": str(path), "existed": snapshot is not None})
         state = {"schema_version": 1, "cargo_home": str(cargo_home), "home": str(home), "profiles": entries}
+        if Path(shell).name == "zsh" and profiles[0].parent != home:
+            state["zdotdir"] = str(profiles[0].parent)
         write_state(install_root / "shell-activation.json", state)
+    elif Path(shell).name == "zsh" and all(
+        Path(entry["path"]).name in {".zprofile", ".zshrc"} for entry in state["profiles"]
+    ):
+        if profiles[0].parent != Path(state["profiles"][0]["path"]).parent:
+            raise InstallError(
+                "shell startup directory changed since activation; uninstall before switching it"
+            )
     for index, entry in enumerate(state["profiles"]):
         path = Path(entry["path"])
         snapshot = check_shell_block(path, block, legacy_block)

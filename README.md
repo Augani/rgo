@@ -83,11 +83,13 @@ shim first to manage that home.
 native and supervised modes requires undo and a fresh `RGO_HOME` until a safe
 storage migration exists. The opt-in Unix bundle installer (`--supervised --no-service`)
 adds an owned PATH block to standard Bash or zsh login and interactive startup
-files, then removes only that block on `--uninstall`. Direct `rgo setup` does
-not edit shell files. The installer prints an `export PATH=...` command for
-its current shell; custom startup layouts and GUI-launched IDEs still need
-explicit activation checks. Unattended GC remains off by default; enabling it
-is still experimental while the lifecycle safety gate is open.
+files, then removes only that block on `--uninstall`. A zsh session with an
+absolute, user-owned `ZDOTDIR` uses its `.zprofile` and `.zshrc` there. Direct
+`rgo setup` does not edit shell files. The installer prints an `export PATH=...`
+command for its current shell; other custom startup layouts and GUI-launched
+IDEs still need explicit activation checks. Unattended GC remains off by
+default; enabling it is still experimental while the lifecycle safety gate is
+open.
 
 For a private Windows evaluation, run
 `rgo setup --supervised --real-cargo C:\absolute\path\to\cargo.exe --no-service`

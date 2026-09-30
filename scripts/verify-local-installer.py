@@ -63,7 +63,14 @@ def main() -> None:
             raise ValueError("supervised installer probe shell must be zsh or bash")
         if supervised:
             environment["SHELL"] = shell
-            original_profile = home / (".zprofile" if Path(shell).name == "zsh" else ".bash_profile")
+            profile_home = home
+            if Path(shell).name == "zsh" and os.environ.get("RGO_INSTALLER_TEST_ZDOTDIR") == "1":
+                profile_home = home / ".config" / "zsh"
+                profile_home.mkdir(parents=True)
+                environment["ZDOTDIR"] = str(profile_home)
+            original_profile = profile_home / (
+                ".zprofile" if Path(shell).name == "zsh" else ".bash_profile"
+            )
             original_profile_contents = "# existing profile without a final newline"
             original_profile.write_text(original_profile_contents)
         def fresh_shell(
@@ -146,6 +153,10 @@ def main() -> None:
                 RGO_HOME=str(second_rgo_home),
                 PATH=f"{cargo_home / 'rgo/shims'}{os.pathsep}{os.environ['PATH']}",
             )
+            if "ZDOTDIR" in environment:
+                second_dotdir = second_home / ".config" / "zsh"
+                second_dotdir.mkdir(parents=True)
+                second_environment["ZDOTDIR"] = str(second_dotdir)
             second_installer = installer.copy()
             second_installer[second_installer.index("--cargo-home") + 1] = str(second_cargo_home)
             second_installer[second_installer.index("--rgo-home") + 1] = str(second_rgo_home)
