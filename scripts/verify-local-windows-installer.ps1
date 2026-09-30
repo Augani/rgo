@@ -588,3 +588,6 @@ fn main() {
     $env:RUSTUP_TOOLCHAIN = $oldToolchain
     $env:PATH = $oldPath
 }
+
+# The expected failed task query after uninstall leaves LASTEXITCODE=1.
+exit 0
