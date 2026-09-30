@@ -79,8 +79,21 @@ pub fn run(
     } else {
         select_context(real_cargo, toolchain, cargo_args, &paths)?
     };
-    let mut session =
-        supervision::lock_cargo_session(&paths, selection.as_ref().map(|(dir, _)| dir.as_path()))?;
+    let mut session = match supervision::lock_cargo_session(
+        &paths,
+        selection.as_ref().map(|(dir, _)| dir.as_path()),
+    ) {
+        Ok(session) => session,
+        Err(error) => {
+            if let Some((_, root)) = &selection {
+                eprintln!(
+                    "rgo: managed lifecycle lock unavailable ({error:#}); using checkout storage"
+                );
+                return exec_real_cargo_in_checkout(real_cargo, &args, root);
+            }
+            return Err(error);
+        }
+    };
     // The launcher may be the only process a no-service user runs. Start the
     // requested daemon after taking the session guard, before admitting this
     // invocation to managed storage. A missing or incompatible daemon leaves
@@ -103,11 +116,21 @@ pub fn run(
     };
     if let Some(issue) = maintenance_issue {
         eprintln!("rgo: {issue}; using ordinary Cargo storage");
-        if selection.is_some() {
-            let global = supervision::lock_cargo_session(&paths, None)?;
-            drop(session);
-            session = global;
-            selection = None;
+        if let Some((_, root)) = &selection {
+            match supervision::lock_cargo_session(&paths, None) {
+                Ok(global) => {
+                    drop(session);
+                    session = global;
+                    selection = None;
+                }
+                Err(error) => {
+                    eprintln!(
+                        "rgo: fallback lifecycle lock unavailable ({error:#}); using checkout storage"
+                    );
+                    drop(session);
+                    return exec_real_cargo_in_checkout(real_cargo, &args, root);
+                }
+            }
         }
     }
     if let Some((dir, root)) = &selection {
@@ -126,10 +149,20 @@ pub fn run(
             tracing::warn!(%error, "managed context unavailable; using ordinary Cargo storage");
             // Acquire the conservative guard before releasing this context's
             // guard, so no GC pass can slip between the two modes.
-            let global = supervision::lock_cargo_session(&paths, None)?;
-            drop(session);
-            session = global;
-            selection = None;
+            match supervision::lock_cargo_session(&paths, None) {
+                Ok(global) => {
+                    drop(session);
+                    session = global;
+                    selection = None;
+                }
+                Err(lock_error) => {
+                    eprintln!(
+                        "rgo: fallback lifecycle lock unavailable ({lock_error:#}); using checkout storage"
+                    );
+                    drop(session);
+                    return exec_real_cargo_in_checkout(real_cargo, &args, root);
+                }
+            }
         }
     }
     if let Some((build_dir, _)) = &selection {
@@ -152,7 +185,7 @@ pub fn run(
             &command_args,
             &args,
             &paths,
-            selection.is_some(),
+            selection.as_ref().map(|(_, root)| root.as_path()),
             session,
         )
     }
@@ -179,6 +212,27 @@ fn is_rgo_cargo_shim(path: &Path) -> bool {
                 .and_then(Path::file_name)
                 .is_some_and(|name| name.to_string_lossy().eq_ignore_ascii_case("rgo"))
     })
+}
+
+/// A selected workspace has no caller-supplied build-dir override. If rgo's
+/// guard fails before Cargo starts, explicitly keep this invocation's build
+/// state in its checkout even if a Cargo config changes concurrently.
+#[cfg(any(unix, windows))]
+fn exec_real_cargo_in_checkout(real_cargo: &Path, args: &[OsString], root: &Path) -> Result<()> {
+    let local_build_dir = root.join("target");
+    let path = local_build_dir
+        .to_str()
+        .context("checkout path is not UTF-8")?;
+    let setting = format!("build.build-dir={}", serde_json::to_string(path)?);
+    let (toolchain, cargo_args) = split_toolchain(args);
+    let mut local_args = Vec::with_capacity(args.len() + 2);
+    if let Some(toolchain) = toolchain {
+        local_args.push(toolchain.to_os_string());
+    }
+    local_args.push(OsString::from("--config"));
+    local_args.push(OsString::from(setting));
+    local_args.extend(cargo_args.iter().cloned());
+    exec_real_cargo(real_cargo, &local_args)
 }
 
 #[cfg(unix)]
@@ -217,7 +271,7 @@ fn run_supervised_windows(
     args: &[OsString],
     fallback_args: &[OsString],
     paths: &RgoPaths,
-    managed: bool,
+    managed_root: Option<&Path>,
     session: supervision::SessionGuard,
 ) -> Result<()> {
     let mut job = match super::windows_job::JobGuard::spawn(real_cargo, args) {
@@ -229,11 +283,21 @@ fn run_supervised_windows(
             // Creation failed before Cargo could execute. If this invocation
             // had selected a context, take the conservative global guard
             // before releasing that context's guard and dropping its override.
-            if managed {
-                let global = supervision::lock_cargo_session(paths, None)?;
-                drop(session);
-                let _guard = global;
-                return exec_real_cargo(real_cargo, fallback_args);
+            if let Some(root) = managed_root {
+                match supervision::lock_cargo_session(paths, None) {
+                    Ok(global) => {
+                        drop(session);
+                        let _guard = global;
+                        return exec_real_cargo(real_cargo, fallback_args);
+                    }
+                    Err(lock_error) => {
+                        eprintln!(
+                            "rgo: fallback lifecycle lock unavailable ({lock_error:#}); using checkout storage"
+                        );
+                        drop(session);
+                        return exec_real_cargo_in_checkout(real_cargo, fallback_args, root);
+                    }
+                }
             }
             let _guard = session;
             return exec_real_cargo(real_cargo, fallback_args);
