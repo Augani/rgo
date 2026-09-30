@@ -562,6 +562,42 @@ fn main() {
         -not (Test-Path (Join-Path $serviceProject 'target/debug/rgo_windows_installer_service_probe.exe'))) {
         throw 'unchanged Cargo did not build through the service-managed supervised installer'
     }
+    $serviceUpgradeArgs = $serviceArgs.Clone()
+    $serviceUpgradeArgs['ReleaseTag'] = $upgradeTag
+    $serviceUpgradeArgs['Archive'] = $upgradeArchive
+    $serviceUpgradeArgs['Sha256'] = $upgradeSha
+    $serviceStatePath = Join-Path $serviceCargoHome 'rgo/installer-windows.json'
+    $oldServiceState = [IO.File]::ReadAllText($serviceStatePath)
+    try {
+        $env:RGO_SETUP_TEST_EXIT_AFTER_RECORD = '1'
+        try {
+            & $installScript @serviceUpgradeArgs
+            throw 'forced service-managed upgrade interruption unexpectedly succeeded'
+        } catch {
+            if ($_.Exception.Message -notmatch 'exit 88' -or
+                $_.Exception.Message -match 'rollback also failed') { throw }
+        }
+    } finally { Remove-Item Env:RGO_SETUP_TEST_EXIT_AFTER_RECORD -ErrorAction SilentlyContinue }
+    $task = Get-ScheduledTask -TaskPath '\rgo\' -TaskName $taskLeaf -ErrorAction Stop
+    if ([IO.File]::ReadAllText($serviceStatePath) -cne $oldServiceState -or
+        (Test-Path -LiteralPath (Join-Path $serviceCargoHome 'rgo/installer-windows-upgrade.json')) -or
+        -not [string]::Equals($task.Actions[0].Execute,
+            (Join-Path $serviceCargoHome "rgo/versions/$top/rgo.exe"), [StringComparison]::OrdinalIgnoreCase)) {
+        throw 'interrupted service-managed upgrade did not restore the old release and task'
+    }
+    & $installScript @serviceUpgradeArgs
+    $task = Get-ScheduledTask -TaskPath '\rgo\' -TaskName $taskLeaf -ErrorAction Stop
+    $serviceRecord = Get-Content -LiteralPath (Join-Path $serviceCargoHome '.rgo-install.json') -Raw | ConvertFrom-Json
+    $env:PATH = "$(Split-Path -Path $serviceRecord.supervised_cargo.shim_path -Parent);$oldPath"
+    if ($serviceRecord.binary_version -ne $upgradeVersion -or
+        -not [string]::Equals($task.Actions[0].Execute,
+            (Join-Path $serviceCargoHome "rgo/versions/$upgradeTop/rgo.exe"), [StringComparison]::OrdinalIgnoreCase) -or
+        -not [string]::Equals((Get-Command cargo.exe -ErrorAction Stop).Source,
+            $serviceRecord.supervised_cargo.shim_path, [StringComparison]::OrdinalIgnoreCase)) {
+        throw 'service-managed upgrade did not activate the new daemon and unchanged Cargo'
+    }
+    & cargo build --offline --manifest-path (Join-Path $serviceProject 'Cargo.toml') | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw 'unchanged Cargo failed after service-managed upgrade' }
     & $installScript -Uninstall -CargoHome $serviceCargoHome -RgoHome $serviceRgoHome
     $installed = $false
     $null = & schtasks.exe /Query /TN $servicePlan.service.label /HRESULT 2>&1
@@ -570,7 +606,7 @@ fn main() {
         (Get-RawUserPathKind) -ne $expectedUserPathKind) {
         throw 'service-managed supervised uninstall changed User PATH despite -NoUserPath'
     }
-    Write-Host 'Windows installer: native upgrade/rollback, supervised upgrade, service activation, and exact User PATH restoration passed'
+    Write-Host 'Windows installer: native and supervised upgrade/rollback, service upgrade, and exact User PATH restoration passed'
 } finally {
     if ($heldCargo -and -not $heldCargo.HasExited) {
         if ($heldRelease) { [IO.File]::WriteAllText($heldRelease, 'release') }

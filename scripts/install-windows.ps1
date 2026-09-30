@@ -6,7 +6,8 @@
 .DESCRIPTION
     Release archives require a SHA-256 match and a GitHub artifact attestation.
     DevelopmentBundle is only for a local, disposable build probe. Version
-    upgrades are limited to installations made with -NoService.
+    Native version upgrades currently require -NoService. Supervised installs
+    can upgrade with their existing service mode preserved.
 #>
 param(
     [string]$ReleaseTag,
@@ -405,6 +406,84 @@ function Assert-ServiceHealthy([string]$Cli, $State) {
     Assert-Condition ($service.Count -eq 1 -and $service[0].level -eq 'ok') 'owned daemon service is not running; rerun with -Repair'
 }
 
+function Parse-ServiceAction([string]$XmlText) {
+    [xml]$definition = $XmlText
+    $actions = @($definition.SelectNodes('//*[local-name()="Actions"]/*[local-name()="Exec"]'))
+    Assert-Condition ($actions.Count -eq 1) 'scheduled daemon must have exactly one executable action'
+    $command = $actions[0].SelectSingleNode('*[local-name()="Command"]')
+    $arguments = $actions[0].SelectSingleNode('*[local-name()="Arguments"]')
+    Assert-Condition ($null -ne $command -and $command.InnerText) 'scheduled daemon action has no executable'
+    $argumentText = if ($null -eq $arguments) { '' } else { $arguments.InnerText }
+    return @{ command = $command.InnerText; arguments = $argumentText }
+}
+
+function Assert-ServicePlan($Service, [string]$Cli) {
+    Assert-Condition ($null -ne $Service -and $Service.label -match '^rgo\\daemon-[0-9a-f]{16}$' -and
+        $Service.path -ceq $Service.label -and $Service.contents) 'invalid planned daemon task'
+    $action = Parse-ServiceAction $Service.contents
+    $expected = "daemon --foreground --home `"$script:resolvedRgoHome`""
+    Assert-Condition ((Test-SamePath $action.command $Cli) -and $action.arguments -ceq $expected) 'planned daemon action differs from its verified release'
+}
+
+function Get-ServiceTaskAction([string]$Label) {
+    $output = (& schtasks.exe /Query /TN $Label /HRESULT 2>&1 | Out-String).Trim()
+    $code = $LASTEXITCODE
+    if ($code -ne 0) {
+        if ($code -in @(-2147024894, -2147024893) -or
+            ($code -eq 1 -and $output -in @(
+                'ERROR: The system cannot find the file specified.',
+                'ERROR: The system cannot find the path specified.'))) { return $null }
+        throw "could not query scheduled daemon $Label (exit $code): $output"
+    }
+    $leaf = $Label.Substring('rgo\'.Length)
+    $task = Get-ScheduledTask -TaskPath '\rgo\' -TaskName $leaf -ErrorAction Stop
+    $actions = @($task.Actions)
+    Assert-Condition ($actions.Count -eq 1 -and
+        $actions[0].CimClass.CimClassName -eq 'MSFT_TaskExecAction' -and
+        $actions[0].Execute) 'scheduled daemon has an unexpected action'
+    return @{ command = [string]$actions[0].Execute; arguments = [string]$actions[0].Arguments }
+}
+
+function Assert-OwnedServiceTask($OldService, $NewService) {
+    Assert-Condition ($OldService.label -ceq $NewService.label -and
+        $OldService.path -ceq $NewService.path) 'service upgrade changed its owned task name'
+    $current = Get-ServiceTaskAction $OldService.label
+    if ($null -eq $current) { return }
+    $old = Parse-ServiceAction $OldService.contents
+    $new = Parse-ServiceAction $NewService.contents
+    $matchesOld = (Test-SamePath $current.command $old.command) -and $current.arguments -ceq $old.arguments
+    $matchesNew = (Test-SamePath $current.command $new.command) -and $current.arguments -ceq $new.arguments
+    Assert-Condition ($matchesOld -or $matchesNew) 'scheduled daemon action changed outside this upgrade'
+}
+
+function Assert-TaskMatchesService($Service) {
+    $current = Get-ServiceTaskAction $Service.label
+    $expected = Parse-ServiceAction $Service.contents
+    Assert-Condition ($null -ne $current -and
+        (Test-SamePath $current.command $expected.command) -and
+        $current.arguments -ceq $expected.arguments) 'scheduled daemon does not run the selected release'
+}
+
+function Remove-OwnedServiceTask($OldService, $NewService) {
+    Assert-OwnedServiceTask $OldService $NewService
+    $label = $OldService.label
+    if ($null -eq (Get-ServiceTaskAction $label)) { return }
+    $leaf = $label.Substring('rgo\'.Length)
+    $task = Get-ScheduledTask -TaskPath '\rgo\' -TaskName $leaf -ErrorAction Stop
+    if ([int]$task.State -eq 4) {
+        Invoke-Checked 'schtasks.exe' @('/End', '/TN', $label) | Out-Null
+        $deadline = [DateTime]::UtcNow.AddSeconds(15)
+        do {
+            $task = Get-ScheduledTask -TaskPath '\rgo\' -TaskName $leaf -ErrorAction Stop
+            if ([int]$task.State -ne 4) { break }
+            Assert-Condition ([DateTime]::UtcNow -lt $deadline) 'scheduled daemon did not stop during upgrade recovery'
+            Start-Sleep -Milliseconds 100
+        } while ($true)
+    }
+    Assert-OwnedServiceTask $OldService $NewService
+    Invoke-Checked 'schtasks.exe' @('/Delete', '/TN', $label, '/F') | Out-Null
+}
+
 function Test-ExactText([AllowNull()][object]$Left, [AllowNull()][object]$Right) {
     if ($null -eq $Left -or $null -eq $Right) {
         return ($null -eq $Left -and $null -eq $Right)
@@ -428,8 +507,9 @@ function Test-ActivationPath([string]$Path, [string]$FallbackPath) {
 }
 
 function Upgrade-Plan([string]$Cli, [bool]$NoWrapper, [bool]$Supervised,
-    [string]$RealCargo, [string]$ShimPath) {
-    $arguments = @('setup', '--installer-plan-json', '--no-service')
+    [string]$RealCargo, [string]$ShimPath, [bool]$NoService = $true) {
+    $arguments = @('setup', '--installer-plan-json')
+    if ($NoService) { $arguments += '--no-service' }
     if ($NoWrapper) { $arguments += '--no-wrapper' }
     if ($Supervised) { $arguments += @('--supervised', '--real-cargo', $RealCargo) }
     $output = Invoke-Checked $Cli $arguments
@@ -463,11 +543,17 @@ function Upgrade-Plan([string]$Cli, [bool]$NoWrapper, [bool]$Supervised,
             (Test-SamePath $record.supervised_cargo.real_cargo $RealCargo) -and
             $record.supervised_cargo.shim_contents -eq $binary.Value) 'staged CLI planned an inconsistent Cargo activation'
     }
-    return $entries
+    $service = if ($plan.PSObject.Properties['service']) { $plan.service } else { $null }
+    if ($NoService) {
+        Assert-Condition ($null -eq $service) 'no-service upgrade unexpectedly planned a daemon task'
+    } else {
+        Assert-ServicePlan $service $Cli
+    }
+    return @{ files = @($entries); service = $service }
 }
 
-function Assert-UpgradeState($State, [string]$Role) {
-    Assert-Condition ($State.schemaVersion -eq 1 -and $State.noService -and
+function Assert-UpgradeState($State, [string]$Role, [bool]$AllowService = $false) {
+    Assert-Condition ($State.schemaVersion -eq 1 -and ($AllowService -or $State.noService) -and
         (Test-SamePath $State.cargoHome $script:resolvedCargoHome) -and
         (Test-SamePath $State.rgoHome $script:resolvedRgoHome) -and
         (Test-SamePath $State.installRoot $script:resolvedInstallRoot) -and
@@ -477,11 +563,12 @@ function Assert-UpgradeState($State, [string]$Role) {
         $State.cliDigest -match '^[0-9a-f]{64}$' -and $State.wrapperDigest -match '^[0-9a-f]{64}$') "invalid $Role installer state"
 }
 
-function Assert-SupervisedUpgradePair($OldState, $NewState) {
-    Assert-UpgradeState $OldState 'old'
-    Assert-UpgradeState $NewState 'new'
+function Assert-SupervisedUpgradePair($OldState, $NewState, [bool]$AllowService = $false) {
+    Assert-UpgradeState $OldState 'old' $AllowService
+    Assert-UpgradeState $NewState 'new' $AllowService
     Assert-Condition ((Test-SupervisedState $OldState) -and (Test-SupervisedState $NewState) -and
         -not $OldState.noWrapper -and -not $NewState.noWrapper -and
+        [bool]$OldState.noService -eq [bool]$NewState.noService -and
         $OldState.versionDirectory -ne $NewState.versionDirectory -and
         (Test-SamePath $OldState.realCargo $NewState.realCargo) -and
         [bool]$OldState.noUserPath -eq [bool]$NewState.noUserPath -and
@@ -529,6 +616,13 @@ function Invoke-WithSetupLocks([scriptblock]$Action) {
 
 function Recover-Upgrade([string]$JournalPath) {
     if (-not (Test-Path -LiteralPath $JournalPath)) { return }
+    Assert-PlainFile $JournalPath
+    Assert-Condition ((Get-Item -LiteralPath $JournalPath).Length -le 67108864) 'upgrade journal is too large'
+    $journal = Read-Json $JournalPath
+    if ($journal.schemaVersion -eq 3) {
+        Recover-SupervisedServiceUpgrade $JournalPath $journal
+        return
+    }
     Invoke-WithSetupLocks { Recover-UpgradeGuarded $JournalPath }
 }
 
@@ -537,7 +631,7 @@ function Recover-UpgradeGuarded([string]$JournalPath) {
     Assert-PlainFile $JournalPath
     Assert-Condition ((Get-Item -LiteralPath $JournalPath).Length -le 67108864) 'upgrade journal is too large'
     $journal = Read-Json $JournalPath
-    if ($journal.schemaVersion -eq 2) {
+    if ($journal.schemaVersion -in @(2, 3)) {
         Recover-SupervisedUpgradeGuarded $JournalPath $journal
         return
     }
@@ -602,8 +696,48 @@ function Recover-UpgradeGuarded([string]$JournalPath) {
     Remove-Item -LiteralPath $JournalPath -Force
 }
 
+function Recover-SupervisedServiceUpgrade([string]$JournalPath, $Journal) {
+    Assert-Condition ($Journal.schemaVersion -eq 3 -and
+        -not $Journal.oldState.noService -and -not $Journal.newState.noService) 'invalid service-upgrade journal'
+    $null = Assert-SupervisedUpgradePair $Journal.oldState $Journal.newState $true
+    $oldCli = Join-Path (Join-Path $script:versions $Journal.oldState.versionDirectory) 'rgo.exe'
+    $newCli = Join-Path (Join-Path $script:versions $Journal.newState.versionDirectory) 'rgo.exe'
+    foreach ($pair in @(@($oldCli, $Journal.oldState.cliDigest), @($newCli, $Journal.newState.cliDigest))) {
+        Assert-PlainFile $pair[0]
+        Assert-Condition ((File-Digest $pair[0]) -eq $pair[1]) "service rollback binary changed: $($pair[0])"
+    }
+    Assert-ServicePlan $Journal.service.old $oldCli
+    Assert-ServicePlan $Journal.service.new $newCli
+    Assert-OwnedServiceTask $Journal.service.old $Journal.service.new
+    $state = Read-Json $script:statePath
+    $currentStateJson = $state | ConvertTo-Json -Depth 8 -Compress
+    $committed = Test-ExactText $currentStateJson ($Journal.newState | ConvertTo-Json -Depth 8 -Compress)
+    Assert-Condition ($committed -or
+        (Test-ExactText $currentStateJson ($Journal.oldState | ConvertTo-Json -Depth 8 -Compress))) 'service upgrade journal and installed state disagree'
+
+    # The task is outside the Cargo activation snapshot. Remove only its
+    # verified old/new action, restore the snapshot under setup locks, then
+    # use the retained selected CLI to register and verify its own daemon.
+    Remove-OwnedServiceTask $Journal.service.old $Journal.service.new
+    Invoke-WithSetupLocks { Recover-UpgradeGuarded $JournalPath }
+    $selected = if ($committed) { $Journal.newState } else { $Journal.oldState }
+    $selectedCli = if ($committed) { $newCli } else { $oldCli }
+    $interruptionProbe = $env:RGO_SETUP_TEST_EXIT_AFTER_RECORD
+    Remove-Item Env:RGO_SETUP_TEST_EXIT_AFTER_RECORD -ErrorAction SilentlyContinue
+    try {
+        Invoke-Checked $selectedCli @('setup', '--supervised', '--real-cargo', $selected.realCargo) | Out-Null
+    } finally {
+        if ($null -ne $interruptionProbe) { $env:RGO_SETUP_TEST_EXIT_AFTER_RECORD = $interruptionProbe }
+    }
+    $selectedService = if ($committed) { $Journal.service.new } else { $Journal.service.old }
+    Assert-TaskMatchesService $selectedService
+    Assert-ServiceHealthy $selectedCli $selected
+    Assert-PlainCargoActivation $selectedCli $selected
+    Remove-Item -LiteralPath $JournalPath -Force
+}
+
 function Recover-SupervisedUpgradeGuarded([string]$JournalPath, $Journal) {
-    $pair = Assert-SupervisedUpgradePair $Journal.oldState $Journal.newState
+    $pair = Assert-SupervisedUpgradePair $Journal.oldState $Journal.newState ($Journal.schemaVersion -eq 3)
     $oldDir = Join-Path $script:versions $Journal.oldState.versionDirectory
     $newDir = Join-Path $script:versions $Journal.newState.versionDirectory
     $oldCli = Join-Path $oldDir 'rgo.exe'
@@ -701,7 +835,7 @@ function Recover-SupervisedUpgradeGuarded([string]$JournalPath, $Journal) {
             Assert-ShimFallback $pair.newShim $script:resolvedCargoHome $Journal.newState.realCargo
         }
     }
-    Remove-Item -LiteralPath $JournalPath -Force
+    if ($Journal.schemaVersion -ne 3) { Remove-Item -LiteralPath $JournalPath -Force }
 }
 
 function Invoke-NoServiceUpgrade($OldState, [string]$Top, [string]$ArchiveDigest,
@@ -742,7 +876,8 @@ function Invoke-NoServiceUpgrade($OldState, [string]$Top, [string]$ArchiveDigest
         noService = $true; noWrapper = $NewNoWrapper; noUserPath = [bool]$noUserPath
         pathAdded = [bool]$OldState.pathAdded; priorUserPath = $OldState.priorUserPath
     }
-    $files = @(Upgrade-Plan $newCli $NewNoWrapper)
+    $plan = Upgrade-Plan $newCli $NewNoWrapper $false $null $null
+    $files = @($plan.files)
     $recordPath = Join-Path $script:resolvedCargoHome '.rgo-install.json'
     $recordEntry = @($files | Where-Object { Test-SamePath $_.path $recordPath })[0]
     Assert-Condition ($null -ne $recordEntry.after) 'staged CLI plans to remove the installation record'
@@ -782,10 +917,11 @@ function Invoke-NoServiceUpgrade($OldState, [string]$Top, [string]$ArchiveDigest
 
 function Invoke-SupervisedUpgrade($OldState, [string]$Top, [string]$ArchiveDigest,
     [string]$CliDigest, [string]$WrapperDigest, [string]$Extracted) {
-    Assert-Condition ($script:NoService -and -not $script:Repair) 'supervised version upgrades require -NoService and cannot use -Repair'
+    Assert-Condition (-not $script:Repair) 'version upgrades cannot use -Repair'
     Assert-Condition (-not (Test-Path -LiteralPath $script:pendingPath)) 'finish the pending first installation before upgrading'
     Assert-Condition ($OldState.versionDirectory -ne $Top) 'a release tag cannot be repacked with different bytes'
-    Assert-UpgradeState $OldState 'old'
+    Assert-UpgradeState $OldState 'old' $true
+    Assert-Condition ([bool]$script:NoService -eq [bool]$OldState.noService) 'preserve the existing service mode during a version upgrade'
     Select-OwnedShim $OldState
     $oldShim = $script:shimPath
     $oldDir = Join-Path $script:versions $OldState.versionDirectory
@@ -800,6 +936,7 @@ function Invoke-SupervisedUpgrade($OldState, [string]$Top, [string]$ArchiveDiges
     }
     Assert-ShimFallback $oldShim $script:resolvedCargoHome $OldState.realCargo
     Assert-Record $OldState $oldCli $oldWrapper
+    if (-not $OldState.noService) { Assert-ServiceHealthy $oldCli $OldState }
     Assert-OwnedUserPath $OldState
     $beforePath = if ($OldState.noUserPath) { $null } else { Get-UserPathSnapshot }
     if (-not $OldState.noUserPath) {
@@ -819,19 +956,27 @@ function Invoke-SupervisedUpgrade($OldState, [string]$Top, [string]$ArchiveDiges
         installRoot = $script:resolvedInstallRoot; binDir = $script:resolvedBinDir
         versionDirectory = $Top; archiveDigest = $ArchiveDigest
         cliDigest = $CliDigest; wrapperDigest = $WrapperDigest
-        noService = $true; noWrapper = $false; noUserPath = [bool]$OldState.noUserPath
+        noService = [bool]$OldState.noService; noWrapper = $false; noUserPath = [bool]$OldState.noUserPath
         supervised = $true; realCargo = $OldState.realCargo; shimPath = $newShim
         pathAdded = [bool]$OldState.pathAdded; priorUserPath = $OldState.priorUserPath
         priorUserPathPresent = [bool]$OldState.priorUserPathPresent
         priorUserPathRaw = $OldState.priorUserPathRaw; priorUserPathKind = $OldState.priorUserPathKind
     })
-    $pair = Assert-SupervisedUpgradePair $OldState $newState
+    $pair = Assert-SupervisedUpgradePair $OldState $newState (-not $OldState.noService)
     if (Test-Path -LiteralPath $pair.newShim) {
         Assert-PlainFile $pair.newShim
         Assert-Condition ((File-Digest $pair.newShim) -eq $CliDigest) 'new Cargo shim exists with different bytes'
         Assert-ShimFallback $pair.newShim $script:resolvedCargoHome $OldState.realCargo
     }
-    $files = @(Upgrade-Plan $newCli $false $true $OldState.realCargo $pair.newShim)
+    $plan = Upgrade-Plan $newCli $false $true $OldState.realCargo $pair.newShim ([bool]$OldState.noService)
+    $files = @($plan.files)
+    $oldService = $null
+    if (-not $OldState.noService) {
+        $oldPlan = Upgrade-Plan $oldCli $false $true $OldState.realCargo $pair.oldShim $false
+        $oldService = $oldPlan.service
+        Assert-OwnedServiceTask $oldService $plan.service
+        Assert-TaskMatchesService $oldService
+    }
     $recordPath = Join-Path $script:resolvedCargoHome '.rgo-install.json'
     $recordEntry = @($files | Where-Object { Test-SamePath $_.path $recordPath })[0]
     $plannedRecord = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($recordEntry.after)) | ConvertFrom-Json
@@ -842,12 +987,16 @@ function Invoke-SupervisedUpgrade($OldState, [string]$Top, [string]$ArchiveDiges
         @{ present = $true; value = (Expected-OwnedUserPath $newState); kind = $beforePath.kind }
     }
     Select-OwnedShim $OldState
-    Write-JsonAtomic $script:upgradeJournalPath ([ordered]@{
-        schemaVersion = 2; oldState = $OldState; newState = $newState
+    $journal = [ordered]@{
+        schemaVersion = $(if ($OldState.noService) { 2 } else { 3 }); oldState = $OldState; newState = $newState
         files = $files; userPathBefore = $beforePath; userPathAfter = $afterPath
-    })
+    }
+    if (-not $OldState.noService) { $journal['service'] = @{ old = $oldService; new = $plan.service } }
+    Write-JsonAtomic $script:upgradeJournalPath $journal
     try {
-        Invoke-Checked $newCli @('setup', '--supervised', '--real-cargo', $OldState.realCargo, '--no-service') | Out-Null
+        $setupArgs = @('setup', '--supervised', '--real-cargo', $OldState.realCargo)
+        if ($OldState.noService) { $setupArgs += '--no-service' }
+        Invoke-Checked $newCli $setupArgs | Out-Null
         foreach ($entry in $files) {
             Assert-Condition (Test-ExactText (Encoded-File $entry.path) $entry.after) "supervised setup differed from its installer plan: $($entry.path)"
         }
@@ -856,6 +1005,10 @@ function Invoke-SupervisedUpgrade($OldState, [string]$Top, [string]$ArchiveDiges
         Select-OwnedShim $newState
         Assert-ShimFallback $pair.newShim $script:resolvedCargoHome $OldState.realCargo
         Assert-Record $newState $newCli $newWrapper
+        if (-not $OldState.noService) {
+            Assert-TaskMatchesService $plan.service
+            Assert-ServiceHealthy $newCli $newState
+        }
         Assert-PlainCargoActivation $newCli $newState
         if (-not $OldState.noUserPath) {
             $currentPath = Get-UserPathSnapshot
