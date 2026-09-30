@@ -125,6 +125,8 @@ $env:RUSTUP_TOOLCHAIN = 'stable'
 $installArgs = @{ ReleaseTag = $tag; Archive = $archive; Sha256 = $sha
     DevelopmentBundle = $true; CargoHome = $cargoHome; RgoHome = $rgoHome; NoUserPath = $true }
 $installed = $false
+$cleanupCargoHome = $cargoHome
+$cleanupRgoHome = $rgoHome
 $heldCargo = $null
 $heldRelease = $null
 try {
@@ -263,6 +265,7 @@ fn main() {
     # so this probe never mixes native and supervised GC domains.
     $rgoHome = Join-Path $sandbox '.rgo-supervised'
     New-Item -ItemType Directory -Path $rgoHome | Out-Null
+    $cleanupRgoHome = $rgoHome
     $supervisedArgs['RgoHome'] = $rgoHome
     $supervisedArgs['Supervised'] = $true
     $supervisedArgs['RealCargo'] = $realCargo
@@ -534,6 +537,8 @@ fn main() {
     $serviceArgs = $supervisedArgs.Clone()
     $serviceArgs['CargoHome'] = $serviceCargoHome
     $serviceArgs['RgoHome'] = $serviceRgoHome
+    $cleanupCargoHome = $serviceCargoHome
+    $cleanupRgoHome = $serviceRgoHome
     $servicePlan = (& $cli setup --supervised --real-cargo $realCargo --installer-plan-json | Out-String).Trim() | ConvertFrom-Json
     if ($LASTEXITCODE -ne 0 -or -not $servicePlan.service.label) {
         throw 'supervised installer service plan is missing its task label'
@@ -581,20 +586,22 @@ fn main() {
     $task = Get-ScheduledTask -TaskPath '\rgo\' -TaskName $taskLeaf -ErrorAction Stop
     if ([IO.File]::ReadAllText($serviceStatePath) -cne $oldServiceState -or
         (Test-Path -LiteralPath (Join-Path $serviceCargoHome 'rgo/installer-windows-upgrade.json')) -or
-        -not [string]::Equals($task.Actions[0].Execute,
-            (Join-Path $serviceCargoHome "rgo/versions/$top/rgo.exe"), [StringComparison]::OrdinalIgnoreCase)) {
+        -not [string]::Equals((Normalize-PlanPath $task.Actions[0].Execute),
+            (Normalize-PlanPath (Join-Path $serviceCargoHome "rgo/versions/$top/rgo.exe")), [StringComparison]::OrdinalIgnoreCase)) {
         throw 'interrupted service-managed upgrade did not restore the old release and task'
     }
     & $installScript @serviceUpgradeArgs
     $task = Get-ScheduledTask -TaskPath '\rgo\' -TaskName $taskLeaf -ErrorAction Stop
     $serviceRecord = Get-Content -LiteralPath (Join-Path $serviceCargoHome '.rgo-install.json') -Raw | ConvertFrom-Json
     $env:PATH = "$(Split-Path -Path $serviceRecord.supervised_cargo.shim_path -Parent);$oldPath"
+    $expectedTask = Join-Path $serviceCargoHome "rgo/versions/$upgradeTop/rgo.exe"
+    $actualCargo = (Get-Command cargo.exe -ErrorAction Stop).Source
     if ($serviceRecord.binary_version -ne $upgradeVersion -or
-        -not [string]::Equals($task.Actions[0].Execute,
-            (Join-Path $serviceCargoHome "rgo/versions/$upgradeTop/rgo.exe"), [StringComparison]::OrdinalIgnoreCase) -or
-        -not [string]::Equals((Get-Command cargo.exe -ErrorAction Stop).Source,
-            $serviceRecord.supervised_cargo.shim_path, [StringComparison]::OrdinalIgnoreCase)) {
-        throw 'service-managed upgrade did not activate the new daemon and unchanged Cargo'
+        -not [string]::Equals((Normalize-PlanPath $task.Actions[0].Execute),
+            (Normalize-PlanPath $expectedTask), [StringComparison]::OrdinalIgnoreCase) -or
+        -not [string]::Equals((Normalize-PlanPath $actualCargo),
+            (Normalize-PlanPath $serviceRecord.supervised_cargo.shim_path), [StringComparison]::OrdinalIgnoreCase)) {
+        throw "service-managed upgrade activation mismatch: version=$($serviceRecord.binary_version) task=$($task.Actions[0].Execute) expectedTask=$expectedTask cargo=$actualCargo expectedCargo=$($serviceRecord.supervised_cargo.shim_path)"
     }
     & cargo build --offline --manifest-path (Join-Path $serviceProject 'Cargo.toml') | Out-Null
     if ($LASTEXITCODE -ne 0) { throw 'unchanged Cargo failed after service-managed upgrade' }
@@ -613,7 +620,7 @@ fn main() {
         if (-not $heldCargo.WaitForExit(10000)) { $heldCargo.Kill() }
     }
     if ($installed) {
-        try { & $installScript -Uninstall -CargoHome $cargoHome -RgoHome $rgoHome | Out-Null }
+        try { & $installScript -Uninstall -CargoHome $cleanupCargoHome -RgoHome $cleanupRgoHome | Out-Null }
         catch { Write-Warning "Best-effort sandbox uninstall failed: $_" }
     }
     $env:HOME = $oldHome
