@@ -183,16 +183,14 @@ fn doctor_reports_project_build_override_and_legacy_config_precedence() {
             .any(|message| { message.contains("config sets build.target-dir = \"legacy\"") })
     );
 
-    std::fs::write(
-        sandbox.cargo_home.join("config.toml"),
-        "[build]\nbuild-dir = \"global-build\"\n",
-    )
-    .unwrap();
+    let global_config = sandbox.cargo_home.join("config.toml");
+    std::fs::write(&global_config, "[build]\nbuild-dir = \"global-build\"\n").unwrap();
     let report = doctor(&sandbox.home);
     assert!(!report["entries"].as_array().unwrap().iter().any(|entry| {
-        entry["message"]
-            .as_str()
-            .is_some_and(|message| message.contains("project configuration"))
+        entry["message"].as_str().is_some_and(|message| {
+            message.contains("project configuration")
+                && message.contains(&global_config.display().to_string())
+        })
     }));
 }
 
