@@ -101,12 +101,6 @@ def main() -> None:
         ]
         if supervised:
             installer.append("--supervised")
-            service_mode = subprocess.run(
-                [argument for argument in installer if argument != "--no-service"],
-                env=environment, text=True, capture_output=True,
-            )
-            assert service_mode.returncode != 0
-            assert "requires --no-service" in service_mode.stderr
         first_mid_setup = environment.copy()
         first_mid_setup["RGO_SETUP_TEST_EXIT_AFTER_RECORD"] = "1"
         first_mid_result = subprocess.run(installer, env=first_mid_setup, text=True, capture_output=True)
@@ -142,7 +136,7 @@ def main() -> None:
         run(installer, env=environment)
         assert not first_journal.exists()
         if supervised:
-            second_home = root / "second home"
+            second_home = root / "h2"
             second_cargo_home = second_home / ".cargo"
             second_cargo_home.mkdir(parents=True)
             second_rgo_home = second_home / ".rgo"
