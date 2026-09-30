@@ -82,7 +82,7 @@ fn render_flavor(executable: &Path, flavor: Flavor) -> Result<RenderedService> {
             xml_escape(&paths.root.display().to_string())
         );
         let contents = format!(
-            "<?xml version=\"1.0\" encoding=\"UTF-16\"?>\n\
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
 <!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n\
 <plist version=\"1.0\">\n<dict>\n\
   <key>Label</key><string>{label}</string>\n\
@@ -154,7 +154,7 @@ fn render_flavor(executable: &Path, flavor: Flavor) -> Result<RenderedService> {
         };
         let sid = current_user_sid()?;
         let contents = format!(
-            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+            "<?xml version=\"1.0\" encoding=\"UTF-16\"?>\n\
 <Task version=\"1.2\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">\n\
   <Triggers><LogonTrigger><Enabled>true</Enabled><UserId>{sid}</UserId></LogonTrigger></Triggers>\n\
   <Principals><Principal id=\"Author\"><UserId>{sid}</UserId><LogonType>InteractiveToken</LogonType><RunLevel>LeastPrivilege</RunLevel></Principal></Principals>\n\
