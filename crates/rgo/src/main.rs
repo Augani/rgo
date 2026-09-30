@@ -46,8 +46,8 @@ enum Cmd {
         undo: bool,
         #[arg(long)]
         dry_run: bool,
-        /// Private installer protocol: report the exact no-service activation writes.
-        #[arg(long, hide = true, requires = "no_service", conflicts_with_all = ["undo", "dry_run"])]
+        /// Private installer protocol: report activation writes and any service definition.
+        #[arg(long, hide = true, conflicts_with_all = ["undo", "dry_run"])]
         installer_plan_json: bool,
         /// Skip installing the launchd/systemd/schtasks service.
         #[arg(long)]

@@ -1648,10 +1648,25 @@ def main() -> None:
                 planned_after = None
                 try:
                     run(cli, *setup_args, "--dry-run", environment=environment)
+                    plan = json.loads(
+                        run(cli, *setup_args, "--installer-plan-json", environment=environment).stdout
+                    )
+                    if not isinstance(plan, dict) or plan.get("schema_version") != 1:
+                        raise InstallError("setup returned an invalid activation plan")
+                    service_plan = plan.get("service")
+                    if args.no_service:
+                        if service_plan is not None:
+                            raise InstallError("no-service setup unexpectedly planned a daemon service")
+                    elif (
+                        not isinstance(service_plan, dict)
+                        or not isinstance(service_plan.get("path"), str)
+                        or not Path(service_plan["path"]).is_absolute()
+                        or not isinstance(service_plan.get("label"), str)
+                        or not service_plan["label"]
+                        or not isinstance(service_plan.get("contents"), str)
+                    ):
+                        raise InstallError("service setup returned an invalid daemon definition")
                     if journal is not None:
-                        plan = json.loads(
-                            run(cli, *setup_args, "--installer-plan-json", environment=environment).stdout
-                        )
                         planned_after = planned_snapshot(
                             plan, activation_before, state_path, new_state
                         )
@@ -1675,6 +1690,10 @@ def main() -> None:
                         and environment.get("RGO_SETUP_TEST_EXIT_AFTER_RECORD") == "1",
                     )
                     setup_completed = True
+                    if service_plan is not None:
+                        installed_service = file_snapshot(Path(service_plan["path"]))
+                        if installed_service is None or installed_service[0] != service_plan["contents"].encode():
+                            raise InstallError("installed daemon definition differs from the setup plan")
                     if activation_before is not None:
                         replacement = activation_snapshot(tuple(activation_before))
                         replacement[state_path] = (state_bytes(new_state), 0o600)

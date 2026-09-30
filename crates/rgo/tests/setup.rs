@@ -27,6 +27,42 @@ fn fake_sccache_path(sandbox: &Sandbox) -> std::ffi::OsString {
         .unwrap()
 }
 
+#[test]
+fn service_installer_plan_reports_exact_definition_without_activation() {
+    ensure_workspace_bins_built().unwrap();
+    let sandbox = Sandbox::new().unwrap();
+    let real_cargo = std::env::var_os("CARGO").unwrap();
+    let planned = sandbox
+        .cmd(cargo_bin("rgo"))
+        .args(["setup", "--supervised", "--real-cargo"])
+        .arg(real_cargo)
+        .arg("--installer-plan-json")
+        .output()
+        .unwrap();
+    assert!(
+        planned.status.success(),
+        "{}",
+        String::from_utf8_lossy(&planned.stderr)
+    );
+    let plan: serde_json::Value = serde_json::from_slice(&planned.stdout).unwrap();
+    let service = &plan["service"];
+    assert!(
+        service["label"]
+            .as_str()
+            .is_some_and(|label| !label.is_empty())
+    );
+    let path = std::path::Path::new(service["path"].as_str().unwrap());
+    #[cfg(unix)]
+    assert!(path.is_absolute());
+    assert!(
+        service["contents"]
+            .as_str()
+            .is_some_and(|contents| contents.contains("daemon"))
+    );
+    assert!(!path.exists());
+    assert!(!sandbox.cargo_home.join(".rgo-install.json").exists());
+}
+
 #[cfg(unix)]
 #[test]
 fn setup_rejects_an_unbindable_daemon_socket_before_activation() {

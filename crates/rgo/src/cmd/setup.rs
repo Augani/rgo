@@ -57,6 +57,15 @@ struct InstallerPlan {
     files: BTreeMap<String, Option<PlannedFile>>,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     binaries: BTreeMap<String, String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    service: Option<PlannedService>,
+}
+
+#[derive(Serialize)]
+struct PlannedService {
+    path: String,
+    label: String,
+    contents: String,
 }
 
 pub fn run(
@@ -68,8 +77,8 @@ pub fn run(
     supervised: bool,
     real_cargo: Option<PathBuf>,
 ) -> Result<()> {
-    if installer_plan_json && (undo || dry_run || !no_service) {
-        bail!("installer activation plans require setup --no-service");
+    if installer_plan_json && (undo || dry_run) {
+        bail!("installer activation plans cannot undo setup or combine with --dry-run");
     }
     let dry_run = dry_run || installer_plan_json;
     if supervised && !cfg!(any(unix, windows)) {
@@ -770,6 +779,17 @@ pub fn run(
                 schema_version: 1,
                 files,
                 binaries,
+                service: if no_service {
+                    None
+                } else {
+                    let executable = std::env::current_exe().context("locating rgo executable")?;
+                    let rendered = service::render(&executable)?;
+                    Some(PlannedService {
+                        path: rendered.path.display().to_string(),
+                        label: rendered.label,
+                        contents: rendered.contents,
+                    })
+                },
             })?
         );
         return Ok(());
