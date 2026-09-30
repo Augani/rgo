@@ -180,7 +180,8 @@ fn validate_real_cargo(real_cargo: &Path, executable: &Path) -> Result<()> {
         || is_rgo_shim(&canonical)
         || real_cargo
             .file_name()
-            .is_none_or(|name| name != "cargo.exe")
+            .and_then(|name| name.to_str())
+            .is_none_or(|name| !name.eq_ignore_ascii_case("cargo.exe"))
     {
         bail!("Cargo launcher does not name a safe real Cargo proxy");
     }

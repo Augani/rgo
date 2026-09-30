@@ -1236,7 +1236,7 @@ fn prepare_supervised_cargo(
                 "no real Cargo executable found on PATH; pass --real-cargo /absolute/path/to/cargo",
             )?
     };
-    if !real.is_absolute() || real.file_name().is_none_or(|name| name != shim_name()) {
+    if !real.is_absolute() || !has_cargo_executable_name(&real) {
         bail!(
             "the real Cargo proxy must be an absolute path whose basename is `{}`",
             shim_name()
@@ -1289,16 +1289,31 @@ fn prepare_supervised_cargo(
 }
 
 fn is_rgo_cargo_shim(path: &Path) -> bool {
-    if !path.file_name().is_some_and(|name| name == shim_name()) {
+    if !has_cargo_executable_name(path) {
         return false;
     }
     path.ancestors().any(|directory| {
-        directory.file_name().is_some_and(|name| name == "shims")
+        has_path_component_name(directory, "shims")
             && directory
                 .parent()
-                .and_then(Path::file_name)
-                .is_some_and(|name| name == "rgo")
+                .is_some_and(|parent| has_path_component_name(parent, "rgo"))
     })
+}
+
+fn has_cargo_executable_name(path: &Path) -> bool {
+    has_path_component_name(path, shim_name())
+}
+
+fn has_path_component_name(path: &Path, expected: &str) -> bool {
+    let Some(name) = path.file_name() else {
+        return false;
+    };
+    if cfg!(windows) {
+        name.to_str()
+            .is_some_and(|name| name.eq_ignore_ascii_case(expected))
+    } else {
+        name == expected
+    }
 }
 
 #[cfg(windows)]
