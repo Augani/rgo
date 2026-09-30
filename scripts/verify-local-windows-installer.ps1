@@ -542,6 +542,18 @@ fn main() {
     $installed = $true
     & schtasks.exe /Query /TN $servicePlan.service.label /XML /HRESULT | Out-Null
     if ($LASTEXITCODE -ne 0) { throw 'supervised installer did not register its scheduled task' }
+    $null = & schtasks.exe /End /TN $servicePlan.service.label 2>&1
+    $taskLeaf = $servicePlan.service.label.Substring('rgo\'.Length)
+    $stopDeadline = [DateTime]::UtcNow.AddSeconds(15)
+    while ((Get-ScheduledTask -TaskPath '\rgo\' -TaskName $taskLeaf).State -eq 'Running') {
+        if ([DateTime]::UtcNow -gt $stopDeadline) { throw 'private scheduled task did not stop for the repair probe' }
+        Start-Sleep -Milliseconds 100
+    }
+    & schtasks.exe /Delete /TN $servicePlan.service.label /F | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw 'private scheduled task could not be removed for the repair probe' }
+    & $installScript @serviceArgs -Repair
+    & schtasks.exe /Query /TN $servicePlan.service.label /XML /HRESULT | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw 'supervised installer repair did not restore its scheduled task' }
     $serviceRecord = Get-Content -LiteralPath (Join-Path $serviceCargoHome '.rgo-install.json') -Raw | ConvertFrom-Json
     $env:PATH = "$(Split-Path -Path $serviceRecord.supervised_cargo.shim_path -Parent);$oldPath"
     Remove-Item Env:RGO_HOME

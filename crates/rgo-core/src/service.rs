@@ -147,16 +147,23 @@ fn render_flavor(executable: &Path, flavor: Flavor) -> Result<RenderedService> {
             Flavor::Scoped => format!("rgo\\daemon-{suffix}"),
             Flavor::Legacy => "rgo\\daemon".into(),
         };
-        let task = match flavor {
-            Flavor::Scoped => format!(
-                "\"{}\" daemon --foreground --home \"{}\"",
-                executable.display(),
-                paths.root.display()
-            ),
-            Flavor::Legacy => format!("\"{}\" daemon --foreground", executable.display()),
+        let command = plain_windows_path(&executable.display().to_string());
+        let arguments = match flavor {
+            Flavor::Scoped => format!("daemon --foreground --home \"{}\"", paths.root.display()),
+            Flavor::Legacy => "daemon --foreground".into(),
         };
-        let contents =
-            format!("schtasks.exe /Create /TN \"{label}\" /SC ONLOGON /TR \"{task}\" /RL LIMITED");
+        let sid = current_user_sid()?;
+        let contents = format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+<Task version=\"1.2\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">\n\
+  <Triggers><LogonTrigger><Enabled>true</Enabled><UserId>{sid}</UserId></LogonTrigger></Triggers>\n\
+  <Principals><Principal id=\"Author\"><UserId>{sid}</UserId><LogonType>InteractiveToken</LogonType><RunLevel>LeastPrivilege</RunLevel></Principal></Principals>\n\
+  <Settings><Enabled>true</Enabled><AllowStartOnDemand>true</AllowStartOnDemand><AllowHardTerminate>true</AllowHardTerminate><ExecutionTimeLimit>PT0S</ExecutionTimeLimit></Settings>\n\
+  <Actions Context=\"Author\"><Exec><Command>{}</Command><Arguments>{}</Arguments></Exec></Actions>\n\
+</Task>\n",
+            xml_escape(&command),
+            xml_escape(&arguments)
+        );
         Ok(RenderedService {
             path: PathBuf::from(&label),
             contents,
@@ -542,26 +549,43 @@ pub fn install(
     }
     #[cfg(target_os = "windows")]
     {
-        let task = format!(
-            "\"{}\" daemon --foreground --home \"{}\"",
-            executable.display(),
-            paths.root.display()
-        );
-        let mut args = vec![
-            "/Create",
-            "/TN",
-            &rendered.label,
-            "/SC",
-            "ONLOGON",
-            "/TR",
-            &task,
-            "/RL",
-            "LIMITED",
-        ];
-        if previous_executable.is_some() {
-            args.push("/F");
-        }
-        command("schtasks.exe", args)?;
+        use std::io::Write;
+
+        // /TR reparses nested quotes in executable and --home paths. Register
+        // the XML action so Task Scheduler receives both fields separately.
+        let definition = paths.state_dir().join(format!(
+            ".service-task-{}-{}.xml",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let registration = (|| -> Result<()> {
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&definition)
+                .with_context(|| format!("creating {}", definition.display()))?;
+            file.write_all(rendered.contents.as_bytes())?;
+            file.sync_all()?;
+            drop(file);
+            command(
+                "schtasks.exe",
+                [
+                    "/Create",
+                    "/TN",
+                    &rendered.label,
+                    "/XML",
+                    definition
+                        .to_str()
+                        .context("task definition path is not UTF-8")?,
+                    "/F",
+                ],
+            )
+        })();
+        let _ = std::fs::remove_file(&definition);
+        registration?;
         // ONLOGON only registers the next session. Activate the task now so
         // setup can verify an actual daemon before reporting maintenance ready.
         command("schtasks.exe", ["/Run", "/TN", &rendered.label])?;
@@ -826,7 +850,7 @@ fn unsafe_get_uid() -> u32 {
         .unwrap_or(0)
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 fn xml_escape(value: &str) -> String {
     value
         .replace('&', "&amp;")
@@ -834,6 +858,46 @@ fn xml_escape(value: &str) -> String {
         .replace('>', "&gt;")
         .replace('"', "&quot;")
         .replace('\'', "&apos;")
+}
+
+#[cfg(target_os = "windows")]
+fn plain_windows_path(path: &str) -> String {
+    if let Some(unc) = path.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{unc}")
+    } else if let Some(ordinary) = path.strip_prefix(r"\\?\") {
+        ordinary.to_owned()
+    } else {
+        path.to_owned()
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn current_user_sid() -> Result<String> {
+    let output = Command::new("powershell.exe")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "[System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value",
+        ])
+        .output()
+        .context("reading current Windows user SID")?;
+    ensure!(
+        output.status.success(),
+        "could not read current Windows user SID"
+    );
+    let sid = String::from_utf8(output.stdout)
+        .context("decoding current Windows user SID")?
+        .trim()
+        .to_owned();
+    ensure!(
+        sid.starts_with("S-1-")
+            && sid
+                .chars()
+                .all(|ch| ch.is_ascii_digit() || ch == 'S' || ch == '-'),
+        "invalid current Windows user SID"
+    );
+    Ok(sid)
 }
 
 #[cfg(target_os = "linux")]

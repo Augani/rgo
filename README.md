@@ -100,8 +100,9 @@ directory first on `PATH` in the shell or tool launching Cargo, then run
 `rgo doctor --verify`. This leaves the rustup Cargo proxy in place; direct
 invocations of that proxy use ordinary local storage. `rgo setup --undo --no-service`
 removes the activation but retains the versioned shim as a fallback for open
-shells. The installer can opt into this mode with `-Supervised -NoService` and
-`-RealCargo`; it places the shim ahead of Cargo on User PATH. Automatic
+shells. The installer can opt into this mode with `-Supervised -RealCargo`;
+`-NoService` is optional for a private evaluation without Task Scheduler. It
+places the shim ahead of Cargo on User PATH. Automatic
 destructive GC remains disabled by default.
 
 For a no-service activation, setup and undo stop a compatible daemon started

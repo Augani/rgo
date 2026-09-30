@@ -392,6 +392,19 @@ function Assert-PlainCargoActivation([string]$Cli, $State) {
     }
 }
 
+function Assert-ServiceHealthy([string]$Cli, $State) {
+    if ($State.noService) { return }
+    $arguments = @('setup', '--dry-run')
+    $noWrapper = if ($State -is [System.Collections.IDictionary]) { [bool]$State['noWrapper'] }
+        else { [bool]($State.PSObject.Properties['noWrapper'] -and $State.noWrapper) }
+    if ($noWrapper) { $arguments += '--no-wrapper' }
+    if (Test-SupervisedState $State) { $arguments += @('--supervised', '--real-cargo', $State.realCargo) }
+    Invoke-Checked $Cli $arguments | Out-Null
+    $report = Invoke-Checked $Cli @('doctor', '--json') | ConvertFrom-Json
+    $service = @($report.entries | Where-Object { $_.message -like 'daemon service *' })
+    Assert-Condition ($service.Count -eq 1 -and $service[0].level -eq 'ok') 'owned daemon service is not running; rerun with -Repair'
+}
+
 function Test-ExactText([AllowNull()][object]$Left, [AllowNull()][object]$Right) {
     if ($null -eq $Left -or $null -eq $Right) {
         return ($null -eq $Left -and $null -eq $Right)
@@ -1275,12 +1288,21 @@ try {
                 }
             }
             try {
+                $shimNeedsRepair = $false
                 if ($installedSupervised) {
                     $fallbackPath = Join-Path $shimDir '.rgo-cargo-fallback.json'
                     if (-not (Test-Path -LiteralPath $shimPath) -or -not (Test-Path -LiteralPath $fallbackPath)) {
                         Assert-Condition $Repair 'owned Cargo shim or fallback is missing; rerun with -Repair and the same verified bundle'
-                        Invoke-Checked $cli @('setup', '--supervised', '--real-cargo', $state.realCargo, '--no-service') | Out-Null
+                        $shimNeedsRepair = $true
                     }
+                }
+                if ($shimNeedsRepair -or ($Repair -and -not $state.noService)) {
+                    $repairSetupArgs = @('setup')
+                    if ($state.noService) { $repairSetupArgs += '--no-service' }
+                    if ($installedSupervised) { $repairSetupArgs += @('--supervised', '--real-cargo', $state.realCargo) }
+                    Invoke-Checked $cli $repairSetupArgs | Out-Null
+                }
+                if ($installedSupervised) {
                     Assert-PlainFile $shimPath
                     Assert-Condition ((File-Digest $shimPath) -eq $cliDigest) 'owned Cargo shim differs from the verified release'
                     Assert-PlainFile $fallbackPath
@@ -1290,6 +1312,7 @@ try {
                         (Test-SamePath $fallback.real_cargo $state.realCargo)) 'owned Cargo fallback differs from the installer state'
                 }
                 Assert-PlainCargoActivation $cli $state
+                Assert-ServiceHealthy $cli $state
             }
             catch {
                 $verificationError = $_
@@ -1386,6 +1409,7 @@ try {
                 (Test-SamePath $fallback.real_cargo $state.realCargo)) 'owned Cargo fallback differs from the installer state'
         }
         Assert-PlainCargoActivation $cli $state
+        Assert-ServiceHealthy $cli $state
         foreach ($pair in @(@($commandWrapper, $wrapper, $wrapperDigest), @($commandCli, $cli, $cliDigest))) {
             if (Test-Path -LiteralPath $pair[0]) {
                 Assert-PlainFile $pair[0]
