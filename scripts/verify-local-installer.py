@@ -224,6 +224,20 @@ def main() -> None:
         assert "differs from the verified archive" in refused.stderr or "unexpected contents" in refused.stderr
         run([*installer, "--repair"], env=environment)
         assert missing_binary.is_file()
+        pointer = cargo_home / ".rgo-home"
+        expected_pointer = f"{rgo_home}\n"
+        pointer.write_text("damaged-pointer\n")
+        run([*installer, "--repair"], env=environment)
+        assert pointer.read_text() == expected_pointer
+        other_root = root / "another-rgo-home"
+        pointer.write_text(f"{other_root}\n")
+        refused_pointer = subprocess.run(
+            [*installer, "--repair"], env=environment, text=True, capture_output=True,
+        )
+        assert refused_pointer.returncode != 0
+        assert "different absolute storage root" in refused_pointer.stderr
+        assert pointer.read_text() == f"{other_root}\n"
+        pointer.write_text(expected_pointer)
         if not supervised:
             pair = [Path(active["rgo_binary"]).parent / name for name in ("rgo", "rgo-rustc-wrapper")]
             for member in pair:

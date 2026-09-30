@@ -928,6 +928,16 @@ def repair_owned(
     root = Path(str(record["rgo_home"]))
     if environment.get("RGO_HOME") and Path(environment["RGO_HOME"]).absolute() != root:
         raise InstallError("repair RGO_HOME differs from the activation record")
+    if root.is_symlink() or (root / "state").is_symlink():
+        raise InstallError("repair refuses a symlinked storage root or state directory")
+    owner_path = root / "state/owner-cargo-home"
+    mode_path = root / "state/storage-mode"
+    owner = file_snapshot(owner_path)
+    mode = file_snapshot(mode_path)
+    if owner is None or owner[0] != f"{cargo_home}\n".encode() or mode is None or mode[0] != (
+        b"supervised\n" if supervised else b"native\n"
+    ):
+        raise InstallError("repair requires the recorded Cargo-home owner and storage mode")
     environment["RGO_HOME"] = str(root)
     for name, target in (("rgo", cli), ("rgo-rustc-wrapper", wrapper)):
         link = bin_dir / name
@@ -941,6 +951,17 @@ def repair_owned(
         existing = version_dir / name
         if existing.is_symlink() or (existing.exists() and not existing.is_file()):
             raise InstallError(f"repair refuses unexpected version member {existing}")
+    pointer = cargo_home / ".rgo-home"
+    previous_pointer = file_snapshot(pointer)
+    expected_pointer = (f"{root}\n".encode(), 0o600)
+    if previous_pointer is not None:
+        try:
+            previous_root = previous_pointer[0].decode("utf-8").rstrip("\r\n")
+        except UnicodeDecodeError:
+            previous_root = ""
+        if Path(previous_root).is_absolute() and previous_root != str(root):
+            raise InstallError("repair refuses a pointer to a different absolute storage root")
+    repaired_pointer = previous_pointer != expected_pointer
     replaced = []
     for name in sorted(expected_names):
         existing = version_dir / name
@@ -960,14 +981,29 @@ def repair_owned(
     wrapper_banner = run(wrapper, "--rgo-version", environment=environment).stdout.strip()
     if wrapper_banner != expected_wrapper_banner:
         raise InstallError("repaired wrapper does not match the activation protocol")
+    if repaired_pointer:
+        expected_state = {
+            pointer: expected_pointer,
+            owner_path: owner,
+            mode_path: mode,
+            record_path: record_file,
+            state_path: state_file,
+        }
+        previous_state = {**expected_state, pointer: previous_pointer}
+        restore_activation(cargo_home, root, expected_state, previous_state)
     verify_environment = environment.copy()
     verify_environment.pop("RGO_HOME", None)
     if supervised:
         shim_dir = cargo_home / "rgo/shims"
         verify_environment["PATH"] = f"{shim_dir}{os.pathsep}{environment.get('PATH', '')}"
-    doctor = run(cli, "doctor", "--verify", "--json", environment=verify_environment)
-    if json.loads(doctor.stdout).get("activation_verified") is not True:
-        raise InstallError("repaired binaries did not restore plain Cargo activation")
+    try:
+        doctor = run(cli, "doctor", "--verify", "--json", environment=verify_environment)
+        if json.loads(doctor.stdout).get("activation_verified") is not True:
+            raise InstallError("repaired binaries did not restore plain Cargo activation")
+    except Exception:
+        if repaired_pointer:
+            restore_activation(cargo_home, root, previous_state, expected_state)
+        raise
     print(f"repaired {', '.join(replaced) if replaced else 'verified files'} in {version_dir}")
 
 
