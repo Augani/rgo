@@ -299,6 +299,12 @@ pub fn write_durable_pin(paths: &RgoPaths, dir: &Path) -> Result<()> {
 /// Import an old marker only if no newer explicit pin/unpin decision exists.
 pub fn migrate_legacy_pin(paths: &RgoPaths, dir: &Path) -> Result<()> {
     let _decision_lock = lock_pin_decisions(paths)?;
+    // Callers discover legacy markers before taking this lock. An unpin may
+    // remove the marker in between, so repeat the observation while serialized
+    // with the durable decision before creating a new pin record.
+    if !is_pinned_dir(dir) {
+        return Ok(());
+    }
     let record = pin_record_path(paths, dir)?;
     let parent = ensure_pin_parent(paths, &record)?;
     use std::io::Write;
@@ -469,11 +475,22 @@ impl PinPruneScanner {
 pub(crate) fn prune_unpin_decision_guarded(paths: &RgoPaths, dir: &Path) -> Result<bool> {
     let _decision_lock = lock_pin_decisions(paths)?;
     let record = pin_record_path(paths, dir)?;
-    match std::fs::symlink_metadata(dir) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+    let context_exists = match std::fs::symlink_metadata(dir) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
+            let shard = dir.parent().context("managed context has no shard")?;
+            let shard_metadata = std::fs::symlink_metadata(shard)
+                .with_context(|| format!("checking {}", shard.display()))?;
+            ensure!(
+                shard_metadata.is_dir() && !shard_metadata.file_type().is_symlink(),
+                "unsafe managed build shard {}",
+                shard.display()
+            );
+            true
+        }
         Ok(_) => return Ok(false),
         Err(error) => return Err(error).with_context(|| format!("checking {}", dir.display())),
-    }
+    };
     match std::fs::symlink_metadata(&record) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
         Ok(metadata)
@@ -490,6 +507,13 @@ pub(crate) fn prune_unpin_decision_guarded(paths: &RgoPaths, dir: &Path) -> Resu
         .read_to_end(&mut contents)?;
     if contents != b"unpin\n" {
         return Ok(false);
+    }
+    if context_exists {
+        // The exclusive lifecycle guard rules out a launcher that already
+        // observed this decision and might still restore an old marker. A new
+        // launcher cannot enter until both the marker and decision are gone.
+        remove_pin_marker(dir)?;
+        sync_pin_parent(dir)?;
     }
     std::fs::remove_file(&record)?;
     sync_pin_parent(record.parent().context("pin record has no parent")?)?;
@@ -1051,7 +1075,7 @@ mod tests {
     }
 
     #[test]
-    fn incremental_pin_scan_recovers_absent_unpin_decisions() {
+    fn incremental_pin_scan_recovers_unpin_decisions() {
         let root = tempfile::tempdir().unwrap();
         let paths = RgoPaths {
             root: root.path().join("rgo"),
@@ -1062,9 +1086,6 @@ mod tests {
         for dir in &absent {
             remove_durable_pin(&paths, dir).unwrap();
         }
-        let present = paths.builds_dir().join("bb/present");
-        std::fs::create_dir_all(&present).unwrap();
-        remove_durable_pin(&paths, &present).unwrap();
         let pinned = paths.builds_dir().join("cc/pinned");
         write_durable_pin(&paths, &pinned).unwrap();
 
@@ -1077,15 +1098,30 @@ mod tests {
         for dir in &absent {
             assert!(!pin_record_path(&paths, dir).unwrap().exists());
         }
+        let present = paths.builds_dir().join("bb/present");
+        std::fs::create_dir_all(&present).unwrap();
+        let active = crate::supervision::lock_cargo_session(&paths, Some(&present)).unwrap();
+        remove_durable_pin(&paths, &present).unwrap();
+        // A launcher that observed the old pin before unpin can still restore
+        // its compatibility marker while its session is active.
+        write_pin_marker(&present).unwrap();
+        for _ in 0..20 {
+            scan.scan(&paths, 2).unwrap();
+        }
         assert!(pin_record_path(&paths, &present).unwrap().exists());
-        assert!(pin_record_path(&paths, &pinned).unwrap().exists());
-        assert!(is_pinned(&paths, &pinned));
-
-        std::fs::remove_dir(&present).unwrap();
+        assert!(is_pinned_dir(&present));
+        drop(active);
         for _ in 0..20 {
             scan.scan(&paths, 2).unwrap();
         }
         assert!(!pin_record_path(&paths, &present).unwrap().exists());
+        assert!(!is_pinned_dir(&present));
+        // A migration that observed the old marker before pruning must
+        // recheck under the decision lock instead of reviving the pin.
+        migrate_legacy_pin(&paths, &present).unwrap();
+        assert!(!is_pinned(&paths, &present));
+        assert!(pin_record_path(&paths, &pinned).unwrap().exists());
+        assert!(is_pinned(&paths, &pinned));
     }
 
     #[cfg(unix)]
