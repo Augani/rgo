@@ -321,14 +321,21 @@ fn task_is_running(label: &str) -> Result<bool> {
     // Query the scheduler's state rather than assuming registration means a
     // daemon process exists. The numeric TASK_STATE value is locale-neutral;
     // 4 is TASK_STATE_RUNNING (one or more instances are running).
+    let (folder, name) = label.rsplit_once('\\').unwrap_or(("", label));
+    let task_path = if folder.is_empty() {
+        "\\".to_owned()
+    } else {
+        format!("\\{folder}\\")
+    };
     let output = Command::new("powershell.exe")
         .args([
             "-NoProfile",
             "-NonInteractive",
             "-Command",
-            "$task = Get-ScheduledTask -TaskPath '\\' -TaskName $env:RGO_TASK_LABEL -ErrorAction Stop; [int]$task.State",
+            "$task = Get-ScheduledTask -TaskPath $env:RGO_TASK_PATH -TaskName $env:RGO_TASK_NAME -ErrorAction Stop; [int]$task.State",
         ])
-        .env("RGO_TASK_LABEL", label)
+        .env("RGO_TASK_PATH", task_path)
+        .env("RGO_TASK_NAME", name)
         .output()
         .with_context(|| format!("querying Task Scheduler state for {label}"))?;
     if !output.status.success() {
