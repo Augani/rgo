@@ -271,6 +271,8 @@ pub fn run(paths: RgoPaths, cfg: Resolved) -> Result<()> {
             if let Err(error) = maintenance(&maintenance_state) {
                 tracing::warn!(%error, "daemon maintenance failed");
             }
+            #[cfg(debug_assertions)]
+            mark_maintenance_tick_for_test();
         }
     });
     loop {
@@ -301,6 +303,23 @@ pub fn run(paths: RgoPaths, cfg: Resolved) -> Result<()> {
         .join()
         .map_err(|_| anyhow::anyhow!("daemon maintenance thread panicked during shutdown"))?;
     Ok(())
+}
+
+/// Debug-only completion marker for the multi-project maintenance-cycle probe.
+#[cfg(debug_assertions)]
+fn mark_maintenance_tick_for_test() {
+    let Some(path) = std::env::var_os("RGO_TEST_MAINTENANCE_TICK_LOG") else {
+        return;
+    };
+    let result = (|| -> std::io::Result<()> {
+        use std::io::Write;
+        let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+        file.write_all(b"tick\n")?;
+        file.sync_data()
+    })();
+    if let Err(error) = result {
+        tracing::warn!(%error, "could not mark completed maintenance tick");
+    }
 }
 
 #[cfg(unix)]

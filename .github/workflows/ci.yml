@@ -60,6 +60,14 @@ jobs:
       - name: Test workspace
         timeout-minutes: 8
         run: cargo test --workspace
+      - uses: actions/setup-python@v5
+        if: matrix.toolchain == 'stable'
+        with:
+          python-version: '3.11'
+      - name: Verify 100-project budget recovery
+        if: matrix.toolchain == 'stable'
+        timeout-minutes: 8
+        run: python scripts/verify-100-project-recovery.py
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
       - name: Format
