@@ -37,7 +37,11 @@ build script, test process, or a Cargo process waiting on a lock. Cargo's
 documented [build-directory configuration](https://doc.rust-lang.org/cargo/reference/config.html#buildbuild-dir)
 establishes where intermediates go; it does not give rgo a context-wide
 ownership lock. The profile `.cargo-build-lock` probe is only an additional
-liveness heuristic.
+liveness heuristic. Fresh contexts created by supervised Cargo carry a
+`supervised_origin` sidecar field; GC can skip the ten-minute timestamp grace
+for those contexts, while still refusing a held or unreadable profile lock and
+holding rgo's lifecycle guard through deletion. Existing and uncertain
+contexts retain that grace. This does not make an unsupervised override safe.
 
 ## Proposed exclusion protocol
 
