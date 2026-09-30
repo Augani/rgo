@@ -521,7 +521,15 @@ pub fn install(
         )?;
         atomic_write(&rendered.path, rendered.contents.as_bytes())?;
         command("systemctl", ["--user", "daemon-reload"])?;
-        command("systemctl", ["--user", "enable", "--now", &rendered.label])?;
+        if previous_executable.is_some() {
+            // `enable --now` does not restart an already active unit after its
+            // ExecStart changes. A verified replacement must run the daemon
+            // from the newly installed definition before setup reports health.
+            command("systemctl", ["--user", "enable", &rendered.label])?;
+            command("systemctl", ["--user", "restart", &rendered.label])?;
+        } else {
+            command("systemctl", ["--user", "enable", "--now", &rendered.label])?;
+        }
         Ok(rendered)
     }
     #[cfg(target_os = "windows")]
