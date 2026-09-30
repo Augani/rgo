@@ -386,6 +386,7 @@ fn stage_and_remove_with(
         None
     };
     validate_deletion_path(paths, victim)?;
+    validate_managed_directory(&paths.tmp_dir())?;
     after_phase(DeletePhase::Locked);
     #[cfg(debug_assertions)]
     pause_after_gc_lock_for_test()?;
@@ -408,7 +409,7 @@ fn stage_and_remove_with(
     if is_live_managed_path(paths, victim)? {
         anyhow::bail!("live Cargo build lock detected near {}", victim.display());
     }
-    std::fs::create_dir_all(paths.tmp_dir())?;
+    validate_managed_directory(&paths.tmp_dir())?;
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -487,6 +488,7 @@ fn validate_deletion_path(paths: &RgoPaths, victim: &Path) -> Result<()> {
         "invalid managed deletion path {}",
         victim.display()
     );
+    validate_managed_directory(domain)?;
     let mut prefix = domain.clone();
     if let Some(parent) = relative.parent() {
         for component in parent.components() {
@@ -506,6 +508,17 @@ fn validate_deletion_path(paths: &RgoPaths, victim: &Path) -> Result<()> {
         !metadata.file_type().is_symlink(),
         "refusing symlinked deletion target {}",
         victim.display()
+    );
+    Ok(())
+}
+
+fn validate_managed_directory(directory: &Path) -> Result<()> {
+    let metadata = std::fs::symlink_metadata(directory)
+        .with_context(|| format!("checking managed directory {}", directory.display()))?;
+    anyhow::ensure!(
+        metadata.is_dir() && !metadata.file_type().is_symlink(),
+        "unsafe managed directory {}",
+        directory.display()
     );
     Ok(())
 }
@@ -982,6 +995,41 @@ mod tests {
         symlink(&outside, paths.cas_dir().join("linked")).unwrap();
         assert!(remove_atomically(&paths, &paths.cas_dir().join("linked/user-file")).is_err());
         assert_eq!(std::fs::read(&file).unwrap(), b"preserve");
+
+        std::fs::remove_file(paths.cas_dir().join("linked")).unwrap();
+        std::fs::remove_dir(paths.cas_dir()).unwrap();
+        symlink(&outside, paths.cas_dir()).unwrap();
+        assert!(remove_atomically(&paths, &paths.cas_dir().join("user-file")).is_err());
+        assert_eq!(std::fs::read(&file).unwrap(), b"preserve");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staging_directory_replacement_after_gc_lock_blocks_delete() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let paths = RgoPaths {
+            root: root.path().join("rgo"),
+        };
+        paths.ensure_layout().unwrap();
+        let victim = paths.cas_dir().join("owned-object");
+        std::fs::write(&victim, b"managed").unwrap();
+        let outside = root.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("keep"), b"preserve").unwrap();
+
+        let error = stage_and_remove_with(&paths, &victim, |phase| {
+            if phase == DeletePhase::Locked {
+                std::fs::rename(paths.tmp_dir(), paths.root.join("tmp.saved")).unwrap();
+                symlink(&outside, paths.tmp_dir()).unwrap();
+            }
+        })
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("unsafe managed directory"));
+        assert_eq!(std::fs::read(&victim).unwrap(), b"managed");
+        assert_eq!(std::fs::read(outside.join("keep")).unwrap(), b"preserve");
+        assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 1);
     }
 
     #[test]

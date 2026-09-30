@@ -155,13 +155,14 @@ impl RgoPaths {
         format!("{}/{{workspace-path-hash}}", self.builds_dir().display())
     }
 
-    fn private_dirs(&self) -> [PathBuf; 8] {
+    fn private_dirs(&self) -> [PathBuf; 9] {
         [
             self.state_dir(),
             self.state_dir().join("locks"),
             self.pending_maintenance_dir(),
             self.pin_records_dir(),
             self.builds_dir(),
+            self.cas_dir(),
             self.tmp_dir(),
             self.quarantine_dir(),
             self.logs_dir(),
