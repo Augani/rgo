@@ -7,6 +7,28 @@ fn adopt_reports_target_storage_and_refuses_unsafe_selective_delete() {
     let sandbox = Sandbox::new().unwrap();
     let project = sandbox.projects.join("legacy");
     let target = project.join("target/debug");
+    std::fs::create_dir_all(project.join("src")).unwrap();
+    std::fs::write(project.join("src/main.rs"), "fn main() {}\n").unwrap();
+    std::fs::write(
+        project.join("Cargo.toml"),
+        "[package]\nname='legacy'\nversion='0.1.0'\n",
+    )
+    .unwrap();
+    let build = sandbox
+        .cargo()
+        .args([
+            "build",
+            "--offline",
+            "--manifest-path",
+            project.join("Cargo.toml").to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        build.status.success(),
+        "{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
     std::fs::create_dir_all(target.join("deps")).unwrap();
     std::fs::create_dir_all(target.join("build")).unwrap();
     std::fs::create_dir_all(target.join("incremental")).unwrap();
@@ -14,11 +36,6 @@ fn adopt_reports_target_storage_and_refuses_unsafe_selective_delete() {
     std::fs::create_dir_all(target.join("examples")).unwrap();
     std::fs::create_dir_all(target.join("doc")).unwrap();
     std::fs::create_dir_all(target.join("package")).unwrap();
-    std::fs::write(
-        project.join("Cargo.toml"),
-        "[package]\nname='legacy'\nversion='0.1.0'\n",
-    )
-    .unwrap();
     let final_binary = target.join("legacy");
     std::fs::write(&final_binary, b"keep me").unwrap();
     std::fs::write(target.join("examples/example"), b"example").unwrap();
@@ -39,6 +56,25 @@ fn adopt_reports_target_storage_and_refuses_unsafe_selective_delete() {
         stdout.contains("includes final outputs and user files"),
         "{stdout}"
     );
+    assert!(target.join("deps/liblegacy.rlib").exists());
+
+    let preview = sandbox
+        .cmd(cargo_bin("rgo"))
+        .args(["adopt", "--preview-full-clean", project.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        preview.status.success(),
+        "{}",
+        String::from_utf8_lossy(&preview.stderr)
+    );
+    let output = String::from_utf8_lossy(&preview.stdout);
+    assert!(output.contains("Cargo full-clean preview"), "{output}");
+    assert!(
+        output.contains("not a selective migration plan"),
+        "{output}"
+    );
+    assert_eq!(std::fs::read(&final_binary).unwrap(), b"keep me");
     assert!(target.join("deps/liblegacy.rlib").exists());
 
     let delete = sandbox

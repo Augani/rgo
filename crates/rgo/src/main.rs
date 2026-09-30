@@ -104,6 +104,9 @@ enum Cmd {
         /// Former deletion option; now fails because safe selective removal is unproven.
         #[arg(long)]
         delete: bool,
+        /// Ask Cargo to preview a complete clean of exactly one selected legacy target.
+        #[arg(long)]
+        preview_full_clean: bool,
         roots: Vec<std::path::PathBuf>,
     },
     /// Run the coordination daemon (Phase 2).
@@ -199,7 +202,11 @@ fn main() -> Result<()> {
         Some(Cmd::Pin { id }) => cmd::pin::run(&id, true),
         Some(Cmd::Unpin { id }) => cmd::pin::run(&id, false),
         Some(Cmd::Clean { id }) => cmd::clean::run(&id),
-        Some(Cmd::Adopt { roots, delete }) => cmd::adopt::run(roots, delete),
+        Some(Cmd::Adopt {
+            roots,
+            delete,
+            preview_full_clean,
+        }) => cmd::adopt::run(roots, delete, preview_full_clean),
         Some(Cmd::Daemon { foreground, home }) => cmd::daemon::run(foreground, home),
         None => cmd::passthrough::run(cli.cargo_args),
     };
