@@ -3,6 +3,7 @@
 //! build-dir and target-dir, so logical sums overstate reality.
 
 use std::collections::HashSet;
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -62,6 +63,16 @@ struct FileIdentity {
     inode: Option<(u64, u64)>,
     links: u64,
     logical_bytes: u64,
+}
+
+/// Only rgo-owned top-level entries belong to its storage budget. In
+/// particular, a user may select a root near Cargo's registry or a checkout;
+/// those neighboring files must not become apparent rgo pressure.
+fn budget_root_entry(name: &OsStr) -> bool {
+    matches!(
+        name.to_str(),
+        Some("builds" | "cas" | "state" | "tmp" | "quarantine" | "logs" | "config.toml")
+    )
 }
 
 impl FileIdentity {
@@ -254,10 +265,24 @@ impl TriggerScan {
                     return Ok(Some(total));
                 }
             };
+            if entry.depth() == 1 && !budget_root_entry(entry.file_name()) {
+                if entry.file_type().is_dir() {
+                    self.walk.as_mut().unwrap().skip_current_dir();
+                }
+                continue;
+            }
             if entry.depth() == 1 && entry.file_type().is_symlink() {
                 let path = entry.path().to_path_buf();
                 self.invalidate();
                 anyhow::bail!("unsafe symlinked storage entry {}", path.display());
+            }
+            if entry.depth() == 1
+                && ((entry.file_name() == "config.toml" && !entry.file_type().is_file())
+                    || (entry.file_name() != "config.toml" && !entry.file_type().is_dir()))
+            {
+                let path = entry.path().to_path_buf();
+                self.invalidate();
+                anyhow::bail!("unsafe managed storage entry {}", path.display());
             }
             if matches!(entry.depth(), 2 | 3) {
                 let builds = self.root.as_ref().unwrap().join("builds");
@@ -312,36 +337,36 @@ impl TriggerScan {
     }
 }
 
-/// Files under rgo's root other than managed build contexts and CAS. This
-/// includes temporary, quarantine, state, logs, and owned root-level files.
-/// Unknown entries are counted but never selected for deletion by this scan.
+/// Rgo-owned files outside managed build contexts and CAS. Unknown neighbors
+/// under the selected root are outside the budget and never selected here.
 pub fn auxiliary_usage(paths: &RgoPaths) -> Result<Usage> {
     auxiliary_usage_with_scanner(paths, &mut Scanner::new())
 }
 
 fn auxiliary_usage_with_scanner(paths: &RgoPaths, scanner: &mut Scanner) -> Result<Usage> {
-    let entries = match std::fs::read_dir(&paths.root) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Usage::default()),
-        Err(error) => {
-            return Err(error).with_context(|| format!("reading {}", paths.root.display()));
-        }
-    };
     let mut total = Usage::default();
-    for entry in entries {
-        let path = entry?.path();
-        if path == paths.builds_dir() || path == paths.cas_dir() {
-            continue;
-        }
-        ensure!(
-            !std::fs::symlink_metadata(&path)?.file_type().is_symlink(),
-            "unsafe symlinked auxiliary entry {}",
-            path.display()
-        );
-        let usage = scanner.measure_checked(&path)?;
+    for path in [
+        paths.state_dir(),
+        paths.tmp_dir(),
+        paths.quarantine_dir(),
+        paths.logs_dir(),
+    ] {
+        let usage = scanner.measure_optional(&path)?;
         total.physical_bytes = total.physical_bytes.saturating_add(usage.physical_bytes);
         total.logical_bytes = total.logical_bytes.saturating_add(usage.logical_bytes);
         total.files = total.files.saturating_add(usage.files);
+    }
+    let config = paths.config_file();
+    match std::fs::symlink_metadata(&config) {
+        Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
+            let usage = scanner.measure_checked(&config)?;
+            total.physical_bytes = total.physical_bytes.saturating_add(usage.physical_bytes);
+            total.logical_bytes = total.logical_bytes.saturating_add(usage.logical_bytes);
+            total.files = total.files.saturating_add(usage.files);
+        }
+        Ok(_) => anyhow::bail!("unsafe storage configuration {}", config.display()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error).with_context(|| format!("checking {}", config.display())),
     }
     Ok(total)
 }
@@ -520,6 +545,8 @@ mod tests {
         std::fs::write(build.join("output"), vec![0u8; 8192]).unwrap();
         std::fs::create_dir_all(paths.cas_dir()).unwrap();
         std::fs::write(paths.cas_dir().join("object"), vec![0u8; 8192]).unwrap();
+        std::fs::create_dir_all(paths.root.join("registry")).unwrap();
+        std::fs::write(paths.root.join("registry/download"), vec![0u8; 8192]).unwrap();
         let expected = Scanner::new().measure(&paths.tmp_dir()).physical_bytes
             + Scanner::new().measure(&paths.state_dir()).physical_bytes;
         assert_eq!(auxiliary_usage(&paths).unwrap().physical_bytes, expected);
@@ -527,6 +554,10 @@ mod tests {
         {
             std::os::unix::fs::symlink(paths.tmp_dir(), paths.root.join("unexpected-link"))
                 .unwrap();
+            assert_eq!(auxiliary_usage(&paths).unwrap().physical_bytes, expected);
+            let logs = paths.logs_dir();
+            std::fs::remove_dir(&logs).unwrap();
+            std::os::unix::fs::symlink(paths.tmp_dir(), logs).unwrap();
             assert!(auxiliary_usage(&paths).is_err());
         }
     }
@@ -595,6 +626,10 @@ mod tests {
         std::fs::create_dir_all(paths.cas_dir()).unwrap();
         std::fs::hard_link(&artifact, paths.cas_dir().join("linked-object")).unwrap();
         std::fs::write(paths.state_dir().join("other-state"), vec![b'y'; 4096]).unwrap();
+        std::fs::create_dir_all(paths.root.join("registry")).unwrap();
+        std::fs::write(paths.root.join("registry/download"), vec![b'z'; 8192]).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&artifact, paths.root.join("other-link")).unwrap();
 
         let expected = managed_snapshot(&paths).unwrap().total_bytes();
         let mut scan = TriggerScan::default();

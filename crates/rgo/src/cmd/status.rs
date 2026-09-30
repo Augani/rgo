@@ -46,6 +46,7 @@ pub fn run() -> Result<()> {
             "Configured budget    {:>10}",
             human(status.hard_limit_bytes)
         );
+        println!("Outside budget       Cargo downloads, toolchains, checkout final outputs");
         println!(
             "Automatic GC         {}",
             if e.cfg.gc.auto {
@@ -190,6 +191,7 @@ pub fn run() -> Result<()> {
     println!("  other rgo state    {:>10}", human(auxiliary_bytes));
     println!("Soft GC watermark    {:>10}", human(e.cfg.soft_watermark));
     println!("Configured budget    {:>10}", human(e.cfg.max_size));
+    println!("Outside budget       Cargo downloads, toolchains, checkout final outputs");
     println!(
         "Automatic GC         {}",
         if e.cfg.gc.auto {
