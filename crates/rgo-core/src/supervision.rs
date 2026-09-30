@@ -104,29 +104,52 @@ fn write_pending_record(path: &Path, record: &PendingMaintenance) -> Result<()> 
     Ok(())
 }
 
-/// Read only the shallow pending-record directory; no Cargo-owned build
-/// contents are visited. Invalid records remain visible in the daemon log.
-pub fn pending_maintenance(paths: &RgoPaths) -> Result<Vec<PendingMaintenance>> {
-    let _lock = pending_lock(paths)?;
-    let mut pending = Vec::new();
-    for entry in std::fs::read_dir(paths.pending_maintenance_dir())? {
-        let entry = entry?;
-        let path = entry.path();
-        let result = (|| -> Result<PendingMaintenance> {
-            let metadata = std::fs::symlink_metadata(&path)?;
-            anyhow::ensure!(metadata.is_file() && !metadata.file_type().is_symlink());
-            let record: PendingMaintenance = serde_json::from_slice(&std::fs::read(&path)?)?;
-            anyhow::ensure!(pending_path(paths, &record.context)? == path);
-            Ok(record)
-        })();
-        match result {
-            Ok(record) => pending.push(record),
-            Err(error) => {
-                tracing::warn!(path = %path.display(), %error, "invalid pending maintenance record")
+/// Carry the directory cursor across daemon ticks so launch signals from many
+/// projects cannot make one maintenance tick scan an unbounded number of files.
+#[derive(Default)]
+pub struct PendingMaintenanceScanner {
+    entries: Option<std::fs::ReadDir>,
+}
+
+impl PendingMaintenanceScanner {
+    /// Examine at most `limit` shallow records. A new launch during a sweep
+    /// remains durable and is seen when the directory is opened again.
+    pub fn scan(&mut self, paths: &RgoPaths, limit: usize) -> Result<Vec<PendingMaintenance>> {
+        let _lock = pending_lock(paths)?;
+        if self.entries.is_none() {
+            self.entries = Some(std::fs::read_dir(paths.pending_maintenance_dir())?);
+        }
+        let mut pending = Vec::new();
+        for _ in 0..limit {
+            let entry = match self.entries.as_mut().unwrap().next() {
+                Some(entry) => entry?,
+                None => {
+                    self.entries = None;
+                    break;
+                }
+            };
+            let path = entry.path();
+            let result = (|| -> Result<PendingMaintenance> {
+                let metadata = std::fs::symlink_metadata(&path)?;
+                anyhow::ensure!(metadata.is_file() && !metadata.file_type().is_symlink());
+                let record: PendingMaintenance = serde_json::from_slice(&std::fs::read(&path)?)?;
+                anyhow::ensure!(pending_path(paths, &record.context)? == path);
+                Ok(record)
+            })();
+            match result {
+                Ok(record) => pending.push(record),
+                Err(error) => {
+                    tracing::warn!(path = %path.display(), %error, "invalid pending maintenance record")
+                }
             }
         }
+        Ok(pending)
     }
-    Ok(pending)
+}
+
+#[cfg(test)]
+fn pending_maintenance(paths: &RgoPaths) -> Result<Vec<PendingMaintenance>> {
+    PendingMaintenanceScanner::default().scan(paths, usize::MAX)
 }
 
 /// The context guard makes the final comparison/removal atomic with respect
@@ -535,6 +558,35 @@ fn try_lock_exclusive(file: &File) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pending_scan_bounds_each_tick_and_revisits_new_launches() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = RgoPaths {
+            root: root.path().join("rgo"),
+        };
+        let contexts: Vec<_> = (0..70)
+            .map(|index| paths.builds_dir().join(format!("aa/context-{index}")))
+            .collect();
+        for context in &contexts {
+            mark_pending_maintenance(&paths, context).unwrap();
+        }
+        let mut scanner = PendingMaintenanceScanner::default();
+        let first = scanner.scan(&paths, 17).unwrap();
+        assert_eq!(first.len(), 17);
+        let late = paths.builds_dir().join("aa/late-launch");
+        mark_pending_maintenance(&paths, &late).unwrap();
+
+        let mut seen: std::collections::HashSet<_> =
+            first.into_iter().map(|record| record.context).collect();
+        for _ in 0..12 {
+            let batch = scanner.scan(&paths, 17).unwrap();
+            assert!(batch.len() <= 17);
+            seen.extend(batch.into_iter().map(|record| record.context));
+        }
+        assert!(contexts.iter().all(|context| seen.contains(context)));
+        assert!(seen.contains(&late));
+    }
 
     #[test]
     fn completed_maintenance_cannot_erase_a_newer_or_active_launch() {

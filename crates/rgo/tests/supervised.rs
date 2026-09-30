@@ -441,7 +441,9 @@ fn opted_in_maintenance_reclaims_an_idle_real_cargo_build() {
     // Both post-build signals must survive Cargo's recent profile-lock grace.
     let retry_deadline = Instant::now() + Duration::from_secs(15);
     let deferred = loop {
-        let records = supervision::pending_maintenance(&paths).unwrap();
+        let records = supervision::PendingMaintenanceScanner::default()
+            .scan(&paths, 32)
+            .unwrap();
         let due = [context.as_path(), other_context.as_path()].map(|dir| {
             records
                 .iter()

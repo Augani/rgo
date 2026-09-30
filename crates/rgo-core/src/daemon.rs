@@ -37,6 +37,7 @@ const MAX_EVENT_DRAINS_PER_PASS: usize = 4;
 const MAX_EVENT_SCAN_ENTRIES_PER_PASS: usize = 256;
 const MAX_EVENT_BATCH_PRUNE_PER_PASS: usize = 64;
 const MAX_PIN_SCAN_ENTRIES_PER_PASS: usize = 32;
+const MAX_PENDING_MAINTENANCE_ENTRIES_PER_PASS: usize = 32;
 /// Bound on concurrent client connections; excess connections are refused so a flood
 /// of stalled or malformed clients cannot exhaust daemon threads or file descriptors.
 /// Clients see a dropped connection and fall back to ordinary cargo behavior.
@@ -105,6 +106,7 @@ struct State {
     cas: Store,
     operation_lock: Arc<Mutex<()>>,
     pin_pruner: Arc<Mutex<context::PinPruneScanner>>,
+    pending_scanner: Arc<Mutex<crate::supervision::PendingMaintenanceScanner>>,
     trigger_scan: Arc<Mutex<crate::size::TriggerScan>>,
     event_drainer: Arc<Mutex<CacheEventDrainScanner>>,
     batch_prune_cursor: Arc<Mutex<i64>>,
@@ -245,6 +247,9 @@ pub fn run(paths: RgoPaths, cfg: Resolved) -> Result<()> {
         cas,
         operation_lock: Arc::new(Mutex::new(())),
         pin_pruner: Arc::new(Mutex::new(context::PinPruneScanner::default())),
+        pending_scanner: Arc::new(Mutex::new(
+            crate::supervision::PendingMaintenanceScanner::default(),
+        )),
         trigger_scan: Arc::new(Mutex::new(crate::size::TriggerScan::default())),
         event_drainer: Arc::new(Mutex::new(event_drainer)),
         batch_prune_cursor: Arc::new(Mutex::new(batch_prune_cursor)),
@@ -1784,7 +1789,11 @@ fn maintenance(state: &State) -> Result<()> {
             // trigger sweep on the next maintenance tick.
             state.trigger_scan.lock().unwrap().invalidate();
         } else {
-            let pending = crate::supervision::pending_maintenance(&state.paths)?;
+            let pending = state
+                .pending_scanner
+                .lock()
+                .unwrap()
+                .scan(&state.paths, MAX_PENDING_MAINTENANCE_ENTRIES_PER_PASS)?;
             let now = crate::context::unix_now();
             let idle_launch = pending
                 .iter()
@@ -2403,6 +2412,9 @@ mod tests {
             cas,
             operation_lock: Arc::new(Mutex::new(())),
             pin_pruner: Arc::new(Mutex::new(context::PinPruneScanner::default())),
+            pending_scanner: Arc::new(Mutex::new(
+                crate::supervision::PendingMaintenanceScanner::default(),
+            )),
             trigger_scan: Arc::new(Mutex::new(crate::size::TriggerScan::default())),
             event_drainer: Arc::new(Mutex::new(CacheEventDrainScanner::default())),
             batch_prune_cursor: Arc::new(Mutex::new(0)),
