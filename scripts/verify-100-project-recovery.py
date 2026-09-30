@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Exercise bounded automatic cleanup after 100 unchanged Cargo builds.
+"""Exercise bounded automatic cleanup through two waves of 100 Cargo builds.
 
 The probe uses private HOME/CARGO_HOME/RGO_HOME, a supervised Cargo shim, and
 real offline builds. Its debug daemon marker counts completed maintenance
@@ -150,66 +150,72 @@ def probe(root: Path) -> None:
     if selected_cargo is None or not os.path.samefile(selected_cargo, shim):
         raise RuntimeError(f"PATH did not select the supervised Cargo launcher: {selected_cargo}")
     config = rgo_home / "config.toml"
-    config.write_text("[storage]\nmax_size = '1GB'\nmin_free_space = '0B'\n[gc]\nauto = true\n")
-
     first = None
     second = None
     try:
-        env["RGO_DAEMON_POLL_SECS"] = "3600"
-        first = start_daemon(root, env)
-        wait_ready(first[0], env, root)
-        start = time.monotonic()
-        for index in range(PROJECTS):
-            project = root / f"project-{index:03}"
-            (project / "src").mkdir(parents=True)
-            (project / "Cargo.toml").write_text(
-                f'[package]\nname = "bulk-{index:03}"\nversion = "0.1.0"\nedition = "2021"\n'
-            )
-            (project / "src" / "main.rs").write_text("fn main() {}\n")
-            run(["cargo", "build", "--offline", "--quiet"], env, cwd=project)
-            if index == 0 and len(contexts(rgo_home)) != 1:
-                raise RuntimeError("first build bypassed supervised Cargo storage")
-        before = contexts(rgo_home)
-        if len(before) != PROJECTS:
-            raise RuntimeError(f"expected {PROJECTS} managed contexts, got {len(before)}")
-        pending = list((rgo_home / "state" / "pending-maintenance").iterdir())
-        if len(pending) != PROJECTS:
-            raise RuntimeError(f"expected {PROJECTS} pending launches, got {len(pending)}")
-        print(f"built {PROJECTS} projects in {time.monotonic() - start:.1f}s", flush=True)
-        stop_daemon(*first)
-        first = None
+        for wave in (1, 2):
+            config.write_text("[storage]\nmax_size = '1GB'\nmin_free_space = '0B'\n[gc]\nauto = true\n")
+            env["RGO_DAEMON_POLL_SECS"] = "3600"
+            env.pop("RGO_TEST_MAINTENANCE_TICK_LOG", None)
+            first = start_daemon(root, env)
+            wait_ready(first[0], env, root)
+            start = time.monotonic()
+            for index in range(PROJECTS):
+                project = root / f"project-{index:03}"
+                (project / "src").mkdir(parents=True, exist_ok=True)
+                (project / "Cargo.toml").write_text(
+                    f'[package]\nname = "bulk-{index:03}"\nversion = "0.1.0"\nedition = "2021"\n'
+                )
+                (project / "src" / "main.rs").write_text(f"fn main() {{ println!(\"wave {wave}\"); }}\n")
+                run(["cargo", "build", "--offline", "--quiet"], env, cwd=project)
+                if wave == 1 and index == 0 and len(contexts(rgo_home)) != 1:
+                    raise RuntimeError("first build bypassed supervised Cargo storage")
+            before = contexts(rgo_home)
+            if len(before) != PROJECTS:
+                raise RuntimeError(f"wave {wave}: expected {PROJECTS} managed contexts, got {len(before)}")
+            pending_dir = rgo_home / "state" / "pending-maintenance"
+            pending = list(pending_dir.iterdir())
+            if len(pending) != PROJECTS:
+                raise RuntimeError(f"wave {wave}: expected {PROJECTS} pending launches, got {len(pending)}")
+            print(f"wave {wave}: built {PROJECTS} projects in {time.monotonic() - start:.1f}s", flush=True)
+            stop_daemon(*first)
+            first = None
 
-        aged = age_profile_locks(before)
-        if aged < PROJECTS:
-            raise RuntimeError(f"only {aged} completed Cargo profile locks were found")
-        config.write_text(f"[storage]\nmax_size = '{BUDGET}'\nmin_free_space = '0B'\n[gc]\nauto = true\n")
-        marker = root / "maintenance-ticks.log"
-        env["RGO_DAEMON_POLL_SECS"] = "1"
-        env["RGO_TEST_MAINTENANCE_TICK_LOG"] = str(marker)
-        second = start_daemon(root, env)
-        wait_ready(second[0], env, root)
-        deadline = time.monotonic() + 60
-        while tick_count(marker) < 2 and time.monotonic() < deadline:
-            if second[0].poll() is not None:
-                raise RuntimeError(f"maintenance daemon exited {second[0].returncode}")
-            time.sleep(0.05)
-        if tick_count(marker) < 2:
-            raise RuntimeError("two maintenance cycles did not complete within 60 seconds")
-        remaining = contexts(rgo_home)
-        status = run([str(RGO), "status"], env, cwd=root).stdout
-        if "Over budget" in status:
-            raise RuntimeError(f"budget still unmet after two cycles:\n{status}")
-        for index in range(PROJECTS):
-            executable = root / f"project-{index:03}" / "target" / "debug" / (
-                f"bulk-{index:03}.exe" if os.name == "nt" else f"bulk-{index:03}"
+            aged = age_profile_locks(before)
+            if aged < PROJECTS:
+                raise RuntimeError(f"wave {wave}: only {aged} completed Cargo profile locks were found")
+            config.write_text(f"[storage]\nmax_size = '{BUDGET}'\nmin_free_space = '0B'\n[gc]\nauto = true\n")
+            marker = root / f"maintenance-ticks-wave-{wave}.log"
+            env["RGO_DAEMON_POLL_SECS"] = "1"
+            env["RGO_TEST_MAINTENANCE_TICK_LOG"] = str(marker)
+            second = start_daemon(root, env)
+            wait_ready(second[0], env, root)
+            deadline = time.monotonic() + 60
+            while tick_count(marker) < 2 and time.monotonic() < deadline:
+                if second[0].poll() is not None:
+                    raise RuntimeError(f"wave {wave}: maintenance daemon exited {second[0].returncode}")
+                time.sleep(0.05)
+            if tick_count(marker) < 2:
+                raise RuntimeError(f"wave {wave}: two maintenance cycles did not complete within 60 seconds")
+            remaining = contexts(rgo_home)
+            status = run([str(RGO), "status"], env, cwd=root).stdout
+            if "Over budget" in status:
+                raise RuntimeError(f"wave {wave}: budget still unmet after two cycles:\n{status}")
+            if any(pending_dir.iterdir()):
+                raise RuntimeError(f"wave {wave}: pending launch records were not retired")
+            for index in range(PROJECTS):
+                executable = root / f"project-{index:03}" / "target" / "debug" / (
+                    f"bulk-{index:03}.exe" if os.name == "nt" else f"bulk-{index:03}"
+                )
+                if not executable.is_file():
+                    raise RuntimeError(f"wave {wave}: checkout output disappeared: {executable}")
+            print(
+                f"wave {wave}: two completed cycles, {len(remaining)} managed contexts remain; "
+                f"budget met, pending queue empty, {PROJECTS} checkout executables preserved",
+                flush=True,
             )
-            if not executable.is_file():
-                raise RuntimeError(f"checkout output disappeared: {executable}")
-        print(
-            f"two completed cycles: {len(remaining)} managed contexts remain; "
-            f"budget met and {PROJECTS} checkout executables preserved",
-            flush=True,
-        )
+            stop_daemon(*second)
+            second = None
     finally:
         if second is not None:
             stop_daemon(*second)
