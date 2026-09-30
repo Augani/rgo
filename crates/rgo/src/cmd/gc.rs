@@ -56,8 +56,8 @@ pub fn run(dry_run: bool, aggressive: bool, auto: bool, target: Option<String>) 
     };
     if report.skipped_live > 0 {
         println!(
-            "{} context(s) skipped: built within the last {} min",
-            report.skipped_live, 10
+            "{} context(s) skipped: recently changed or held Cargo profile lock",
+            report.skipped_live
         );
     }
     if report.skipped_leased > 0 {
