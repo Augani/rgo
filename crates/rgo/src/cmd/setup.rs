@@ -1153,7 +1153,9 @@ pub fn run(
 /// Probe the service-created daemon directly. Starting one through
 /// `ensure_running` here would hide a broken launchd/systemd/task registration.
 fn wait_for_daemon(executable: &Path, paths: &RgoPaths) -> Result<()> {
-    let deadline = Instant::now() + Duration::from_secs(5);
+    // The first Windows status read starts PowerShell and imports the
+    // ScheduledTasks module; allow that cold query as well as daemon startup.
+    let deadline = Instant::now() + Duration::from_secs(if cfg!(windows) { 15 } else { 5 });
     loop {
         let failure = match service::status(executable) {
             Ok(status) if status.supported && status.installed && status.running => {

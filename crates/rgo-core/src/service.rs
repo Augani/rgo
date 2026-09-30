@@ -316,6 +316,38 @@ fn query_task_action(label: &str) -> Result<Option<TaskAction>> {
     parse_task_action(&xml).map(Some)
 }
 
+#[cfg(target_os = "windows")]
+fn task_is_running(label: &str) -> Result<bool> {
+    // Query the scheduler's state rather than assuming registration means a
+    // daemon process exists. The numeric TASK_STATE value is locale-neutral;
+    // 4 is TASK_STATE_RUNNING (one or more instances are running).
+    let output = Command::new("powershell.exe")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "$task = Get-ScheduledTask -TaskPath '\\' -TaskName $env:RGO_TASK_LABEL -ErrorAction Stop; [int]$task.State",
+        ])
+        .env("RGO_TASK_LABEL", label)
+        .output()
+        .with_context(|| format!("querying Task Scheduler state for {label}"))?;
+    if !output.status.success() {
+        bail!(
+            "querying Task Scheduler state for {label}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    let state: u32 = String::from_utf8(output.stdout)?
+        .trim()
+        .parse()
+        .with_context(|| format!("decoding Task Scheduler state for {label}"))?;
+    ensure!(
+        state <= 4,
+        "unexpected Task Scheduler state {state} for {label}"
+    );
+    Ok(state == 4)
+}
+
 #[cfg(any(target_os = "windows", test))]
 fn decode_task_xml(bytes: &[u8]) -> Result<String> {
     if bytes.starts_with(&[0xff, 0xfe]) {
@@ -692,13 +724,16 @@ fn status_flavor(executable: &Path, flavor: Flavor) -> Result<ServiceStatus> {
     #[cfg(target_os = "windows")]
     {
         let installed = query_task_action(&rendered.label)?.is_some();
+        let running = installed && task_is_running(&rendered.label)?;
         Ok(ServiceStatus {
             supported: true,
             installed,
-            running: installed,
+            running,
             location: rendered.path,
-            detail: if installed {
-                "registered"
+            detail: if running {
+                "running"
+            } else if installed {
+                "registered but not running"
             } else {
                 "not registered"
             }
