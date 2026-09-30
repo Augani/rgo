@@ -257,16 +257,19 @@ fn select_context(
     paths: &RgoPaths,
 ) -> Result<Option<(PathBuf, PathBuf)>> {
     if workspace_command(args).is_none()
-        || args.iter().any(|arg| {
-            arg.to_str().is_some_and(|text| {
-                text == "--config"
-                    || text.starts_with("--config=")
-                    || text == "-C"
-                    || text.starts_with("-C")
-                    || text == "-Z"
-                    || text.starts_with("-Z")
+        || args
+            .iter()
+            .take_while(|arg| arg.as_os_str() != OsStr::new("--"))
+            .any(|arg| {
+                arg.to_str().is_some_and(|text| {
+                    text == "--config"
+                        || text.starts_with("--config=")
+                        || text == "-C"
+                        || text.starts_with("-C")
+                        || text == "-Z"
+                        || text.starts_with("-Z")
+                })
             })
-        })
     {
         return Ok(None);
     }

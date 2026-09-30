@@ -962,6 +962,21 @@ fn shimmed_cargo_isolated_from_direct_cargo_and_holds_gc_lock_through_run() {
         String::from_utf8_lossy(&warm.stderr)
     );
     assert!(context::read_sidecar(context).unwrap().last_seen > 1);
+    stale["last_seen"] = serde_json::json!(1);
+    std::fs::write(&sidecar_path, serde_json::to_vec(&stale).unwrap()).unwrap();
+    let application_flags = sandbox
+        .cmd("cargo")
+        .current_dir(&project)
+        .env("PATH", &search_path)
+        .args(["run", "--offline", "--", "--config", "app.toml", "-C", "-Z"])
+        .output()
+        .unwrap();
+    assert!(
+        application_flags.status.success(),
+        "{}",
+        String::from_utf8_lossy(&application_flags.stderr)
+    );
+    assert!(context::read_sidecar(context).unwrap().last_seen > 1);
     context::write_durable_pin(&paths, context).unwrap();
 
     let package_clean = sandbox
