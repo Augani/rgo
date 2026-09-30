@@ -17,6 +17,19 @@ function Invoke-Checked {
     return $output
 }
 
+function Get-OwnedDaemonPid([string]$Executable, [string]$Root) {
+    for ($attempt = 0; $attempt -lt 20; $attempt++) {
+        $daemonProcesses = @(Get-CimInstance Win32_Process -Filter "Name = 'rgo.exe'" | Where-Object {
+            $_.ExecutablePath -and
+            [string]::Equals($_.ExecutablePath, $Executable, [StringComparison]::OrdinalIgnoreCase) -and
+            $_.CommandLine -and $_.CommandLine.Contains("daemon --foreground --home `"$Root`"")
+        })
+        if ($daemonProcesses.Count -eq 1) { return [int]$daemonProcesses[0].ProcessId }
+        Start-Sleep -Milliseconds 100
+    }
+    throw "Expected one owned daemon process for $Root"
+}
+
 $sandbox = Join-Path $env:RUNNER_TEMP "rgo service $([guid]::NewGuid().ToString('N'))"
 $cargoHome = Join-Path $sandbox '.cargo'
 $rgoHome = Join-Path $sandbox '.rgo'
@@ -69,6 +82,7 @@ try {
         throw "Setup did not verify a healthy scheduled daemon: $setup"
     }
     Invoke-Checked 'schtasks.exe' @('/Query', '/TN', $taskName, '/XML', '/HRESULT') | Out-Null
+    $firstDaemonPid = Get-OwnedDaemonPid $cli $rgoHome
 
     $manifest = Join-Path $project 'Cargo.toml'
     Set-Content -Encoding utf8 $manifest "[package]`nname = 'rgo_service_probe'`nversion = '0.1.0'`nedition = '2021'`n"
@@ -83,6 +97,15 @@ try {
     }
     if (-not (Test-Path (Join-Path $rgoHome 'state/owner-cargo-home'))) {
         throw 'Setup did not record ownership in the selected storage root'
+    }
+
+    $repeatSetup = Invoke-Checked $cli @('setup')
+    if ($repeatSetup -notmatch 'daemon service: healthy') {
+        throw "Repeated setup did not verify a healthy scheduled daemon: $repeatSetup"
+    }
+    $replacementDaemonPid = Get-OwnedDaemonPid $cli $rgoHome
+    if ($replacementDaemonPid -eq $firstDaemonPid) {
+        throw 'Repeated setup left the previous scheduled daemon instance running'
     }
 
     Invoke-Checked $cli @('setup', '--undo') | Out-Null

@@ -560,6 +560,25 @@ pub fn install(
     {
         use std::io::Write;
 
+        // Re-registering an active task does not replace its running daemon.
+        // Stop the verified old instance before publishing the new action so
+        // the health check observes the newly installed executable.
+        if previous_executable.is_some() && query_task_action(&rendered.label)?.is_some() {
+            if task_is_running(&rendered.label)? {
+                command("schtasks.exe", ["/End", "/TN", &rendered.label])?;
+                for _ in 0..50 {
+                    if !task_is_running(&rendered.label)? {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+                ensure!(
+                    !task_is_running(&rendered.label)?,
+                    "previous scheduled daemon did not stop: {}",
+                    rendered.label
+                );
+            }
+        }
         // /TR reparses nested quotes in executable and --home paths. Register
         // the XML action so Task Scheduler receives both fields separately.
         let definition = paths.state_dir().join(format!(
