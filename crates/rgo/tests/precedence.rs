@@ -215,7 +215,12 @@ fn setup_uses_cargos_legacy_home_config_when_present() {
         let managed = rgo_core::paths::RgoPaths {
             root: sandbox.rgo_home.clone(),
         };
-        assert_eq!(managed.managed_build_dirs().len(), 1);
+        let manifest = std::fs::canonicalize(project.join("Cargo.toml")).unwrap();
+        assert!(managed.managed_build_dirs().iter().any(|dir| {
+            rgo_core::context::read_sidecar(dir).is_some_and(|sidecar| {
+                std::fs::canonicalize(sidecar.manifest_path).is_ok_and(|path| path == manifest)
+            })
+        }));
 
         let undo = sandbox
             .cmd(cargo_bin("rgo"))

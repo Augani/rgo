@@ -16,6 +16,8 @@ use rgo_core::service;
 use rgo_protocol::{Request, Response};
 use serde::{Deserialize, Serialize};
 
+use super::doctor;
+
 const INSTALL_RECORD_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -895,6 +897,49 @@ pub fn run(
             }
             return Err(error);
         }
+    }
+    // The source-install path calls setup directly, without the installer's
+    // postflight. Prove that plain Cargo actually selects a discoverable
+    // managed build directory before starting maintenance. Repeated setup
+    // with unchanged activation needs no additional builds.
+    if !undo
+        && !dry_run
+        && !supervised
+        && (old_record.is_none() || next != current)
+        && let Err(error) = doctor::verify_plain_cargo(&paths, managed_wrapper.as_deref())
+    {
+        let rollback = (|| -> Result<()> {
+            if cargo_config::read_or_empty(&cfg_path)? != next {
+                bail!(
+                    "Cargo configuration changed during verification; leaving recovery state intact"
+                );
+            }
+            if config_existed {
+                atomic_write_config(&cfg_path, &current)?;
+            } else {
+                std::fs::remove_file(&cfg_path)?;
+            }
+            rollback_setup_state(&[
+                (&pointer_path, old_pointer.as_deref()),
+                (&inner_path, old_inner.as_deref()),
+                (&record_path, old_record_bytes.as_deref()),
+                (&owner_path, old_owner.as_deref()),
+            ])?;
+            if old_mode.is_some() || !has_build_storage(&paths)? {
+                restore_optional(&mode_path, old_mode.as_deref())?;
+            }
+            Ok(())
+        })();
+        return match rollback {
+            Ok(()) => Err(anyhow::anyhow!(
+                "plain Cargo activation could not be verified ({error:#}); prior Cargo settings were restored"
+            )),
+            Err(rollback) => Err(anyhow::anyhow!(
+                "plain Cargo activation could not be verified ({error:#}); rollback failed ({rollback:#}); inspect `rgo doctor` and run `rgo setup --undo`"
+            )),
+        };
+    }
+    if next != current && !dry_run {
         println!("updated {}", cfg_path.display());
     }
     if dry_run {

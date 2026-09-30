@@ -1,6 +1,32 @@
 use assert_cmd::cargo::cargo_bin;
 use rgo_testkit::{Sandbox, ensure_workspace_bins_built};
 
+fn fake_sccache_path(sandbox: &Sandbox) -> std::ffi::OsString {
+    let directory = sandbox.projects.join("fake-sccache-bin");
+    std::fs::create_dir_all(&directory).unwrap();
+    let source = directory.join("main.rs");
+    std::fs::write(
+        &source,
+        "fn main() { let mut args = std::env::args_os().skip(1); let rustc = args.next().unwrap(); let status = std::process::Command::new(rustc).args(args).status().unwrap(); std::process::exit(status.code().unwrap_or(1)); }\n",
+    )
+    .unwrap();
+    let binary = directory.join(format!("sccache{}", std::env::consts::EXE_SUFFIX));
+    let output = std::process::Command::new("rustc")
+        .arg(&source)
+        .arg("-o")
+        .arg(&binary)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let original = std::env::var_os("PATH").unwrap_or_default();
+    std::env::join_paths(std::iter::once(directory).chain(std::env::split_paths(&original)))
+        .unwrap()
+}
+
 #[cfg(unix)]
 #[test]
 fn setup_rejects_a_broken_legacy_config_link_without_touching_modern_config() {
@@ -613,12 +639,14 @@ fn different_storage_roots_render_different_service_names() {
 fn setup_composes_and_restores_an_existing_rustc_wrapper() {
     ensure_workspace_bins_built().unwrap();
     let sandbox = Sandbox::new().unwrap();
+    let path = fake_sccache_path(&sandbox);
     sandbox
         .write_cargo_config("[build]\nrustc-wrapper = \"sccache\"\njobs = 2\n")
         .unwrap();
     let rgo = cargo_bin("rgo");
     let setup = sandbox
         .cmd(&rgo)
+        .env("PATH", &path)
         .args(["setup", "--no-service"])
         .output()
         .unwrap();
@@ -721,11 +749,13 @@ fn custom_rgo_home_survives_a_fresh_cargo_process() {
     let managed = rgo_core::paths::RgoPaths {
         root: custom_home.clone(),
     };
-    assert_eq!(managed.managed_build_dirs().len(), 1);
+    let manifest = std::fs::canonicalize(project.join("Cargo.toml")).unwrap();
     assert!(
-        managed.managed_build_dirs()[0]
-            .join(rgo_protocol::SIDECAR_FILE)
-            .is_file(),
+        managed.managed_build_dirs().iter().any(|dir| {
+            rgo_core::context::read_sidecar(dir).is_some_and(|sidecar| {
+                std::fs::canonicalize(sidecar.manifest_path).is_ok_and(|path| path == manifest)
+            })
+        }),
         "the wrapper must attribute the custom context without RGO_HOME"
     );
     assert!(
@@ -779,6 +809,21 @@ fn storage_only_activation_is_verified_from_cargos_build_script_location() {
     ensure_workspace_bins_built().unwrap();
     let sandbox = Sandbox::new().unwrap();
     let rgo = cargo_bin("rgo");
+    let rejected = sandbox
+        .cmd(&rgo)
+        .env(
+            "CARGO_BUILD_BUILD_DIR",
+            sandbox.projects.join("override-before-setup"),
+        )
+        .args(["setup", "--no-wrapper", "--no-service"])
+        .output()
+        .unwrap();
+    assert!(!rejected.status.success());
+    assert!(
+        String::from_utf8_lossy(&rejected.stderr).contains("prior Cargo settings were restored")
+    );
+    assert!(!sandbox.cargo_home.join("config.toml").exists());
+    assert!(!sandbox.cargo_home.join(".rgo-install.json").exists());
     let setup = sandbox
         .cmd(&rgo)
         .args(["setup", "--no-wrapper", "--no-service"])
@@ -894,6 +939,7 @@ fn setup_and_undo_preserve_inline_and_dotted_build_settings() {
 fn setup_keeps_included_wrapper_settings_and_uses_storage_only() {
     ensure_workspace_bins_built().unwrap();
     let sandbox = Sandbox::new().unwrap();
+    let path = fake_sccache_path(&sandbox);
     sandbox
         .write_cargo_config("include = [\"extra.toml\"]\n")
         .unwrap();
@@ -902,6 +948,7 @@ fn setup_keeps_included_wrapper_settings_and_uses_storage_only() {
     let rgo = cargo_bin("rgo");
     let setup = sandbox
         .cmd(&rgo)
+        .env("PATH", &path)
         .args(["setup", "--no-service"])
         .output()
         .unwrap();

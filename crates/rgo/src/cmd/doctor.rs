@@ -527,7 +527,10 @@ pub fn run(json: bool, verify: bool) -> Result<()> {
     report.print(json)
 }
 
-fn verify_plain_cargo(paths: &rgo_core::paths::RgoPaths, wrapper: Option<&str>) -> Result<()> {
+pub(super) fn verify_plain_cargo(
+    paths: &rgo_core::paths::RgoPaths,
+    wrapper: Option<&str>,
+) -> Result<()> {
     if let Some(wrapper) = wrapper {
         anyhow::ensure!(
             Path::new(wrapper).is_file(),
@@ -602,6 +605,16 @@ fn verify_plain_cargo(paths: &rgo_core::paths::RgoPaths, wrapper: Option<&str>) 
             }),
             "Cargo reached the managed build root but rgo's configured wrapper did not attribute this context"
         );
+    }
+    // This private, randomly named workspace has no remaining Cargo process.
+    // Its checked context belongs only to the probe and should not consume
+    // the user's budget or appear as an orphan after setup/doctor.
+    if std::fs::remove_dir_all(context).is_ok() {
+        // Cargo's workspace hash can create a parent shard. Remove it only
+        // when empty, leaving any other managed context untouched.
+        if let Some(shard) = context.parent().filter(|shard| *shard != expected) {
+            let _ = std::fs::remove_dir(shard);
+        }
     }
     Ok(())
 }
