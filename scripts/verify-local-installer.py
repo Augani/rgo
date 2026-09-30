@@ -240,7 +240,7 @@ def main() -> None:
             assert all(member.is_file() for member in pair)
 
         # Simulate an older versioned install with the same protocol. The
-        # native branch also forces verification failure after replacement.
+        # native branch also forces setup's activation probe to fail after replacement.
         active = json.loads((cargo_home / ".rgo-install.json").read_text())
         old_dir = cargo_home / "rgo" / "versions" / "older-fixture"
         old_dir.mkdir()
@@ -279,7 +279,8 @@ def main() -> None:
             version_only_cargo["PATH"] = str(fake_bin)
             failed = subprocess.run(installer, env=version_only_cargo, text=True, capture_output=True)
             assert failed.returncode != 0, "upgrade unexpectedly verified with a non-building Cargo"
-            assert "doctor --verify --json failed" in failed.stderr, failed.stderr
+            assert "plain Cargo activation could not be verified" in failed.stderr, failed.stderr
+            assert "prior Cargo settings were restored" in failed.stderr, failed.stderr
             rolled_back = json.loads((cargo_home / ".rgo-install.json").read_text())
             assert Path(rolled_back["rgo_binary"]).resolve() == old_cli.resolve()
             assert (cargo_home / "bin" / "rgo").resolve() == old_cli.resolve()
