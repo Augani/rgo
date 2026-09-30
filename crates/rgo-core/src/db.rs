@@ -20,7 +20,7 @@ use rusqlite::{
 use crate::context;
 use crate::paths::RgoPaths;
 
-const SCHEMA_VERSION: i64 = 6;
+const SCHEMA_VERSION: i64 = 7;
 const CACHE_EVENT_HISTORY_LIMIT: i64 = 10_000;
 const OPERATION_HISTORY_LIMIT: i64 = 100;
 const REMOTE_TERMINAL_HISTORY_LIMIT: i64 = 1_000;
@@ -356,6 +356,30 @@ impl StateDb {
             INSERT OR IGNORE INTO remote_counters(id) VALUES (1);
             ",
         )?;
+        if current != Some(SCHEMA_VERSION) {
+            // SQLite's UNIQUE(key, kind, digest) permits duplicate NULL
+            // digests. Keep an active upload if an older database contains
+            // duplicates, then enforce one row per logical job.
+            connection.execute_batch(
+                "BEGIN IMMEDIATE;
+                 DELETE FROM remote_jobs WHERE job_id IN (
+                     SELECT job_id FROM (
+                         SELECT job_id, ROW_NUMBER() OVER (
+                             PARTITION BY key, kind, COALESCE(digest, '')
+                             ORDER BY CASE status
+                                 WHEN 'RUNNING' THEN 0
+                                 WHEN 'PENDING' THEN 1
+                                 WHEN 'RETRY' THEN 2
+                                 ELSE 3 END,
+                                 job_id DESC
+                         ) AS duplicate_rank FROM remote_jobs
+                     ) WHERE duplicate_rank > 1
+                 );
+                 CREATE UNIQUE INDEX IF NOT EXISTS remote_jobs_identity
+                     ON remote_jobs(key, kind, COALESCE(digest, ''));
+                 COMMIT;",
+            )?;
+        }
         // These tables are additive, so advancing an older marker is a safe
         // migration for databases created by earlier versions.
         connection.execute(
@@ -1174,7 +1198,17 @@ impl StateDb {
         self.connection.execute(
             "INSERT INTO remote_jobs(key, kind, digest, status, created_at, updated_at)
              VALUES(?1, ?2, ?3, 'PENDING', ?4, ?4)
-             ON CONFLICT(key, kind, digest) DO UPDATE SET status = 'PENDING', updated_at = ?4",
+             ON CONFLICT DO UPDATE SET
+                 status = CASE WHEN remote_jobs.status = 'FAILED' THEN 'PENDING'
+                               ELSE remote_jobs.status END,
+                 attempts = CASE WHEN remote_jobs.status = 'FAILED' THEN 0
+                                 ELSE remote_jobs.attempts END,
+                 next_attempt_at = CASE WHEN remote_jobs.status = 'FAILED' THEN 0
+                                        ELSE remote_jobs.next_attempt_at END,
+                 last_error = CASE WHEN remote_jobs.status = 'FAILED' THEN NULL
+                                   ELSE remote_jobs.last_error END,
+                 updated_at = CASE WHEN remote_jobs.status = 'FAILED' THEN excluded.updated_at
+                                   ELSE remote_jobs.updated_at END",
             params![key, kind, digest, now],
         )?;
         Ok(())
@@ -2006,10 +2040,62 @@ mod tests {
         db.queue_remote_job("key", "manifest", None).unwrap();
         assert_eq!(db.next_remote_job().unwrap().as_deref(), Some("key"));
         assert!(db.claim_remote_job("key").unwrap());
+        db.queue_remote_job("key", "manifest", None).unwrap();
+        assert_eq!(db.next_remote_job().unwrap(), None);
+        assert!(!db.claim_remote_job("key").unwrap());
         db.recover_remote_jobs().unwrap();
         assert_eq!(db.next_remote_job().unwrap().as_deref(), Some("key"));
         let status = db.remote_status(true, Some("https://cache.example"), Some("stable"));
         assert_eq!(status.unwrap().queue_depth, 1);
+        assert!(db.claim_remote_job("key").unwrap());
+        db.finish_remote_job("key", None).unwrap();
+        db.queue_remote_job("key", "manifest", None).unwrap();
+        assert_eq!(db.next_remote_job().unwrap(), None);
+        let count: i64 = db
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM remote_jobs WHERE key='key'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn remote_job_upgrade_deduplicates_null_digest_without_losing_active_upload() {
+        let root = tempdir().unwrap();
+        let paths = RgoPaths {
+            root: root.path().join("rgo"),
+        };
+        paths.ensure_layout().unwrap();
+        let db = StateDb::open(&paths).unwrap();
+        db.connection
+            .execute_batch(
+                "DROP INDEX remote_jobs_identity;
+                 UPDATE schema_meta SET value='6' WHERE key='schema_version';
+                 INSERT INTO remote_jobs(key, kind, digest, status, created_at, updated_at)
+                   VALUES('key', 'manifest', NULL, 'DONE', 1, 1),
+                         ('key', 'manifest', NULL, 'RUNNING', 2, 2),
+                         ('key', 'manifest', NULL, 'PENDING', 3, 3);",
+            )
+            .unwrap();
+        drop(db);
+        let db = StateDb::open(&paths).unwrap();
+        let (count, status): (i64, String) = db
+            .connection
+            .query_row(
+                "SELECT COUNT(*), status FROM remote_jobs WHERE key='key'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(status, "RUNNING");
+        db.queue_remote_job("key", "manifest", None).unwrap();
+        assert_eq!(db.next_remote_job().unwrap(), None);
+        db.recover_remote_jobs().unwrap();
+        assert_eq!(db.next_remote_job().unwrap().as_deref(), Some("key"));
     }
 
     #[test]
