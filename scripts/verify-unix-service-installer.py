@@ -25,7 +25,7 @@ def main() -> None:
         raise RuntimeError("this service probe requires macOS launchd")
     target = "aarch64-apple-darwin" if platform.machine().lower() in {"arm64", "aarch64"} else "x86_64-apple-darwin"
     version = "v" + subprocess.check_output([ROOT / "target/debug/rgo", "--version"], text=True).split()[1]
-    root = Path(tempfile.mkdtemp(prefix="rgo-svc-", dir="/tmp"))
+    root = Path(tempfile.mkdtemp(prefix="rgo svc ü ", dir="/tmp"))
     home = root / "h"
     cargo_home = home / "c"
     rgo_home = home / "r"
