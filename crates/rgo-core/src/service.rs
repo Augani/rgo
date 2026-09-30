@@ -82,7 +82,7 @@ fn render_flavor(executable: &Path, flavor: Flavor) -> Result<RenderedService> {
             xml_escape(&paths.root.display().to_string())
         );
         let contents = format!(
-            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+            "<?xml version=\"1.0\" encoding=\"UTF-16\"?>\n\
 <!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n\
 <plist version=\"1.0\">\n<dict>\n\
   <key>Label</key><string>{label}</string>\n\
@@ -567,7 +567,11 @@ pub fn install(
                 .create_new(true)
                 .open(&definition)
                 .with_context(|| format!("creating {}", definition.display()))?;
-            file.write_all(rendered.contents.as_bytes())?;
+            let mut xml_bytes = vec![0xff, 0xfe];
+            for unit in rendered.contents.encode_utf16() {
+                xml_bytes.extend_from_slice(&unit.to_le_bytes());
+            }
+            file.write_all(&xml_bytes)?;
             file.sync_all()?;
             drop(file);
             command(
