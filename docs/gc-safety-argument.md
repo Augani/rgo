@@ -29,6 +29,13 @@ global build directory or has an unresolved include. Supervised setup rejects
 those configs before activation; a dry-run can still inspect native storage.
 These admission checks do not cover project, environment, or CLI overrides by
 an unsupervised Cargo process, nor prove all supervised process trees safe.
+Cargo permits a direct invocation to select any writable build directory with
+an explicit override, including rgo's internal path. Because that process runs
+as the same user, rgo cannot prevent this deliberate namespace entry with
+ordinary directory permissions. The release contract must either exclude
+direct invocations explicitly pointed at rgo's managed namespace or obtain a
+cooperative Cargo lifecycle hook; this boundary is unresolved, not evidence
+that all direct Cargo launches are safe.
 Undo removes the active owner record, so a retained storage root cannot be
 destructively cleaned through `rgo gc` after uninstall; a separately reviewed
 offline purge remains release work.
@@ -104,9 +111,9 @@ process-level session guard.
   GC takes its stable guard. A newly started unchanged `cargo build` reaches
   its session lock but cannot enter Cargo until deletion finishes; it then
   recreates the managed context while the old generation's marker stays gone.
-  A Windows counterpart is prepared using its Job Object assignment marker;
-  its live execution is a required CI check. This is one start/delete ordering case,
-  not the full command and platform matrix.
+  The [Windows counterpart](https://github.com/Augani/rgo/actions/runs/36591556311)
+  passed using its Job Object assignment marker. This is one start/delete
+  ordering case, not the full command and platform matrix.
 - The [Windows creation-time assignment run](https://github.com/Augani/rgo/actions/runs/36518298190)
   exercised a guardian kill before Cargo resumed and a real child after
   launch. Earlier [Windows job checks](https://github.com/Augani/rgo/actions/runs/36484591309)
@@ -130,8 +137,9 @@ process-level session guard.
 - A private-home `cargo doc` fixture holds rustdoc before it writes output,
   refuses removal of the active context, and reclaims an unrelated idle one.
   After release, the requested documentation appears in the checkout and the
-  context becomes reclaimable. It passed locally on macOS arm64; supported
-  platform and other rustdoc-command coverage remain open.
+  context becomes reclaimable. It passed locally on macOS arm64 and in the
+  [Linux and macOS CI workspace suites](https://github.com/Augani/rgo/actions/runs/36785074208);
+  other rustdoc-command coverage remains open.
 - The supervised launcher refreshes its owned sidecar before each admitted
   Cargo invocation. A private-home unchanged second `cargo build` confirms a
   no-op invocation updates `last_seen` without rustc running. It passed locally
@@ -153,7 +161,7 @@ process-level session guard.
   also found that package clean preserved the sidecar, full clean removed the
   context, and the next native build restored attribution on Linux, macOS, and
   Windows. Interrupted clean and cross-version pin semantics remain open.
-- The current required [CI matrix](https://github.com/Augani/rgo/actions/runs/36531530596)
+- A required [CI matrix](https://github.com/Augani/rgo/actions/runs/36783276609)
   passes across Linux, macOS, and Windows. It is a regression signal for
   existing fixtures, not a full lifecycle proof.
 
