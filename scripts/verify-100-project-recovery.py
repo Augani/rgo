@@ -153,9 +153,15 @@ def probe(root: Path) -> None:
                 (project / "src").mkdir(parents=True, exist_ok=True)
                 (project / "Cargo.toml").write_text(
                     f'[package]\nname = "bulk-{index:03}"\nversion = "0.1.0"\nedition = "2021"\n'
+                    '[features]\nchurn = []\n'
                 )
-                (project / "src" / "main.rs").write_text(f"fn main() {{ println!(\"wave {wave}\"); }}\n")
-                run(["cargo", "build", "--offline", "--quiet"], env, cwd=project)
+                (project / "src" / "main.rs").write_text(
+                    f'fn main() {{ println!("wave {wave} feature {{}}", cfg!(feature = "churn")); }}\n'
+                )
+                command = ["cargo", "build", "--offline", "--quiet"]
+                if wave == 2:
+                    command.extend(["--features", "churn"])
+                run(command, env, cwd=project)
                 if wave == 1 and index == 0 and len(contexts(rgo_home)) != 1:
                     raise RuntimeError("first build bypassed supervised Cargo storage")
             before = contexts(rgo_home)
@@ -199,6 +205,11 @@ def probe(root: Path) -> None:
                 )
                 if not executable.is_file():
                     raise RuntimeError(f"wave {wave}: checkout output disappeared: {executable}")
+                if index in (0, PROJECTS - 1):
+                    output = run([str(executable)], env, cwd=executable.parent).stdout.strip()
+                    expected = f"wave {wave} feature {'true' if wave == 2 else 'false'}"
+                    if output != expected:
+                        raise RuntimeError(f"wave {wave}: {executable} printed {output!r}, expected {expected!r}")
             print(
                 f"wave {wave}: two completed cycles, {len(remaining)} managed contexts remain; "
                 f"budget met, pending queue empty, {PROJECTS} checkout executables preserved",
