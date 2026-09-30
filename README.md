@@ -156,6 +156,10 @@ Cargo treats intermediate and final paths separately. Project
 intermediates. `--target-dir`, `CARGO_TARGET_DIR`, and project
 `build.target-dir` move final outputs but can leave managed intermediates
 enabled. Cargo 1.91 or newer is required for `build.build-dir`.
+Run `rgo doctor --json` from a project to see build-directory overrides in
+its current-directory config chain and any direct project target-directory
+setting. `doctor --verify` tests a disposable project, so it checks installation
+activation rather than that project's effective build location.
 
 `RGO_BYPASS=1` bypasses rgo's wrapper behavior; it does not disable Cargo's
 configured build directory or a running maintenance service. To put one project

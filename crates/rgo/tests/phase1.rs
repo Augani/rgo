@@ -117,6 +117,86 @@ fn doctor_does_not_start_daemon_and_emits_structured_output() {
 }
 
 #[test]
+fn doctor_reports_project_build_override_and_legacy_config_precedence() {
+    ensure_workspace_bins_built().unwrap();
+    let sandbox = Sandbox::new().unwrap();
+    let project = sandbox.simple_bin("doctor-project-config").unwrap();
+    let config_dir = project.join(".cargo");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::write(
+        config_dir.join("config.toml"),
+        "include = [\"override.toml\"]\n[build]\ntarget-dir = \"finals\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        config_dir.join("override.toml"),
+        "[build]\nbuild-dir = \"intermediates\"\n",
+    )
+    .unwrap();
+    let doctor = |cwd: &std::path::Path| {
+        let output = sandbox
+            .cmd(cargo_bin("rgo"))
+            .current_dir(cwd)
+            .args(["doctor", "--json"])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()
+    };
+    let report = doctor(&project);
+    let messages: Vec<&str> = report["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|entry| entry["message"].as_str())
+        .collect();
+    assert!(
+        messages
+            .iter()
+            .any(|message| { message.contains("config.toml may set build.build-dir") })
+    );
+    assert!(
+        messages
+            .iter()
+            .any(|message| { message.contains("config.toml sets build.target-dir = \"finals\"") })
+    );
+
+    // Cargo ignores config.toml when the extensionless file exists here.
+    std::fs::write(
+        config_dir.join("config"),
+        "[build]\ntarget-dir = \"legacy\"\n",
+    )
+    .unwrap();
+    let report = doctor(&project);
+    let messages: Vec<&str> = report["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|entry| entry["message"].as_str())
+        .collect();
+    assert!(!messages.iter().any(|message| {
+        message.contains("project configuration") && message.contains("may set build.build-dir")
+    }));
+    assert!(
+        messages
+            .iter()
+            .any(|message| { message.contains("config sets build.target-dir = \"legacy\"") })
+    );
+
+    std::fs::write(
+        sandbox.cargo_home.join("config.toml"),
+        "[build]\nbuild-dir = \"global-build\"\n",
+    )
+    .unwrap();
+    let report = doctor(&sandbox.home);
+    assert!(!report["entries"].as_array().unwrap().iter().any(|entry| {
+        entry["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("project configuration"))
+    }));
+}
+
+#[test]
 fn gc_target_rejects_non_concrete_sizes_before_startup() {
     ensure_workspace_bins_built().unwrap();
     let sandbox = Sandbox::new().unwrap();

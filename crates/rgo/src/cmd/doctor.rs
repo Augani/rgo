@@ -300,6 +300,7 @@ pub fn run(json: bool, verify: bool) -> Result<()> {
             ),
         );
     }
+    check_project_configs(&cargo_home, &mut check, &mut info);
     check(
         e.paths.builds_dir().is_dir(),
         format!(
@@ -535,6 +536,98 @@ pub fn run(json: bool, verify: bool) -> Result<()> {
         return Ok(());
     }
     report.print(json)
+}
+
+fn check_project_configs(
+    cargo_home: &Path,
+    check: &mut impl FnMut(bool, String),
+    info: &mut impl FnMut(String),
+) {
+    let cwd = match std::env::current_dir() {
+        Ok(cwd) => cwd,
+        Err(error) => {
+            check(
+                false,
+                format!("cannot inspect Cargo project configuration: {error}"),
+            );
+            return;
+        }
+    };
+    let cargo_home_identity = cargo_home.canonicalize().ok();
+    let mut found = false;
+    for directory in cwd.ancestors() {
+        // Cargo searches `.cargo/config` before `.cargo/config.toml` at each
+        // level, starting at the process working directory. This is also the
+        // search used by the supervised launcher before it admits a context.
+        let config_dir = directory.join(".cargo");
+        if config_dir == cargo_home
+            || cargo_home_identity
+                .as_ref()
+                .is_some_and(|home| config_dir.canonicalize().is_ok_and(|path| &path == home))
+        {
+            continue;
+        }
+        let path = cargo_config::effective_home_config(&config_dir);
+        match std::fs::symlink_metadata(&path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                check(
+                    false,
+                    format!(
+                        "cannot inspect Cargo project configuration {}: {error}",
+                        path.display()
+                    ),
+                );
+                continue;
+            }
+            Ok(_) => found = true,
+        }
+        match cargo_config::may_set_build_dir_in_file(&path) {
+            Ok(true) => check(
+                false,
+                format!(
+                    "project configuration {} may set build.build-dir; this working directory may use a different intermediate location than the Cargo-home setting (supervised Cargo leaves it unmanaged)",
+                    path.display()
+                ),
+            ),
+            Ok(false) => {}
+            Err(error) => check(
+                false,
+                format!(
+                    "cannot prove project configuration {} leaves build.build-dir unchanged: {error:#}; supervised Cargo leaves this working directory unmanaged",
+                    path.display()
+                ),
+            ),
+        }
+        if let Ok(text) = std::fs::read_to_string(&path) {
+            if let Ok(inspection) = cargo_config::inspect(&text) {
+                if let Some(target) = inspection.target_dir {
+                    info(format!(
+                        "project configuration {} sets build.target-dir = {target:?}; this changes final outputs, not the build directory",
+                        path.display()
+                    ));
+                }
+                if let Some(wrapper) = inspection.rustc_wrapper {
+                    info(format!(
+                        "project configuration {} sets build.rustc-wrapper = {wrapper:?}; wrapper composition may differ here",
+                        path.display()
+                    ));
+                }
+                if let Some(wrapper) = inspection.rustc_workspace_wrapper_outside_fence {
+                    info(format!(
+                        "project configuration {} sets build.rustc-workspace-wrapper = {wrapper:?}; wrapper composition may differ here",
+                        path.display()
+                    ));
+                }
+            }
+        }
+    }
+    if !found {
+        info(format!(
+            "no project Cargo configuration found from {} through its ancestors",
+            cwd.display()
+        ));
+    }
 }
 
 pub(super) fn verify_plain_cargo(
