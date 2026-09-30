@@ -24,6 +24,8 @@ const SCHEMA_VERSION: i64 = 7;
 const CACHE_EVENT_HISTORY_LIMIT: i64 = 10_000;
 const OPERATION_HISTORY_LIMIT: i64 = 100;
 const REMOTE_TERMINAL_HISTORY_LIMIT: i64 = 1_000;
+const REMOTE_QUEUE_LIMIT: i64 = 1_024;
+const REMOTE_RUNNING_LIMIT: i64 = 4;
 const MAX_INCREMENTAL_VACUUM_PAGES: i64 = 256;
 const WAL_SIZE_LIMIT_BYTES: i64 = 8 * 1024 * 1024;
 const LEGACY_VACUUM_FREE_MARGIN_BYTES: u64 = 16 * 1024 * 1024;
@@ -1197,7 +1199,8 @@ impl StateDb {
 
     pub fn queue_remote_job(&self, key: &str, kind: &str, digest: Option<&str>) -> Result<()> {
         let now = unix_now();
-        self.connection.execute(
+        let transaction = self.connection.unchecked_transaction()?;
+        transaction.execute(
             "INSERT INTO remote_jobs(key, kind, digest, status, created_at, updated_at)
              VALUES(?1, ?2, ?3, 'PENDING', ?4, ?4)
              ON CONFLICT DO UPDATE SET
@@ -1213,6 +1216,8 @@ impl StateDb {
                                    ELSE remote_jobs.updated_at END",
             params![key, kind, digest, now],
         )?;
+        cap_queued_remote_jobs(&transaction)?;
+        transaction.commit()?;
         Ok(())
     }
 
@@ -1246,8 +1251,9 @@ impl StateDb {
     pub fn claim_remote_job(&self, key: &str) -> Result<bool> {
         Ok(self.connection.execute(
             "UPDATE remote_jobs SET status='RUNNING', updated_at=?1
-             WHERE key=?2 AND status IN ('PENDING', 'RETRY') AND next_attempt_at <= ?1",
-            params![unix_now(), key],
+             WHERE key=?2 AND status IN ('PENDING', 'RETRY') AND next_attempt_at <= ?1
+               AND (SELECT COUNT(*) FROM remote_jobs WHERE status='RUNNING') < ?3",
+            params![unix_now(), key, REMOTE_RUNNING_LIMIT],
         )? != 0)
     }
 
@@ -1406,6 +1412,7 @@ impl StateDb {
                 (SELECT COALESCE(MAX(verify_id), 0) FROM cache_verifications) - ?1",
             params![OPERATION_HISTORY_LIMIT],
         )?;
+        cap_queued_remote_jobs(&transaction)?;
         transaction.execute(
             "DELETE FROM remote_jobs WHERE status IN ('DONE', 'FAILED')
                 AND job_id <= (SELECT COALESCE(MAX(job_id), 0) FROM remote_jobs) - ?1",
@@ -1644,6 +1651,23 @@ impl StateDb {
             )?
             .max(0) as u64)
     }
+}
+
+fn cap_queued_remote_jobs(connection: &Connection) -> Result<()> {
+    // Uploads are optional. Keep the most recently active queued jobs and
+    // preserve every running worker; its objects may already be in use.
+    connection.execute(
+        "UPDATE remote_jobs SET status='FAILED',
+                last_error='remote upload queue limit exceeded', updated_at=?1
+         WHERE job_id IN (
+             SELECT job_id FROM remote_jobs
+             WHERE status IN ('PENDING', 'RETRY')
+             ORDER BY updated_at DESC, job_id DESC
+             LIMIT -1 OFFSET ?2
+         )",
+        params![unix_now(), REMOTE_QUEUE_LIMIT],
+    )?;
+    Ok(())
 }
 
 fn record_cache_event_on(connection: &Connection, event: &CacheEvent) -> Result<()> {
@@ -2112,6 +2136,51 @@ mod tests {
         assert_eq!(db.next_remote_job().unwrap(), None);
         db.recover_remote_jobs().unwrap();
         assert_eq!(db.next_remote_job().unwrap().as_deref(), Some("key"));
+    }
+
+    #[test]
+    fn remote_queue_is_bounded_without_cancelling_a_running_upload() {
+        let root = tempdir().unwrap();
+        let paths = RgoPaths {
+            root: root.path().join("rgo"),
+        };
+        paths.ensure_layout().unwrap();
+        let db = StateDb::open(&paths).unwrap();
+        for index in 0..REMOTE_RUNNING_LIMIT {
+            let key = format!("running-{index}");
+            db.queue_remote_job(&key, "manifest", None).unwrap();
+            assert!(db.claim_remote_job(&key).unwrap());
+        }
+        db.queue_remote_job("waiting", "manifest", None).unwrap();
+        assert!(!db.claim_remote_job("waiting").unwrap());
+        db.finish_remote_job("running-0", None).unwrap();
+        assert!(db.claim_remote_job("waiting").unwrap());
+        for index in 0..=REMOTE_QUEUE_LIMIT {
+            db.queue_remote_job(&format!("queued-{index:04}"), "manifest", None)
+                .unwrap();
+        }
+        assert_eq!(
+            db.remote_status(true, None, None).unwrap().queue_depth,
+            1_024
+        );
+        let oldest: String = db
+            .connection
+            .query_row(
+                "SELECT status FROM remote_jobs WHERE key='queued-0000'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(oldest, "FAILED");
+        let running: String = db
+            .connection
+            .query_row(
+                "SELECT status FROM remote_jobs WHERE key='running-1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(running, "RUNNING");
     }
 
     #[test]
