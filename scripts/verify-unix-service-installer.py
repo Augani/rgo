@@ -73,6 +73,10 @@ def main() -> None:
         fresh["PATH"] = f"{cargo_home / 'rgo/shims'}{os.pathsep}{fresh['PATH']}"
         run(["cargo", "build", "--offline"], fresh, project)
         assert list((rgo_home / "builds").glob("*/*/.rgo-context.json"))
+        active_cli = Path(record["rgo_binary"])
+        active_cli.unlink()
+        run([*installer, "--repair"], environment)
+        assert active_cli.is_file()
         run(uninstaller, environment)
         assert not (cargo_home / ".rgo-install.json").exists()
         assert not (cargo_home / "rgo/installer-state.json").exists()

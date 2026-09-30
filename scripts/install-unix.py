@@ -920,6 +920,7 @@ def repair_owned(
     environment: dict[str, str],
     version: str,
     supervised: bool,
+    no_service: bool,
     test_exit_after_first_replacement: bool = False,
 ) -> None:
     if version_dir.is_symlink() or not version_dir.is_dir():
@@ -941,7 +942,7 @@ def repair_owned(
         not isinstance(state, dict)
         or not isinstance(record, dict)
         or state.get("schema_version") != 1
-        or state.get("no_service") is not True
+        or state.get("no_service") is not no_service
         or state.get("supervised", False) is not supervised
         or Path(str(state.get("rgo_binary", ""))).resolve() != cli.resolve()
         or Path(str(record.get("rgo_binary", ""))).resolve() != cli.resolve()
@@ -953,7 +954,7 @@ def repair_owned(
             and Path(str(record["wrapper_binary"])).resolve() != wrapper.resolve()
         )
     ):
-        raise InstallError("repair bundle does not match the owned no-service activation")
+        raise InstallError("repair bundle does not match the owned activation")
     expected_version = version.removeprefix("v")
     expected_wrapper_banner = (
         f"rgo-rustc-wrapper {expected_version} protocol {record.get('protocol_version')}"
@@ -1033,6 +1034,17 @@ def repair_owned(
         shim_dir = cargo_home / "rgo/shims"
         verify_environment["PATH"] = f"{shim_dir}{os.pathsep}{environment.get('PATH', '')}"
     try:
+        if not no_service:
+            setup_args = ["setup"]
+            if supervised:
+                previous_shim = record.get("supervised_cargo")
+                if not isinstance(previous_shim, dict) or not isinstance(previous_shim.get("real_cargo"), str):
+                    raise InstallError("owned supervised Cargo proxy is not recorded")
+                setup_args.extend(["--supervised", "--real-cargo", previous_shim["real_cargo"]])
+            elif record.get("wrapper_binary") is None:
+                setup_args.append("--no-wrapper")
+            run(cli, *setup_args, "--dry-run", environment=environment)
+            run(cli, *setup_args, environment=environment)
         doctor = run(cli, "doctor", "--verify", "--json", environment=verify_environment)
         if json.loads(doctor.stdout).get("activation_verified") is not True:
             raise InstallError("repaired binaries did not restore plain Cargo activation")
@@ -1259,7 +1271,7 @@ def main() -> None:
     parser.add_argument("--supervised", action="store_true", help="install the opt-in Cargo PATH launcher")
     parser.add_argument("--real-cargo", type=Path, help="absolute path to the existing Cargo proxy")
     parser.add_argument("--verify-only", action="store_true")
-    parser.add_argument("--repair", action="store_true", help="restore an owned no-service version from this verified bundle")
+    parser.add_argument("--repair", action="store_true", help="restore an owned version from this verified bundle")
     parser.add_argument("--uninstall", action="store_true", help="undo an owned install and remove its command links")
     args = parser.parse_args()
     if args.uninstall and (
@@ -1268,8 +1280,8 @@ def main() -> None:
         or args.supervised or args.real_cargo
     ):
         raise InstallError("--uninstall cannot be combined with release, repair, or verification inputs")
-    if args.repair and (args.verify_only or not args.no_service):
-        raise InstallError("--repair requires --no-service and cannot be combined with --verify-only")
+    if args.repair and args.verify_only:
+        raise InstallError("--repair cannot be combined with --verify-only")
     if args.real_cargo and not args.supervised:
         raise InstallError("--real-cargo requires --supervised")
 
@@ -1385,7 +1397,7 @@ def main() -> None:
                 if args.repair:
                     repair_owned(
                         stage, version_dir, cargo_home, install_root, bin_dir,
-                        environment, args.version, args.supervised,
+                        environment, args.version, args.supervised, args.no_service,
                         args.development_bundle
                         and os.environ.get("RGO_INSTALLER_TEST_EXIT_DURING_REPAIR") == "1",
                     )
