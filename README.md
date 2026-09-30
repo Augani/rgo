@@ -136,6 +136,7 @@ rgo gc [--dry-run] [--aggressive] [--target 20GB]   # preview in any mode; recla
 rgo pin <id> / rgo unpin <id>                      # protect a context from GC
 rgo clean <id>                                     # remove one supervised context now
 rgo adopt [dirs...]                                # report legacy target/ storage; read-only
+rgo adopt --preview-full-clean <project>           # ask Cargo to list a full clean; read-only
 rgo cache stats|explain <key>|verify               # inspect the opt-in cache
 ```
 
@@ -143,6 +144,8 @@ A pin protects the context from rgo cleanup until `rgo unpin`. An explicit
 `cargo clean` still removes its build files; the pin intent survives and
 protects the context after the next build. `rgo ls` shows retained pins even
 while their contexts are absent; `rgo unpin <id>` releases one.
+The adoption preview includes final outputs and possible user files; it is not
+a selective migration command. `rgo adopt --delete` remains unavailable.
 
 ## Precedence and bypass
 
