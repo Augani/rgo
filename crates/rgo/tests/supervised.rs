@@ -417,7 +417,30 @@ fn opted_in_maintenance_reclaims_an_idle_real_cargo_build() {
         String::from_utf8_lossy(&second_build.stderr)
     );
     assert!(context.exists());
+    // The first post-build pass must retain its signal while Cargo's recent
+    // profile lock makes this otherwise idle context temporarily ineligible.
+    let retry_deadline = Instant::now() + Duration::from_secs(15);
+    let deferred = loop {
+        let record = supervision::pending_maintenance(&paths)
+            .unwrap()
+            .into_iter()
+            .find(|record| record.context == *context);
+        if let Some(record) = record.filter(|record| record.retry_after.is_some()) {
+            break record;
+        }
+        assert!(
+            Instant::now() < retry_deadline,
+            "maintenance cleared the launch signal before the profile-lock grace expired"
+        );
+        thread::sleep(Duration::from_millis(50));
+    };
+    assert!(deferred.retry_after.unwrap() > context::unix_now());
     age_finished_cargo_profile_locks(context);
+    // Advance only the persisted retry deadline; the daemon must still take
+    // its normal authoritative snapshot and lifecycle guard before deleting.
+    assert!(
+        supervision::defer_pending_maintenance(&paths, &deferred, context::unix_now()).unwrap()
+    );
     let second_deadline = Instant::now() + Duration::from_secs(15);
     while context.exists() && Instant::now() < second_deadline {
         assert!(daemon.0.try_wait().unwrap().is_none());

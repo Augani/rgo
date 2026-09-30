@@ -1785,8 +1785,10 @@ fn maintenance(state: &State) -> Result<()> {
             state.trigger_scan.lock().unwrap().invalidate();
         } else {
             let pending = crate::supervision::pending_maintenance(&state.paths)?;
+            let now = crate::context::unix_now();
             let idle_launch = pending
                 .iter()
+                .filter(|record| record.retry_after.is_none_or(|retry| retry <= now))
                 .try_fold(false, |found, record| -> Result<bool> {
                     if found {
                         Ok(true)
@@ -1798,8 +1800,7 @@ fn maintenance(state: &State) -> Result<()> {
                     }
                 })?;
             let free_bytes = volume_free_bytes_checked(&state.paths.root)?;
-            let age_due = crate::context::unix_now()
-                .saturating_sub(state.db.lock().unwrap().last_real_gc_at()?)
+            let age_due = now.saturating_sub(state.db.lock().unwrap().last_real_gc_at()?)
                 >= AGE_MAINTENANCE_INTERVAL.as_secs();
             let urgent = free_bytes < state.cfg.min_free_space || age_due;
             // This advisory scan runs outside the operation lock. It visits a
@@ -1819,12 +1820,34 @@ fn maintenance(state: &State) -> Result<()> {
             };
             if urgent || pressure || idle_launch {
                 match run_gc(state, false, false, true, None) {
-                    Ok(_) => {
+                    Ok(report) => {
                         state.trigger_scan.lock().unwrap().mark_completed();
+                        let unmet = report
+                            .remaining_managed_bytes
+                            .is_some_and(|bytes| bytes > report.target_bytes)
+                            || report
+                                .volume_free_after_bytes
+                                .is_none_or(|free| free < state.cfg.min_free_space);
                         for record in &pending {
-                            if let Err(error) =
+                            let retry = unmet
+                                .then(|| {
+                                    crate::context::recent_profile_lock_retry_at(
+                                        &record.context,
+                                        crate::gc::LIVE_WINDOW,
+                                        SystemTime::now(),
+                                    )
+                                })
+                                .flatten();
+                            let result = if let Some(retry) = retry {
+                                crate::supervision::defer_pending_maintenance(
+                                    &state.paths,
+                                    record,
+                                    retry,
+                                )
+                            } else {
                                 crate::supervision::clear_pending_maintenance(&state.paths, record)
-                            {
+                            };
+                            if let Err(error) = result {
                                 tracing::warn!(%error, context = %record.context.display(), "could not clear pending maintenance");
                             }
                         }

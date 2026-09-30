@@ -84,6 +84,23 @@ impl BuildContext {
     }
 }
 
+/// Earliest whole-second maintenance tick after all recently modified Cargo
+/// profile locks in a context have passed their conservative grace period.
+/// The lifecycle guard still decides whether deletion is safe at that time.
+pub fn recent_profile_lock_retry_at(
+    build_dir: &Path,
+    within: Duration,
+    now: SystemTime,
+) -> Option<u64> {
+    lock_files(build_dir)
+        .filter_map(|path| std::fs::metadata(path).ok()?.modified().ok())
+        .filter(|modified| now.duration_since(*modified).unwrap_or_default() < within)
+        .filter_map(|modified| modified.checked_add(within))
+        .filter_map(|expires| expires.duration_since(UNIX_EPOCH).ok())
+        .map(|expires| expires.as_secs().saturating_add(1))
+        .max()
+}
+
 pub fn workspace_state(sidecar: &ContextSidecar) -> WorkspaceState {
     let root = Path::new(&sidecar.workspace_root);
     let manifest = Path::new(&sidecar.manifest_path);

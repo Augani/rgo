@@ -43,6 +43,8 @@ pub fn context_for_workspace(paths: &RgoPaths, workspace_root: &Path) -> Result<
 pub struct PendingMaintenance {
     pub context: PathBuf,
     pub generation: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_after: Option<u64>,
 }
 
 fn pending_path(paths: &RgoPaths, context: &Path) -> Result<PathBuf> {
@@ -87,8 +89,13 @@ pub fn mark_pending_maintenance(paths: &RgoPaths, context: &Path) -> Result<()> 
     let record = PendingMaintenance {
         context: context.to_path_buf(),
         generation,
+        retry_after: None,
     };
-    let file = open_lock_file(&path)?;
+    write_pending_record(&path, &record)
+}
+
+fn write_pending_record(path: &Path, record: &PendingMaintenance) -> Result<()> {
+    let file = open_lock_file(path)?;
     file.set_len(0)?;
     let mut file = file;
     use std::io::Write;
@@ -125,6 +132,24 @@ pub fn pending_maintenance(paths: &RgoPaths) -> Result<Vec<PendingMaintenance>> 
 /// The context guard makes the final comparison/removal atomic with respect
 /// to admitted launches. A new launch that starts during GC retains its record.
 pub fn clear_pending_maintenance(paths: &RgoPaths, record: &PendingMaintenance) -> Result<bool> {
+    finish_pending_maintenance(paths, record, None)
+}
+
+/// Keep an unmet launch signal until Cargo's conservative profile-lock grace
+/// expires. A new launch resets the delay by advancing its generation.
+pub fn defer_pending_maintenance(
+    paths: &RgoPaths,
+    record: &PendingMaintenance,
+    retry_after: u64,
+) -> Result<bool> {
+    finish_pending_maintenance(paths, record, Some(retry_after))
+}
+
+fn finish_pending_maintenance(
+    paths: &RgoPaths,
+    record: &PendingMaintenance,
+    retry_after: Option<u64>,
+) -> Result<bool> {
     let Some(_context_guard) = try_lock_gc(paths, Some(&record.context))? else {
         return Ok(false);
     };
@@ -138,7 +163,17 @@ pub fn clear_pending_maintenance(paths: &RgoPaths, record: &PendingMaintenance) 
     if current.context != record.context || current.generation != record.generation {
         return Ok(false);
     }
-    std::fs::remove_file(path)?;
+    if let Some(retry_after) = retry_after {
+        write_pending_record(
+            &path,
+            &PendingMaintenance {
+                retry_after: Some(retry_after),
+                ..current
+            },
+        )?;
+    } else {
+        std::fs::remove_file(path)?;
+    }
     Ok(true)
 }
 
@@ -517,7 +552,18 @@ mod tests {
         assert!(!clear_pending_maintenance(&paths, &original).unwrap());
         let newer = pending_maintenance(&paths).unwrap().pop().unwrap();
         assert!(newer.generation > original.generation);
-        assert!(clear_pending_maintenance(&paths, &newer).unwrap());
+        let retry = crate::context::unix_now() + 60;
+        assert!(defer_pending_maintenance(&paths, &newer, retry).unwrap());
+        assert_eq!(
+            pending_maintenance(&paths).unwrap()[0].retry_after,
+            Some(retry)
+        );
+        mark_pending_maintenance(&paths, &context).unwrap();
+        let latest = pending_maintenance(&paths).unwrap().pop().unwrap();
+        assert!(latest.generation > newer.generation);
+        assert_eq!(latest.retry_after, None);
+        assert!(!clear_pending_maintenance(&paths, &newer).unwrap());
+        assert!(clear_pending_maintenance(&paths, &latest).unwrap());
         assert!(pending_maintenance(&paths).unwrap().is_empty());
     }
 
