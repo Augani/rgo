@@ -152,6 +152,8 @@ Doctor now compares the resolved first `cargo` on `PATH` with the recorded super
 
 Doctor now scans the current directory's Cargo config chain through its ancestors using Cargo's legacy-file precedence and the bounded include scanner already used by the supervised launcher. It warns when a project file may override the build directory and reports directly configured project target directories separately. A private-home fixture covers an included override and the extensionless `config` taking precedence over `config.toml`. This is read-only diagnosis: `doctor --verify` still probes a disposable workspace, and CLI flags, all included target settings, and exact effective path expansion remain outside this check.
 
+Doctor now checks the default Cargo selected from its current working directory separately from the installed rustup toolchain inventory. In supervised mode it asks the recorded real Cargo proxy directly, so this read-only check does not create launcher lifecycle locks. An incompatible active Cargo is a warning with an unmanaged reason; inactive toolchains are informational, including older versions kept for source compatibility. This does not yet prove a one-off `cargo +toolchain` launch or the full capability matrix.
+
 The layout initializer now rejects a filesystem-root `RGO_HOME` and a pre-existing root writable by other users before creating state. It leaves an existing root's permissions alone while keeping rgo's own subdirectories private; this prevents setup from changing permissions on a shared directory such as `/tmp`. A live custom-root/security matrix remains open.
 
 ### P2 — Prove cleanup safe for ordinary Cargo

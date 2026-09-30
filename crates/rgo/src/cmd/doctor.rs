@@ -457,7 +457,13 @@ pub fn run(json: bool, verify: bool) -> Result<()> {
             )
         },
     );
-    check_toolchains(&mut check);
+    check_toolchains(
+        supervised
+            .as_ref()
+            .and_then(|mode| mode["real_cargo"].as_str()),
+        &mut check,
+        &mut info,
+    );
     if verify {
         check_filesystem(&e.paths.root, &mut check, &mut info);
     } else {
@@ -722,7 +728,46 @@ pub(super) fn verify_plain_cargo(
     Ok(())
 }
 
-fn check_toolchains(check: &mut impl FnMut(bool, String)) {
+fn check_toolchains(
+    real_cargo: Option<&str>,
+    check: &mut impl FnMut(bool, String),
+    info: &mut impl FnMut(String),
+) {
+    // In supervised mode, ask the recorded rustup proxy directly. Invoking
+    // the shim just to print a version would create lifecycle lock files in
+    // what is otherwise a read-only diagnostic command.
+    let cargo = real_cargo.unwrap_or("cargo");
+    match Command::new(cargo).arg("--version").output() {
+        Ok(output) if output.status.success() => {
+            let banner = String::from_utf8_lossy(&output.stdout);
+            let compatible = cargo_config::supports_build_dir(&banner);
+            check(
+                compatible,
+                format!(
+                    "active Cargo from this working directory: {} (build-dir {}supported; requires Cargo >= 1.91.0){}",
+                    banner.trim(),
+                    if compatible { "" } else { "not " },
+                    if compatible {
+                        ""
+                    } else {
+                        "; this toolchain uses ordinary local intermediates"
+                    }
+                ),
+            );
+        }
+        Ok(output) => check(
+            false,
+            format!(
+                "active Cargo at {cargo:?} could not report its version (exit {}): {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr).trim()
+            ),
+        ),
+        Err(error) => check(
+            false,
+            format!("active Cargo at {cargo:?} cannot run: {error}"),
+        ),
+    }
     let names = Command::new("rustup")
         .args(["toolchain", "list"])
         .output()
@@ -735,39 +780,27 @@ fn check_toolchains(check: &mut impl FnMut(bool, String)) {
                 .map(str::to_owned)
                 .collect::<Vec<_>>()
         })
-        .filter(|names| !names.is_empty())
-        .unwrap_or_else(|| vec!["current".into()]);
+        .unwrap_or_default();
     for name in names {
-        let output = if name == "current" {
-            Command::new("cargo").arg("--version").output()
-        } else {
-            Command::new("rustup")
-                .args(["run", &name, "cargo", "--version"])
-                .output()
-        };
-        let Ok(output) = output else {
-            check(
-                false,
-                format!(
-                    "toolchain {name} could not run cargo; remediation: install it with `rustup toolchain install {name}`"
-                ),
-            );
-            continue;
+        let output = Command::new("rustup")
+            .args(["run", &name, "cargo", "--version"])
+            .output();
+        let output = match output {
+            Ok(output) if output.status.success() => output,
+            _ => {
+                info(format!(
+                    "installed toolchain {name}: Cargo version unavailable"
+                ));
+                continue;
+            }
         };
         let text = String::from_utf8_lossy(&output.stdout);
         let compatible = cargo_config::supports_build_dir(&text);
-        check(
-            compatible,
-            format!(
-                "toolchain {name}: {}build-dir compatible (requires Cargo >= 1.91.0){}",
-                text.trim(),
-                if compatible {
-                    ""
-                } else {
-                    "; relocation is unavailable with this Cargo; upgrade the toolchain to manage intermediates"
-                }
-            ),
-        );
+        info(format!(
+            "installed toolchain {name}: {}build-dir {}supported (requires Cargo >= 1.91.0)",
+            text.trim(),
+            if compatible { "" } else { "not " },
+        ));
     }
 }
 

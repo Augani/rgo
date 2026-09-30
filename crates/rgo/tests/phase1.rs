@@ -114,6 +114,18 @@ fn doctor_does_not_start_daemon_and_emits_structured_output() {
                         .is_some_and(|message| message.contains("automatic GC disabled")))
             )
     );
+    let entries = report["entries"].as_array().unwrap();
+    assert!(entries.iter().any(|entry| {
+        entry["level"] == "ok"
+            && entry["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("active Cargo from this working directory"))
+    }));
+    assert!(entries.iter().all(|entry| {
+        entry["message"].as_str().is_none_or(|message| {
+            !message.starts_with("installed toolchain") || entry["level"] == "info"
+        })
+    }));
 }
 
 #[test]
