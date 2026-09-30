@@ -368,8 +368,9 @@ pub struct GcReport {
     pub skipped_unavailable: u64,
     #[serde(default)]
     pub protected_context_bytes: u64,
-    /// CAS bytes protected by active producer/consumer leases or by queued
-    /// and running uploads. Measured at the start of the pass.
+    /// CAS bytes protected by active producer/consumer leases or running
+    /// uploads. Queued uploads may be retired under local storage pressure.
+    /// Measured at the start of the pass.
     #[serde(default)]
     pub cas_eviction_deferred_bytes: u64,
     #[serde(default)]

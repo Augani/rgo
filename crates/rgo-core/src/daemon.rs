@@ -1292,7 +1292,9 @@ fn run_gc(
                 Ok(()) => {
                     execution.reclaimed_bytes =
                         execution.reclaimed_bytes.saturating_add(item.action.bytes);
-                    state.db.lock().unwrap().forget_cache_entry(&item.key)?;
+                    let db = state.db.lock().unwrap();
+                    db.retire_queued_remote_job(&item.key)?;
+                    db.forget_cache_entry(&item.key)?;
                 }
                 Err(error) => {
                     tracing::warn!(key = %item.key, %error, "skipped CAS manifest eviction");
@@ -1648,8 +1650,8 @@ fn select_cas_manifests(
 ) -> Result<Vec<CasManifestEviction>> {
     // Producers and consumers may hold objects not yet represented by a
     // committed manifest, so defer all eviction while their lease is live.
-    // A queued or running upload reads only its committed manifest: protect
-    // that key and its references while allowing unrelated keys to age out.
+    // A running upload reads its committed manifest: protect that key and its
+    // references. A queued upload can be retired if its local entry is evicted.
     if active_cache_lease {
         return Ok(Vec::new());
     }
@@ -1827,6 +1829,9 @@ fn process_remote_jobs(state: &State) -> Result<()> {
     if state.remote.is_none() || !state.cfg.remote.upload {
         return Ok(());
     }
+    // Coordinate the PENDING -> RUNNING transition with GC's selection and
+    // deletion pass. Once claimed, the RUNNING key protects the worker's reads.
+    let _operation = state.operation_lock.lock().unwrap();
     let key = {
         let db = state.db.lock().unwrap();
         db.next_remote_job()?
@@ -2436,14 +2441,14 @@ mod tests {
         assert_eq!(stats.manifests, 1);
         assert_eq!(stats.objects, 1);
 
-        // A queued upload protects its own manifest and objects, but must
-        // not hold unrelated cold CAS data above the storage target.
+        // A queued upload does not block unrelated cold CAS eviction, and
+        // can itself be retired when storage pressure needs its bytes.
         let cold_key = "c".repeat(64);
         let cold_object = state
             .cas
             .put_bytes(&vec![b'c'; 2 * 1024 * 1024], 0o444)
             .unwrap();
-        let cold = make_manifest(&cold_key, cold_object.clone(), now);
+        let cold = make_manifest(&cold_key, cold_object.clone(), now - 50);
         state.cas.write_manifest(&cold).unwrap();
         {
             let db = state.db.lock().unwrap();
@@ -2454,8 +2459,7 @@ mod tests {
         let status = status_report(&state).unwrap();
         let target = status.managed_bytes.saturating_sub(1024 * 1024);
         let preview = run_gc(&state, true, false, false, Some(target)).unwrap();
-        assert!(preview.cas_eviction_deferred_bytes >= 2 * 1024 * 1024);
-        assert!(preview.cas_eviction_deferred_bytes < status.cas_bytes.unwrap());
+        assert_eq!(preview.cas_eviction_deferred_bytes, 0);
         assert!(preview.actions.iter().any(|action| {
             action.path == state.cas.manifest_path(&cold_key).display().to_string()
         }));
@@ -2468,6 +2472,31 @@ mod tests {
         assert!(state.cas.manifest_path(&new_key).is_file());
         assert!(state.cas.object_path(&new_object.digest).is_file());
         assert!(context_dir.is_dir());
+
+        // A worker that has claimed the job is still reading its objects.
+        // The same pressure must wait until that worker is finished.
+        {
+            let db = state.db.lock().unwrap();
+            assert!(db.claim_remote_job(&new_key).unwrap());
+        }
+        let target = status_report(&state)
+            .unwrap()
+            .managed_bytes
+            .saturating_sub(1024 * 1024);
+        let running = run_gc(&state, true, false, false, Some(target)).unwrap();
+        assert!(running.cas_eviction_deferred_bytes >= 2 * 1024 * 1024);
+        assert!(!running.actions.iter().any(|action| {
+            action.path == state.cas.manifest_path(&new_key).display().to_string()
+        }));
+        state.db.lock().unwrap().recover_remote_jobs().unwrap();
+        let queued = run_gc(&state, true, false, false, Some(target)).unwrap();
+        assert!(queued.actions.iter().any(|action| {
+            action.path == state.cas.manifest_path(&new_key).display().to_string()
+        }));
+        run_gc(&state, false, false, false, Some(target)).unwrap();
+        assert!(!state.cas.manifest_path(&new_key).exists());
+        assert!(!state.cas.object_path(&new_object.digest).exists());
+        assert_eq!(state.db.lock().unwrap().next_remote_job().unwrap(), None);
     }
 
     #[test]

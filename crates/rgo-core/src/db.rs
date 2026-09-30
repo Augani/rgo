@@ -930,13 +930,15 @@ impl StateDb {
         Ok(paths.into_iter().collect())
     }
 
+    /// Keys whose CAS entries cannot be evicted during this pass. Queued
+    /// uploads are omitted because GC can retire them under local pressure.
     pub fn active_cache_keys(&self) -> Result<Vec<String>> {
         let mut statement = self.connection.prepare(
             "SELECT workspace_root FROM leases
              WHERE scope IN ('cache', 'cache_build', 'cache_remote')
                AND expires_at > ?1 AND workspace_root IS NOT NULL
              UNION SELECT key FROM remote_jobs
-             WHERE status IN ('PENDING', 'RETRY', 'RUNNING')",
+             WHERE status = 'RUNNING'",
         )?;
         statement
             .query_map(params![unix_now()], |row| row.get(0))?
@@ -1264,6 +1266,20 @@ impl StateDb {
         self.connection.execute(
             "UPDATE remote_jobs SET status='RETRY', next_attempt_at=?1 WHERE status='RUNNING'",
             params![unix_now()],
+        )?;
+        Ok(())
+    }
+
+    /// A queued upload is best effort: once its local manifest has been
+    /// evicted, it must no longer enter the worker pool. Running uploads are
+    /// never retired here because they may still be reading CAS objects.
+    pub fn retire_queued_remote_job(&self, key: &str) -> Result<()> {
+        self.connection.execute(
+            "UPDATE remote_jobs SET status='FAILED',
+                    last_error='local cache entry evicted by retention or storage pressure',
+                    updated_at=?1
+             WHERE key=?2 AND status IN ('PENDING', 'RETRY')",
+            params![unix_now(), key],
         )?;
         Ok(())
     }
