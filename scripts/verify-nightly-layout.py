@@ -50,6 +50,7 @@ def probe(mode: str, rustup_home: str) -> None:
             RGO_HOME=str(rgo_home),
             RUSTUP_HOME=rustup_home,
             RUSTUP_TOOLCHAIN="nightly",
+            CARGO_INCREMENTAL="1",
         )
         for variable in (
             "CARGO_TARGET_DIR",
