@@ -42,6 +42,8 @@ $wrapper = Join-Path (Get-Location) 'target/debug/rgo-rustc-wrapper.exe'
 if (-not (Test-Path $cli) -or -not (Test-Path $wrapper)) {
     throw 'Build both workspace binaries before the Windows service smoke'
 }
+$realCargo = (Get-Command cargo.exe).Source
+$priorPath = $env:PATH
 
 $setupAttempted = $false
 $undone = $false
@@ -93,7 +95,59 @@ try {
         throw 'Undo left the managed Cargo configuration fence behind'
     }
     $undone = $true
-    Write-Host 'Windows scheduled service: activated, used by plain Cargo, and undone'
+
+    $supervisedHome = Join-Path $env:RUNNER_TEMP "rgo supervised service $([guid]::NewGuid().ToString('N'))"
+    $supervisedCargoHome = Join-Path $supervisedHome '.cargo'
+    $supervisedRgoHome = Join-Path $supervisedHome '.rgo'
+    $supervisedProject = Join-Path $supervisedHome 'plain-cargo'
+    New-Item -ItemType Directory -Force -Path @($supervisedCargoHome, $supervisedRgoHome, (Join-Path $supervisedProject 'src')) | Out-Null
+    Set-Content -Encoding utf8 (Join-Path $supervisedProject 'Cargo.toml') "[package]`nname = 'rgo_supervised_service_probe'`nversion = '0.1.0'`nedition = '2021'`n"
+    Set-Content -Encoding utf8 (Join-Path $supervisedProject 'src/main.rs') 'fn main() { println!("rgo"); }'
+    $env:HOME = $supervisedHome
+    $env:USERPROFILE = $supervisedHome
+    $env:CARGO_HOME = $supervisedCargoHome
+    $env:RGO_HOME = $supervisedRgoHome
+    $supervisedSetupAttempted = $false
+    $supervisedUndone = $false
+    try {
+        $plan = Invoke-Checked $cli @('setup', '--supervised', '--real-cargo', $realCargo, '--installer-plan-json') | ConvertFrom-Json
+        if (-not $plan.service.label -or -not $plan.service.contents) {
+            throw 'supervised setup did not plan a scheduled daemon'
+        }
+        $supervisedTask = $plan.service.label
+        $supervisedSetupAttempted = $true
+        $supervisedSetup = Invoke-Checked $cli @('setup', '--supervised', '--real-cargo', $realCargo)
+        if ($supervisedSetup -notmatch 'daemon service: healthy') {
+            throw "Supervised setup did not verify a healthy scheduled daemon: $supervisedSetup"
+        }
+        Invoke-Checked 'schtasks.exe' @('/Query', '/TN', $supervisedTask, '/XML', '/HRESULT') | Out-Null
+        $record = Get-Content -LiteralPath (Join-Path $supervisedCargoHome '.rgo-install.json') -Raw -Encoding UTF8 | ConvertFrom-Json
+        $shimDir = Split-Path -Parent $record.supervised_cargo.shim_path
+        $env:PATH = "$shimDir;$priorPath"
+        Remove-Item Env:RGO_HOME
+        Invoke-Checked 'cargo' @('build', '--offline', '--manifest-path', (Join-Path $supervisedProject 'Cargo.toml')) | Out-Null
+        if (-not (Test-Path (Join-Path $supervisedProject 'target/debug/rgo_supervised_service_probe.exe'))) {
+            throw 'Supervised Cargo did not leave the requested executable in target/debug'
+        }
+        $doctor = Invoke-Checked $cli @('doctor', '--verify', '--json') | ConvertFrom-Json
+        if ($doctor.activation_verified -ne $true) {
+            throw 'Supervised service activation did not verify plain Cargo'
+        }
+        Invoke-Checked $cli @('setup', '--undo') | Out-Null
+        $null = & schtasks.exe /Query /TN $supervisedTask /HRESULT 2>&1
+        if ($LASTEXITCODE -eq 0) {
+            throw "Supervised undo left the scheduled task $supervisedTask registered"
+        }
+        $supervisedUndone = $true
+    }
+    finally {
+        if ($supervisedSetupAttempted -and -not $supervisedUndone) {
+            try { Invoke-Checked $cli @('setup', '--undo') | Out-Null }
+            catch { Write-Warning "Best-effort supervised sandbox undo failed: $_" }
+        }
+        $env:PATH = $priorPath
+    }
+    Write-Host 'Windows scheduled services: native and supervised Cargo activated, used, and undone'
 }
 finally {
     if ($setupAttempted -and -not $undone) {
@@ -106,6 +160,7 @@ finally {
     $env:RGO_HOME = $priorRgoHome
     $env:RUSTUP_HOME = $priorRustupHome
     $env:RUSTUP_TOOLCHAIN = $priorToolchain
+    $env:PATH = $priorPath
 }
 
 # The expected failed `schtasks /Query` after undo leaves LASTEXITCODE=1 even
