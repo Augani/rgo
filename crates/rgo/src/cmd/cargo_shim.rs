@@ -277,7 +277,9 @@ fn select_context(
     {
         return Ok(None);
     }
-    if config_may_override_build_dir()? {
+    // An unreadable or vanished working directory cannot prove where Cargo
+    // would build. Keep the command available under the global session guard.
+    if config_may_override_build_dir().unwrap_or(true) {
         return Ok(None);
     }
 
@@ -305,26 +307,35 @@ fn select_context(
     if let Some(manifest) = argument_value(args, "--manifest-path") {
         locate.arg("--manifest-path").arg(manifest);
     }
-    let output = locate.output().context("locating Cargo workspace")?;
+    let Ok(output) = locate.output() else {
+        return Ok(None);
+    };
     if !output.status.success() {
         return Ok(None);
     }
     let Ok(report) = serde_json::from_slice::<CargoProject>(&output.stdout) else {
         return Ok(None);
     };
-    if !report.root.is_absolute() || !report.root.is_file() {
+    if !report.root.is_absolute() {
         return Ok(None);
     }
-    let manifest = report.root.canonicalize()?;
-    let root = manifest
-        .parent()
-        .context("Cargo workspace manifest has no parent")?;
+    let Ok(manifest) = report.root.canonicalize() else {
+        return Ok(None);
+    };
+    if !manifest.is_file() {
+        return Ok(None);
+    }
+    let Some(root) = manifest.parent() else {
+        return Ok(None);
+    };
     // Sidecars store workspace paths as UTF-8. Keep an unrepresentable root
     // outside the managed namespace until that format can preserve OS bytes.
     if root.to_str().is_none() {
         return Ok(None);
     }
-    let dir = supervision::context_for_workspace(paths, root)?;
+    let Ok(dir) = supervision::context_for_workspace(paths, root) else {
+        return Ok(None);
+    };
     Ok(Some((dir, root.to_path_buf())))
 }
 

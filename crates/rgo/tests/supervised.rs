@@ -626,6 +626,40 @@ fn unsupported_cargo_is_rejected_at_setup_and_left_unmanaged_by_the_launcher() {
 }
 
 #[test]
+fn lost_working_directory_keeps_cargo_passthrough_available() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let sandbox = Sandbox::new().unwrap();
+    let removed = sandbox.home.join("removed-working-directory");
+    std::fs::create_dir(&removed).unwrap();
+    let fake = sandbox.home.join("ordinary-cargo");
+    std::fs::write(&fake, "#!/bin/sh\necho 'ordinary Cargo ran'\nexit 7\n").unwrap();
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let output = sandbox
+        .cmd("sh")
+        .args([
+            "-c",
+            "cd \"$1\" && rmdir \"$1\" && exec \"$2\" cargo-shim --real-cargo \"$3\" -- build",
+            "sh",
+        ])
+        .arg(&removed)
+        .arg(env!("CARGO_BIN_EXE_rgo"))
+        .arg(&fake)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(7));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("ordinary Cargo ran"));
+    assert!(
+        RgoPaths {
+            root: sandbox.rgo_home
+        }
+        .managed_build_dirs()
+        .is_empty()
+    );
+}
+
+#[test]
 fn concurrent_cargo_clean_protects_its_context_but_allows_other_gc() {
     use std::os::unix::fs::PermissionsExt;
 
