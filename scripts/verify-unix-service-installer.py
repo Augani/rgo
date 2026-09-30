@@ -58,6 +58,12 @@ def main() -> None:
     ]
     completed = False
     try:
+        interrupted = environment.copy()
+        interrupted["RGO_SETUP_TEST_EXIT_AFTER_RECORD"] = "1"
+        first = subprocess.run(installer, env=interrupted, text=True, capture_output=True, timeout=120)
+        assert first.returncode == 88, first.stderr
+        assert (cargo_home / ".rgo-install.json").exists()
+        assert not (cargo_home / "rgo/installer-state.json").exists()
         run(installer, environment)
         record = json.loads((cargo_home / ".rgo-install.json").read_text())
         assert record["supervised_cargo"] is not None
@@ -82,6 +88,15 @@ def main() -> None:
         assert not (cargo_home / "rgo/installer-state.json").exists()
         assert not (cargo_home / "rgo/shims/cargo").exists()
         assert (cargo_home / "config.toml").read_text() == "[net]\noffline = true\n"
+        after_setup = environment.copy()
+        after_setup["RGO_INSTALLER_TEST_EXIT_AFTER_SETUP_DONE"] = "1"
+        second = subprocess.run(installer, env=after_setup, text=True, capture_output=True, timeout=120)
+        assert second.returncode == 86, second.stderr
+        assert (cargo_home / ".rgo-install.json").exists()
+        assert not (cargo_home / "rgo/installer-state.json").exists()
+        run(installer, environment)
+        assert (cargo_home / "rgo/installer-state.json").exists()
+        run(uninstaller, environment)
         completed = True
         print("private supervised service install, Cargo build, and uninstall passed")
     finally:

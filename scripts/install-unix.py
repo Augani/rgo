@@ -1055,6 +1055,82 @@ def repair_owned(
     print(f"repaired {', '.join(replaced) if replaced else 'verified files'} in {version_dir}")
 
 
+def resume_service_install(
+    record: dict[str, object],
+    cli: Path,
+    cargo_home: Path,
+    install_root: Path,
+    bin_dir: Path,
+    state_path: Path,
+    environment: dict[str, str],
+    version: str,
+    supervised: bool,
+    real_cargo: Path | None,
+) -> None:
+    """Finish a first service activation interrupted before installer state was saved."""
+    root = Path(str(record.get("rgo_home", "")))
+    wrapper = cli.with_name("rgo-rustc-wrapper")
+    if (
+        record.get("cargo_home") != str(cargo_home)
+        or record.get("binary_version") != version.removeprefix("v")
+        or Path(str(record.get("rgo_binary", ""))).resolve() != cli.resolve()
+        or Path(str(record.get("install_root", ""))).resolve() != cli.parent.resolve()
+        or not root.is_absolute()
+        or (record.get("supervised_cargo") is not None) is not supervised
+        or file_snapshot(state_path) is not None
+    ):
+        raise InstallError("partial service activation does not match this verified bundle")
+    activation_paths(cargo_home, install_root, record)
+    if environment.get("RGO_HOME") and Path(environment["RGO_HOME"]).expanduser().absolute() != root:
+        raise InstallError("partial service activation belongs to another RGO_HOME")
+    environment["RGO_HOME"] = str(root)
+    owner = file_snapshot(root / "state/owner-cargo-home")
+    mode = file_snapshot(root / "state/storage-mode")
+    if (owner is not None and owner[0] != f"{cargo_home}\n".encode()) or (
+        mode is not None and mode[0] != (b"supervised\n" if supervised else b"native\n")
+    ):
+        raise InstallError("partial service activation has conflicting root ownership")
+    expected_wrapper = f"rgo-rustc-wrapper {version.removeprefix('v')} protocol {record.get('protocol_version')}"
+    if run(wrapper, "--rgo-version", environment=environment).stdout.strip() != expected_wrapper:
+        raise InstallError("partial service activation has a mismatched wrapper")
+    setup_args = ["setup"]
+    if supervised:
+        shim = record["supervised_cargo"]
+        if not isinstance(shim, dict) or not isinstance(shim.get("real_cargo"), str) or real_cargo is None:
+            raise InstallError("partial service activation has no recorded Cargo proxy")
+        if Path(shim["real_cargo"]).resolve() != real_cargo.resolve():
+            raise InstallError("partial service activation uses a different Cargo proxy")
+        setup_args.extend(["--supervised", "--real-cargo", shim["real_cargo"]])
+    elif record.get("wrapper_binary") is None:
+        setup_args.append("--no-wrapper")
+    links = (bin_dir / "rgo-rustc-wrapper", bin_dir / "rgo")
+    for path, target in ((links[0], wrapper), (links[1], cli)):
+        existing = link_snapshot((path,))[path]
+        if existing is not None and (path.parent / existing).resolve() != target.resolve():
+            raise InstallError(f"partial service activation has a changed command link: {path}")
+
+    run(cli, *setup_args, "--dry-run", environment=environment)
+    run(cli, *setup_args, environment=environment)
+    fresh = environment.copy()
+    fresh.pop("RGO_HOME", None)
+    if supervised:
+        fresh["PATH"] = f"{cargo_home / 'rgo/shims'}{os.pathsep}{fresh.get('PATH', '')}"
+    doctor = run(cli, "doctor", "--verify", "--json", environment=fresh)
+    if json.loads(doctor.stdout).get("activation_verified") is not True:
+        raise InstallError("partial service activation could not verify plain Cargo")
+    for path, target in ((links[0], wrapper), (links[1], cli)):
+        existing = link_snapshot((path,))[path]
+        if existing is not None and (path.parent / existing).resolve() != target.resolve():
+            raise InstallError(f"command link changed while recovering: {path}")
+        publish_entrypoint(path, target)
+    write_state(state_path, {
+        "schema_version": 1,
+        "rgo_binary": str(cli.resolve()),
+        "no_service": False,
+        "supervised": supervised,
+    })
+
+
 def uninstall_owned(
     cargo_home: Path,
     install_root: Path,
@@ -1444,6 +1520,19 @@ def main() -> None:
                         or not isinstance(old_record.get("rgo_binary"), str)
                     ):
                         raise InstallError("existing activation has an invalid binary record")
+                    if state is None and not args.no_service:
+                        resume_service_install(
+                            old_record, cli, cargo_home, install_root, bin_dir,
+                            state_path, environment, args.version, args.supervised, real_cargo,
+                        )
+                        print(f"resumed first service installation of {args.version}")
+                        if args.supervised:
+                            ensure_shell_activation(
+                                install_root, cargo_home,
+                                Path(environment.get("HOME") or Path.home()).expanduser().absolute(),
+                                environment.get("SHELL", ""),
+                            )
+                        return
                     previous_cli = Path(old_record["rgo_binary"]).resolve()
                     if (
                         not isinstance(state, dict)
@@ -1593,8 +1682,8 @@ def main() -> None:
                             raise InstallError("replacement setup differed from its recorded activation plan")
                         journal["phase"] = "setup_done"
                         write_state(journal_path, journal)
-                        if args.development_bundle and os.environ.get("RGO_INSTALLER_TEST_EXIT_AFTER_SETUP_DONE") == "1":
-                            os._exit(86)
+                    if args.development_bundle and os.environ.get("RGO_INSTALLER_TEST_EXIT_AFTER_SETUP_DONE") == "1":
+                        os._exit(86)
                     verify_environment = environment.copy()
                     verify_environment.pop("RGO_HOME", None)
                     if args.supervised:
