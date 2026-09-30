@@ -416,41 +416,83 @@ fn opted_in_maintenance_reclaims_an_idle_real_cargo_build() {
         "{}",
         String::from_utf8_lossy(&second_build.stderr)
     );
+    let other_project = sandbox.simple_bin("supervised-budget-other").unwrap();
+    let other_build = sandbox
+        .cmd("cargo")
+        .current_dir(&other_project)
+        .env("PATH", &path)
+        .env_remove("RGO_HOME")
+        .args(["build", "--offline"])
+        .output()
+        .unwrap();
+    assert!(
+        other_build.status.success(),
+        "{}",
+        String::from_utf8_lossy(&other_build.stderr)
+    );
+    let other_context = paths
+        .checked_managed_build_dirs()
+        .unwrap()
+        .into_iter()
+        .find(|dir| dir != context)
+        .expect("second project's managed context");
     assert!(context.exists());
-    // The first post-build pass must retain its signal while Cargo's recent
-    // profile lock makes this otherwise idle context temporarily ineligible.
+    assert!(other_context.exists());
+    // Both post-build signals must survive Cargo's recent profile-lock grace.
     let retry_deadline = Instant::now() + Duration::from_secs(15);
     let deferred = loop {
-        let record = supervision::pending_maintenance(&paths)
-            .unwrap()
-            .into_iter()
-            .find(|record| record.context == *context);
-        if let Some(record) = record.filter(|record| record.retry_after.is_some()) {
-            break record;
+        let records = supervision::pending_maintenance(&paths).unwrap();
+        let due = [context.as_path(), other_context.as_path()].map(|dir| {
+            records
+                .iter()
+                .find(|record| record.context == dir && record.retry_after.is_some())
+                .cloned()
+        });
+        if let [Some(first), Some(second)] = due {
+            break [first, second];
         }
         assert!(
             Instant::now() < retry_deadline,
-            "maintenance cleared the launch signal before the profile-lock grace expired"
+            "maintenance lost one of two launch signals before profile-lock grace expired"
         );
         thread::sleep(Duration::from_millis(50));
     };
-    assert!(deferred.retry_after.unwrap() > context::unix_now());
+    drop(daemon);
     age_finished_cargo_profile_locks(context);
-    // Advance only the persisted retry deadline; the daemon must still take
-    // its normal authoritative snapshot and lifecycle guard before deleting.
-    assert!(
-        supervision::defer_pending_maintenance(&paths, &deferred, context::unix_now()).unwrap()
+    age_finished_cargo_profile_locks(&other_context);
+    // Advance only the persisted retry deadlines. A restarted daemon must
+    // still take its own authoritative snapshot and lifecycle guards.
+    for record in &deferred {
+        assert!(record.retry_after.unwrap() > context::unix_now());
+        assert!(
+            supervision::defer_pending_maintenance(&paths, record, context::unix_now()).unwrap()
+        );
+    }
+    let mut daemon = StopDaemon(
+        sandbox
+            .cmd(rgo)
+            .args(["daemon", "--foreground"])
+            .env("RGO_DAEMON_POLL_SECS", "1")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
     );
     let second_deadline = Instant::now() + Duration::from_secs(15);
-    while context.exists() && Instant::now() < second_deadline {
+    while (context.exists() || other_context.exists()) && Instant::now() < second_deadline {
         assert!(daemon.0.try_wait().unwrap().is_none());
         thread::sleep(Duration::from_millis(100));
     }
     assert!(
-        !context.exists(),
-        "maintenance did not reclaim the rebuilt context"
+        !context.exists() && !other_context.exists(),
+        "maintenance did not reclaim both idle project contexts"
     );
     assert!(final_binary.is_file());
+    assert!(
+        other_project
+            .join("target/debug/supervised-budget-other")
+            .is_file()
+    );
     let second_response = ipc::request_with_timeout(
         &paths.socket_path(),
         Request::QueryStatus,
