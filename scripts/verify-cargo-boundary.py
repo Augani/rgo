@@ -102,7 +102,7 @@ def probe(version: str, rustup_home: str) -> None:
                 raise RuntimeError(f"expected one attributed Cargo 1.91 build context; got {sidecars}")
             sidecar = sidecars[0]
             context = sidecar.parent
-            context_id = context.relative_to(expected_root).as_posix()
+            context_id = str(context.relative_to(expected_root))
             run([str(RGO), "pin", context_id], cwd=project, env=env)
             run(["cargo", "clean", "-p", "rgo_boundary_probe", "--offline"], cwd=project, env=env)
             if not sidecar.is_file():
@@ -112,7 +112,7 @@ def probe(version: str, rustup_home: str) -> None:
                 raise RuntimeError("Cargo 1.91 full clean retained the managed build context")
             absent_listing = run([str(RGO), "ls"], cwd=project, env=env).stdout
             if context_id not in absent_listing or "(context absent; pin retained)" not in absent_listing:
-                raise RuntimeError("Cargo 1.91 full clean lost the durable pin")
+                raise RuntimeError(f"Cargo 1.91 full clean lost the durable pin:\n{absent_listing}")
             rebuilt_out_dirs = build_out_dirs(project, env)
             if not rebuilt_out_dirs or not all(path.is_relative_to(expected_root) for path in rebuilt_out_dirs):
                 raise RuntimeError("Cargo 1.91 rebuild after clean did not use managed storage")
@@ -120,7 +120,7 @@ def probe(version: str, rustup_home: str) -> None:
                 raise RuntimeError("Cargo 1.91 rebuild did not restore rgo's attribution sidecar")
             rebuilt_listing = run([str(RGO), "ls"], cwd=project, env=env).stdout
             if not any(context_id in line and "PIN" in line for line in rebuilt_listing.splitlines()):
-                raise RuntimeError("Cargo 1.91 rebuild lost the durable pin")
+                raise RuntimeError(f"Cargo 1.91 rebuild lost the durable pin:\n{rebuilt_listing}")
             run([str(RGO), "unpin", context_id], cwd=project, env=env)
             unpinned_listing = run([str(RGO), "ls"], cwd=project, env=env).stdout
             if any(context_id in line and "PIN" in line for line in unpinned_listing.splitlines()):
