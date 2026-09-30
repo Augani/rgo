@@ -161,10 +161,14 @@ pub fn run(json: bool, verify: bool) -> Result<()> {
         });
         check(owned, "supervised Cargo launcher matches its installation record; remediation: rerun `rgo setup --supervised`".into());
         let active = shim.as_ref().is_some_and(|shim| {
+            let Ok(owned_path) = shim.canonicalize() else {
+                return false;
+            };
             std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
                 .map(|dir| dir.join(if cfg!(windows) { "cargo.exe" } else { "cargo" }))
                 .find(|path| path.is_file())
-                .is_some_and(|path| path == *shim)
+                .and_then(|path| path.canonicalize().ok())
+                .is_some_and(|path| path == owned_path)
         });
         supervised_ready = owned
             && active

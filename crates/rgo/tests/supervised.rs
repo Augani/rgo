@@ -1032,6 +1032,31 @@ fn shimmed_cargo_isolated_from_direct_cargo_and_holds_gc_lock_through_run() {
     assert!(!inactive.status.success());
     let inactive_report: serde_json::Value = serde_json::from_slice(&inactive.stdout).unwrap();
     assert_eq!(inactive_report["activation_verified"], false);
+    let shim_alias = sandbox.home.join("shim-alias");
+    std::os::unix::fs::symlink(&shim_dir, &shim_alias).unwrap();
+    let mut alias_search_path = vec![shim_alias];
+    alias_search_path.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap()));
+    let alias_search_path = std::env::join_paths(alias_search_path).unwrap();
+    let alias_doctor = sandbox
+        .cmd(rgo)
+        .env("PATH", &alias_search_path)
+        .args(["doctor", "--json"])
+        .output()
+        .unwrap();
+    assert!(alias_doctor.status.success());
+    let alias_report: serde_json::Value = serde_json::from_slice(&alias_doctor.stdout).unwrap();
+    assert!(
+        alias_report["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| {
+                entry["level"] == "ok"
+                    && entry["message"].as_str().is_some_and(|message| {
+                        message.starts_with("Cargo on PATH resolves to the supervised launcher")
+                    })
+            })
+    );
     let mut search_path = vec![shim_dir];
     search_path.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap()));
     let search_path = std::env::join_paths(search_path).unwrap();
