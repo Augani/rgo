@@ -148,6 +148,8 @@ The exact Cargo 1.91 probe now also checks `cargo clean -p`, full `cargo clean`,
 
 Setup and undo now reject malformed or duplicated ownership fences, a fenced block without its Cargo-home installation record, and any fenced values beyond the exact settings recorded at setup. Dry-run undo applies the same service ownership preflight as actual undo. This closes accidental removal of later edits inside the fence, but recovery from a lost installation record still requires a deliberate repair design and is not counted as a complete P1 transaction.
 
+Doctor now compares the resolved first `cargo` on `PATH` with the recorded supervised launcher, so a shell whose PATH directory is a symlink to the owned shim is reported active. It also requires the recorded shim itself to be a regular, unsymlinked file before declaring it owned; matching bytes through a replacement symlink no longer pass the health check. The existing private-home supervised fixture exercises both cases, and the [15-job diagnostic matrix](https://github.com/Augani/rgo/actions/runs/36756421466) passed across Linux, macOS, and Windows. This improves the current-process activation report; GUI PATH inheritance and full effective project-config discovery remain open.
+
 The layout initializer now rejects a filesystem-root `RGO_HOME` and a pre-existing root writable by other users before creating state. It leaves an existing root's permissions alone while keeping rgo's own subdirectories private; this prevents setup from changing permissions on a shared directory such as `/tmp`. A live custom-root/security matrix remains open.
 
 ### P2 — Prove cleanup safe for ordinary Cargo
