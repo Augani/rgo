@@ -309,21 +309,25 @@ pub fn plan(inp: &Inputs) -> Result<Plan> {
 /// Whole-context pressure candidates in LRU order. The daemon uses these only
 /// after garbage, expired state, and cold CAS have had their turn at the same
 /// target; the executor still repeats its lock safety check before removal.
-pub fn pressure_candidates(inp: &Inputs) -> Vec<Action> {
-    let mut contexts: Vec<&BuildContext> = inp
-        .contexts
-        .iter()
-        .filter(|context| {
-            !context.is_orphan()
-                && !crate::context::is_pinned(inp.paths, &context.dir)
-                && !context.workspace_unavailable()
-                && !inp.pinned.iter().any(|path| same_path(path, &context.dir))
-                && !inp.leased.iter().any(|path| same_path(path, &context.dir))
-                && !context.recently_locked(profile_lock_grace(context.sidecar.as_ref()), inp.now)
-        })
-        .collect();
+pub fn pressure_candidates(inp: &Inputs) -> Result<Vec<Action>> {
+    let mut contexts: Vec<&BuildContext> = Vec::new();
+    for context in inp.contexts {
+        if context.is_orphan()
+            || crate::context::is_pinned(inp.paths, &context.dir)
+            || context.workspace_unavailable()
+            || inp.pinned.iter().any(|path| same_path(path, &context.dir))
+            || inp.leased.iter().any(|path| same_path(path, &context.dir))
+        {
+            continue;
+        }
+        if !context
+            .recently_locked_checked(profile_lock_grace(context.sidecar.as_ref()), inp.now)?
+        {
+            contexts.push(context);
+        }
+    }
     contexts.sort_by_key(|context| context.last_used);
-    contexts
+    Ok(contexts
         .into_iter()
         .map(|context| Action {
             tier: Tier::Pressure,
@@ -331,7 +335,7 @@ pub fn pressure_candidates(inp: &Inputs) -> Vec<Action> {
             bytes: context.usage.physical_bytes,
             reason: "disk pressure (LRU)".into(),
         })
-        .collect()
+        .collect())
 }
 
 /// Deletes are `rename` into `tmp/` (atomic, same volume) then recursive remove, so a
@@ -1787,9 +1791,10 @@ mod tests {
                 }
             })
             .collect::<Vec<_>>();
-        let plan = plan(&Inputs {
+        let cfg = test_cfg();
+        let inputs = Inputs {
             paths: &paths,
-            cfg: &test_cfg(),
+            cfg: &cfg,
             contexts: &contexts,
             other_managed_bytes: 0,
             pinned: &[],
@@ -1799,8 +1804,8 @@ mod tests {
             age_maintenance: false,
             allow_pressure_contexts: true,
             target_bytes: Some(1_000_000),
-        })
-        .unwrap();
+        };
+        let plan = plan(&inputs).unwrap();
         assert_eq!(plan.managed_bytes, 6 * 1024 * 1024);
         assert_eq!(plan.actions.len(), 3);
         assert!(
@@ -1809,6 +1814,9 @@ mod tests {
                 .all(|action| action.tier == Tier::Pressure)
         );
         assert!(plan.reclaim_bytes() >= plan.managed_bytes - plan.target_bytes);
+        assert_eq!(pressure_candidates(&inputs).unwrap().len(), 3);
+        std::fs::create_dir_all(contexts[0].dir.join("debug/.cargo-build-lock")).unwrap();
+        assert!(pressure_candidates(&inputs).is_err());
     }
 
     #[test]

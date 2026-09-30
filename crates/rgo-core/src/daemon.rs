@@ -856,7 +856,7 @@ fn status_report(state: &State) -> Result<StatusReport> {
     let mut build_preview = budget_plan.clone();
     append_pressure_for_preview(
         &mut build_preview,
-        gc::pressure_candidates(&budget_inputs),
+        gc::pressure_candidates(&budget_inputs)?,
         state.cfg.min_free_space,
     );
     let reclaimable_build_bytes = build_preview.reclaim_bytes();
@@ -1374,7 +1374,7 @@ fn run_gc(
                 target_bytes: Some(plan.target_bytes),
             };
             let mut remaining = needed;
-            let actions = gc::pressure_candidates(&pressure_inputs)
+            let actions = gc::pressure_candidates(&pressure_inputs)?
                 .into_iter()
                 .take_while(|action| {
                     if remaining == 0 {
@@ -1501,7 +1501,7 @@ fn extend_gc_preview(
             }
         }
     }
-    append_pressure_for_preview(plan, gc::pressure_candidates(inputs), min_free_space);
+    append_pressure_for_preview(plan, gc::pressure_candidates(inputs)?, min_free_space);
     Ok(())
 }
 
