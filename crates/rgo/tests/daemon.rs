@@ -774,6 +774,36 @@ fn daemon_coordinates_builds_and_pins_contexts() {
         String::from_utf8_lossy(&unpin.stderr)
     );
 
+    let paths = rgo_core::paths::RgoPaths {
+        root: sb.rgo_home.clone(),
+    };
+    let context = paths.builds_dir().join(&id);
+    std::fs::remove_dir_all(&context).unwrap();
+    let stale_pin = ipc::request(
+        &paths.socket_path(),
+        Request::Pin {
+            build_dir: context.display().to_string(),
+        },
+    )
+    .unwrap();
+    assert!(matches!(stale_pin, Response::Error { .. }));
+    assert!(!rgo_core::context::is_pinned(&paths, &context));
+    #[cfg(unix)]
+    {
+        let outside = sb.home.join("outside-pin-target");
+        std::fs::create_dir(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, &context).unwrap();
+        let symlink_pin = ipc::request(
+            &paths.socket_path(),
+            Request::Pin {
+                build_dir: context.display().to_string(),
+            },
+        )
+        .unwrap();
+        assert!(matches!(symlink_pin, Response::Error { .. }));
+        assert!(!outside.join(rgo_core::context::PIN_MARKER).exists());
+    }
+
     daemon.kill().unwrap();
     let _ = daemon.wait();
 }

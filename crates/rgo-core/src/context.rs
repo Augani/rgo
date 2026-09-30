@@ -608,9 +608,26 @@ fn workspace_device_matches(
 
 pub fn write_pin_marker(dir: &Path) -> Result<()> {
     let marker = dir.join(PIN_MARKER);
-    std::fs::File::create(&marker)
-        .with_context(|| format!("writing pin marker {}", marker.display()))?;
-    Ok(())
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&marker)
+    {
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let metadata = std::fs::symlink_metadata(&marker)
+                .with_context(|| format!("checking pin marker {}", marker.display()))?;
+            anyhow::ensure!(
+                metadata.is_file() && !metadata.file_type().is_symlink(),
+                "unsafe pin marker {}",
+                marker.display()
+            );
+            Ok(())
+        }
+        Err(error) => {
+            Err(error).with_context(|| format!("writing pin marker {}", marker.display()))
+        }
+    }
 }
 
 pub fn remove_pin_marker(dir: &Path) -> Result<()> {
@@ -901,6 +918,7 @@ mod tests {
         std::fs::create_dir(&dir).unwrap();
         assert!(!is_pinned_dir(&dir));
         write_pin_marker(&dir).unwrap();
+        write_pin_marker(&dir).unwrap();
         assert!(is_pinned_dir(&dir));
         remove_pin_marker(&dir).unwrap();
         assert!(!is_pinned_dir(&dir));
@@ -913,6 +931,13 @@ mod tests {
                 is_pinned_dir(&dir),
                 "a broken pin marker must protect the context"
             );
+            assert!(write_pin_marker(&dir).is_err());
+            std::fs::remove_file(dir.join(PIN_MARKER)).unwrap();
+            let outside = root.path().join("outside");
+            std::fs::write(&outside, b"keep this data").unwrap();
+            std::os::unix::fs::symlink(&outside, dir.join(PIN_MARKER)).unwrap();
+            assert!(write_pin_marker(&dir).is_err());
+            assert_eq!(std::fs::read(&outside).unwrap(), b"keep this data");
             std::fs::remove_file(dir.join(PIN_MARKER)).unwrap();
         }
         // Writing a marker for a missing directory fails loudly.

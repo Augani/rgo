@@ -447,6 +447,17 @@ fn handle_request_result(state: &State, request: Request) -> Result<Response> {
             let _operation = state.operation_lock.lock().unwrap();
             let path = Path::new(&build_dir);
             validate_managed_path(&state.paths, path)?;
+            // The CLI may have listed this context before a GC pass removed
+            // it. Check again under the operation lock, and reject symlinked
+            // shards or contexts before writing the compatibility marker.
+            if !state
+                .paths
+                .checked_managed_build_dirs()?
+                .iter()
+                .any(|context| context == path)
+            {
+                bail!("managed context does not exist: {}", path.display());
+            }
             context::write_durable_pin(&state.paths, path)?;
             // Compatibility with older rgo versions that read only the
             // in-context marker. The stable record remains authoritative.
