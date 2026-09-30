@@ -19,6 +19,18 @@ fn setup_rejects_a_broken_legacy_config_link_without_touching_modern_config() {
     assert!(String::from_utf8_lossy(&result.stderr).contains("regular Cargo config file"));
     assert_eq!(std::fs::read_to_string(modern).unwrap(), original);
     assert!(!sandbox.cargo_home.join(".rgo-install.json").exists());
+    let doctor = sandbox
+        .cmd(cargo_bin("rgo"))
+        .args(["doctor", "--json"])
+        .output()
+        .unwrap();
+    assert!(doctor.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&doctor.stdout).unwrap();
+    assert!(report["entries"].as_array().unwrap().iter().any(|entry| {
+        entry["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("cannot inspect Cargo home configuration"))
+    }));
 }
 
 #[test]

@@ -83,7 +83,22 @@ pub fn run(json: bool, verify: bool) -> Result<()> {
 
     let cargo_home = cargo_home()?;
     let cfg_path = cargo_config::effective_home_config(&cargo_home);
-    let insp = cargo_config::inspect(&cargo_config::read_or_empty(&cfg_path)?)?;
+    let (insp, config_ok) = match cargo_config::read_or_empty(&cfg_path)
+        .and_then(|text| cargo_config::inspect(&text))
+    {
+        Ok(inspection) => (inspection, true),
+        Err(error) => {
+            check(
+                false,
+                format!(
+                    "cannot inspect Cargo home configuration {}: {error:#}; repair the file before activation",
+                    cfg_path.display()
+                ),
+            );
+            supervised_ready = false;
+            (cargo_config::Inspection::default(), false)
+        }
+    };
     let supervised = std::fs::read(cargo_home.join(".rgo-install.json"))
         .ok()
         .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
@@ -124,9 +139,9 @@ pub fn run(json: bool, verify: bool) -> Result<()> {
             false
         };
         check(
-            !insp.has_fence,
+            config_ok && !insp.has_fence,
             format!(
-                "no global rgo build-directory fence in {}",
+                "no global rgo build-directory fence in {} (configuration must be readable)",
                 cfg_path.display()
             ),
         );
@@ -153,6 +168,7 @@ pub fn run(json: bool, verify: bool) -> Result<()> {
         });
         supervised_ready = owned
             && active
+            && config_ok
             && !insp.has_fence
             && !included_build_dir
             && insp.build_dir_outside_fence.is_none();
@@ -177,14 +193,16 @@ pub fn run(json: bool, verify: bool) -> Result<()> {
         }
     } else {
         check(
-            insp.has_fence,
+            config_ok && insp.has_fence,
             format!(
                 "rgo fence present in {}; remediation: run `rgo setup`",
                 cfg_path.display()
             ),
         );
         check(
-            insp.configured_build_dir.as_deref() == Some(e.paths.build_dir_template().as_str()),
+            config_ok
+                && insp.configured_build_dir.as_deref()
+                    == Some(e.paths.build_dir_template().as_str()),
             format!(
                 "global build.build-dir = {:?} (expected {:?}); remediation: run `rgo setup`",
                 insp.configured_build_dir,
@@ -192,7 +210,7 @@ pub fn run(json: bool, verify: bool) -> Result<()> {
             ),
         );
         check(
-            insp.build_dir_outside_fence.is_none(),
+            config_ok && insp.build_dir_outside_fence.is_none(),
             format!(
                 "no conflicting build.build-dir outside fence ({:?}); remediation: remove the override from {}",
                 insp.build_dir_outside_fence,
