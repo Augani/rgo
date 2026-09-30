@@ -40,10 +40,18 @@ fn daemon_closes_inherited_nonstdio_descriptors() {
         .spawn()
         .unwrap();
     drop(writer);
-    reader
-        .set_read_timeout(Some(Duration::from_secs(2)))
-        .unwrap();
-    let result = reader.read(&mut [0u8; 1]);
+    reader.set_nonblocking(true).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let result = loop {
+        match reader.read(&mut [0u8; 1]) {
+            Err(error)
+                if error.kind() == std::io::ErrorKind::WouldBlock && Instant::now() < deadline =>
+            {
+                thread::sleep(Duration::from_millis(10));
+            }
+            result => break result,
+        }
+    };
     let _ = daemon.kill();
     let _ = daemon.wait();
     assert_eq!(
