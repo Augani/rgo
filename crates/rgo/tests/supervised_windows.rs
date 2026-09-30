@@ -5,7 +5,6 @@ use std::process::{Child, Stdio};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
-use assert_cmd::cargo::cargo_bin;
 use rgo_core::context;
 use rgo_core::gc;
 use rgo_core::ipc;
@@ -125,11 +124,14 @@ fn setup_activates_unchanged_cargo_exe_and_undo_restores_direct_cargo() {
         .workspace("windows-virtual-workspace", &["member"])
         .unwrap();
     let member = workspace.join("member/Cargo.toml");
+    let wrapper = PathBuf::from(env!("CARGO_BIN_EXE_rgo"))
+        .with_file_name(format!("rgo-rustc-wrapper{}", std::env::consts::EXE_SUFFIX));
+    assert!(wrapper.is_file());
     let virtual_build = sandbox
         .cmd("cmd.exe")
         .current_dir(&sandbox.home)
         .env("PATH", &path)
-        .env("RUSTC_WRAPPER", cargo_bin("rgo-rustc-wrapper"))
+        .env("RUSTC_WRAPPER", &wrapper)
         .args(["/C", "cargo", "build", "--offline", "--manifest-path"])
         .arg(&member)
         .output()
