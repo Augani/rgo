@@ -273,27 +273,7 @@ pub fn write_durable_pin(paths: &RgoPaths, dir: &Path) -> Result<()> {
     let _decision_lock = lock_pin_decisions(paths)?;
     let record = pin_record_path(paths, dir)?;
     let parent = ensure_pin_parent(paths, &record)?;
-    let metadata = std::fs::symlink_metadata(&record);
-    match metadata {
-        Ok(metadata) => ensure!(
-            metadata.is_file() && !metadata.file_type().is_symlink(),
-            "unsafe pin record {}",
-            record.display()
-        ),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error).with_context(|| format!("checking {}", record.display())),
-    }
-    use std::io::Write;
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(&record)
-        .with_context(|| format!("writing {}", record.display()))?;
-    file.write_all(b"pin\n")?;
-    file.sync_all()?;
-    sync_pin_parent(parent)?;
-    Ok(())
+    write_pin_decision(paths, &record, parent, b"pin\n")
 }
 
 /// Import an old marker only if no newer explicit pin/unpin decision exists.
@@ -307,26 +287,16 @@ pub fn migrate_legacy_pin(paths: &RgoPaths, dir: &Path) -> Result<()> {
     }
     let record = pin_record_path(paths, dir)?;
     let parent = ensure_pin_parent(paths, &record)?;
-    use std::io::Write;
-    match std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&record)
-    {
-        Ok(mut file) => {
-            file.write_all(b"pin\n")?;
-            file.sync_all()?;
-            sync_pin_parent(parent)?;
+    match std::fs::symlink_metadata(&record) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            write_pin_decision(paths, &record, parent, b"pin\n")?;
         }
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            let metadata = std::fs::symlink_metadata(&record)?;
-            ensure!(
-                metadata.is_file() && !metadata.file_type().is_symlink(),
-                "unsafe pin record {}",
-                record.display()
-            );
-        }
-        Err(error) => return Err(error).with_context(|| format!("writing {}", record.display())),
+        Ok(metadata) => ensure!(
+            metadata.is_file() && !metadata.file_type().is_symlink(),
+            "unsafe pin record {}",
+            record.display()
+        ),
+        Err(error) => return Err(error).with_context(|| format!("checking {}", record.display())),
     }
     Ok(())
 }
@@ -361,17 +331,47 @@ pub fn remove_durable_pin(paths: &RgoPaths, dir: &Path) -> Result<()> {
     let _decision_lock = lock_pin_decisions(paths)?;
     let record = pin_record_path(paths, dir)?;
     let parent = ensure_pin_parent(paths, &record)?;
-    use std::io::Write;
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(&record)
-        .with_context(|| format!("writing {}", record.display()))?;
-    file.write_all(b"unpin\n")?;
-    file.sync_all()?;
-    sync_pin_parent(parent)?;
+    write_pin_decision(paths, &record, parent, b"unpin\n")?;
     remove_pin_marker(dir)?;
+    Ok(())
+}
+
+/// The caller holds `pin-decisions.lock`. A crash before rename leaves the
+/// previous decision intact; the one fixed staging name cannot accumulate.
+fn write_pin_decision(paths: &RgoPaths, record: &Path, parent: &Path, bytes: &[u8]) -> Result<()> {
+    match std::fs::symlink_metadata(record) {
+        Ok(metadata) => ensure!(
+            metadata.is_file() && !metadata.file_type().is_symlink(),
+            "unsafe pin record {}",
+            record.display()
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error).with_context(|| format!("checking {}", record.display())),
+    }
+    let staging = paths.state_dir().join("locks/pin-decision-write.tmp");
+    match std::fs::symlink_metadata(&staging) {
+        Ok(metadata) if metadata.is_dir() => {
+            anyhow::bail!("pin decision staging path is a directory")
+        }
+        Ok(_) => std::fs::remove_file(&staging)?,
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => return Err(error.into()),
+        Err(_) => {}
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&staging)?;
+    use std::io::Write;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    drop(file);
+    std::fs::rename(&staging, record)
+        .with_context(|| format!("replacing pin decision {}", record.display()))?;
+    sync_pin_parent(parent)?;
     Ok(())
 }
 
@@ -984,6 +984,35 @@ mod tests {
         }
         // Writing a marker for a missing directory fails loudly.
         assert!(write_pin_marker(&root.path().join("gone")).is_err());
+    }
+
+    #[test]
+    fn durable_pin_update_preserves_the_previous_decision_on_write_failure() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = RgoPaths {
+            root: root.path().join("rgo"),
+        };
+        let dir = paths.builds_dir().join("aa/context");
+        std::fs::create_dir_all(&dir).unwrap();
+        write_durable_pin(&paths, &dir).unwrap();
+        let record = pin_record_path(&paths, &dir).unwrap();
+        let staging = paths.state_dir().join("locks/pin-decision-write.tmp");
+        std::fs::create_dir(&staging).unwrap();
+        assert!(remove_durable_pin(&paths, &dir).is_err());
+        assert_eq!(std::fs::read(&record).unwrap(), b"pin\n");
+        std::fs::remove_dir(&staging).unwrap();
+        remove_durable_pin(&paths, &dir).unwrap();
+        assert_eq!(std::fs::read(&record).unwrap(), b"unpin\n");
+
+        #[cfg(unix)]
+        {
+            let outside = root.path().join("outside");
+            std::fs::write(&outside, b"preserve").unwrap();
+            std::fs::remove_file(&record).unwrap();
+            std::os::unix::fs::symlink(&outside, &record).unwrap();
+            assert!(remove_durable_pin(&paths, &dir).is_err());
+            assert_eq!(std::fs::read(&outside).unwrap(), b"preserve");
+        }
     }
 
     #[cfg(unix)]

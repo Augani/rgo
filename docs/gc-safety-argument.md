@@ -76,7 +76,9 @@ liveness heuristic.
    availability, and the documented Cargo profile lock after acquiring its
    guard. A missing or unreadable sidecar, lock state, or workspace identity
    prevents context deletion. Pin decisions live outside the evictable tree so
-   a full `cargo clean` cannot silently erase intent. GC stages by same-volume
+   a full `cargo clean` cannot silently erase intent. New pin/unpin decisions
+   replace their record through a synced staging file under the decision lock;
+   a failed write leaves the prior decision intact. GC stages by same-volume
    rename into its owned temporary domain before recursive removal.
 
 The ordering required for the first two steps is **session shared lock before
