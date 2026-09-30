@@ -1057,6 +1057,33 @@ fn shimmed_cargo_isolated_from_direct_cargo_and_holds_gc_lock_through_run() {
                     })
             })
     );
+    let shim_backup = sandbox.home.join("shim-backup");
+    std::fs::rename(&shim, &shim_backup).unwrap();
+    std::os::unix::fs::symlink(&shim_backup, &shim).unwrap();
+    let linked_doctor = sandbox
+        .cmd(rgo)
+        .env("PATH", &alias_search_path)
+        .args(["doctor", "--json"])
+        .output()
+        .unwrap();
+    assert!(linked_doctor.status.success());
+    let linked_report: serde_json::Value = serde_json::from_slice(&linked_doctor.stdout).unwrap();
+    assert!(
+        linked_report["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| {
+                entry["level"] == "warning"
+                    && entry["message"].as_str().is_some_and(|message| {
+                        message.starts_with(
+                            "supervised Cargo launcher matches its installation record",
+                        )
+                    })
+            })
+    );
+    std::fs::remove_file(&shim).unwrap();
+    std::fs::rename(shim_backup, &shim).unwrap();
     let mut search_path = vec![shim_dir];
     search_path.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap()));
     let search_path = std::env::join_paths(search_path).unwrap();

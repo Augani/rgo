@@ -147,6 +147,12 @@ pub fn run(json: bool, verify: bool) -> Result<()> {
         );
         let shim = mode["shim_path"].as_str().map(PathBuf::from);
         let owned = shim.as_ref().is_some_and(|path| {
+            let Ok(metadata) = std::fs::symlink_metadata(path) else {
+                return false;
+            };
+            if !metadata.is_file() || metadata.file_type().is_symlink() {
+                return false;
+            }
             let Some(contents) = mode["shim_contents"].as_str() else {
                 return false;
             };
