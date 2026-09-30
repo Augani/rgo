@@ -102,17 +102,29 @@ def probe(version: str, rustup_home: str) -> None:
                 raise RuntimeError(f"expected one attributed Cargo 1.91 build context; got {sidecars}")
             sidecar = sidecars[0]
             context = sidecar.parent
+            context_id = context.relative_to(expected_root).as_posix()
+            run([str(RGO), "pin", context_id], cwd=project, env=env)
             run(["cargo", "clean", "-p", "rgo_boundary_probe", "--offline"], cwd=project, env=env)
             if not sidecar.is_file():
                 raise RuntimeError("Cargo 1.91 clean -p removed rgo's top-level sidecar")
             run(["cargo", "clean", "--offline"], cwd=project, env=env)
             if context.exists():
                 raise RuntimeError("Cargo 1.91 full clean retained the managed build context")
+            absent_listing = run([str(RGO), "ls"], cwd=project, env=env).stdout
+            if context_id not in absent_listing or "(context absent; pin retained)" not in absent_listing:
+                raise RuntimeError("Cargo 1.91 full clean lost the durable pin")
             rebuilt_out_dirs = build_out_dirs(project, env)
             if not rebuilt_out_dirs or not all(path.is_relative_to(expected_root) for path in rebuilt_out_dirs):
                 raise RuntimeError("Cargo 1.91 rebuild after clean did not use managed storage")
             if not sidecar.is_file():
                 raise RuntimeError("Cargo 1.91 rebuild did not restore rgo's attribution sidecar")
+            rebuilt_listing = run([str(RGO), "ls"], cwd=project, env=env).stdout
+            if not any(context_id in line and "PIN" in line for line in rebuilt_listing.splitlines()):
+                raise RuntimeError("Cargo 1.91 rebuild lost the durable pin")
+            run([str(RGO), "unpin", context_id], cwd=project, env=env)
+            unpinned_listing = run([str(RGO), "ls"], cwd=project, env=env).stdout
+            if any(context_id in line and "PIN" in line for line in unpinned_listing.splitlines()):
+                raise RuntimeError("explicit unpin after Cargo 1.91 clean did not take effect")
 
             run([str(RGO), "setup", "--undo", "--no-service"], cwd=project, env=env)
             if config.read_bytes() != ORIGINAL_CONFIG:
@@ -131,7 +143,7 @@ def main() -> None:
     ).stdout.strip()
     for version in ("1.90.0", "1.91.0"):
         probe(version, rustup_home)
-    print("Cargo 1.90 rejects activation; Cargo 1.91 relocates, cleans, rebuilds, and reverses with unchanged Cargo commands")
+    print("Cargo 1.90 rejects activation; Cargo 1.91 relocates, preserves pins through clean and rebuild, and reverses with unchanged Cargo commands")
 
 
 if __name__ == "__main__":
