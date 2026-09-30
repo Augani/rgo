@@ -101,10 +101,8 @@ pub fn run() -> Result<()> {
         if contexts.iter().any(|context| context.dir == path) {
             continue;
         }
-        let id = path
-            .strip_prefix(e.paths.builds_dir())?
-            .display()
-            .to_string();
+        let relative = path.strip_prefix(e.paths.builds_dir())?;
+        let id = context::context_id(relative);
         println!(
             "{:<18} {:>10} {:>10} {:>10}  {:<3} {:<3} (context absent; pin retained)",
             id, "-", "-", "-", "PIN", ""

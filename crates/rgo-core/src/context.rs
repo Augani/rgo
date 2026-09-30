@@ -30,18 +30,9 @@ pub enum WorkspaceState {
 }
 
 impl BuildContext {
-    /// `xx/yyyy…` — the two components Cargo's `{workspace-path-hash}` produced.
+    /// Stable `xx/yyyy…` ID for the managed context.
     pub fn id(&self) -> String {
-        let name = |p: &Path| {
-            p.file_name()
-                .and_then(|s| s.to_str())
-                .unwrap_or("?")
-                .to_owned()
-        };
-        match self.dir.parent() {
-            Some(shard) => format!("{}/{}", name(shard), name(&self.dir)),
-            None => name(&self.dir),
-        }
+        context_id(&self.dir)
     }
 
     /// A missing manifest is confirmed only while its workspace volume is
@@ -81,6 +72,20 @@ impl BuildContext {
                 .map(|m| now.duration_since(m).unwrap_or_default() < within)
                 .unwrap_or(false)
         })
+    }
+}
+
+/// User-facing ID for an rgo-owned context, with the same separator on every OS.
+pub fn context_id(dir: &Path) -> String {
+    let name = |p: &Path| {
+        p.file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("?")
+            .to_owned()
+    };
+    match dir.parent() {
+        Some(shard) => format!("{}/{}", name(shard), name(dir)),
+        None => name(dir),
     }
 }
 

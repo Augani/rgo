@@ -102,7 +102,7 @@ def probe(version: str, rustup_home: str) -> None:
                 raise RuntimeError(f"expected one attributed Cargo 1.91 build context; got {sidecars}")
             sidecar = sidecars[0]
             context = sidecar.parent
-            context_id = str(context.relative_to(expected_root))
+            context_id = context.relative_to(expected_root).as_posix()
             run([str(RGO), "pin", context_id], cwd=project, env=env)
             run(["cargo", "clean", "-p", "rgo_boundary_probe", "--offline"], cwd=project, env=env)
             if not sidecar.is_file():
