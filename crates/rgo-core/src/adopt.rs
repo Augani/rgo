@@ -17,13 +17,17 @@ pub struct Candidate {
     /// Allocated-byte estimate for this target directory, including requested
     /// outputs and user files. External hardlinks may make this larger than
     /// unique physical usage. It is not a reclaimable-byte estimate.
-    pub usage: Usage,
+    /// A failed walk is not a zero-byte target. Keep the error so callers
+    /// cannot present a partial scan as a complete storage estimate.
+    pub usage: Result<Usage, String>,
     pub skipped_reason: Option<String>,
 }
 
 impl Candidate {
     pub fn has_storage(&self) -> bool {
-        self.usage.physical_bytes > 0
+        self.usage
+            .as_ref()
+            .is_ok_and(|usage| usage.physical_bytes > 0)
     }
 }
 
@@ -80,7 +84,14 @@ pub fn scan(roots: &[PathBuf]) -> Result<ScanReport> {
                     .any(|parent: &PathBuf| entry.path().starts_with(parent))
                     && seen.insert(entry.path().to_path_buf())
                 {
-                    candidates.push(scan_target(entry.path())?);
+                    let candidate = scan_target(entry.path());
+                    if let Err(reason) = &candidate.usage {
+                        skipped.push(SkippedPath {
+                            path: candidate.target_dir.clone(),
+                            reason: format!("target storage estimate unavailable: {reason}"),
+                        });
+                    }
+                    candidates.push(candidate);
                 }
                 // `scan_target` measures the directory. Do not traverse its
                 // artifact tree again while searching for other projects.
@@ -95,26 +106,20 @@ pub fn scan(roots: &[PathBuf]) -> Result<ScanReport> {
     })
 }
 
-fn scan_target(target: &Path) -> Result<Candidate> {
+fn scan_target(target: &Path) -> Candidate {
     let project_root = find_project_root(target);
     let override_reason = project_root
         .as_deref()
         .and_then(|root| project_override_reason_in_workspace(target, root));
-    let unreadable = target.read_dir().is_err();
-    let skipped_reason = unreadable
-        .then(|| "target directory is unreadable".to_owned())
-        .or(override_reason);
-    let usage = if !unreadable {
-        Scanner::new().measure(target)
-    } else {
-        Usage::default()
-    };
-    Ok(Candidate {
+    let usage = Scanner::new()
+        .measure_checked(target)
+        .map_err(|error| format!("{error:#}"));
+    Candidate {
         target_dir: target.to_path_buf(),
         project_root,
         usage,
-        skipped_reason,
-    })
+        skipped_reason: override_reason,
+    }
 }
 
 fn should_descend(entry: &DirEntry) -> bool {
@@ -206,8 +211,8 @@ mod tests {
         std::fs::write(target.join("deps/libx.rlib"), b"intermediate").unwrap();
         let report = scan(&[root.path().to_path_buf()]).unwrap();
         let candidate = &report.candidates[0];
-        assert_eq!(candidate.usage.files, 2);
-        assert!(candidate.usage.physical_bytes > 0);
+        assert_eq!(candidate.usage.as_ref().unwrap().files, 2);
+        assert!(candidate.usage.as_ref().unwrap().physical_bytes > 0);
     }
 
     #[test]
@@ -280,7 +285,7 @@ mod tests {
             .iter()
             .find(|candidate| candidate.target_dir == project.join("target"))
             .unwrap();
-        assert_eq!(candidate.usage.files, 2);
+        assert_eq!(candidate.usage.as_ref().unwrap().files, 2);
         let member_candidate = report
             .candidates
             .iter()
@@ -340,8 +345,8 @@ mod tests {
 
         let report = scan(&[root.path().to_path_buf()]).unwrap();
         let candidate = &report.candidates[0];
-        assert_eq!(candidate.usage.files, 1);
-        assert!(candidate.usage.physical_bytes > 0);
+        assert_eq!(candidate.usage.as_ref().unwrap().files, 1);
+        assert!(candidate.usage.as_ref().unwrap().physical_bytes > 0);
     }
 
     #[cfg(unix)]
@@ -362,5 +367,22 @@ mod tests {
                 .any(|item| item.path == unreadable || item.path.starts_with(&unreadable))
         );
         assert!(report.candidates.is_empty());
+
+        let project = root.path().join("project");
+        let target = project.join("target");
+        let unreadable_child = target.join("debug/deps/unreadable");
+        std::fs::create_dir_all(&unreadable_child).unwrap();
+        std::fs::write(
+            project.join("Cargo.toml"),
+            "[package]\nname='x'\nversion='0.1.0'\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&unreadable_child, std::fs::Permissions::from_mode(0o000))
+            .unwrap();
+        let report = scan(&[root.path().to_path_buf()]).unwrap();
+        std::fs::set_permissions(&unreadable_child, std::fs::Permissions::from_mode(0o700))
+            .unwrap();
+        assert!(report.candidates[0].usage.is_err());
+        assert!(report.skipped.iter().any(|item| item.path == target));
     }
 }

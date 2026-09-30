@@ -44,13 +44,19 @@ pub fn run(roots: Vec<PathBuf>, delete: bool) -> Result<()> {
         if let Some(reason) = &candidate.skipped_reason {
             println!("  note: {reason}");
         }
-        if candidate.usage.physical_bytes == 0 {
-            println!("  no allocated files observed");
-        } else {
-            println!(
-                "  target storage estimate: {} (includes final outputs and user files)",
-                human(candidate.usage.physical_bytes)
-            );
+        match &candidate.usage {
+            Ok(usage) if usage.physical_bytes == 0 => {
+                println!("  no allocated files observed");
+            }
+            Ok(usage) => {
+                println!(
+                    "  target storage estimate: {} (includes final outputs and user files)",
+                    human(usage.physical_bytes)
+                );
+            }
+            Err(error) => {
+                println!("  target storage estimate unavailable: {error}");
+            }
         }
     }
     println!("\nReport only. No files were removed.");

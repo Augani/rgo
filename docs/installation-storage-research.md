@@ -256,6 +256,8 @@ reclaimable-byte claim. The implementation also stopped inspecting
 `.cargo-build-lock` remains as a defense-in-depth heuristic, with unattended
 destructive GC still disabled.
 
+Cargo's current [`clean --dry-run` option](https://doc.rust-lang.org/cargo/commands/cargo-clean.html) previews what a whole-target clean would remove, but the documented no-option clean deletes the entire target directory, including final outputs that rgo promises to leave alone. That preview is useful for a future explicitly destructive migration choice; it is not a safe selective-deletion plan. The read-only adoption scan now treats an unreadable nested target path as an unavailable estimate instead of silently undercounting it.
+
 The initial fixes added sandbox regressions for F1, F3, and F6, corrected the
 doctor version boundary, and made database-open recovery discriminate confirmed
 SQLite corruption from ordinary open errors. These changes do not close the
