@@ -166,8 +166,53 @@ def main() -> None:
         run(installer, environment)
         assert (cargo_home / "rgo/installer-state.json").exists()
         run(uninstaller, environment)
+
+        after_service_file = environment.copy()
+        after_service_file["RGO_SETUP_TEST_EXIT_AFTER_SERVICE_FILE"] = "1"
+        third = subprocess.run(
+            installer, env=after_service_file, text=True, capture_output=True, timeout=120
+        )
+        assert third.returncode == 90, third.stderr
+        assert (cargo_home / ".rgo-install.json").exists()
+        assert not (cargo_home / "rgo/installer-state.json").exists()
+        run(installer, environment)
+        run(uninstaller, environment)
+
+        native_home = root / "native-home"
+        native_cargo_home = native_home / ".cargo"
+        native_rgo_home = native_home / ".rgo"
+        native_cargo_home.mkdir(parents=True)
+        (native_cargo_home / "config.toml").write_text("[net]\noffline = true\n")
+        native_environment = environment.copy()
+        native_environment.update(
+            HOME=str(native_home), CARGO_HOME=str(native_cargo_home),
+            RGO_HOME=str(native_rgo_home),
+        )
+        native_installer = [
+            sys.executable, str(ROOT / "scripts/install-unix.py"),
+            "--archive", str(archive), "--version", version,
+            "--sha256", hashlib.sha256(archive.read_bytes()).hexdigest(),
+            "--development-bundle", "--cargo-home", str(native_cargo_home),
+            "--rgo-home", str(native_rgo_home),
+        ]
+        native_upgrade = native_installer.copy()
+        native_upgrade[native_upgrade.index("--archive") + 1] = str(upgrade_archive)
+        native_upgrade[native_upgrade.index("--version") + 1] = new_tag
+        native_upgrade[native_upgrade.index("--sha256") + 1] = hashlib.sha256(
+            upgrade_archive.read_bytes()
+        ).hexdigest()
+        run(native_installer, native_environment)
+        run(native_upgrade, native_environment)
+        native_record = json.loads((native_cargo_home / ".rgo-install.json").read_text())
+        assert native_record["binary_version"] == new_version
+        assert native_record["supervised_cargo"] is None
+        run([
+            sys.executable, str(ROOT / "scripts/install-unix.py"), "--uninstall",
+            "--cargo-home", str(native_cargo_home), "--development-bundle",
+        ], native_environment)
+        assert (native_cargo_home / "config.toml").read_text() == "[net]\noffline = true\n"
         completed = True
-        print("private supervised service install, Cargo build, and uninstall passed")
+        print("private supervised and native service install, upgrade, Cargo build, and uninstall passed")
     finally:
         if completed:
             shutil.rmtree(root)
