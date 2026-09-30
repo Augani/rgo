@@ -1095,19 +1095,29 @@ fn acquire_context_lease(build_dir: &Path) -> Option<u64> {
 fn attribute(args: &[OsString]) -> Option<PathBuf> {
     let out_dir = arg_value(args, "--out-dir")?;
     let build_dir = find_managed_build_dir(Path::new(&out_dir))?;
-    if std::env::var_os("CARGO_PRIMARY_PACKAGE").is_none()
-        && std::env::var_os("RGO_MANIFEST_PATH").is_none()
+    let explicit_manifest = std::env::var_os("RGO_MANIFEST_PATH");
+    let sidecar_path = build_dir.join(SIDECAR_FILE);
+    // The supervised Cargo launcher writes the workspace identity before
+    // rustc starts. CARGO_MANIFEST_DIR names a package member, so it must not
+    // replace an existing workspace sidecar when no explicit root was passed.
+    if explicit_manifest.is_none()
+        && !matches!(
+            std::fs::symlink_metadata(&sidecar_path),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound
+        )
     {
+        return Some(build_dir);
+    }
+    if std::env::var_os("CARGO_PRIMARY_PACKAGE").is_none() && explicit_manifest.is_none() {
         return Some(build_dir);
     }
     let manifest_dir = std::env::var_os("CARGO_MANIFEST_DIR")?;
     // CARGO_MANIFEST_DIR is the *package*; RGO_MANIFEST_PATH (set by `rgo <cmd>`) is the workspace root.
-    let manifest_path = std::env::var_os("RGO_MANIFEST_PATH")
+    let manifest_path = explicit_manifest
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(&manifest_dir).join("Cargo.toml"));
     let workspace_root = manifest_path.parent()?.to_path_buf();
 
-    let sidecar_path = build_dir.join(SIDECAR_FILE);
     let now = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs();
     let existing: Option<ContextSidecar> = std::fs::read_to_string(&sidecar_path)
         .ok()

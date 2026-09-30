@@ -5,6 +5,7 @@ use std::process::{Child, Stdio};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
+use assert_cmd::cargo::cargo_bin;
 use rgo_core::context;
 use rgo_core::gc;
 use rgo_core::ipc;
@@ -12,7 +13,7 @@ use rgo_core::paths::RgoPaths;
 use rgo_core::size;
 use rgo_core::supervision;
 use rgo_protocol::{Request, Response};
-use rgo_testkit::Sandbox;
+use rgo_testkit::{Sandbox, ensure_workspace_bins_built};
 use windows_sys::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0, WAIT_TIMEOUT};
 use windows_sys::Win32::System::Threading::{
     OpenProcess, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE, TerminateProcess, WaitForSingleObject,
@@ -118,6 +119,39 @@ fn setup_activates_unchanged_cargo_exe_and_undo_restores_direct_cargo() {
         "{}\n{}",
         String::from_utf8_lossy(&doctor.stdout),
         String::from_utf8_lossy(&doctor.stderr)
+    );
+    ensure_workspace_bins_built().unwrap();
+    let workspace = sandbox
+        .workspace("windows-virtual-workspace", &["member"])
+        .unwrap();
+    let member = workspace.join("member/Cargo.toml");
+    let virtual_build = sandbox
+        .cmd("cmd.exe")
+        .current_dir(&sandbox.home)
+        .env("PATH", &path)
+        .env("RUSTC_WRAPPER", cargo_bin("rgo-rustc-wrapper"))
+        .args(["/C", "cargo", "build", "--offline", "--manifest-path"])
+        .arg(&member)
+        .output()
+        .unwrap();
+    assert!(
+        virtual_build.status.success(),
+        "{}",
+        String::from_utf8_lossy(&virtual_build.stderr)
+    );
+    let workspace = workspace.canonicalize().unwrap();
+    assert!(
+        paths
+            .checked_managed_build_dirs()
+            .unwrap()
+            .iter()
+            .any(|dir| {
+                context::read_sidecar(dir).is_some_and(|sidecar| {
+                    PathBuf::from(sidecar.workspace_root)
+                        .canonicalize()
+                        .is_ok_and(|root| root == workspace)
+                })
+            })
     );
     std::fs::remove_file(&shim).unwrap();
     let repaired = sandbox

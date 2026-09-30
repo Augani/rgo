@@ -5,6 +5,7 @@ use std::process::{Child, Stdio};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
+use assert_cmd::cargo::cargo_bin;
 use rgo_core::context;
 use rgo_core::gc;
 use rgo_core::ipc;
@@ -12,7 +13,7 @@ use rgo_core::paths::RgoPaths;
 use rgo_core::size;
 use rgo_core::supervision;
 use rgo_protocol::{Request, Response};
-use rgo_testkit::Sandbox;
+use rgo_testkit::{Sandbox, ensure_workspace_bins_built};
 
 fn cargo_proxy() -> PathBuf {
     std::env::split_paths(&std::env::var_os("PATH").expect("PATH"))
@@ -1530,10 +1531,12 @@ fn shimmed_cargo_isolated_from_direct_cargo_and_holds_gc_lock_through_run() {
 
     let workspace = sandbox.workspace("virtual-workspace", &["member"]).unwrap();
     let member = workspace.join("member/Cargo.toml");
+    ensure_workspace_bins_built().unwrap();
     let virtual_build = sandbox
         .cmd("cargo")
         .current_dir(&sandbox.home)
         .env("PATH", &search_path)
+        .env("RUSTC_WRAPPER", cargo_bin("rgo-rustc-wrapper"))
         .args(["build", "--offline", "--manifest-path"])
         .arg(&member)
         .output()
