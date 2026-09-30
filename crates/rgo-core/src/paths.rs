@@ -194,6 +194,25 @@ impl RgoPaths {
             "RGO_HOME must not be a filesystem root"
         );
         #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+
+            // The daemon must be able to bind this name before setup installs
+            // a service or changes Cargo's configuration. sun_path includes
+            // the terminating NUL byte.
+            #[cfg(target_os = "macos")]
+            const SUN_PATH_CAPACITY: usize = 104;
+            #[cfg(target_os = "linux")]
+            const SUN_PATH_CAPACITY: usize = 108;
+            #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+            const SUN_PATH_CAPACITY: usize = 100;
+            ensure!(
+                self.socket_path().as_os_str().as_bytes().len() < SUN_PATH_CAPACITY,
+                "RGO_HOME is too long for the daemon Unix socket {}; choose a shorter storage path",
+                self.socket_path().display()
+            );
+        }
+        #[cfg(unix)]
         if self.root.exists() {
             use std::os::unix::fs::PermissionsExt;
             let mode = std::fs::metadata(&self.root)?.permissions().mode();

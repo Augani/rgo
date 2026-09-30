@@ -29,6 +29,35 @@ fn fake_sccache_path(sandbox: &Sandbox) -> std::ffi::OsString {
 
 #[cfg(unix)]
 #[test]
+fn setup_rejects_an_unbindable_daemon_socket_before_activation() {
+    ensure_workspace_bins_built().unwrap();
+    let sandbox = Sandbox::new().unwrap();
+    let long_root = sandbox
+        .rgo_home
+        .with_file_name(format!("rgo-{}", "x".repeat(120)));
+    let config = sandbox.cargo_home.join("config.toml");
+    std::fs::write(&config, "[net]\noffline = true\n").unwrap();
+
+    let result = sandbox
+        .cmd(cargo_bin("rgo"))
+        .env("RGO_HOME", &long_root)
+        .args(["setup", "--no-service"])
+        .output()
+        .unwrap();
+    assert!(!result.status.success());
+    assert!(
+        String::from_utf8_lossy(&result.stderr).contains("too long for the daemon Unix socket")
+    );
+    assert!(!long_root.exists());
+    assert_eq!(
+        std::fs::read_to_string(config).unwrap(),
+        "[net]\noffline = true\n"
+    );
+    assert!(!sandbox.cargo_home.join(".rgo-install.json").exists());
+}
+
+#[cfg(unix)]
+#[test]
 fn setup_rejects_a_broken_legacy_config_link_without_touching_modern_config() {
     ensure_workspace_bins_built().unwrap();
     let sandbox = Sandbox::new().unwrap();

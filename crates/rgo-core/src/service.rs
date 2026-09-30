@@ -499,7 +499,8 @@ pub fn install(
         std::fs::create_dir_all(paths.logs_dir())?;
         atomic_write(&rendered.path, rendered.contents.as_bytes())?;
         let domain = format!("gui/{}", unsafe_get_uid());
-        let _ = command("launchctl", ["bootout", &domain, &rendered.label]);
+        let service_target = format!("{domain}/{}", rendered.label);
+        let _ = command("launchctl", ["bootout", &service_target]);
         command(
             "launchctl",
             [
@@ -625,7 +626,10 @@ fn uninstall_flavor(executable: &Path, flavor: Flavor) -> Result<()> {
         )
         .is_ok()
         {
-            command("launchctl", ["bootout", &domain, &rendered.label])?;
+            command(
+                "launchctl",
+                ["bootout", &format!("{domain}/{}", rendered.label)],
+            )?;
         }
         remove_if_exists(&rendered.path)?;
         Ok(())

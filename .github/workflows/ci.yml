@@ -55,6 +55,7 @@ jobs:
           if [ "$RUNNER_OS" = "macOS" ]; then export RGO_INSTALLER_TEST_ZDOTDIR=1; fi
           python3 scripts/verify-local-installer.py
           python3 scripts/verify-local-installer.py --supervised
+          if [ "$RUNNER_OS" = "macOS" ]; then python3 scripts/verify-unix-service-installer.py; fi
       - name: Probe nightly build-dir layouts
         if: matrix.toolchain == 'nightly'
         run: python3 scripts/verify-nightly-layout.py

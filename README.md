@@ -81,7 +81,8 @@ Cargo proxy and uses that home's ordinary local storage; put the matching
 shim first to manage that home.
 `rgo setup --undo --no-service` removes the owned launcher. Switching between
 native and supervised modes requires undo and a fresh `RGO_HOME` until a safe
-storage migration exists. The opt-in Unix bundle installer (`--supervised --no-service`)
+storage migration exists. The opt-in Unix bundle installer (`--supervised`,
+optionally with `--no-service`)
 adds an owned PATH block to standard Bash or zsh login and interactive startup
 files, then removes only that block on `--uninstall`. A zsh session with an
 absolute, user-owned `ZDOTDIR` uses its `.zprofile` and `.zshrc` there. Direct
@@ -181,7 +182,7 @@ GC guard for that command's lifetime.
 | Daemon unavailable | inspect `rgo doctor` and the service logs, then rerun `rgo setup` for this installation; native `--no-service` provides no automatic maintenance |
 | Metadata database corrupt | confirmed SQLite corruption is moved to `state/meta.sqlite.corrupt-*` and the index is rebuilt; other open errors are reported |
 | CAS object corrupt | quarantined automatically to `~/.rgo/quarantine/`; next build misses cleanly |
-| Remove an installer-owned Unix `--no-service` activation | run the same installer's `--uninstall` option; it restores Cargo settings, removes owned command links and supervised shell PATH blocks, and retains versioned binaries and managed data for explicit later cleanup |
+| Remove an installer-owned Unix activation | run the same installer's `--uninstall` option; it stops an owned service when present, restores Cargo settings, removes owned command links and supervised shell PATH blocks, and retains versioned binaries and managed data for explicit later cleanup |
 | Remove an installer-owned Windows activation | run `scripts/install-windows.ps1 -Uninstall` with the same destination options; it verifies ownership, undoes Cargo setup, removes owned command copies and its PATH entry, and retains versioned binaries and managed data |
 | Other installations | `rgo setup --undo`, then remove binaries only after confirming no Cargo build still needs them; decide separately whether to retain managed data |
 

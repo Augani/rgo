@@ -1097,11 +1097,11 @@ def uninstall_owned(
                 or Path(str(record.get("install_root", ""))).resolve() != cli.parent
                 or record.get("cargo_home") != str(cargo_home)
                 or state.get("schema_version") != 1
-                or state.get("no_service") is not True
+                or not isinstance(state.get("no_service"), bool)
                 or state.get("supervised", False) is not (record.get("supervised_cargo") is not None)
                 or Path(str(state.get("rgo_binary", ""))).resolve() != cli
             ):
-                raise InstallError("uninstall requires a matching owned no-service installation")
+                raise InstallError("uninstall requires a matching owned installation")
             activation_paths(cargo_home, install_root, record)
             previous_links = link_snapshot(links)
             if (
@@ -1151,7 +1151,7 @@ def uninstall_owned(
             or Path(str(record.get("install_root", ""))).resolve() != cli.parent
             or record.get("cargo_home") != str(cargo_home)
             or state.get("schema_version") != 1
-            or state.get("no_service") is not True
+            or not isinstance(state.get("no_service"), bool)
             or state.get("supervised", False) is not (record.get("supervised_cargo") is not None)
             or Path(str(state.get("rgo_binary", ""))).resolve() != cli
         ):
@@ -1188,7 +1188,10 @@ def uninstall_owned(
             Path(environment.get("HOME") or Path.home()).expanduser().absolute(),
         )
         if current_record is not None or journal.get("phase") == "prepared":
-            run(cli, "setup", "--undo", "--no-service", environment=environment)
+            undo_args = ["setup", "--undo"]
+            if state["no_service"]:
+                undo_args.append("--no-service")
+            run(cli, *undo_args, environment=environment)
             journal["phase"] = "setup_done"
             write_state(journal_path, journal)
             if development_probe and os.environ.get("RGO_INSTALLER_TEST_EXIT_AFTER_UNDO") == "1":
@@ -1257,7 +1260,7 @@ def main() -> None:
     parser.add_argument("--real-cargo", type=Path, help="absolute path to the existing Cargo proxy")
     parser.add_argument("--verify-only", action="store_true")
     parser.add_argument("--repair", action="store_true", help="restore an owned no-service version from this verified bundle")
-    parser.add_argument("--uninstall", action="store_true", help="undo an owned no-service install and remove its command links")
+    parser.add_argument("--uninstall", action="store_true", help="undo an owned install and remove its command links")
     args = parser.parse_args()
     if args.uninstall and (
         args.repair or args.verify_only or args.archive or args.repo or args.version or args.latest
@@ -1269,8 +1272,6 @@ def main() -> None:
         raise InstallError("--repair requires --no-service and cannot be combined with --verify-only")
     if args.real_cargo and not args.supervised:
         raise InstallError("--real-cargo requires --supervised")
-    if args.supervised and not args.no_service and not args.verify_only:
-        raise InstallError("supervised installer activation currently requires --no-service until service-managed uninstall is supported")
 
     if os.name != "posix" or platform.system() not in {"Darwin", "Linux"}:
         raise InstallError("this installer supports macOS and glibc Linux; Windows uses a separate installer")

@@ -1513,27 +1513,27 @@ fn lock_daemon_for_activation(paths: &RgoPaths) -> Result<File> {
         .open(&path)
         .with_context(|| format!("opening {}", path.display()))?;
     if !file.try_lock_exclusive()? {
-        match ipc::request_with_timeout(
+        let shutdown_error = match ipc::request_with_timeout(
             &paths.socket_path(),
             Request::Shutdown,
             Duration::from_secs(5),
         ) {
-            Ok(Response::Ok) => {}
-            Ok(response) => bail!(
-                "a daemon is still running for {}; shutdown was refused: {response:?}",
-                paths.root.display()
-            ),
-            Err(error) => bail!(
-                "a daemon is still running for {}; could not request shutdown: {error:#}",
-                paths.root.display()
-            ),
-        }
+            Ok(Response::Ok) => None,
+            Ok(response) => Some(format!("shutdown was refused: {response:?}")),
+            Err(error) => Some(format!("could not request shutdown: {error:#}")),
+        };
         let deadline = Instant::now() + Duration::from_secs(10);
         while Instant::now() < deadline {
             if file.try_lock_exclusive()? {
                 return Ok(file);
             }
             std::thread::sleep(Duration::from_millis(25));
+        }
+        if let Some(error) = shutdown_error {
+            bail!(
+                "a daemon is still running for {}: {error}",
+                paths.root.display()
+            );
         }
         bail!(
             "a daemon is still running for {} after shutdown; activation is unchanged",
