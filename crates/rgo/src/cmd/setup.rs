@@ -902,12 +902,13 @@ pub fn run(
     // postflight. Prove that plain Cargo actually selects a discoverable
     // managed build directory before starting maintenance. Repeated setup
     // with unchanged activation needs no additional builds.
-    if !undo
-        && !dry_run
-        && !supervised
-        && (old_record.is_none() || next != current)
-        && let Err(error) = doctor::verify_plain_cargo(&paths, managed_wrapper.as_deref())
-    {
+    let activation_probe =
+        if !undo && !dry_run && !supervised && (old_record.is_none() || next != current) {
+            doctor::verify_plain_cargo(&paths, managed_wrapper.as_deref())
+        } else {
+            Ok(())
+        };
+    if let Err(error) = activation_probe {
         let rollback = (|| -> Result<()> {
             if cargo_config::read_or_empty(&cfg_path)? != next {
                 bail!(
