@@ -2,8 +2,7 @@
 //! counting each hard-linked inode once. Cargo hardlinks uplifted binaries between the
 //! build-dir and target-dir, so logical sums overstate reality.
 
-use std::collections::HashSet;
-use std::ffi::OsStr;
+use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -63,16 +62,6 @@ struct FileIdentity {
     inode: Option<(u64, u64)>,
     links: u64,
     logical_bytes: u64,
-}
-
-/// Only rgo-owned top-level entries belong to its storage budget. In
-/// particular, a user may select a root near Cargo's registry or a checkout;
-/// those neighboring files must not become apparent rgo pressure.
-fn budget_root_entry(name: &OsStr) -> bool {
-    matches!(
-        name.to_str(),
-        Some("builds" | "cas" | "state" | "tmp" | "quarantine" | "logs" | "config.toml")
-    )
 }
 
 impl FileIdentity {
@@ -203,6 +192,7 @@ impl Scanner {
 pub(crate) struct TriggerScan {
     walk: Option<walkdir::IntoIter>,
     root: Option<PathBuf>,
+    remaining: VecDeque<(PathBuf, bool)>,
     scanner: Scanner,
     usage: Usage,
     last_completed: Option<Instant>,
@@ -216,9 +206,10 @@ impl TriggerScan {
         self.usage.physical_bytes
     }
 
-    /// Visit at most `limit` filesystem entries. A quiet completed sweep waits
-    /// for `interval` before starting another; an incomplete sweep resumes on
-    /// the next call. Any scan error discards the partial total.
+    /// Spend at most `limit` steps opening owned domains or visiting entries.
+    /// A quiet completed sweep waits for `interval` before starting another;
+    /// an incomplete sweep resumes on the next call. Any scan error discards
+    /// the partial total.
     pub(crate) fn advance(
         &mut self,
         paths: &RgoPaths,
@@ -226,7 +217,7 @@ impl TriggerScan {
         interval: Duration,
     ) -> Result<Option<u64>> {
         ensure!(limit > 0, "trigger scan limit must be positive");
-        if self.walk.is_none() {
+        if self.root.is_none() {
             if self
                 .last_completed
                 .is_some_and(|completed| completed.elapsed() < interval)
@@ -240,20 +231,28 @@ impl TriggerScan {
                 .canonicalize()
                 .with_context(|| format!("resolving {}", paths.root.display()))?;
             ensure!(root.is_dir(), "storage root is not a directory");
-            self.walk = Some(WalkDir::new(&root).follow_links(false).into_iter());
+            // Resolve only rgo-owned paths. Walking the root and filtering
+            // names would scan unrelated neighbors and disagree with direct
+            // path lookup on case-insensitive filesystems.
+            self.remaining = [
+                ("builds", false),
+                ("cas", false),
+                ("state", false),
+                ("tmp", false),
+                ("quarantine", false),
+                ("logs", false),
+                ("config.toml", true),
+            ]
+            .into_iter()
+            .map(|(name, file)| (root.join(name), file))
+            .collect();
             self.root = Some(root);
             self.scanner = Scanner::new();
             self.usage = Usage::default();
         }
         for _ in 0..limit {
-            let next = self.walk.as_mut().unwrap().next();
-            let entry = match next {
-                Some(Ok(entry)) => entry,
-                Some(Err(error)) => {
-                    self.invalidate();
-                    return Err(error).context("walking managed storage for automatic trigger");
-                }
-                None => {
+            if self.walk.is_none() {
+                let Some((path, file)) = self.remaining.pop_front() else {
                     let expected = self.root.as_ref().unwrap();
                     let actual = paths.root.canonicalize();
                     if !actual.as_ref().is_ok_and(|actual| actual == expected) {
@@ -263,32 +262,43 @@ impl TriggerScan {
                     let total = self.usage.physical_bytes;
                     self.mark_completed();
                     return Ok(Some(total));
-                }
-            };
-            if entry.depth() == 1 && !budget_root_entry(entry.file_name()) {
-                if entry.file_type().is_dir() {
-                    self.walk.as_mut().unwrap().skip_current_dir();
+                };
+                match std::fs::symlink_metadata(&path) {
+                    Ok(metadata)
+                        if !metadata.file_type().is_symlink()
+                            && ((file && metadata.is_file()) || (!file && metadata.is_dir())) =>
+                    {
+                        self.walk = Some(WalkDir::new(&path).follow_links(false).into_iter());
+                    }
+                    Ok(_) => {
+                        self.invalidate();
+                        anyhow::bail!("unsafe managed storage entry {}", path.display());
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => {
+                        self.invalidate();
+                        return Err(error).with_context(|| format!("checking {}", path.display()));
+                    }
                 }
                 continue;
             }
-            if entry.depth() == 1 && entry.file_type().is_symlink() {
-                let path = entry.path().to_path_buf();
-                self.invalidate();
-                anyhow::bail!("unsafe symlinked storage entry {}", path.display());
-            }
-            if entry.depth() == 1
-                && ((entry.file_name() == "config.toml" && !entry.file_type().is_file())
-                    || (entry.file_name() != "config.toml" && !entry.file_type().is_dir()))
-            {
-                let path = entry.path().to_path_buf();
-                self.invalidate();
-                anyhow::bail!("unsafe managed storage entry {}", path.display());
-            }
-            if matches!(entry.depth(), 2 | 3) {
+            let next = self.walk.as_mut().unwrap().next();
+            let entry = match next {
+                Some(Ok(entry)) => entry,
+                Some(Err(error)) => {
+                    self.invalidate();
+                    return Err(error).context("walking managed storage for automatic trigger");
+                }
+                None => {
+                    self.walk = None;
+                    continue;
+                }
+            };
+            if matches!(entry.depth(), 1 | 2) {
                 let builds = self.root.as_ref().unwrap().join("builds");
                 let is_build_shard =
-                    entry.depth() == 2 && entry.path().parent() == Some(builds.as_path());
-                let is_build_context = entry.depth() == 3
+                    entry.depth() == 1 && entry.path().parent() == Some(builds.as_path());
+                let is_build_context = entry.depth() == 2
                     && entry.path().parent().and_then(Path::parent) == Some(builds.as_path());
                 if (is_build_shard || is_build_context) && !entry.file_type().is_dir() {
                     let path = entry.path().to_path_buf();
@@ -323,6 +333,7 @@ impl TriggerScan {
     pub(crate) fn mark_completed(&mut self) {
         self.walk = None;
         self.root = None;
+        self.remaining.clear();
         self.scanner = Scanner::new();
         self.usage = Usage::default();
         self.last_completed = Some(Instant::now());
@@ -331,6 +342,7 @@ impl TriggerScan {
     pub(crate) fn invalidate(&mut self) {
         self.walk = None;
         self.root = None;
+        self.remaining.clear();
         self.scanner = Scanner::new();
         self.usage = Usage::default();
         self.last_completed = None;
@@ -618,6 +630,8 @@ mod tests {
         let paths = RgoPaths {
             root: root.path().join("rgo"),
         };
+        std::fs::create_dir_all(paths.root.join("State")).unwrap();
+        std::fs::write(paths.root.join("State/preexisting"), vec![b'q'; 4096]).unwrap();
         paths.ensure_layout().unwrap();
         let context = paths.builds_dir().join("aa/context");
         std::fs::create_dir_all(context.join("debug/incremental")).unwrap();
