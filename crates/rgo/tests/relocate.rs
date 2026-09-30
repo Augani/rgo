@@ -4,6 +4,16 @@
 
 use assert_cmd::cargo::cargo_bin;
 use rgo_testkit::{Sandbox, ensure_workspace_bins_built};
+use std::path::Path;
+
+fn expected_workspace(path: &Path) -> String {
+    let canonical = std::fs::canonicalize(path).unwrap();
+    let raw = canonical.to_string_lossy();
+    let path = raw.as_ref();
+    #[cfg(windows)]
+    let path = path.strip_prefix(r"\\?\").unwrap_or(path);
+    path.to_owned()
+}
 
 #[test]
 fn plain_cargo_build_is_relocated_and_binary_still_uplifted() {
@@ -73,7 +83,7 @@ fn plain_cargo_build_is_relocated_and_binary_still_uplifted() {
     assert!(ls.status.success());
     let out = String::from_utf8_lossy(&ls.stdout);
     assert!(
-        out.contains(proj.to_str().unwrap()),
+        out.contains(&expected_workspace(&proj)),
         "rgo ls should attribute the build-dir via the wrapper sidecar:\n{out}"
     );
 }
@@ -121,22 +131,21 @@ fn worktrees_of_one_repo_group_under_a_header_in_ls() {
     let ls = sb.cmd(cargo_bin("rgo")).arg("ls").output().unwrap();
     assert!(ls.status.success());
     let out = String::from_utf8_lossy(&ls.stdout);
-    let repo = std::fs::canonicalize(&main).unwrap();
-    let header = format!("── {} (2 contexts)", repo.display());
+    let header = format!("── {} (2 contexts)", expected_workspace(&main));
     assert!(
         out.contains(&header),
         "expected worktree group header {header:?}:\n{out}"
     );
     assert!(
-        out.contains(main.to_str().unwrap()),
+        out.contains(&expected_workspace(&main)),
         "main row missing:\n{out}"
     );
     assert!(
-        out.contains(linked.to_str().unwrap()),
+        out.contains(&expected_workspace(&linked)),
         "linked worktree row missing:\n{out}"
     );
     assert!(
-        out.contains(solo.to_str().unwrap()),
+        out.contains(&expected_workspace(&solo)),
         "solo row missing:\n{out}"
     );
     // The solo repo must not get a group header of its own.

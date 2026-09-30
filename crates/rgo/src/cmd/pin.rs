@@ -5,13 +5,16 @@ use rgo_core::context;
 use rgo_core::ipc;
 use rgo_protocol::{Request, Response};
 
-use super::{daemon, env};
+use super::{daemon, env, workspace_matches};
 
 pub fn run(id: &str, pin: bool) -> Result<()> {
     let e = env()?;
-    let existing = context::list(&e.paths)?
-        .into_iter()
-        .find(|c| c.id() == id || c.sidecar.as_ref().is_some_and(|s| s.workspace_root == id));
+    let existing = context::list(&e.paths)?.into_iter().find(|c| {
+        c.id() == id
+            || c.sidecar
+                .as_ref()
+                .is_some_and(|s| workspace_matches(&s.workspace_root, id))
+    });
     let (path, label) = if let Some(context) = existing {
         let label = context.id();
         (context.dir, label)

@@ -6,7 +6,7 @@ use anyhow::Result;
 use rgo_core::context;
 use rgo_core::db::StateDb;
 
-use super::{env, human};
+use super::{display_workspace_path, env, human};
 
 pub fn run() -> Result<()> {
     let e = env()?;
@@ -41,11 +41,19 @@ pub fn run() -> Result<()> {
 
     let print_row = |c: &context::BuildContext| {
         let ws = match &c.sidecar {
-            Some(s) if c.is_orphan() => format!("{} (orphan)", s.workspace_root),
-            Some(s) if c.workspace_unavailable() => {
-                format!("{} (workspace unavailable; protected)", s.workspace_root)
+            Some(s) if c.is_orphan() => {
+                format!(
+                    "{} (orphan)",
+                    display_workspace_path(Path::new(&s.workspace_root))
+                )
             }
-            Some(s) => s.workspace_root.clone(),
+            Some(s) if c.workspace_unavailable() => {
+                format!(
+                    "{} (workspace unavailable; protected)",
+                    display_workspace_path(Path::new(&s.workspace_root))
+                )
+            }
+            Some(s) => display_workspace_path(Path::new(&s.workspace_root)),
             None => "? (unattributed; protected)".to_owned(),
         };
         let idle = humantime::format_duration(std::time::Duration::from_secs(
@@ -108,8 +116,8 @@ pub fn run() -> Result<()> {
 /// `<repo>/.git` displays as `<repo>`; anything else shows the resolved path.
 fn repo_label(common: &Path) -> String {
     match common.file_name() {
-        Some(name) if name == ".git" => common.parent().unwrap_or(common).display().to_string(),
-        _ => common.display().to_string(),
+        Some(name) if name == ".git" => display_workspace_path(common.parent().unwrap_or(common)),
+        _ => display_workspace_path(common),
     }
 }
 

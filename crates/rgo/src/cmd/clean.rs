@@ -3,14 +3,16 @@ use rgo_core::context;
 use rgo_core::ipc;
 use rgo_protocol::{Request, Response};
 
-use super::{daemon, env, human};
+use super::{daemon, env, human, workspace_matches};
 
 pub fn run(id: &str) -> Result<()> {
     let e = env()?;
-    let Some(c) = context::list(&e.paths)?
-        .into_iter()
-        .find(|c| c.id() == id || c.sidecar.as_ref().is_some_and(|s| s.workspace_root == id))
-    else {
+    let Some(c) = context::list(&e.paths)?.into_iter().find(|c| {
+        c.id() == id
+            || c.sidecar
+                .as_ref()
+                .is_some_and(|s| workspace_matches(&s.workspace_root, id))
+    }) else {
         bail!("no managed context {id:?}; see `rgo ls`");
     };
     e.paths.require_supervised_deletion()?;

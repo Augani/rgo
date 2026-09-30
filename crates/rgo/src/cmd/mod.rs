@@ -33,3 +33,40 @@ pub fn env() -> Result<Env> {
 pub fn human(b: u64) -> String {
     bytesize::ByteSize(b).display().iec().to_string()
 }
+
+fn workspace_matches(stored: &str, requested: &str) -> bool {
+    if stored == requested {
+        return true;
+    }
+    if !std::path::Path::new(requested).is_absolute() {
+        return false;
+    }
+    match (
+        std::fs::canonicalize(stored),
+        std::fs::canonicalize(requested),
+    ) {
+        (Ok(stored), Ok(requested)) => stored == requested,
+        _ => false,
+    }
+}
+
+fn display_workspace_path(path: &std::path::Path) -> String {
+    let raw = path.to_string_lossy();
+    #[cfg(windows)]
+    {
+        if let Some(unc) = raw.strip_prefix(r"\\?\UNC\") {
+            return format!(r"\\{unc}");
+        }
+        if let Some(rest) = raw.strip_prefix(r"\\?\") {
+            let bytes = rest.as_bytes();
+            if bytes.len() >= 3
+                && bytes[0].is_ascii_alphabetic()
+                && bytes[1] == b':'
+                && bytes[2] == b'\\'
+            {
+                return rest.to_owned();
+            }
+        }
+    }
+    raw.into_owned()
+}

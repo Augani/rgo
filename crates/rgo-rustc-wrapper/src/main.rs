@@ -1201,7 +1201,27 @@ fn resolve_workspace_manifest(package_manifest: &Path) -> Option<PathBuf> {
         return None;
     }
     let path = path.canonicalize().ok()?;
+    #[cfg(windows)]
+    let path = regular_windows_path(path)?;
     path.parent()?.to_str()?;
+    Some(path)
+}
+
+#[cfg(windows)]
+fn regular_windows_path(path: PathBuf) -> Option<PathBuf> {
+    let raw = path.to_str()?;
+    let Some(rest) = raw.strip_prefix(r"\\?\") else {
+        return Some(path);
+    };
+    if let Some(unc) = rest.strip_prefix(r"UNC\") {
+        let regular = PathBuf::from(format!(r"\\{unc}"));
+        return Some(if regular.is_file() { regular } else { path });
+    }
+    let bytes = rest.as_bytes();
+    if bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && bytes[2] == b'\\' {
+        let regular = PathBuf::from(rest);
+        return Some(if regular.is_file() { regular } else { path });
+    }
     Some(path)
 }
 
