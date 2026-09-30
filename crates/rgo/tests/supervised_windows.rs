@@ -263,6 +263,33 @@ fn setup_activates_unchanged_cargo_exe_and_undo_restores_direct_cargo() {
         managed_before_direct
     );
 
+    let pointer_path = sandbox.cargo_home.join(".rgo-home");
+    let original_pointer = std::fs::read(&pointer_path).unwrap();
+    std::fs::write(&pointer_path, b"relative-broken-pointer\n").unwrap();
+    let damaged_pointer_project = sandbox.simple_bin("windows-damaged-pointer").unwrap();
+    let damaged_pointer = sandbox
+        .cmd("cmd.exe")
+        .current_dir(&damaged_pointer_project)
+        .env("PATH", &path)
+        .env_remove("RGO_HOME")
+        .args(["/C", "cargo", "build", "--offline"])
+        .output()
+        .unwrap();
+    assert!(
+        damaged_pointer.status.success(),
+        "{}",
+        String::from_utf8_lossy(&damaged_pointer.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&damaged_pointer.stderr).contains("cannot locate managed storage")
+    );
+    assert!(checkout_executable(&damaged_pointer_project).is_file());
+    assert_eq!(
+        paths.checked_managed_build_dirs().unwrap().len(),
+        managed_before_direct
+    );
+    std::fs::write(&pointer_path, original_pointer).unwrap();
+
     let fallback_path = shim.parent().unwrap().join(".rgo-cargo-fallback.json");
     let original_fallback = std::fs::read(&fallback_path).unwrap();
     let mut changed_fallback: serde_json::Value =
