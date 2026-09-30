@@ -143,6 +143,12 @@ def probe(root: Path) -> None:
     record = json.loads((cargo_home / ".rgo-install.json").read_text())
     shim = Path(record["supervised_cargo"]["shim_path"])
     env["PATH"] = str(shim.parent) + os.pathsep + env["PATH"]
+    # On Windows, CreateProcess resolves an unqualified executable against the
+    # parent's PATH, not the env= override passed to subprocess.run.
+    os.environ["PATH"] = env["PATH"]
+    selected_cargo = shutil.which("cargo")
+    if selected_cargo is None or not os.path.samefile(selected_cargo, shim):
+        raise RuntimeError(f"PATH did not select the supervised Cargo launcher: {selected_cargo}")
     config = rgo_home / "config.toml"
     config.write_text("[storage]\nmax_size = '1GB'\nmin_free_space = '0B'\n[gc]\nauto = true\n")
 
@@ -161,6 +167,8 @@ def probe(root: Path) -> None:
             )
             (project / "src" / "main.rs").write_text("fn main() {}\n")
             run(["cargo", "build", "--offline", "--quiet"], env, cwd=project)
+            if index == 0 and len(contexts(rgo_home)) != 1:
+                raise RuntimeError("first build bypassed supervised Cargo storage")
         before = contexts(rgo_home)
         if len(before) != PROJECTS:
             raise RuntimeError(f"expected {PROJECTS} managed contexts, got {len(before)}")
