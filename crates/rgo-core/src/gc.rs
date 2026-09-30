@@ -1374,6 +1374,7 @@ mod tests {
             dir: context_dir,
             sidecar: Some(ContextSidecar {
                 version: rgo_protocol::PROTOCOL_VERSION,
+                workspace_verified: true,
                 workspace_root: root.path().display().to_string(),
                 manifest_path: manifest.display().to_string(),
                 workspace_device: crate::context::workspace_device(root.path()),
@@ -1447,6 +1448,7 @@ mod tests {
         .unwrap();
         let sidecar = || ContextSidecar {
             version: rgo_protocol::PROTOCOL_VERSION,
+            workspace_verified: true,
             workspace_root: root.path().display().to_string(),
             manifest_path: manifest.display().to_string(),
             workspace_device: crate::context::workspace_device(root.path()),
@@ -1535,6 +1537,7 @@ mod tests {
             dir,
             sidecar: Some(ContextSidecar {
                 version: rgo_protocol::PROTOCOL_VERSION,
+                workspace_verified: true,
                 workspace_root: manifest.parent().unwrap().display().to_string(),
                 manifest_path: manifest.display().to_string(),
                 workspace_device: crate::context::workspace_device(manifest.parent().unwrap()),
@@ -1626,6 +1629,7 @@ mod tests {
                 dir,
                 sidecar: Some(ContextSidecar {
                     version: rgo_protocol::PROTOCOL_VERSION,
+                    workspace_verified: true,
                     workspace_root: workspace.display().to_string(),
                     manifest_path: manifest.display().to_string(),
                     workspace_device: crate::context::workspace_device(&workspace),
@@ -1697,6 +1701,7 @@ mod tests {
                     dir,
                     sidecar: Some(ContextSidecar {
                         version: rgo_protocol::PROTOCOL_VERSION,
+                        workspace_verified: true,
                         workspace_root: workspace.display().to_string(),
                         manifest_path: manifest.display().to_string(),
                         workspace_device: crate::context::workspace_device(&workspace),

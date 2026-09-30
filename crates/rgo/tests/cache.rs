@@ -337,6 +337,7 @@ if [ -n "$FAKE_RUSTC_OLD_MTIME" ]; then touch -t 202001010000 "$out"/*; fi
         command
             .env("FAKE_RUSTC_LOG", &fixture.log)
             .env("CARGO_MANIFEST_DIR", worktree)
+            .env("RGO_MANIFEST_PATH", worktree.join("Cargo.toml"))
             .args([
                 fixture.fake_rustc.as_os_str(),
                 "--crate-name".as_ref(),

@@ -25,6 +25,10 @@ pub const LEASE_ENV: &str = "RGO_LEASE_ID";
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContextSidecar {
     pub version: u32,
+    /// True when the root came from Cargo's workspace resolution (or the
+    /// supervised launcher). Older wrapper sidecars need one-time validation.
+    #[serde(default)]
+    pub workspace_verified: bool,
     pub workspace_root: String,
     pub manifest_path: String,
     /// Unix device ID or Windows volume serial at attribution time. Older

@@ -778,6 +778,7 @@ pub fn write_sidecar(
     let first_seen = read_sidecar(dir).map(|s| s.first_seen).unwrap_or(now);
     let sc = ContextSidecar {
         version: PROTOCOL_VERSION,
+        workspace_verified: true,
         workspace_root: workspace_root.display().to_string(),
         manifest_path: manifest_path.display().to_string(),
         workspace_device: workspace_device(workspace_root),
@@ -1154,6 +1155,7 @@ mod tests {
         std::fs::write(&manifest, "[workspace]\n").unwrap();
         let sidecar = ContextSidecar {
             version: PROTOCOL_VERSION,
+            workspace_verified: true,
             workspace_root: workspace.display().to_string(),
             manifest_path: manifest.display().to_string(),
             workspace_device: workspace_device(&workspace),

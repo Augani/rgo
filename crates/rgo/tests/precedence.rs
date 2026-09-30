@@ -235,3 +235,87 @@ fn setup_uses_cargos_legacy_home_config_when_present() {
         assert_eq!(std::fs::read_to_string(&legacy).unwrap(), user_config);
     }
 }
+
+#[test]
+fn native_cargo_attributes_member_build_to_workspace_root() {
+    ensure_workspace_bins_built().unwrap();
+    let sandbox = Sandbox::new().unwrap();
+    let setup = sandbox
+        .cmd(cargo_bin("rgo"))
+        .args(["setup", "--no-service"])
+        .output()
+        .unwrap();
+    assert!(
+        setup.status.success(),
+        "{}",
+        String::from_utf8_lossy(&setup.stderr)
+    );
+
+    let workspace = sandbox.workspace("native-member", &["member"]).unwrap();
+    let member_manifest = workspace.join("member/Cargo.toml");
+    let build = sandbox
+        .cargo()
+        .current_dir(&sandbox.home)
+        .args(["build", "--offline", "--manifest-path"])
+        .arg(&member_manifest)
+        .output()
+        .unwrap();
+    assert!(
+        build.status.success(),
+        "{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+
+    let managed = rgo_core::paths::RgoPaths {
+        root: sandbox.rgo_home.clone(),
+    };
+    let contexts = managed.managed_build_dirs();
+    assert_eq!(contexts.len(), 1);
+    let sidecar = rgo_core::context::read_sidecar(&contexts[0]).unwrap();
+    assert!(sidecar.workspace_verified);
+    assert_eq!(
+        PathBuf::from(sidecar.workspace_root)
+            .canonicalize()
+            .unwrap(),
+        workspace.canonicalize().unwrap()
+    );
+    assert_eq!(
+        PathBuf::from(sidecar.manifest_path).canonicalize().unwrap(),
+        workspace.join("Cargo.toml").canonicalize().unwrap()
+    );
+
+    // Sidecars from earlier native installs lack verification and can contain
+    // the member path. The next real compile must correct that identity.
+    let sidecar_path = contexts[0].join(rgo_protocol::SIDECAR_FILE);
+    let mut legacy: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&sidecar_path).unwrap()).unwrap();
+    legacy.as_object_mut().unwrap().remove("workspace_verified");
+    legacy["workspace_root"] = serde_json::json!(workspace.join("member"));
+    legacy["manifest_path"] = serde_json::json!(member_manifest);
+    std::fs::write(&sidecar_path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+    std::fs::write(
+        workspace.join("member/src/main.rs"),
+        "fn main() { println!(\"rebuilt\"); }\n",
+    )
+    .unwrap();
+    let rebuild = sandbox
+        .cargo()
+        .current_dir(&sandbox.home)
+        .args(["build", "--offline", "--manifest-path"])
+        .arg(&member_manifest)
+        .output()
+        .unwrap();
+    assert!(
+        rebuild.status.success(),
+        "{}",
+        String::from_utf8_lossy(&rebuild.stderr)
+    );
+    let repaired = rgo_core::context::read_sidecar(&contexts[0]).unwrap();
+    assert!(repaired.workspace_verified);
+    assert_eq!(
+        PathBuf::from(repaired.workspace_root)
+            .canonicalize()
+            .unwrap(),
+        workspace.canonicalize().unwrap()
+    );
+}

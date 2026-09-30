@@ -130,7 +130,7 @@ fn main() {
     let mut context_lease_id = None;
     if std::env::var_os(BYPASS_ENV).is_none() {
         if let Some(build_dir) = attribute(&args) {
-            let workspace_root = workspace_root();
+            let workspace_root = workspace_root(&build_dir);
             if let Some(raw) = std::env::var_os(LEASE_ENV) {
                 if let Ok(id) = raw.to_string_lossy().parse::<u64>() {
                     let bound = request(Request::BindLease {
@@ -487,7 +487,10 @@ fn classify_invocation(rustc: &Path, args: &[OsString], build_dir: &Path) -> Opt
                 cargo_home.join("registry").join("src"),
                 cargo_home.join("git").join("checkouts"),
             ],
-            workspace_roots: workspace_root().into_iter().map(PathBuf::from).collect(),
+            workspace_roots: workspace_root(build_dir)
+                .into_iter()
+                .map(PathBuf::from)
+                .collect(),
             remap_workspace_paths: remap_workspace_paths_enabled(),
         },
     ) {
@@ -1097,34 +1100,39 @@ fn attribute(args: &[OsString]) -> Option<PathBuf> {
     let build_dir = find_managed_build_dir(Path::new(&out_dir))?;
     let explicit_manifest = std::env::var_os("RGO_MANIFEST_PATH");
     let sidecar_path = build_dir.join(SIDECAR_FILE);
-    // The supervised Cargo launcher writes the workspace identity before
-    // rustc starts. CARGO_MANIFEST_DIR names a package member, so it must not
-    // replace an existing workspace sidecar when no explicit root was passed.
-    if explicit_manifest.is_none()
-        && !matches!(
-            std::fs::symlink_metadata(&sidecar_path),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound
-        )
-    {
+    let existing: Option<ContextSidecar> = match std::fs::read_to_string(&sidecar_path) {
+        Ok(text) => match serde_json::from_str(&text) {
+            Ok(sidecar) => Some(sidecar),
+            Err(_) => return Some(build_dir),
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(_) => return Some(build_dir),
+    };
+    // The launcher writes the resolved root before rustc starts. Older native
+    // wrapper sidecars can contain a member root and need one-time validation.
+    if explicit_manifest.is_none() && existing.as_ref().is_some_and(|sc| sc.workspace_verified) {
         return Some(build_dir);
     }
     if std::env::var_os("CARGO_PRIMARY_PACKAGE").is_none() && explicit_manifest.is_none() {
         return Some(build_dir);
     }
-    let manifest_dir = std::env::var_os("CARGO_MANIFEST_DIR")?;
-    // CARGO_MANIFEST_DIR is the *package*; RGO_MANIFEST_PATH (set by `rgo <cmd>`) is the workspace root.
-    let manifest_path = explicit_manifest
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(&manifest_dir).join("Cargo.toml"));
+    // CARGO_MANIFEST_DIR identifies the package, not necessarily its workspace.
+    // Resolve only when a context is new or carries a legacy unverified sidecar.
+    let manifest_path = match explicit_manifest {
+        Some(path) => PathBuf::from(path),
+        None => {
+            let package_manifest =
+                PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR")?).join("Cargo.toml");
+            resolve_workspace_manifest(&package_manifest)?
+        }
+    };
     let workspace_root = manifest_path.parent()?.to_path_buf();
 
     let now = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs();
-    let existing: Option<ContextSidecar> = std::fs::read_to_string(&sidecar_path)
-        .ok()
-        .and_then(|t| serde_json::from_str(&t).ok());
     if let Some(e) = &existing {
         // Refresh at most once a day to avoid write churn on every rustc invocation.
         if now.saturating_sub(e.last_seen) < 86_400
+            && e.workspace_verified
             && e.manifest_path == manifest_path.to_string_lossy()
             && (cfg!(not(unix)) || e.workspace_device.is_some())
         {
@@ -1133,6 +1141,7 @@ fn attribute(args: &[OsString]) -> Option<PathBuf> {
     }
     let sc = ContextSidecar {
         version: PROTOCOL_VERSION,
+        workspace_verified: true,
         workspace_root: workspace_root.to_string_lossy().into_owned(),
         manifest_path: manifest_path.to_string_lossy().into_owned(),
         workspace_device: {
@@ -1175,6 +1184,27 @@ fn attribute(args: &[OsString]) -> Option<PathBuf> {
     Some(build_dir)
 }
 
+fn resolve_workspace_manifest(package_manifest: &Path) -> Option<PathBuf> {
+    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| OsString::from("cargo"));
+    let output = Command::new(cargo)
+        .args(["locate-project", "--workspace", "--message-format", "json"])
+        .arg("--manifest-path")
+        .arg(package_manifest)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
+    let path = PathBuf::from(report.get("root")?.as_str()?);
+    if !path.is_absolute() || !path.is_file() {
+        return None;
+    }
+    let path = path.canonicalize().ok()?;
+    path.parent()?.to_str()?;
+    Some(path)
+}
+
 #[cfg(windows)]
 #[allow(unsafe_code)]
 fn windows_volume_serial(path: &std::path::Path) -> Option<u64> {
@@ -1210,13 +1240,17 @@ fn windows_volume_serial(path: &std::path::Path) -> Option<u64> {
         .filter(|serial| *serial != 0)
 }
 
-fn workspace_root() -> Option<String> {
-    let manifest = std::env::var_os("RGO_MANIFEST_PATH")
-        .map(PathBuf::from)
+fn workspace_root(build_dir: &Path) -> Option<String> {
+    std::fs::read_to_string(build_dir.join(SIDECAR_FILE))
+        .ok()
+        .and_then(|text| serde_json::from_str::<ContextSidecar>(&text).ok())
+        .filter(|sidecar| sidecar.workspace_verified)
+        .map(|sidecar| sidecar.workspace_root)
         .or_else(|| {
-            std::env::var_os("CARGO_MANIFEST_DIR").map(|p| PathBuf::from(p).join("Cargo.toml"))
-        })?;
-    manifest.parent().map(|p| p.to_string_lossy().into_owned())
+            std::env::var_os("RGO_MANIFEST_PATH")
+                .and_then(|manifest| PathBuf::from(manifest).parent().map(Path::to_path_buf))
+                .map(|root| root.to_string_lossy().into_owned())
+        })
 }
 
 fn request(message: Request) -> Result<Response, String> {
