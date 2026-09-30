@@ -222,6 +222,35 @@ fn opted_in_maintenance_reclaims_idle_bytes_and_reports_pinned_excess() {
             .unwrap()
             .contains("protected build contexts")
     );
+
+    let response = ipc::request_with_timeout(
+        &paths.socket_path(),
+        Request::Unpin {
+            build_dir: pinned.to_string_lossy().into_owned(),
+        },
+        Duration::from_secs(5),
+    )
+    .unwrap();
+    assert!(matches!(response, Response::Ok));
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    while pinned.exists() && std::time::Instant::now() < deadline {
+        assert!(daemon.0.try_wait().unwrap().is_none());
+        thread::sleep(Duration::from_millis(100));
+    }
+    assert!(
+        !pinned.exists(),
+        "unpin did not prompt automatic budget recovery"
+    );
+    let response = ipc::request_with_timeout(
+        &paths.socket_path(),
+        Request::QueryStatus,
+        Duration::from_secs(5),
+    )
+    .unwrap();
+    let Response::Status(status) = response else {
+        panic!("daemon did not return storage status: {response:?}");
+    };
+    assert_eq!(status.unmet_budget_bytes, Some(0));
 }
 
 #[test]

@@ -494,12 +494,27 @@ fn handle_request_result(state: &State, request: Request) -> Result<Response> {
             let _operation = state.operation_lock.lock().unwrap();
             let path = Path::new(&build_dir);
             validate_managed_path(&state.paths, path)?;
+            // Persist the maintenance signal before removing the pin. If the
+            // daemon exits between these writes, the context stays protected
+            // or the next daemon can still see the signal. A failed signal
+            // must not prevent the user's durable unpin.
+            let maintenance_signal_error = if state.cfg.gc.auto {
+                crate::supervision::mark_pending_maintenance(&state.paths, path).err()
+            } else {
+                None
+            };
             context::remove_durable_pin(&state.paths, path)?;
             let db = state.db.lock().unwrap();
             db.set_pin(path, false)?;
             drop(db);
             if let Err(error) = context::try_prune_unpin_decision(&state.paths, path) {
                 tracing::warn!(path = %path.display(), %error, "deferred unpin record pruning");
+            }
+            if let Some(error) = maintenance_signal_error {
+                // Unpin is already durable. Keep the command successful and
+                // fall back to the normal measured pressure sweep.
+                tracing::warn!(path = %path.display(), %error, "could not queue post-unpin maintenance");
+                state.trigger_scan.lock().unwrap().invalidate();
             }
             Ok(Response::Ok)
         }
