@@ -613,7 +613,66 @@ fn main() {
         (Get-RawUserPathKind) -ne $expectedUserPathKind) {
         throw 'service-managed supervised uninstall changed User PATH despite -NoUserPath'
     }
-    Write-Host 'Windows installer: native and supervised upgrade/rollback, service upgrade, and exact User PATH restoration passed'
+
+    $nativeServiceHome = Join-Path $sandbox 'native service ü'
+    $nativeCargoHome = Join-Path $nativeServiceHome '.cargo'
+    $nativeRgoHome = Join-Path $nativeServiceHome '.rgo'
+    New-Item -ItemType Directory -Force -Path @($nativeCargoHome, $nativeRgoHome) | Out-Null
+    $env:HOME = $nativeServiceHome
+    $env:USERPROFILE = $nativeServiceHome
+    $env:CARGO_HOME = $nativeCargoHome
+    $env:RGO_HOME = $nativeRgoHome
+    $env:PATH = $oldPath
+    $nativeArgs = $installArgs.Clone()
+    $nativeArgs['CargoHome'] = $nativeCargoHome
+    $nativeArgs['RgoHome'] = $nativeRgoHome
+    $cleanupCargoHome = $nativeCargoHome
+    $cleanupRgoHome = $nativeRgoHome
+    $nativePlan = (& $cli setup --installer-plan-json | Out-String).Trim() | ConvertFrom-Json
+    if ($LASTEXITCODE -ne 0 -or -not $nativePlan.service.label) {
+        throw 'native installer service plan is missing its task label'
+    }
+    & $installScript @nativeArgs
+    $installed = $true
+    $nativeUpgradeArgs = $nativeArgs.Clone()
+    $nativeUpgradeArgs['ReleaseTag'] = $upgradeTag
+    $nativeUpgradeArgs['Archive'] = $upgradeArchive
+    $nativeUpgradeArgs['Sha256'] = $upgradeSha
+    $nativeStatePath = Join-Path $nativeCargoHome 'rgo/installer-windows.json'
+    $oldNativeState = [IO.File]::ReadAllText($nativeStatePath)
+    try {
+        $env:RGO_SETUP_TEST_EXIT_AFTER_RECORD = '1'
+        try {
+            & $installScript @nativeUpgradeArgs
+            throw 'forced native service upgrade interruption unexpectedly succeeded'
+        } catch {
+            if ($_.Exception.Message -notmatch 'exit 88' -or
+                $_.Exception.Message -match 'rollback also failed') { throw }
+        }
+    } finally { Remove-Item Env:RGO_SETUP_TEST_EXIT_AFTER_RECORD -ErrorAction SilentlyContinue }
+    $nativeLeaf = $nativePlan.service.label.Substring('rgo\'.Length)
+    $nativeTask = Get-ScheduledTask -TaskPath '\rgo\' -TaskName $nativeLeaf -ErrorAction Stop
+    if ([IO.File]::ReadAllText($nativeStatePath) -cne $oldNativeState -or
+        (Test-Path -LiteralPath (Join-Path $nativeCargoHome 'rgo/installer-windows-upgrade.json')) -or
+        -not [string]::Equals((Normalize-PlanPath $nativeTask.Actions[0].Execute),
+            (Normalize-PlanPath (Join-Path $nativeCargoHome "rgo/versions/$top/rgo.exe")), [StringComparison]::OrdinalIgnoreCase)) {
+        throw 'interrupted native service upgrade did not restore the old release and task'
+    }
+    & $installScript @nativeUpgradeArgs
+    $nativeTask = Get-ScheduledTask -TaskPath '\rgo\' -TaskName $nativeLeaf -ErrorAction Stop
+    $nativeRecord = Get-Content -LiteralPath (Join-Path $nativeCargoHome '.rgo-install.json') -Raw | ConvertFrom-Json
+    if ($nativeRecord.binary_version -ne $upgradeVersion -or
+        -not [string]::Equals((Normalize-PlanPath $nativeTask.Actions[0].Execute),
+            (Normalize-PlanPath (Join-Path $nativeCargoHome "rgo/versions/$upgradeTop/rgo.exe")), [StringComparison]::OrdinalIgnoreCase)) {
+        throw 'native service upgrade did not activate the new daemon'
+    }
+    & cargo build --offline --manifest-path (Join-Path $serviceProject 'Cargo.toml') | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw 'unchanged Cargo failed after native service upgrade' }
+    & $installScript -Uninstall -CargoHome $nativeCargoHome -RgoHome $nativeRgoHome
+    $installed = $false
+    $null = & schtasks.exe /Query /TN $nativePlan.service.label /HRESULT 2>&1
+    if ($LASTEXITCODE -eq 0) { throw 'native service uninstall left its scheduled task registered' }
+    Write-Host 'Windows installer: native and supervised upgrade/rollback, service upgrades, and exact User PATH restoration passed'
 } finally {
     if ($heldCargo -and -not $heldCargo.HasExited) {
         if ($heldRelease) { [IO.File]::WriteAllText($heldRelease, 'release') }

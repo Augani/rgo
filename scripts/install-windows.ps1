@@ -6,8 +6,7 @@
 .DESCRIPTION
     Release archives require a SHA-256 match and a GitHub artifact attestation.
     DevelopmentBundle is only for a local, disposable build probe. Version
-    Native version upgrades currently require -NoService. Supervised installs
-    can upgrade with their existing service mode preserved.
+    upgrades preserve the existing service and Cargo activation mode.
 #>
 param(
     [string]$ReleaseTag,
@@ -619,8 +618,8 @@ function Recover-Upgrade([string]$JournalPath) {
     Assert-PlainFile $JournalPath
     Assert-Condition ((Get-Item -LiteralPath $JournalPath).Length -le 67108864) 'upgrade journal is too large'
     $journal = Read-Json $JournalPath
-    if ($journal.schemaVersion -eq 3) {
-        Recover-SupervisedServiceUpgrade $JournalPath $journal
+    if ($journal.schemaVersion -in @(3, 4)) {
+        Recover-ServiceUpgrade $JournalPath $journal
         return
     }
     Invoke-WithSetupLocks { Recover-UpgradeGuarded $JournalPath }
@@ -635,9 +634,13 @@ function Recover-UpgradeGuarded([string]$JournalPath) {
         Recover-SupervisedUpgradeGuarded $JournalPath $journal
         return
     }
-    Assert-Condition ($journal.schemaVersion -eq 1) 'unsupported upgrade journal'
-    Assert-UpgradeState $journal.oldState 'old'
-    Assert-UpgradeState $journal.newState 'new'
+    Assert-Condition ($journal.schemaVersion -in @(1, 4)) 'unsupported upgrade journal'
+    if ($journal.schemaVersion -eq 4) {
+        Assert-NativeServiceUpgradePair $journal.oldState $journal.newState
+    } else {
+        Assert-UpgradeState $journal.oldState 'old'
+        Assert-UpgradeState $journal.newState 'new'
+    }
     $seen = @{}
     foreach ($entry in $journal.files) {
         Assert-Condition (Test-ActivationPath $entry.path) "upgrade journal names an unexpected path: $($entry.path)"
@@ -693,16 +696,38 @@ function Recover-UpgradeGuarded([string]$JournalPath) {
         }
         Assert-Record $journal.oldState $oldCli $oldWrapper
     }
-    Remove-Item -LiteralPath $JournalPath -Force
+    if ($journal.schemaVersion -ne 4) { Remove-Item -LiteralPath $JournalPath -Force }
 }
 
-function Recover-SupervisedServiceUpgrade([string]$JournalPath, $Journal) {
-    Assert-Condition ($Journal.schemaVersion -eq 3 -and
+function Assert-NativeServiceUpgradePair($OldState, $NewState) {
+    Assert-UpgradeState $OldState 'old' $true
+    Assert-UpgradeState $NewState 'new' $true
+    Assert-Condition (-not $OldState.noService -and -not $NewState.noService -and
+        -not (Test-SupervisedState $OldState) -and -not (Test-SupervisedState $NewState) -and
+        [bool]$OldState.noWrapper -eq [bool]$NewState.noWrapper -and
+        [bool]$OldState.noUserPath -eq [bool]$NewState.noUserPath -and
+        [bool]$OldState.pathAdded -eq [bool]$NewState.pathAdded -and
+        $OldState.priorUserPath -eq $NewState.priorUserPath -and
+        $OldState.versionDirectory -ne $NewState.versionDirectory) 'native service upgrade states disagree about installation ownership'
+}
+
+function Recover-ServiceUpgrade([string]$JournalPath, $Journal) {
+    Assert-Condition ($Journal.schemaVersion -in @(3, 4) -and
         -not $Journal.oldState.noService -and -not $Journal.newState.noService) 'invalid service-upgrade journal'
-    $null = Assert-SupervisedUpgradePair $Journal.oldState $Journal.newState $true
+    $shimPair = $null
+    if ($Journal.schemaVersion -eq 3) {
+        $shimPair = Assert-SupervisedUpgradePair $Journal.oldState $Journal.newState $true
+    } else {
+        Assert-NativeServiceUpgradePair $Journal.oldState $Journal.newState
+    }
     $oldCli = Join-Path (Join-Path $script:versions $Journal.oldState.versionDirectory) 'rgo.exe'
     $newCli = Join-Path (Join-Path $script:versions $Journal.newState.versionDirectory) 'rgo.exe'
-    foreach ($pair in @(@($oldCli, $Journal.oldState.cliDigest), @($newCli, $Journal.newState.cliDigest))) {
+    $oldWrapper = Join-Path (Join-Path $script:versions $Journal.oldState.versionDirectory) 'rgo-rustc-wrapper.exe'
+    $newWrapper = Join-Path (Join-Path $script:versions $Journal.newState.versionDirectory) 'rgo-rustc-wrapper.exe'
+    foreach ($pair in @(
+        @($oldCli, $Journal.oldState.cliDigest), @($newCli, $Journal.newState.cliDigest),
+        @($oldWrapper, $Journal.oldState.wrapperDigest), @($newWrapper, $Journal.newState.wrapperDigest)
+    )) {
         Assert-PlainFile $pair[0]
         Assert-Condition ((File-Digest $pair[0]) -eq $pair[1]) "service rollback binary changed: $($pair[0])"
     }
@@ -714,6 +739,31 @@ function Recover-SupervisedServiceUpgrade([string]$JournalPath, $Journal) {
     $committed = Test-ExactText $currentStateJson ($Journal.newState | ConvertTo-Json -Depth 8 -Compress)
     Assert-Condition ($committed -or
         (Test-ExactText $currentStateJson ($Journal.oldState | ConvertTo-Json -Depth 8 -Compress))) 'service upgrade journal and installed state disagree'
+    $fallbackPath = if ($null -eq $shimPair) { $null } else { $shimPair.newFallback }
+    $seen = @{}
+    foreach ($entry in $Journal.files) {
+        Assert-Condition (Test-ActivationPath $entry.path $fallbackPath) "service upgrade journal names an unexpected path: $($entry.path)"
+        $key = Full-Path $entry.path
+        Assert-Condition (-not $seen.ContainsKey($key)) "duplicate service upgrade path: $($entry.path)"
+        $seen[$key] = $true
+        $current = Encoded-File $entry.path
+        if ($committed) {
+            Assert-Condition (Test-ExactText $current $entry.after) "committed activation file changed: $($entry.path)"
+        } else {
+            Assert-Condition ((Test-ExactText $current $entry.before) -or
+                (Test-ExactText $current $entry.after)) "activation file changed during service upgrade: $($entry.path)"
+        }
+    }
+    Assert-Condition ($seen.ContainsKey((Full-Path (Join-Path $script:resolvedCargoHome '.rgo-install.json')))) 'service upgrade journal omitted its installation record'
+    foreach ($pair in @(
+        @((Join-Path $script:resolvedBinDir 'rgo.exe'), $Journal.oldState.cliDigest, $Journal.newState.cliDigest),
+        @((Join-Path $script:resolvedBinDir 'rgo-rustc-wrapper.exe'), $Journal.oldState.wrapperDigest, $Journal.newState.wrapperDigest)
+    )) {
+        Assert-PlainFile $pair[0]
+        $digest = File-Digest $pair[0]
+        Assert-Condition ($digest -eq $pair[1] -or $digest -eq $pair[2]) "service upgrade command changed: $($pair[0])"
+        if ($committed) { Assert-Condition ($digest -eq $pair[2]) "committed service upgrade command is stale: $($pair[0])" }
+    }
 
     # The task is outside the Cargo activation snapshot. Remove only its
     # verified old/new action, restore the snapshot under setup locks, then
@@ -725,7 +775,13 @@ function Recover-SupervisedServiceUpgrade([string]$JournalPath, $Journal) {
     $interruptionProbe = $env:RGO_SETUP_TEST_EXIT_AFTER_RECORD
     Remove-Item Env:RGO_SETUP_TEST_EXIT_AFTER_RECORD -ErrorAction SilentlyContinue
     try {
-        Invoke-Checked $selectedCli @('setup', '--supervised', '--real-cargo', $selected.realCargo) | Out-Null
+        $setupArgs = @('setup')
+        if ($Journal.schemaVersion -eq 3) {
+            $setupArgs += @('--supervised', '--real-cargo', $selected.realCargo)
+        } elseif ($selected.noWrapper) {
+            $setupArgs += '--no-wrapper'
+        }
+        Invoke-Checked $selectedCli $setupArgs | Out-Null
     } finally {
         if ($null -ne $interruptionProbe) { $env:RGO_SETUP_TEST_EXIT_AFTER_RECORD = $interruptionProbe }
     }
@@ -838,11 +894,12 @@ function Recover-SupervisedUpgradeGuarded([string]$JournalPath, $Journal) {
     if ($Journal.schemaVersion -ne 3) { Remove-Item -LiteralPath $JournalPath -Force }
 }
 
-function Invoke-NoServiceUpgrade($OldState, [string]$Top, [string]$ArchiveDigest,
+function Invoke-NativeUpgrade($OldState, [string]$Top, [string]$ArchiveDigest,
     [string]$CliDigest, [string]$WrapperDigest, [string]$Extracted, [bool]$NewNoWrapper) {
-    Assert-UpgradeState $OldState 'old'
-    Assert-Condition (-not (Test-SupervisedState $OldState)) 'supervised Windows upgrades require versioned shim paths; undo and use a fresh storage root for now'
-    Assert-Condition ($script:NoService -and -not $script:Repair) 'version upgrades currently require -NoService and cannot use -Repair'
+    Assert-UpgradeState $OldState 'old' $true
+    Assert-Condition (-not (Test-SupervisedState $OldState)) 'native upgrade received a supervised installer state'
+    Assert-Condition (-not $script:Repair) 'version upgrades cannot use -Repair'
+    Assert-Condition ([bool]$script:NoService -eq [bool]$OldState.noService) 'preserve the existing service mode during a version upgrade'
     $oldNoWrapper = [bool]($OldState.PSObject.Properties['noWrapper'] -and $OldState.noWrapper)
     Assert-Condition ($NewNoWrapper -eq $oldNoWrapper) 'change wrapper mode separately from a version upgrade'
     Assert-Condition ($OldState.versionDirectory -ne $Top) 'a release tag cannot be repacked with different bytes'
@@ -856,6 +913,7 @@ function Invoke-NoServiceUpgrade($OldState, [string]$Top, [string]$ArchiveDigest
     Assert-Condition ((File-Digest $oldCli) -eq $OldState.cliDigest -and
         (File-Digest $oldWrapper) -eq $OldState.wrapperDigest) 'old release pair changed; repair it before upgrading'
     Assert-Record $OldState $oldCli $oldWrapper
+    if (-not $OldState.noService) { Assert-ServiceHealthy $oldCli $OldState }
     foreach ($entry in @(
         @((Join-Path $script:resolvedBinDir 'rgo.exe'), $OldState.cliDigest),
         @((Join-Path $script:resolvedBinDir 'rgo-rustc-wrapper.exe'), $OldState.wrapperDigest)
@@ -873,11 +931,19 @@ function Invoke-NoServiceUpgrade($OldState, [string]$Top, [string]$ArchiveDigest
         installRoot = $script:resolvedInstallRoot; binDir = $script:resolvedBinDir
         versionDirectory = $Top; archiveDigest = $ArchiveDigest
         cliDigest = $CliDigest; wrapperDigest = $WrapperDigest
-        noService = $true; noWrapper = $NewNoWrapper; noUserPath = [bool]$noUserPath
+        noService = [bool]$OldState.noService; noWrapper = $NewNoWrapper; noUserPath = [bool]$noUserPath
         pathAdded = [bool]$OldState.pathAdded; priorUserPath = $OldState.priorUserPath
     }
-    $plan = Upgrade-Plan $newCli $NewNoWrapper $false $null $null
+    if (-not $OldState.noService) { Assert-NativeServiceUpgradePair $OldState $newState }
+    $plan = Upgrade-Plan $newCli $NewNoWrapper $false $null $null ([bool]$OldState.noService)
     $files = @($plan.files)
+    $oldService = $null
+    if (-not $OldState.noService) {
+        $oldPlan = Upgrade-Plan $oldCli $oldNoWrapper $false $null $null $false
+        $oldService = $oldPlan.service
+        Assert-OwnedServiceTask $oldService $plan.service
+        Assert-TaskMatchesService $oldService
+    }
     $recordPath = Join-Path $script:resolvedCargoHome '.rgo-install.json'
     $recordEntry = @($files | Where-Object { Test-SamePath $_.path $recordPath })[0]
     Assert-Condition ($null -ne $recordEntry.after) 'staged CLI plans to remove the installation record'
@@ -885,17 +951,25 @@ function Invoke-NoServiceUpgrade($OldState, [string]$Top, [string]$ArchiveDigest
     $plannedRecord = [Text.Encoding]::UTF8.GetString(
         [Convert]::FromBase64String($recordEntry.after)) | ConvertFrom-Json
     Assert-Condition ([bool]$oldRecord.wrapper_binary -eq [bool]$plannedRecord.wrapper_binary) 'the effective compiler-wrapper mode changed; restore the previous Cargo configuration before upgrading'
-    Write-JsonAtomic $script:upgradeJournalPath ([ordered]@{
-        schemaVersion = 1; oldState = $OldState; newState = $newState; files = $files
-    })
+    $journal = [ordered]@{
+        schemaVersion = $(if ($OldState.noService) { 1 } else { 4 }); oldState = $OldState
+        newState = $newState; files = $files
+    }
+    if (-not $OldState.noService) { $journal['service'] = @{ old = $oldService; new = $plan.service } }
+    Write-JsonAtomic $script:upgradeJournalPath $journal
     try {
-        $setupArgs = @('setup', '--no-service')
+        $setupArgs = @('setup')
+        if ($OldState.noService) { $setupArgs += '--no-service' }
         if ($NewNoWrapper) { $setupArgs += '--no-wrapper' }
         Invoke-Checked $newCli $setupArgs | Out-Null
         foreach ($entry in $files) {
             Assert-Condition (Test-ExactText (Encoded-File $entry.path) $entry.after) "setup differed from its installer plan: $($entry.path)"
         }
         Assert-Record $newState $newCli $newWrapper
+        if (-not $OldState.noService) {
+            Assert-TaskMatchesService $plan.service
+            Assert-ServiceHealthy $newCli $newState
+        }
         Assert-PlainCargoActivation $newCli $newState
         Publish-CommandCopy $newWrapper (Join-Path $script:resolvedBinDir 'rgo-rustc-wrapper.exe')
         Publish-CommandCopy $newCli (Join-Path $script:resolvedBinDir 'rgo.exe')
@@ -1378,7 +1452,7 @@ try {
                     $oldNoWrapper = $state.PSObject.Properties['noWrapper'] -and $state.noWrapper
                     $nextNoWrapper = if ($PSBoundParameters.ContainsKey('NoWrapper')) { [bool]$NoWrapper }
                         else { [bool]$oldNoWrapper }
-                    Invoke-NoServiceUpgrade $state $top $digest $cliDigest $wrapperDigest $extracted $nextNoWrapper
+                    Invoke-NativeUpgrade $state $top $digest $cliDigest $wrapperDigest $extracted $nextNoWrapper
                 }
                 return
             }
