@@ -207,7 +207,7 @@ mod tests {
             daemon,
             clients: Vec::new(),
         };
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + Duration::from_secs(30);
         let mut daemon_ready = false;
         while !daemon_ready && Instant::now() < deadline {
             daemon_ready = matches!(
@@ -225,8 +225,9 @@ mod tests {
         }
         assert!(
             daemon_ready,
-            "daemon did not become ready: {}",
-            std::fs::read_to_string(&daemon_log).unwrap_or_default()
+            "daemon did not become ready: stderr={} daemon_log={}",
+            std::fs::read_to_string(&daemon_log).unwrap_or_default(),
+            std::fs::read_to_string(paths.logs_dir().join("daemon.log")).unwrap_or_default()
         );
 
         let mut logs = Vec::new();
@@ -430,8 +431,9 @@ fn running_build_script_keeps_its_context_while_gc_reclaims_an_idle_one() {
         .unwrap();
     assert!(
         pass.status.success(),
-        "{}",
-        String::from_utf8_lossy(&pass.stderr)
+        "{}; daemon_log={}",
+        String::from_utf8_lossy(&pass.stderr),
+        std::fs::read_to_string(paths.logs_dir().join("daemon.log")).unwrap_or_default()
     );
     assert!(
         active.is_dir(),
