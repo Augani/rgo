@@ -1861,7 +1861,9 @@ fn maintenance(state: &State) -> Result<()> {
                                 .then(|| {
                                     crate::context::recent_profile_lock_retry_at(
                                         &record.context,
-                                        crate::gc::LIVE_WINDOW,
+                                        crate::gc::profile_lock_grace(
+                                            crate::context::read_sidecar(&record.context).as_ref(),
+                                        ),
                                         SystemTime::now(),
                                     )
                                 })

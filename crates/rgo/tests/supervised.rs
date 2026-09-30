@@ -25,23 +25,6 @@ fn has_entries(path: &Path) -> bool {
     std::fs::read_dir(path).is_ok_and(|mut entries| entries.next().is_some())
 }
 
-fn age_finished_cargo_profile_locks(context: &Path) {
-    let old = SystemTime::now() - Duration::from_secs(7200);
-    for profile in std::fs::read_dir(context).unwrap().flatten() {
-        if profile.path().is_dir() {
-            let lock = profile.path().join(".cargo-build-lock");
-            if lock.is_file() {
-                std::fs::OpenOptions::new()
-                    .write(true)
-                    .open(lock)
-                    .unwrap()
-                    .set_modified(old)
-                    .unwrap();
-            }
-        }
-    }
-}
-
 #[test]
 fn launcher_passes_through_foreign_or_unavailable_storage_roots() {
     let first = Sandbox::new().unwrap();
@@ -367,9 +350,6 @@ fn opted_in_maintenance_reclaims_an_idle_real_cargo_build() {
             .physical_bytes;
     let max_size = other_bytes + context_bytes / 2;
 
-    // The Cargo session has exited. Age only its documented profile-lock
-    // heuristic; the external supervised lifecycle guard remains authoritative.
-    age_finished_cargo_profile_locks(context);
     std::fs::write(
         sandbox.rgo_home.join("config.toml"),
         format!("[storage]\nmax_size = '{max_size}B'\nmin_free_space = '0B'\n[gc]\nauto = true\n"),
@@ -422,6 +402,34 @@ fn opted_in_maintenance_reclaims_an_idle_real_cargo_build() {
         status.unmet_budget_reason
     );
 
+    drop(daemon);
+    let mut parked_daemon = StopDaemon(
+        sandbox
+            .cmd(rgo)
+            .args(["daemon", "--foreground"])
+            .env("RGO_DAEMON_POLL_SECS", "3600")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let ready_deadline = Instant::now() + Duration::from_secs(10);
+    while !matches!(
+        ipc::request_with_timeout(
+            &paths.socket_path(),
+            Request::QueryRemoteStatus,
+            Duration::from_millis(100)
+        ),
+        Ok(Response::RemoteStatus(_))
+    ) {
+        assert!(parked_daemon.0.try_wait().unwrap().is_none());
+        assert!(
+            Instant::now() < ready_deadline,
+            "parked daemon did not start"
+        );
+        thread::sleep(Duration::from_millis(25));
+    }
+
     // Rebuild through the unchanged Cargo command and require maintenance to
     // recover the same budget again. The first successful pass must not be a
     // one-time effect of daemon initialization or a stale initial snapshot.
@@ -465,38 +473,14 @@ fn opted_in_maintenance_reclaims_an_idle_real_cargo_build() {
         .expect("second project's managed context");
     assert!(context.exists());
     assert!(other_context.exists());
-    // Both post-build signals must survive Cargo's recent profile-lock grace.
-    let retry_deadline = Instant::now() + Duration::from_secs(15);
-    let deferred = loop {
-        let records = supervision::PendingMaintenanceScanner::default()
-            .scan(&paths, 32)
-            .unwrap();
-        let due = [context.as_path(), other_context.as_path()].map(|dir| {
-            records
-                .iter()
-                .find(|record| record.context == dir && record.retry_after.is_some())
-                .cloned()
-        });
-        if let [Some(first), Some(second)] = due {
-            break [first, second];
-        }
-        assert!(
-            Instant::now() < retry_deadline,
-            "maintenance lost one of two launch signals before profile-lock grace expired"
-        );
-        thread::sleep(Duration::from_millis(50));
-    };
-    drop(daemon);
-    age_finished_cargo_profile_locks(context);
-    age_finished_cargo_profile_locks(&other_context);
-    // Advance only the persisted retry deadlines. A restarted daemon must
-    // still take its own authoritative snapshot and lifecycle guards.
-    for record in &deferred {
-        assert!(record.retry_after.unwrap() > context::unix_now());
-        assert!(
-            supervision::defer_pending_maintenance(&paths, record, context::unix_now()).unwrap()
-        );
-    }
+    // Both launches remain pending while the daemon is parked. After restart,
+    // their supervised guards and held-lock checks allow immediate recovery.
+    let records = supervision::PendingMaintenanceScanner::default()
+        .scan(&paths, 32)
+        .unwrap();
+    assert_eq!(records.len(), 2);
+    assert!(records.iter().all(|record| record.retry_after.is_none()));
+    drop(parked_daemon);
     let mut daemon = StopDaemon(
         sandbox
             .cmd(rgo)

@@ -17,6 +17,17 @@ use crate::size::Scanner;
 /// Phase 2 replaces this with daemon leases).
 pub const LIVE_WINDOW: Duration = Duration::from_secs(10 * 60);
 
+/// The full-session guard and final held-lock check protect a context created
+/// by the supervised launcher. Older or native contexts retain the timestamp
+/// grace because their earlier writers may not have used that guard.
+pub fn profile_lock_grace(sidecar: Option<&rgo_protocol::ContextSidecar>) -> Duration {
+    if sidecar.is_some_and(|sidecar| sidecar.supervised_origin) {
+        Duration::ZERO
+    } else {
+        LIVE_WINDOW
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Tier {
     Tmp = 0,
@@ -124,7 +135,7 @@ pub fn plan(inp: &Inputs) -> Result<Plan> {
     let mut needed = managed.saturating_sub(target).max(free_deficit);
     let mut lock_protected: HashSet<&Path> = HashSet::new();
     for context in inp.contexts {
-        if context.recently_locked_checked(LIVE_WINDOW, inp.now)? {
+        if context.recently_locked_checked(profile_lock_grace(context.sidecar.as_ref()), inp.now)? {
             lock_protected.insert(context.dir.as_path());
         }
     }
@@ -308,7 +319,7 @@ pub fn pressure_candidates(inp: &Inputs) -> Vec<Action> {
                 && !context.workspace_unavailable()
                 && !inp.pinned.iter().any(|path| same_path(path, &context.dir))
                 && !inp.leased.iter().any(|path| same_path(path, &context.dir))
-                && !context.recently_locked(LIVE_WINDOW, inp.now)
+                && !context.recently_locked(profile_lock_grace(context.sidecar.as_ref()), inp.now)
         })
         .collect();
     contexts.sort_by_key(|context| context.last_used);
@@ -1426,6 +1437,7 @@ mod tests {
             sidecar: Some(ContextSidecar {
                 version: rgo_protocol::PROTOCOL_VERSION,
                 workspace_verified: true,
+                supervised_origin: false,
                 workspace_root: root.path().display().to_string(),
                 manifest_path: manifest.display().to_string(),
                 workspace_device: crate::context::workspace_device(root.path()),
@@ -1500,6 +1512,7 @@ mod tests {
         let sidecar = || ContextSidecar {
             version: rgo_protocol::PROTOCOL_VERSION,
             workspace_verified: true,
+            supervised_origin: false,
             workspace_root: root.path().display().to_string(),
             manifest_path: manifest.display().to_string(),
             workspace_device: crate::context::workspace_device(root.path()),
@@ -1589,6 +1602,7 @@ mod tests {
             sidecar: Some(ContextSidecar {
                 version: rgo_protocol::PROTOCOL_VERSION,
                 workspace_verified: true,
+                supervised_origin: false,
                 workspace_root: manifest.parent().unwrap().display().to_string(),
                 manifest_path: manifest.display().to_string(),
                 workspace_device: crate::context::workspace_device(manifest.parent().unwrap()),
@@ -1681,6 +1695,7 @@ mod tests {
                 sidecar: Some(ContextSidecar {
                     version: rgo_protocol::PROTOCOL_VERSION,
                     workspace_verified: true,
+                    supervised_origin: false,
                     workspace_root: workspace.display().to_string(),
                     manifest_path: manifest.display().to_string(),
                     workspace_device: crate::context::workspace_device(&workspace),
@@ -1753,6 +1768,7 @@ mod tests {
                     sidecar: Some(ContextSidecar {
                         version: rgo_protocol::PROTOCOL_VERSION,
                         workspace_verified: true,
+                        supervised_origin: false,
                         workspace_root: workspace.display().to_string(),
                         manifest_path: manifest.display().to_string(),
                         workspace_device: crate::context::workspace_device(&workspace),

@@ -29,6 +29,10 @@ pub struct ContextSidecar {
     /// supervised launcher). Older wrapper sidecars need one-time validation.
     #[serde(default)]
     pub workspace_verified: bool,
+    /// Set only when rgo created this context through its supervised Cargo
+    /// launcher. Older/native contexts keep the conservative lock-time grace.
+    #[serde(default)]
+    pub supervised_origin: bool,
     pub workspace_root: String,
     pub manifest_path: String,
     /// Unix device ID or Windows volume serial at attribution time. Older
@@ -496,6 +500,7 @@ mod tests {
     fn older_sidecars_without_workspace_identity_remain_readable() {
         let old = r#"{"version":5,"workspace_root":"/work","manifest_path":"/work/Cargo.toml","toolchain":null,"first_seen":1,"last_seen":2}"#;
         let sidecar: ContextSidecar = serde_json::from_str(old).unwrap();
+        assert!(!sidecar.supervised_origin);
         assert_eq!(sidecar.workspace_device, None);
         assert_eq!(sidecar.workspace_mount_id, None);
         assert!(

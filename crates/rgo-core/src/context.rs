@@ -806,11 +806,40 @@ pub fn write_sidecar(
     manifest_path: &Path,
     toolchain: Option<String>,
 ) -> Result<()> {
+    write_sidecar_with_origin(dir, workspace_root, manifest_path, toolchain, false)
+}
+
+/// A pre-existing unmarked context may have been used by native Cargo. Only
+/// a newly created context or one already marked supervised gets this origin.
+pub fn write_supervised_sidecar(
+    dir: &Path,
+    workspace_root: &Path,
+    manifest_path: &Path,
+    newly_created: bool,
+) -> Result<()> {
+    let prior = read_sidecar(dir);
+    let supervised_origin = newly_created
+        || prior.is_some_and(|s| {
+            s.supervised_origin
+                && s.workspace_root == workspace_root.display().to_string()
+                && s.manifest_path == manifest_path.display().to_string()
+        });
+    write_sidecar_with_origin(dir, workspace_root, manifest_path, None, supervised_origin)
+}
+
+fn write_sidecar_with_origin(
+    dir: &Path,
+    workspace_root: &Path,
+    manifest_path: &Path,
+    toolchain: Option<String>,
+    supervised_origin: bool,
+) -> Result<()> {
     let now = unix_now();
     let first_seen = read_sidecar(dir).map(|s| s.first_seen).unwrap_or(now);
     let sc = ContextSidecar {
         version: PROTOCOL_VERSION,
         workspace_verified: true,
+        supervised_origin,
         workspace_root: workspace_root.display().to_string(),
         manifest_path: manifest_path.display().to_string(),
         workspace_device: workspace_device(workspace_root),
@@ -829,7 +858,7 @@ pub fn write_sidecar(
 /// Prepare the two rgo-owned path components for a supervised build without
 /// following a pre-existing shard or context symlink. The storage root is
 /// already private and initialized before the launcher takes its session lock.
-pub fn ensure_managed_context_dir(paths: &RgoPaths, dir: &Path) -> Result<()> {
+pub fn ensure_managed_context_dir(paths: &RgoPaths, dir: &Path) -> Result<bool> {
     let root = paths.builds_dir();
     let relative = dir.strip_prefix(&root)?;
     let mut components = relative.components();
@@ -848,8 +877,10 @@ pub fn ensure_managed_context_dir(paths: &RgoPaths, dir: &Path) -> Result<()> {
         "unsafe managed build root {}",
         root.display()
     );
+    let mut newly_created = false;
     for path in [root.join(shard.as_os_str()), dir.to_path_buf()] {
         match std::fs::create_dir(&path) {
+            Ok(()) if path == dir => newly_created = true,
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
             Err(error) => {
@@ -863,7 +894,7 @@ pub fn ensure_managed_context_dir(paths: &RgoPaths, dir: &Path) -> Result<()> {
             path.display()
         );
     }
-    Ok(())
+    Ok(newly_created)
 }
 
 pub fn unix_now() -> u64 {
@@ -972,6 +1003,34 @@ mod tests {
             usage: Usage::default(),
             incremental_usage: Usage::default(),
         }
+    }
+
+    #[test]
+    fn supervised_origin_requires_a_new_or_previously_supervised_context() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = RgoPaths {
+            root: root.path().join("rgo"),
+        };
+        paths.ensure_layout().unwrap();
+        let workspace = root.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        let manifest = workspace.join("Cargo.toml");
+        std::fs::write(&manifest, "[workspace]\n").unwrap();
+
+        let fresh = paths.builds_dir().join("aa/fresh");
+        assert!(ensure_managed_context_dir(&paths, &fresh).unwrap());
+        write_supervised_sidecar(&fresh, &workspace, &manifest, true).unwrap();
+        assert!(read_sidecar(&fresh).unwrap().supervised_origin);
+        assert!(!ensure_managed_context_dir(&paths, &fresh).unwrap());
+        write_supervised_sidecar(&fresh, &workspace, &manifest, false).unwrap();
+        assert!(read_sidecar(&fresh).unwrap().supervised_origin);
+
+        let legacy = paths.builds_dir().join("bb/legacy");
+        std::fs::create_dir_all(&legacy).unwrap();
+        write_sidecar(&legacy, &workspace, &manifest, None).unwrap();
+        assert!(!ensure_managed_context_dir(&paths, &legacy).unwrap());
+        write_supervised_sidecar(&legacy, &workspace, &manifest, false).unwrap();
+        assert!(!read_sidecar(&legacy).unwrap().supervised_origin);
     }
 
     #[test]
@@ -1241,6 +1300,7 @@ mod tests {
         let sidecar = ContextSidecar {
             version: PROTOCOL_VERSION,
             workspace_verified: true,
+            supervised_origin: false,
             workspace_root: workspace.display().to_string(),
             manifest_path: manifest.display().to_string(),
             workspace_device: workspace_device(&workspace),

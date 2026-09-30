@@ -91,18 +91,6 @@ def wait_ready(process, env: dict[str, str], root: Path) -> None:
     raise RuntimeError("daemon did not become ready within 30 seconds")
 
 
-def age_profile_locks(build_contexts: list[Path]) -> int:
-    old = time.time() - 7200
-    aged = 0
-    for context in build_contexts:
-        for profile in context.iterdir():
-            lock = profile / ".cargo-build-lock"
-            if profile.is_dir() and lock.is_file():
-                os.utime(lock, (old, old))
-                aged += 1
-    return aged
-
-
 def tick_count(path: Path) -> int:
     return path.read_bytes().count(b"tick\n") if path.is_file() else 0
 
@@ -173,6 +161,11 @@ def probe(root: Path) -> None:
             before = contexts(rgo_home)
             if len(before) != PROJECTS:
                 raise RuntimeError(f"wave {wave}: expected {PROJECTS} managed contexts, got {len(before)}")
+            if any(
+                not json.loads((context / ".rgo-context.json").read_text())["supervised_origin"]
+                for context in before
+            ):
+                raise RuntimeError(f"wave {wave}: a context lacks supervised origin")
             pending_dir = rgo_home / "state" / "pending-maintenance"
             pending = list(pending_dir.iterdir())
             if len(pending) != PROJECTS:
@@ -181,9 +174,6 @@ def probe(root: Path) -> None:
             stop_daemon(*first)
             first = None
 
-            aged = age_profile_locks(before)
-            if aged < PROJECTS:
-                raise RuntimeError(f"wave {wave}: only {aged} completed Cargo profile locks were found")
             config.write_text(f"[storage]\nmax_size = '{BUDGET}'\nmin_free_space = '0B'\n[gc]\nauto = true\n")
             marker = root / f"maintenance-ticks-wave-{wave}.log"
             env["RGO_DAEMON_POLL_SECS"] = "1"

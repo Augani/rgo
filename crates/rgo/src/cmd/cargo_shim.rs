@@ -135,11 +135,11 @@ pub fn run(
     }
     if let Some((dir, root)) = &selection {
         let activate = (|| -> Result<()> {
-            context::ensure_managed_context_dir(&paths, dir)?;
+            let newly_created = context::ensure_managed_context_dir(&paths, dir)?;
             if context::is_pinned(&paths, dir) && !context::is_pinned_dir(dir) {
                 context::write_pin_marker(dir)?;
             }
-            context::write_sidecar(dir, root, &root.join("Cargo.toml"), None)?;
+            context::write_supervised_sidecar(dir, root, &root.join("Cargo.toml"), newly_created)?;
             if auto_gc_enabled {
                 supervision::mark_pending_maintenance(&paths, dir)?;
             }

@@ -1142,6 +1142,11 @@ fn attribute(args: &[OsString]) -> Option<PathBuf> {
     let sc = ContextSidecar {
         version: PROTOCOL_VERSION,
         workspace_verified: true,
+        supervised_origin: existing.as_ref().is_some_and(|sidecar| {
+            sidecar.supervised_origin
+                && sidecar.workspace_root == workspace_root.to_string_lossy()
+                && sidecar.manifest_path == manifest_path.to_string_lossy()
+        }),
         workspace_root: workspace_root.to_string_lossy().into_owned(),
         manifest_path: manifest_path.to_string_lossy().into_owned(),
         workspace_device: {
