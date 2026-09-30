@@ -76,13 +76,20 @@ pub fn mark_pending_maintenance(paths: &RgoPaths, context: &Path) -> Result<()> 
     let path = pending_path(paths, context)?;
     let _lock = pending_lock(paths)?;
     let generation = match std::fs::read(&path) {
-        Ok(bytes) => match serde_json::from_slice::<PendingMaintenance>(&bytes) {
-            Ok(record) if record.context == context => record
+        Ok(bytes) => {
+            let record: PendingMaintenance = serde_json::from_slice(&bytes).with_context(|| {
+                format!("invalid pending maintenance record {}", path.display())
+            })?;
+            anyhow::ensure!(
+                record.context == context,
+                "pending maintenance context mismatch at {}",
+                path.display()
+            );
+            record
                 .generation
                 .checked_add(1)
-                .context("pending maintenance generation exhausted")?,
-            _ => 1,
-        },
+                .context("pending maintenance generation exhausted")?
+        }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => 1,
         Err(error) => return Err(error).with_context(|| format!("reading {}", path.display())),
     };
@@ -91,16 +98,40 @@ pub fn mark_pending_maintenance(paths: &RgoPaths, context: &Path) -> Result<()> 
         generation,
         retry_after: None,
     };
-    write_pending_record(&path, &record)
+    write_pending_record(paths, &path, &record)
 }
 
-fn write_pending_record(path: &Path, record: &PendingMaintenance) -> Result<()> {
-    let file = open_lock_file(path)?;
-    file.set_len(0)?;
-    let mut file = file;
+fn write_pending_record(paths: &RgoPaths, path: &Path, record: &PendingMaintenance) -> Result<()> {
+    // The caller holds the pending lock. Keep one staging name outside the
+    // scanned record directory, so a crash cannot leave a partial record or
+    // an unbounded collection of ignored entries.
+    let staging = paths
+        .state_dir()
+        .join("locks/pending-maintenance-write.tmp");
+    match std::fs::symlink_metadata(&staging) {
+        Ok(metadata) if metadata.is_dir() => {
+            bail!("pending maintenance staging path is a directory");
+        }
+        Ok(_) => std::fs::remove_file(&staging)?,
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => return Err(error.into()),
+        Err(_) => {}
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&staging)?;
     use std::io::Write;
     file.write_all(&serde_json::to_vec(&record)?)?;
-    file.sync_data()?;
+    file.sync_all()?;
+    drop(file);
+    std::fs::rename(&staging, path)
+        .with_context(|| format!("replacing pending maintenance record {}", path.display()))?;
+    #[cfg(unix)]
+    std::fs::File::open(path.parent().context("pending record has no parent")?)?.sync_all()?;
     Ok(())
 }
 
@@ -188,6 +219,7 @@ fn finish_pending_maintenance(
     }
     if let Some(retry_after) = retry_after {
         write_pending_record(
+            paths,
             &path,
             &PendingMaintenance {
                 retry_after: Some(retry_after),
@@ -617,6 +649,23 @@ mod tests {
         assert!(!clear_pending_maintenance(&paths, &newer).unwrap());
         assert!(clear_pending_maintenance(&paths, &latest).unwrap());
         assert!(pending_maintenance(&paths).unwrap().is_empty());
+
+        mark_pending_maintenance(&paths, &context).unwrap();
+        let path = pending_path(&paths, &context).unwrap();
+        let original_bytes = std::fs::read(&path).unwrap();
+        let staging = paths
+            .state_dir()
+            .join("locks/pending-maintenance-write.tmp");
+        std::fs::create_dir(&staging).unwrap();
+        assert!(mark_pending_maintenance(&paths, &context).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), original_bytes);
+        std::fs::remove_dir(&staging).unwrap();
+        mark_pending_maintenance(&paths, &context).unwrap();
+        assert_eq!(pending_maintenance(&paths).unwrap()[0].generation, 2);
+
+        std::fs::write(&path, b"truncated").unwrap();
+        assert!(mark_pending_maintenance(&paths, &context).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"truncated");
     }
 
     #[cfg(unix)]
