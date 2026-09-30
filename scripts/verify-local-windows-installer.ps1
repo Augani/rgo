@@ -148,6 +148,37 @@ try {
     Remove-Item -LiteralPath $entry
     & $installScript @installArgs -NoService -Repair
     if (-not (Test-Path $entry)) { throw 'repair did not restore the owned wrapper' }
+    $pointer = Join-Path $cargoHome '.rgo-home'
+    $expectedPointer = [IO.File]::ReadAllText($pointer)
+    [IO.File]::WriteAllText($pointer, "damaged-pointer`n")
+    & $installScript @installArgs -NoService -Repair
+    if ([IO.File]::ReadAllText($pointer) -cne $expectedPointer) { throw 'repair did not restore the Cargo storage pointer' }
+    $otherRoot = Join-Path $sandbox 'other-rgo-home'
+    [IO.File]::WriteAllText($pointer, "$otherRoot`n")
+    try {
+        & $installScript @installArgs -NoService -Repair
+        throw 'repair accepted a pointer to another absolute storage root'
+    } catch {
+        if ($_.Exception.Message -notmatch 'different absolute storage root') { throw }
+    }
+    if ([IO.File]::ReadAllText($pointer) -cne "$otherRoot`n") { throw 'repair overwrote a different storage pointer' }
+    [IO.File]::WriteAllText($pointer, "damaged-pointer`n")
+    $cargoConfig = Join-Path $cargoHome 'config.toml'
+    $savedCargoConfig = [IO.File]::ReadAllBytes($cargoConfig)
+    try {
+        [IO.File]::AppendAllText($cargoConfig, "`nnot valid Cargo TOML`n")
+        try {
+            & $installScript @installArgs -NoService -Repair
+            throw 'repair unexpectedly verified an invalid Cargo configuration'
+        } catch {
+            if ($_.Exception.Message -match 'unexpectedly verified') { throw }
+        }
+        if ([IO.File]::ReadAllText($pointer) -cne "damaged-pointer`n") {
+            throw 'failed verification did not roll back the storage pointer'
+        }
+    } finally { [IO.File]::WriteAllBytes($cargoConfig, $savedCargoConfig) }
+    & $installScript @installArgs -NoService -Repair
+    if ([IO.File]::ReadAllText($pointer) -cne $expectedPointer) { throw 'repair did not recover after a failed verification' }
     $statePath = Join-Path $cargoHome 'rgo/installer-windows.json'
     $oldStateText = [IO.File]::ReadAllText($statePath)
     $oldState = $oldStateText | ConvertFrom-Json
@@ -283,9 +314,15 @@ fn main() {
                 '\supervised-cargo', [StringComparison]::OrdinalIgnoreCase)
         })
     if ($attributed.Count -ne 1) { throw 'unchanged Cargo build did not create one attributed managed context' }
+    $supervisedPointer = Join-Path $cargoHome '.rgo-home'
+    $expectedSupervisedPointer = [IO.File]::ReadAllText($supervisedPointer)
+    Remove-Item -LiteralPath $supervisedPointer
     Remove-Item -LiteralPath $shim
     & $installScript @supervisedArgs -NoService -Repair
     if (-not (Test-Path $shim)) { throw 'supervised repair did not restore the owned Cargo shim' }
+    if ([IO.File]::ReadAllText($supervisedPointer) -cne $expectedSupervisedPointer) {
+        throw 'supervised repair did not restore the Cargo storage pointer'
+    }
     $supervisedUpgradeArgs = $supervisedArgs.Clone()
     $supervisedUpgradeArgs['ReleaseTag'] = $upgradeTag
     $supervisedUpgradeArgs['Archive'] = $upgradeArchive

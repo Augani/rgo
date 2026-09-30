@@ -1220,6 +1220,37 @@ try {
                 $state.cliDigest -eq $cliDigest -and $state.wrapperDigest -eq $wrapperDigest) 'this release tag has different bytes from the installed archive; refusing a repack'
             Assert-OwnedUserPath $state
             Assert-Record $state $cli $wrapper
+            $pointerPath = Join-Path $resolvedCargoHome '.rgo-home'
+            $pointerBefore = Encoded-File $pointerPath
+            $utf8 = [System.Text.UTF8Encoding]::new($false, $true)
+            $pointerExpected = [Convert]::ToBase64String($utf8.GetBytes("$resolvedRgoHome`n"))
+            $pointerNeedsRepair = -not (Test-ExactText $pointerBefore $pointerExpected)
+            if ($pointerNeedsRepair) {
+                Assert-Condition $Repair 'Cargo storage pointer is missing or changed; rerun with -Repair and the same verified bundle'
+                if ($null -ne $pointerBefore) {
+                    try {
+                        $pointerRoot = $utf8.GetString([Convert]::FromBase64String($pointerBefore)).TrimEnd([char[]]"`r`n")
+                        if ([IO.Path]::IsPathRooted($pointerRoot)) {
+                            Assert-Condition (Test-SamePath $pointerRoot $resolvedRgoHome) 'repair refuses a pointer to a different absolute storage root'
+                        }
+                    } catch [System.Text.DecoderFallbackException] { }
+                }
+                Assert-PlainDirectory $resolvedRgoHome
+                Assert-PlainDirectory (Join-Path $resolvedRgoHome 'state')
+                $ownerPath = Join-Path $resolvedRgoHome 'state/owner-cargo-home'
+                $modePath = Join-Path $resolvedRgoHome 'state/storage-mode'
+                $modeText = if ($installedSupervised) { "supervised`n" } else { "native`n" }
+                $ownerBefore = Encoded-File $ownerPath
+                $modeBefore = Encoded-File $modePath
+                Assert-Condition ((Test-ExactText $ownerBefore ([Convert]::ToBase64String($utf8.GetBytes("$resolvedCargoHome`n")))) -and
+                    (Test-ExactText $modeBefore ([Convert]::ToBase64String($utf8.GetBytes($modeText))))) 'repair requires the recorded Cargo-home owner and storage mode'
+                $repairGuards = @(
+                    @{ path = $statePath; before = (Encoded-File $statePath) },
+                    @{ path = (Join-Path $resolvedCargoHome '.rgo-install.json'); before = (Encoded-File (Join-Path $resolvedCargoHome '.rgo-install.json')) },
+                    @{ path = $ownerPath; before = $ownerBefore },
+                    @{ path = $modePath; before = $modeBefore }
+                )
+            }
             if (-not (Test-Path -LiteralPath $versionDir)) {
                 Assert-Condition $Repair "owned version directory is missing: $versionDir"
                 New-Item -ItemType Directory -Path $versionDir | Out-Null
@@ -1234,21 +1265,47 @@ try {
                     Copy-Item -LiteralPath $source -Destination $pair[0]
                 }
             }
-            if ($installedSupervised) {
-                $fallbackPath = Join-Path $shimDir '.rgo-cargo-fallback.json'
-                if (-not (Test-Path -LiteralPath $shimPath) -or -not (Test-Path -LiteralPath $fallbackPath)) {
-                    Assert-Condition $Repair 'owned Cargo shim or fallback is missing; rerun with -Repair and the same verified bundle'
-                    Invoke-Checked $cli @('setup', '--supervised', '--real-cargo', $state.realCargo, '--no-service') | Out-Null
+            if ($pointerNeedsRepair) {
+                Invoke-WithSetupLocks {
+                    foreach ($guard in $repairGuards) {
+                        Assert-Condition (Test-ExactText (Encoded-File $guard.path) $guard.before) "activation changed during repair: $($guard.path)"
+                    }
+                    Assert-Condition (Test-ExactText (Encoded-File $pointerPath) $pointerBefore) 'Cargo storage pointer changed during repair'
+                    Write-EncodedFile $pointerPath $pointerExpected
                 }
-                Assert-PlainFile $shimPath
-                Assert-Condition ((File-Digest $shimPath) -eq $cliDigest) 'owned Cargo shim differs from the verified release'
-                Assert-PlainFile $fallbackPath
-                $fallback = Read-Json $fallbackPath
-                Assert-Condition ($fallback.schema_version -eq 1 -and
-                    (Test-SamePath $fallback.cargo_home $resolvedCargoHome) -and
-                    (Test-SamePath $fallback.real_cargo $state.realCargo)) 'owned Cargo fallback differs from the installer state'
             }
-            Assert-PlainCargoActivation $cli $state
+            try {
+                if ($installedSupervised) {
+                    $fallbackPath = Join-Path $shimDir '.rgo-cargo-fallback.json'
+                    if (-not (Test-Path -LiteralPath $shimPath) -or -not (Test-Path -LiteralPath $fallbackPath)) {
+                        Assert-Condition $Repair 'owned Cargo shim or fallback is missing; rerun with -Repair and the same verified bundle'
+                        Invoke-Checked $cli @('setup', '--supervised', '--real-cargo', $state.realCargo, '--no-service') | Out-Null
+                    }
+                    Assert-PlainFile $shimPath
+                    Assert-Condition ((File-Digest $shimPath) -eq $cliDigest) 'owned Cargo shim differs from the verified release'
+                    Assert-PlainFile $fallbackPath
+                    $fallback = Read-Json $fallbackPath
+                    Assert-Condition ($fallback.schema_version -eq 1 -and
+                        (Test-SamePath $fallback.cargo_home $resolvedCargoHome) -and
+                        (Test-SamePath $fallback.real_cargo $state.realCargo)) 'owned Cargo fallback differs from the installer state'
+                }
+                Assert-PlainCargoActivation $cli $state
+            }
+            catch {
+                $verificationError = $_
+                if ($pointerNeedsRepair) {
+                    try {
+                        Invoke-WithSetupLocks {
+                            foreach ($guard in $repairGuards) {
+                                Assert-Condition (Test-ExactText (Encoded-File $guard.path) $guard.before) "activation changed during pointer rollback: $($guard.path)"
+                            }
+                            Assert-Condition (Test-ExactText (Encoded-File $pointerPath) $pointerExpected) 'Cargo storage pointer changed during pointer rollback'
+                            Write-EncodedFile $pointerPath $pointerBefore
+                        }
+                    } catch { throw "repair verification failed ($verificationError); pointer rollback failed ($_)" }
+                }
+                throw $verificationError
+            }
             if (Test-Path -LiteralPath $pendingPath) {
                 $pending = Read-Json $pendingPath
                 Assert-Condition ($pending.archiveDigest -eq $digest -and $pending.versionDirectory -eq $top) 'stale pending activation conflicts with installed state'
