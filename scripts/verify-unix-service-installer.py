@@ -83,6 +83,75 @@ def main() -> None:
         active_cli.unlink()
         run([*installer, "--repair"], environment)
         assert active_cli.is_file()
+
+        # Build a distinct version so rollback crosses real binary versions,
+        # rather than only switching between paths containing the same build.
+        old_version = version.removeprefix("v")
+        stem, patch = old_version.rsplit(".", 1)
+        new_version = f"{stem}.{int(patch) + 1}"
+        new_tag = f"v{new_version}"
+        source = root / "upgrade-source"
+        source.mkdir()
+        shutil.copy2(ROOT / "Cargo.toml", source / "Cargo.toml")
+        shutil.copy2(ROOT / "Cargo.lock", source / "Cargo.lock")
+        shutil.copytree(ROOT / "crates", source / "crates")
+        manifest = source / "Cargo.toml"
+        manifest.write_text(manifest.read_text().replace(old_version, new_version))
+        build_environment = os.environ.copy()
+        build_environment["CARGO_TARGET_DIR"] = str(root / "upgrade-target")
+        subprocess.run(
+            ["cargo", "build", "--offline", "--manifest-path", str(manifest),
+             "-p", "rgo-storage", "-p", "rgo-rustc-wrapper"],
+            env=build_environment, check=True, timeout=300,
+        )
+        upgrade_name = f"rgo-{new_tag}-{target}"
+        upgrade_archive = root / f"{upgrade_name}.tar.gz"
+        with tarfile.open(upgrade_archive, "w:gz") as bundle:
+            for binary in ("rgo", "rgo-rustc-wrapper"):
+                bundle.add(
+                    root / "upgrade-target/debug" / binary,
+                    arcname=f"{upgrade_name}/{binary}",
+                )
+        upgrade_installer = installer.copy()
+        upgrade_installer[upgrade_installer.index("--archive") + 1] = str(upgrade_archive)
+        upgrade_installer[upgrade_installer.index("--version") + 1] = new_tag
+        upgrade_installer[upgrade_installer.index("--sha256") + 1] = hashlib.sha256(
+            upgrade_archive.read_bytes()
+        ).hexdigest()
+
+        failed_environment = environment.copy()
+        failed_environment["RGO_BYPASS"] = "1"
+        failed_upgrade = subprocess.run(
+            upgrade_installer, env=failed_environment, text=True, capture_output=True, timeout=120
+        )
+        assert failed_upgrade.returncode != 0, "bypassed Cargo unexpectedly verified"
+        assert Path(json.loads((cargo_home / ".rgo-install.json").read_text())["rgo_binary"]).resolve() == active_cli.resolve()
+        assert not (cargo_home / "rgo/installer-transaction.json").exists()
+        old_doctor = subprocess.run(
+            [str(active_cli), "doctor", "--verify", "--json"],
+            env=fresh, text=True, capture_output=True, timeout=120,
+        )
+        assert old_doctor.returncode == 0, old_doctor.stderr
+        assert json.loads(old_doctor.stdout)["activation_verified"] is True
+
+        phases = (
+            ("RGO_SETUP_TEST_EXIT_AFTER_RECORD", 88),
+            ("RGO_SETUP_TEST_EXIT_AFTER_SERVICE_FILE", 90),
+            ("RGO_INSTALLER_TEST_EXIT_AFTER_PREPARED", 85),
+            ("RGO_INSTALLER_TEST_EXIT_AFTER_SETUP_DONE", 86),
+            ("RGO_INSTALLER_TEST_EXIT_AFTER_COMMITTED", 87),
+        )
+        for signal, code in phases:
+            forced = environment.copy()
+            forced[signal] = "1"
+            stopped = subprocess.run(upgrade_installer, env=forced, text=True, capture_output=True, timeout=120)
+            assert stopped.returncode == code, stopped.stderr
+        run(upgrade_installer, environment)
+        upgraded = json.loads((cargo_home / ".rgo-install.json").read_text())
+        assert upgraded["binary_version"] == new_version
+        assert Path(upgraded["rgo_binary"]).resolve() != active_cli.resolve()
+        assert not (cargo_home / "rgo/installer-transaction.json").exists()
+        run(["cargo", "build", "--offline"], fresh, project)
         run(uninstaller, environment)
         assert not (cargo_home / ".rgo-install.json").exists()
         assert not (cargo_home / "rgo/installer-state.json").exists()

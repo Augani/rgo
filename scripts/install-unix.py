@@ -314,8 +314,8 @@ def run(
         capture_output=True,
     )
     if result.returncode:
-        if test_abrupt_exit and result.returncode == 88:
-            os._exit(88)
+        if test_abrupt_exit and result.returncode in {88, 90}:
+            os._exit(result.returncode)
         detail = (result.stderr or result.stdout).strip()
         raise InstallError(
             f"{program.name} {' '.join(arguments)} failed ({result.returncode}): "
@@ -524,6 +524,88 @@ def planned_snapshot(
     if str(state_path) in files:
         raise InstallError("setup plan unexpectedly modifies installer state")
     return planned
+
+
+def checked_service_plan(plan: object, environment: dict[str, str]) -> dict[str, str]:
+    if not isinstance(plan, dict):
+        raise InstallError("service setup returned an invalid daemon definition")
+    path, label, contents = (plan.get(key) for key in ("path", "label", "contents"))
+    if not all(isinstance(value, str) for value in (path, label, contents)):
+        raise InstallError("service setup returned an invalid daemon definition")
+    home = Path(environment.get("HOME") or Path.home()).expanduser().absolute()
+    if platform.system() == "Darwin":
+        if not re.fullmatch(r"com\.rgo\.daemon\.[0-9a-f]{16}", label):
+            raise InstallError("service setup returned an unexpected launchd label")
+        expected = home / "Library/LaunchAgents" / f"{label}.plist"
+    else:
+        if not re.fullmatch(r"rgo-daemon-[0-9a-f]{16}\.service", label):
+            raise InstallError("service setup returned an unexpected systemd unit name")
+        config = Path(environment.get("XDG_CONFIG_HOME") or home / ".config").expanduser().absolute()
+        expected = config / "systemd/user" / label
+    if Path(path) != expected or not contents:
+        raise InstallError("service setup returned an unexpected daemon definition path or content")
+    return {"path": path, "label": label, "contents": contents}
+
+
+def service_setup_args(record: dict[str, object]) -> list[str]:
+    arguments = ["setup"]
+    shim = record.get("supervised_cargo")
+    if shim is not None:
+        if not isinstance(shim, dict) or not isinstance(shim.get("real_cargo"), str):
+            raise InstallError("previous supervised Cargo proxy is not recorded")
+        arguments.extend(["--supervised", "--real-cargo", shim["real_cargo"]])
+    elif record.get("wrapper_binary") is None:
+        arguments.append("--no-wrapper")
+    return arguments
+
+
+def stop_owned_service(label: str, environment: dict[str, str]) -> None:
+    if platform.system() == "Darwin":
+        target = f"gui/{os.getuid()}/{label}"
+        active = subprocess.run(
+            ["/bin/launchctl", "print", target], env=environment, capture_output=True, text=True
+        )
+        if active.returncode == 0:
+            run(Path("/bin/launchctl"), "bootout", target, environment=environment)
+            if subprocess.run(
+                ["/bin/launchctl", "print", target], env=environment, capture_output=True
+            ).returncode == 0:
+                raise InstallError(f"launchd service {label} remained active after bootout")
+    else:
+        manager = Path("/usr/bin/systemctl")
+        if not manager.is_file():
+            manager = Path("/bin/systemctl")
+        run(manager, "--user", "stop", label, environment=environment)
+        if subprocess.run(
+            [str(manager), "--user", "is-active", "--quiet", label],
+            env=environment, capture_output=True,
+        ).returncode == 0:
+            raise InstallError(f"systemd service {label} remained active after stop")
+
+
+def restore_service_upgrade(
+    cargo_home: Path,
+    root: Path,
+    before: dict[Path, tuple[bytes, int] | None],
+    after: dict[Path, tuple[bytes, int] | None],
+    service: dict[str, str],
+    previous_cli: Path,
+    old_record: dict[str, object],
+    environment: dict[str, str],
+) -> None:
+    current = activation_snapshot(tuple(before))
+    for path, value in current.items():
+        if value != before[path] and value != after[path]:
+            raise InstallError(f"activation changed during service upgrade: {path}")
+    stop_owned_service(service["label"], environment)
+    restore_activation(cargo_home, root, before, after)
+    recovery_environment = environment.copy()
+    recovery_environment["RGO_HOME"] = str(root)
+    recovery_environment.pop("RGO_SETUP_TEST_EXIT_AFTER_RECORD", None)
+    recovery_environment.pop("RGO_SETUP_TEST_EXIT_AFTER_SERVICE_FILE", None)
+    run(previous_cli, *service_setup_args(old_record), environment=recovery_environment)
+    if activation_snapshot(tuple(before)) != before:
+        raise InstallError("previous service setup changed the restored activation")
 
 
 def restore_file(path: Path, previous: tuple[bytes, int] | None) -> None:
@@ -822,7 +904,8 @@ def read_journal(path: Path) -> dict[str, object] | None:
 
 
 def recover_journal(
-    journal_path: Path, cargo_home: Path, install_root: Path, bin_dir: Path, versions: Path
+    journal_path: Path, cargo_home: Path, install_root: Path, bin_dir: Path,
+    versions: Path, environment: dict[str, str],
 ) -> None:
     journal = read_journal(journal_path)
     if journal is None:
@@ -854,7 +937,18 @@ def recover_journal(
         if not isinstance(old_record, dict):
             raise InstallError("installer journal previous record is malformed")
     tracked = activation_paths(cargo_home, install_root, old_record)
+    service = None
+    if journal.get("service") is not None:
+        if first_install:
+            raise InstallError("first-install journal unexpectedly names a service upgrade")
+        service = checked_service_plan(journal["service"], environment)
+        tracked += (Path(service["path"]),)
     before = decode_snapshot(encoded_before, tracked)
+    if service is not None and (
+        before[Path(service["path"])] is None
+        or before[Path(service["path"])][0] != service["contents"].encode()
+    ):
+        raise InstallError("installer journal has a mismatched previous service definition")
     root = Path(str(old_record.get("rgo_home", "")))
     if journal.get("rgo_home") != str(root):
         raise InstallError("installer journal storage root does not match the previous record")
@@ -880,6 +974,15 @@ def recover_journal(
             or (bin_dir / old_links[bin_dir / "rgo-rustc-wrapper"]).resolve() != old_wrapper
         ):
             raise InstallError("the previous versioned binary is unavailable for journal recovery")
+        if service is not None:
+            identities = journal.get("old_binaries")
+            expected = {str(previous_cli), str(old_wrapper)}
+            if not isinstance(identities, dict) or set(identities) != expected:
+                raise InstallError("service upgrade journal lacks prior binary identities")
+            for binary in (previous_cli, old_wrapper):
+                digest = identities[str(binary)]
+                if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest) or sha256(binary) != digest:
+                    raise InstallError(f"previous service binary changed before recovery: {binary}")
     phase = journal.get("phase")
     if phase == "prepared":
         current_links = link_snapshot(links)
@@ -889,7 +992,13 @@ def recover_journal(
             if journal.get("after") is None:
                 raise InstallError("setup stopped before a replacement snapshot was recorded; repair the partial activation")
             planned = decode_snapshot(journal["after"], tracked)
-            restore_activation(cargo_home, root, before, planned)
+            if service is not None:
+                restore_service_upgrade(
+                    cargo_home, root, before, planned, service,
+                    previous_cli, old_record, environment,
+                )
+            else:
+                restore_activation(cargo_home, root, before, planned)
         journal_path.unlink()
         print("recovered interrupted installer setup")
         return
@@ -903,7 +1012,13 @@ def recover_journal(
         journal_path.unlink()
         print("confirmed previously committed installer transaction")
         return
-    restore_activation(cargo_home, root, before, after)
+    if service is not None:
+        restore_service_upgrade(
+            cargo_home, root, before, after, service,
+            previous_cli, old_record, environment,
+        )
+    else:
+        restore_activation(cargo_home, root, before, after)
     for path, previous in old_links.items():
         if current_links[path] != previous:
             restore_entrypoint(path, previous)
@@ -1156,7 +1271,7 @@ def uninstall_owned(
             existing_entrypoint(link, versions)
         recover_journal(
             install_root / "installer-transaction.json",
-            cargo_home, install_root, bin_dir, versions,
+            cargo_home, install_root, bin_dir, versions, environment,
         )
         journal_path = install_root / "installer-uninstall.json"
         journal = read_journal(journal_path)
@@ -1462,7 +1577,7 @@ def main() -> None:
             for name in ("rgo", "rgo-rustc-wrapper"):
                 existing_entrypoint(bin_dir / name, versions)
             journal_path = install_root / "installer-transaction.json"
-            recover_journal(journal_path, cargo_home, install_root, bin_dir, versions)
+            recover_journal(journal_path, cargo_home, install_root, bin_dir, versions, environment)
             uninstall_journal = install_root / "installer-uninstall.json"
             if uninstall_journal.exists() or uninstall_journal.is_symlink():
                 raise InstallError("an uninstall is pending; finish it with --uninstall before installing")
@@ -1513,6 +1628,7 @@ def main() -> None:
                 had_activation = record_path.is_file()
                 previous_cli = None
                 rollback_args = None
+                old_service = None
                 if had_activation:
                     old_record = json.loads(record_path.read_text())
                     if (
@@ -1570,29 +1686,29 @@ def main() -> None:
                     ).stdout.strip() != f"rgo-rustc-wrapper {old_version} protocol {old_protocol}":
                         raise InstallError("previous wrapper does not match its activation record")
                     if previous_cli != cli.resolve():
-                        if not args.no_service:
-                            raise InstallError(
-                                "service-managed upgrades need a service rollback transaction; "
-                                "the previous installation remains active"
-                            )
-                        rollback_args = ["setup", "--no-service"]
-                        if args.supervised:
-                            previous_shim = old_record.get("supervised_cargo")
-                            if not isinstance(previous_shim, dict) or not isinstance(
-                                previous_shim.get("real_cargo"), str
-                            ):
-                                raise InstallError("previous supervised Cargo proxy is not recorded")
-                            rollback_args.extend(
-                                ["--supervised", "--real-cargo", previous_shim["real_cargo"]]
-                            )
-                        elif old_record.get("wrapper_binary") is None:
-                            rollback_args.append("--no-wrapper")
+                        rollback_args = service_setup_args(old_record)
+                        if args.no_service:
+                            rollback_args.append("--no-service")
+                        else:
+                            old_plan = json.loads(run(
+                                previous_cli, *rollback_args, "--installer-plan-json",
+                                environment=environment,
+                            ).stdout)
+                            old_service = checked_service_plan(old_plan.get("service"), environment)
                 activation_before = None
                 activation_root = None
                 entrypoints = (bin_dir / "rgo-rustc-wrapper", bin_dir / "rgo")
                 if rollback_args is not None:
                     tracked = activation_paths(cargo_home, install_root, old_record)
+                    if old_service is not None:
+                        tracked += (Path(old_service["path"]),)
                     activation_before = activation_snapshot(tracked)
+                    if old_service is not None and (
+                        activation_before[Path(old_service["path"])] is None
+                        or activation_before[Path(old_service["path"])][0]
+                        != old_service["contents"].encode()
+                    ):
+                        raise InstallError("previous daemon definition differs from its owned plan")
                     activation_root = Path(old_record["rgo_home"])
                 elif not had_activation and args.no_service:
                     if state_path.exists() or (cargo_home / ".rgo-home").exists():
@@ -1637,6 +1753,11 @@ def main() -> None:
                         "config_file": str(config_path) if not had_activation else None,
                         "supervised": args.supervised,
                         "before": encode_snapshot(activation_before),
+                        **({"service": old_service} if old_service is not None else {}),
+                        **({"old_binaries": {
+                            str(previous_cli): sha256(previous_cli),
+                            str(old_wrapper): sha256(old_wrapper),
+                        }} if old_service is not None else {}),
                         "old_links": encode_links(previous_links),
                         "new_links": encode_links({
                             bin_dir / "rgo-rustc-wrapper": version_dir / "rgo-rustc-wrapper",
@@ -1657,19 +1778,21 @@ def main() -> None:
                     if args.no_service:
                         if service_plan is not None:
                             raise InstallError("no-service setup unexpectedly planned a daemon service")
-                    elif (
-                        not isinstance(service_plan, dict)
-                        or not isinstance(service_plan.get("path"), str)
-                        or not Path(service_plan["path"]).is_absolute()
-                        or not isinstance(service_plan.get("label"), str)
-                        or not service_plan["label"]
-                        or not isinstance(service_plan.get("contents"), str)
+                    else:
+                        service_plan = checked_service_plan(service_plan, environment)
+                    if old_service is not None and (
+                        service_plan["path"] != old_service["path"]
+                        or service_plan["label"] != old_service["label"]
                     ):
-                        raise InstallError("service setup returned an invalid daemon definition")
+                        raise InstallError("replacement service changed its owned path or label")
                     if journal is not None:
                         planned_after = planned_snapshot(
                             plan, activation_before, state_path, new_state
                         )
+                        if old_service is not None:
+                            planned_after[Path(old_service["path"])] = (
+                                service_plan["contents"].encode(), 0o600,
+                            )
                         planned_record = planned_after[record_path]
                         if planned_record is None or Path(
                             json.loads(planned_record[0])["rgo_binary"]
@@ -1687,7 +1810,10 @@ def main() -> None:
                         *setup_args,
                         environment=environment,
                         test_abrupt_exit=args.development_bundle
-                        and environment.get("RGO_SETUP_TEST_EXIT_AFTER_RECORD") == "1",
+                        and (
+                            environment.get("RGO_SETUP_TEST_EXIT_AFTER_RECORD") == "1"
+                            or environment.get("RGO_SETUP_TEST_EXIT_AFTER_SERVICE_FILE") == "1"
+                        ),
                     )
                     setup_completed = True
                     if service_plan is not None:
@@ -1728,9 +1854,16 @@ def main() -> None:
                     if planned_after is not None:
                         try:
                             if activation_snapshot(tuple(activation_before)) != activation_before:
-                                restore_activation(
-                                    cargo_home, activation_root, activation_before, planned_after
-                                )
+                                if old_service is not None:
+                                    restore_service_upgrade(
+                                        cargo_home, activation_root, activation_before,
+                                        planned_after, old_service, previous_cli,
+                                        old_record, environment,
+                                    )
+                                else:
+                                    restore_activation(
+                                        cargo_home, activation_root, activation_before, planned_after
+                                    )
                         except Exception as rollback_error:
                             rollback_errors.append(str(rollback_error))
                     elif setup_started and not had_activation:

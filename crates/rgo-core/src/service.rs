@@ -498,6 +498,10 @@ pub fn install(
         )?;
         std::fs::create_dir_all(paths.logs_dir())?;
         atomic_write(&rendered.path, rendered.contents.as_bytes())?;
+        #[cfg(debug_assertions)]
+        if std::env::var_os("RGO_SETUP_TEST_EXIT_AFTER_SERVICE_FILE").is_some() {
+            std::process::exit(90);
+        }
         let domain = format!("gui/{}", unsafe_get_uid());
         let service_target = format!("{domain}/{}", rendered.label);
         let _ = command("launchctl", ["bootout", &service_target]);
@@ -520,6 +524,10 @@ pub fn install(
                 .context("systemd unit path has no parent")?,
         )?;
         atomic_write(&rendered.path, rendered.contents.as_bytes())?;
+        #[cfg(debug_assertions)]
+        if std::env::var_os("RGO_SETUP_TEST_EXIT_AFTER_SERVICE_FILE").is_some() {
+            std::process::exit(90);
+        }
         command("systemctl", ["--user", "daemon-reload"])?;
         if previous_executable.is_some() {
             // `enable --now` does not restart an already active unit after its
