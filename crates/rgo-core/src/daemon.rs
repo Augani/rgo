@@ -37,7 +37,7 @@ const MAX_EVENT_DRAINS_PER_PASS: usize = 4;
 const MAX_EVENT_SCAN_ENTRIES_PER_PASS: usize = 256;
 const MAX_EVENT_BATCH_PRUNE_PER_PASS: usize = 64;
 const MAX_PIN_SCAN_ENTRIES_PER_PASS: usize = 32;
-const MAX_PENDING_MAINTENANCE_ENTRIES_PER_PASS: usize = 32;
+const MAX_PENDING_MAINTENANCE_ENTRIES_PER_PASS: usize = 128;
 /// Bound on concurrent client connections; excess connections are refused so a flood
 /// of stalled or malformed clients cannot exhaust daemon threads or file descriptors.
 /// Clients see a dropped connection and fall back to ordinary cargo behavior.
