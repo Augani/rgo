@@ -1,6 +1,26 @@
 use assert_cmd::cargo::cargo_bin;
 use rgo_testkit::{Sandbox, ensure_workspace_bins_built};
 
+#[cfg(unix)]
+#[test]
+fn setup_rejects_a_broken_legacy_config_link_without_touching_modern_config() {
+    ensure_workspace_bins_built().unwrap();
+    let sandbox = Sandbox::new().unwrap();
+    let modern = sandbox.cargo_home.join("config.toml");
+    let original = "[net]\noffline = true\n";
+    std::fs::write(&modern, original).unwrap();
+    std::os::unix::fs::symlink("missing-config", sandbox.cargo_home.join("config")).unwrap();
+    let result = sandbox
+        .cmd(cargo_bin("rgo"))
+        .args(["setup", "--no-service"])
+        .output()
+        .unwrap();
+    assert!(!result.status.success());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("regular Cargo config file"));
+    assert_eq!(std::fs::read_to_string(modern).unwrap(), original);
+    assert!(!sandbox.cargo_home.join(".rgo-install.json").exists());
+}
+
 #[test]
 fn native_activation_refuses_unprotected_destructive_cleanup() {
     ensure_workspace_bins_built().unwrap();

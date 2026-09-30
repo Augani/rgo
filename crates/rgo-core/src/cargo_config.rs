@@ -45,10 +45,11 @@ pub fn supports_build_dir(text: &str) -> bool {
 /// `config.toml` and reporting a false activation.
 pub fn effective_home_config(cargo_home: &Path) -> std::path::PathBuf {
     let legacy = cargo_home.join("config");
-    if legacy.exists() {
-        legacy
-    } else {
-        cargo_home.join("config.toml")
+    match std::fs::symlink_metadata(&legacy) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            cargo_home.join("config.toml")
+        }
+        _ => legacy,
     }
 }
 
@@ -420,10 +421,12 @@ fn split_fence(text: &str) -> Result<(String, Option<String>)> {
 }
 
 pub fn read_or_empty(path: &Path) -> Result<String> {
-    match std::fs::read_to_string(path) {
-        Ok(t) => Ok(t),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
-        Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
+    match std::fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        Err(error) => Err(error).with_context(|| format!("checking {}", path.display())),
+        Ok(_) => {
+            std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))
+        }
     }
 }
 
@@ -561,6 +564,16 @@ mod tests {
             effective_home_config(home.path()),
             home.path().join("config")
         );
+        #[cfg(unix)]
+        {
+            std::fs::remove_file(home.path().join("config")).unwrap();
+            std::os::unix::fs::symlink("missing-config", home.path().join("config")).unwrap();
+            assert_eq!(
+                effective_home_config(home.path()),
+                home.path().join("config")
+            );
+            assert!(read_or_empty(&home.path().join("config")).is_err());
+        }
     }
 
     #[test]

@@ -437,20 +437,17 @@ pub fn run(
     } else {
         effective_cfg_path
     };
-    let config_existed = cfg_path.exists();
-    if supervised {
-        match std::fs::symlink_metadata(&cfg_path) {
-            Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {}
-            Ok(_) => bail!(
-                "supervised setup requires a regular Cargo config file: {}",
-                cfg_path.display()
-            ),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(error).with_context(|| format!("checking {}", cfg_path.display()));
-            }
+    let config_existed = match std::fs::symlink_metadata(&cfg_path) {
+        Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => true,
+        Ok(_) => bail!(
+            "setup requires a regular Cargo config file: {}",
+            cfg_path.display()
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => {
+            return Err(error).with_context(|| format!("checking {}", cfg_path.display()));
         }
-    }
+    };
     let current = cargo_config::read_or_empty(&cfg_path)?;
     let insp = cargo_config::inspect(&current)?;
     if insp.has_fence {
@@ -859,6 +856,14 @@ pub fn run(
             }
             if !undo && cargo_config::effective_home_config(&cargo_home) != cfg_path {
                 bail!("Cargo home config precedence changed during setup; retry");
+            }
+            match std::fs::symlink_metadata(&cfg_path) {
+                Ok(metadata)
+                    if config_existed
+                        && metadata.is_file()
+                        && !metadata.file_type().is_symlink() => {}
+                Err(error) if !config_existed && error.kind() == std::io::ErrorKind::NotFound => {}
+                _ => bail!("Cargo config path changed during setup; retry"),
             }
             if cargo_config::read_or_empty(&cfg_path)? != current {
                 bail!("{} changed during setup; retry", cfg_path.display());
