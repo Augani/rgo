@@ -511,16 +511,25 @@ pub fn install(
         }
         let domain = format!("gui/{}", unsafe_get_uid());
         let service_target = format!("{domain}/{}", rendered.label);
-        let _ = command("launchctl", ["bootout", &service_target]);
-        command(
-            "launchctl",
-            [
-                "bootstrap",
-                &domain,
-                rendered.path.to_str().unwrap_or_default(),
-            ],
-        )?;
-        Ok(rendered)
+        let plist = rendered
+            .path
+            .to_str()
+            .context("launchd definition path is not UTF-8")?;
+        for attempt in 0..4 {
+            let _ = command("launchctl", ["bootout", &service_target]);
+            match command("launchctl", ["bootstrap", &domain, plist]) {
+                Ok(()) => return Ok(rendered),
+                Err(error)
+                    if attempt < 3 && format!("{error:#}").contains("Bootstrap failed: 5") =>
+                {
+                    // bootout may return before launchd fully releases the
+                    // old job. Retry the owned registration for a short time.
+                    std::thread::sleep(std::time::Duration::from_millis(150 * (attempt + 1)));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        unreachable!("launchd bootstrap loop returns on every final attempt")
     }
     #[cfg(target_os = "linux")]
     {
