@@ -64,14 +64,21 @@ impl BuildContext {
     }
 
     /// Cargo holds `<build-dir>/<profile>/.cargo-build-lock` for the duration of a build.
-    /// A recently modified lock is treated as "probably live" until Phase 2 leases exist.
+    /// Planning protects recent, held, or uninspectable locks; deletion repeats
+    /// the held-lock check after taking its stable context guard.
     pub fn recently_locked(&self, within: Duration, now: SystemTime) -> bool {
-        lock_files(&self.dir).any(|p| {
-            std::fs::metadata(&p)
-                .and_then(|m| m.modified())
-                .map(|m| now.duration_since(m).unwrap_or_default() < within)
-                .unwrap_or(false)
-        })
+        self.recently_locked_checked(within, now).unwrap_or(true)
+    }
+
+    /// Checked planning path: malformed or unreadable profile state must be
+    /// reported rather than silently omitted from a budget decision.
+    pub fn recently_locked_checked(&self, within: Duration, now: SystemTime) -> Result<bool> {
+        for profile in checked_profile_dirs(&self.dir)? {
+            if profile_lock_blocks(&profile, Some((within, now)))? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 }
 
@@ -161,29 +168,49 @@ pub fn lock_files_for_safety(build_dir: &Path) -> bool {
     let Ok(profiles) = checked_profile_dirs(build_dir) else {
         return true;
     };
-    profiles.into_iter().any(|profile| {
-        let path = profile.join(".cargo-build-lock");
-        match std::fs::symlink_metadata(&path) {
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                // A disappeared profile is a race, not evidence that its
-                // lock was absent throughout this deletion check.
-                !std::fs::symlink_metadata(&profile)
-                    .is_ok_and(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())
-            }
-            Err(_) => true,
-            Ok(metadata) if !metadata.file_type().is_file() => true,
-            Ok(_) => {
-                let Ok(file) = std::fs::OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .open(&path)
-                else {
-                    return true;
-                };
-                !matches!(file.try_lock_exclusive(), Ok(true))
-            }
+    profiles
+        .into_iter()
+        .any(|profile| profile_lock_blocks(&profile, None).unwrap_or(true))
+}
+
+fn profile_lock_blocks(profile: &Path, recent: Option<(Duration, SystemTime)>) -> Result<bool> {
+    let path = profile.join(".cargo-build-lock");
+    match std::fs::symlink_metadata(&path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            // A disappeared profile is a race, not evidence that its lock
+            // was absent throughout this check.
+            let metadata = std::fs::symlink_metadata(profile)
+                .with_context(|| format!("checking profile {}", profile.display()))?;
+            ensure!(
+                metadata.is_dir() && !metadata.file_type().is_symlink(),
+                "unsafe Cargo profile {}",
+                profile.display()
+            );
+            Ok(false)
         }
-    })
+        Err(error) => Err(error).with_context(|| format!("checking lock {}", path.display())),
+        Ok(metadata) if !metadata.file_type().is_file() => {
+            anyhow::bail!("unsafe Cargo profile lock {}", path.display())
+        }
+        Ok(metadata) => {
+            if let Some((within, now)) = recent {
+                let modified = metadata
+                    .modified()
+                    .with_context(|| format!("reading lock time {}", path.display()))?;
+                if now.duration_since(modified).unwrap_or_default() < within {
+                    return Ok(true);
+                }
+            }
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&path)
+                .with_context(|| format!("opening lock {}", path.display()))?;
+            Ok(!file
+                .try_lock_exclusive()
+                .with_context(|| format!("checking lock {}", path.display()))?)
+        }
+    }
 }
 
 /// The fast inventory path may skip unreadable entries for display. A deletion
@@ -1167,17 +1194,41 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let context = root.path().join("context");
         let profile = context.join("debug");
+        let now = SystemTime::now();
+        let mut observed = context_at(now);
+        observed.dir = context.clone();
         std::fs::create_dir_all(&profile).unwrap();
         assert!(!lock_files_for_safety(&context));
+        assert!(!observed.recently_locked(Duration::from_secs(600), now));
         symlink(
             profile.join("missing-lock"),
             profile.join(".cargo-build-lock"),
         )
         .unwrap();
         assert!(lock_files_for_safety(&context));
+        assert!(observed.recently_locked(Duration::from_secs(600), now));
         std::fs::remove_file(profile.join(".cargo-build-lock")).unwrap();
         symlink(profile.join("missing-directory"), profile.join("deps")).unwrap();
         assert!(lock_files_for_safety(&context));
+        assert!(observed.recently_locked(Duration::from_secs(600), now));
+    }
+
+    #[test]
+    fn held_old_profile_lock_is_ineligible_for_planning() {
+        let root = tempfile::tempdir().unwrap();
+        let context = root.path().join("context");
+        let profile = context.join("debug");
+        std::fs::create_dir_all(&profile).unwrap();
+        let lock = std::fs::File::create(profile.join(".cargo-build-lock")).unwrap();
+        let now = SystemTime::now();
+        lock.set_modified(now - Duration::from_secs(7200)).unwrap();
+        let mut observed = context_at(now);
+        observed.dir = context;
+        assert!(!observed.recently_locked(Duration::from_secs(600), now));
+        assert!(lock.try_lock_exclusive().unwrap());
+        assert!(observed.recently_locked(Duration::from_secs(600), now));
+        drop(lock);
+        assert!(!observed.recently_locked(Duration::from_secs(600), now));
     }
 
     #[test]

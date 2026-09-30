@@ -1,6 +1,7 @@
 //! Tiered garbage collection. `plan` selects policy from measured contexts and
 //! checked filesystem state; `execute` repeats safety checks before deletion.
 
+use std::collections::HashSet;
 use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -121,11 +122,13 @@ pub fn plan(inp: &Inputs) -> Result<Plan> {
         managed
     };
     let mut needed = managed.saturating_sub(target).max(free_deficit);
-    let skipped_live = inp
-        .contexts
-        .iter()
-        .filter(|c| c.recently_locked(LIVE_WINDOW, inp.now))
-        .count();
+    let mut lock_protected: HashSet<&Path> = HashSet::new();
+    for context in inp.contexts {
+        if context.recently_locked_checked(LIVE_WINDOW, inp.now)? {
+            lock_protected.insert(context.dir.as_path());
+        }
+    }
+    let skipped_live = lock_protected.len();
     let skipped_leased = inp
         .contexts
         .iter()
@@ -149,7 +152,7 @@ pub fn plan(inp: &Inputs) -> Result<Plan> {
             && !c.workspace_unavailable()
             && !inp.pinned.iter().any(|path| same_path(path, &c.dir))
             && !inp.leased.iter().any(|path| same_path(path, &c.dir))
-            && !c.recently_locked(LIVE_WINDOW, inp.now)
+            && !lock_protected.contains(c.dir.as_path())
     };
     let protected_context_bytes = inp
         .contexts
