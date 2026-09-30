@@ -36,15 +36,15 @@ try {
     $sha = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash
 
     foreach ($mode in @('native', 'supervised')) {
-        $home = Join-Path $root $mode
-        $cargoHome = Join-Path $home '.cargo'
-        $rgoHome = Join-Path $home '.rgo'
-        $project = Join-Path $home 'project'
+        $sandboxHome = Join-Path $root $mode
+        $cargoHome = Join-Path $sandboxHome '.cargo'
+        $rgoHome = Join-Path $sandboxHome '.rgo'
+        $project = Join-Path $sandboxHome 'project'
         New-Item -ItemType Directory -Force -Path $cargoHome, (Join-Path $project 'src') | Out-Null
         $originalConfig = "[net]`noffline = true`n"
         [IO.File]::WriteAllText((Join-Path $cargoHome 'config.toml'), $originalConfig)
-        $env:HOME = $home
-        $env:USERPROFILE = $home
+        $env:HOME = $sandboxHome
+        $env:USERPROFILE = $sandboxHome
         $env:CARGO_HOME = $cargoHome
         $env:RGO_HOME = $rgoHome
         $env:RUSTUP_HOME = $rustupHome
