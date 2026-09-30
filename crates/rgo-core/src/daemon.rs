@@ -798,6 +798,7 @@ fn status_report(state: &State) -> Result<StatusReport> {
     let stats = db.stats()?;
     let last_gc = db.last_gc()?.unwrap_or_default();
     let active_cache_keys = db.active_cache_keys()?;
+    let active_cache_lease = db.has_active_cache_lease()?;
     let cache_lru = db.cache_lru()?;
     drop(db);
     // The profile-lock mtime is only a recency heuristic. A long-running
@@ -835,13 +836,14 @@ fn status_report(state: &State) -> Result<StatusReport> {
         state.cfg.min_free_space,
     );
     let reclaimable_build_bytes = build_preview.reclaim_bytes();
-    append_unreferenced_cas(&mut budget_plan, &state.cas, &active_cache_keys)?;
+    append_unreferenced_cas(&mut budget_plan, &state.cas, active_cache_lease)?;
     extend_gc_preview(
         &mut budget_plan,
         &budget_inputs,
         &state.cas,
         &cache_lru,
         &active_cache_keys,
+        active_cache_lease,
         state.cfg.min_free_space,
     )?;
     let eligible_managed_bytes = budget_plan.reclaim_bytes().min(budget_plan.managed_bytes);
@@ -849,22 +851,24 @@ fn status_report(state: &State) -> Result<StatusReport> {
         .managed_bytes
         .saturating_sub(state.cfg.max_size)
         .saturating_sub(eligible_managed_bytes);
+    let protected_cas_bytes = protected_cas_bytes(
+        &state.cas,
+        &active_cache_keys,
+        active_cache_lease,
+        cas_bytes,
+    )?;
     let unclassified = budget_plan
         .managed_bytes
         .saturating_sub(eligible_managed_bytes)
         .saturating_sub(budget_plan.protected_context_bytes)
-        .saturating_sub(if active_cache_keys.is_empty() {
-            0
-        } else {
-            cas_bytes
-        });
+        .saturating_sub(protected_cas_bytes);
     let unmet_budget_reason = if unmet_budget_bytes > 0 {
         let mut reasons = Vec::new();
         if budget_plan.protected_context_bytes > 0 {
             reasons.push("protected build contexts");
         }
-        if !active_cache_keys.is_empty() {
-            reasons.push("active cache work defers CAS eviction");
+        if protected_cas_bytes > 0 {
+            reasons.push("active cache work protects CAS entries");
         }
         if unclassified > 0 {
             reasons.push("operational state or other ineligible data");
@@ -1194,6 +1198,7 @@ fn run_gc(
     let pinned = db.pinned_paths()?;
     let leased = db.protected_paths(&contexts)?;
     let active_cache_keys = db.active_cache_keys()?;
+    let active_cache_lease = db.has_active_cache_lease()?;
     let inputs = Inputs {
         paths: &state.paths,
         cfg: &state.cfg,
@@ -1208,7 +1213,7 @@ fn run_gc(
         target_bytes,
     };
     let mut plan = gc::plan(&inputs)?;
-    append_unreferenced_cas(&mut plan, &state.cas, &active_cache_keys)?;
+    append_unreferenced_cas(&mut plan, &state.cas, active_cache_lease)?;
     let cache_lru = db.cache_lru()?;
     drop(db);
     if dry_run {
@@ -1218,6 +1223,7 @@ fn run_gc(
             &state.cas,
             &cache_lru,
             &active_cache_keys,
+            active_cache_lease,
             state.cfg.min_free_space,
         )?;
     }
@@ -1235,11 +1241,12 @@ fn run_gc(
         skipped_pinned: plan.skipped_pinned as u64,
         skipped_unavailable: plan.skipped_unavailable as u64,
         protected_context_bytes: plan.protected_context_bytes,
-        cas_eviction_deferred_bytes: if active_cache_keys.is_empty() {
-            0
-        } else {
-            cas_bytes
-        },
+        cas_eviction_deferred_bytes: protected_cas_bytes(
+            &state.cas,
+            &active_cache_keys,
+            active_cache_lease,
+            cas_bytes,
+        )?,
         min_free_bytes: state.cfg.min_free_space,
         volume_free_before_bytes: Some(free_bytes),
         remaining_managed_bytes: None,
@@ -1273,6 +1280,7 @@ fn run_gc(
             &state.cas,
             &cache_lru,
             &active_cache_keys,
+            active_cache_lease,
             needed,
             state.cfg.gc.cache_retention,
             crate::context::unix_now(),
@@ -1292,7 +1300,7 @@ fn run_gc(
                 }
             }
         }
-        if active_cache_keys.is_empty() {
+        if !active_cache_lease {
             let mut post = gc::Plan::default();
             for action in unreferenced_cas_actions(&state.cas, &[])? {
                 if !plan
@@ -1431,6 +1439,7 @@ fn extend_gc_preview(
     cas: &Store,
     cache_lru: &[(String, u64)],
     active_cache_keys: &[String],
+    active_cache_lease: bool,
     min_free_space: u64,
 ) -> Result<()> {
     let needed = plan
@@ -1442,6 +1451,7 @@ fn extend_gc_preview(
         cas,
         cache_lru,
         active_cache_keys,
+        active_cache_lease,
         needed,
         inputs.cfg.gc.cache_retention,
         crate::context::unix_now(),
@@ -1453,13 +1463,15 @@ fn extend_gc_preview(
             .collect::<Vec<_>>();
         plan.actions
             .extend(selected.into_iter().map(|item| item.action));
-        for action in unreferenced_cas_actions(cas, &keys)? {
-            if !plan
-                .actions
-                .iter()
-                .any(|existing| existing.path == action.path)
-            {
-                plan.actions.push(action);
+        if !active_cache_lease {
+            for action in unreferenced_cas_actions(cas, &keys)? {
+                if !plan
+                    .actions
+                    .iter()
+                    .any(|existing| existing.path == action.path)
+                {
+                    plan.actions.push(action);
+                }
             }
         }
     }
@@ -1499,18 +1511,62 @@ fn forget_removed_object_rows(state: &State, actions: &[gc::Action]) -> Result<(
 fn append_unreferenced_cas(
     plan: &mut gc::Plan,
     cas: &Store,
-    active_cache_keys: &[String],
+    active_cache_lease: bool,
 ) -> Result<()> {
     // Wrappers publish CAS objects before the manifest is committed. A remote
     // fetch does the same. Those objects look unreferenced until commit, and
     // their digest is not known to the daemon yet, so defer sweeping the whole
     // unreferenced set while any cache producer/consumer/fetch lease is live.
-    if !active_cache_keys.is_empty() {
+    if active_cache_lease {
         return Ok(());
     }
     plan.actions.extend(unreferenced_cas_actions(cas, &[])?);
     plan.actions.sort_by_key(|action| action.tier);
     Ok(())
+}
+
+fn protected_cas_bytes(
+    cas: &Store,
+    protected_keys: &[String],
+    active_cache_lease: bool,
+    cas_bytes: u64,
+) -> Result<u64> {
+    if active_cache_lease {
+        return Ok(cas_bytes);
+    }
+    if protected_keys.is_empty() {
+        return Ok(0);
+    }
+    let protected: HashSet<&str> = protected_keys.iter().map(String::as_str).collect();
+    let mut scanner = crate::size::Scanner::new();
+    let mut seen_objects = HashSet::new();
+    let mut bytes = 0u64;
+    for manifest in cas.list_manifests()? {
+        if !protected.contains(manifest.key.as_str()) {
+            continue;
+        }
+        bytes = bytes.saturating_add(
+            scanner
+                .measure_checked(&cas.manifest_path(&manifest.key))?
+                .physical_bytes,
+        );
+        for digest in manifest
+            .outputs
+            .iter()
+            .map(|output| &output.object.digest)
+            .chain(manifest.stdout.iter().map(|object| &object.digest))
+            .chain(manifest.stderr.iter().map(|object| &object.digest))
+        {
+            if seen_objects.insert(digest.clone()) {
+                bytes = bytes.saturating_add(
+                    scanner
+                        .measure_checked(&cas.object_path(digest))?
+                        .physical_bytes,
+                );
+            }
+        }
+    }
+    Ok(bytes.min(cas_bytes))
 }
 
 fn unreferenced_cas_actions(cas: &Store, excluded_manifests: &[String]) -> Result<Vec<gc::Action>> {
@@ -1585,17 +1641,19 @@ fn select_cas_manifests(
     cas: &Store,
     lru: &[(String, u64)],
     protected_keys: &[String],
+    active_cache_lease: bool,
     mut needed: u64,
     retention: Duration,
     now: u64,
 ) -> Result<Vec<CasManifestEviction>> {
-    // A producer can publish objects before committing its manifest, and an
-    // upload can read objects without the operation lock. Defer all manifest
-    // eviction while either is active; partial protection needs a separate
-    // tested reference protocol.
-    if !protected_keys.is_empty() {
+    // Producers and consumers may hold objects not yet represented by a
+    // committed manifest, so defer all eviction while their lease is live.
+    // A queued or running upload reads only its committed manifest: protect
+    // that key and its references while allowing unrelated keys to age out.
+    if active_cache_lease {
         return Ok(Vec::new());
     }
+    let protected: HashSet<&str> = protected_keys.iter().map(String::as_str).collect();
     let last_used: HashMap<&str, u64> = lru.iter().map(|(key, at)| (key.as_str(), *at)).collect();
     let mut manifests = cas.list_manifests()?;
     manifests.sort_by_key(|manifest| {
@@ -1625,6 +1683,9 @@ fn select_cas_manifests(
     }
     let mut selected = Vec::new();
     for manifest in manifests {
+        if protected.contains(manifest.key.as_str()) {
+            continue;
+        }
         let used = last_used
             .get(manifest.key.as_str())
             .copied()
@@ -2270,6 +2331,7 @@ mod tests {
             &cas,
             &db.cache_lru().unwrap(),
             &[],
+            false,
             0,
             Duration::from_secs(30),
             now,
@@ -2373,6 +2435,39 @@ mod tests {
             .unwrap();
         assert_eq!(stats.manifests, 1);
         assert_eq!(stats.objects, 1);
+
+        // A queued upload protects its own manifest and objects, but must
+        // not hold unrelated cold CAS data above the storage target.
+        let cold_key = "c".repeat(64);
+        let cold_object = state
+            .cas
+            .put_bytes(&vec![b'c'; 2 * 1024 * 1024], 0o444)
+            .unwrap();
+        let cold = make_manifest(&cold_key, cold_object.clone(), now);
+        state.cas.write_manifest(&cold).unwrap();
+        {
+            let db = state.db.lock().unwrap();
+            db.record_cache_manifest(&wire_manifest(&cold), &state.cas.manifest_path(&cold_key))
+                .unwrap();
+            db.queue_remote_job(&new_key, "manifest", None).unwrap();
+        }
+        let status = status_report(&state).unwrap();
+        let target = status.managed_bytes.saturating_sub(1024 * 1024);
+        let preview = run_gc(&state, true, false, false, Some(target)).unwrap();
+        assert!(preview.cas_eviction_deferred_bytes >= 2 * 1024 * 1024);
+        assert!(preview.cas_eviction_deferred_bytes < status.cas_bytes.unwrap());
+        assert!(preview.actions.iter().any(|action| {
+            action.path == state.cas.manifest_path(&cold_key).display().to_string()
+        }));
+        assert!(!preview.actions.iter().any(|action| {
+            action.path == state.cas.manifest_path(&new_key).display().to_string()
+        }));
+        run_gc(&state, false, false, false, Some(target)).unwrap();
+        assert!(!state.cas.manifest_path(&cold_key).exists());
+        assert!(!state.cas.object_path(&cold_object.digest).exists());
+        assert!(state.cas.manifest_path(&new_key).is_file());
+        assert!(state.cas.object_path(&new_object.digest).is_file());
+        assert!(context_dir.is_dir());
     }
 
     #[test]
@@ -2412,9 +2507,9 @@ mod tests {
         let store = Store::new(root.path().join("cas"), root.path().join("quarantine")).unwrap();
         let object = store.put_bytes(b"not committed yet", 0o444).unwrap();
         let mut plan = gc::Plan::default();
-        append_unreferenced_cas(&mut plan, &store, &["active-key".into()]).unwrap();
+        append_unreferenced_cas(&mut plan, &store, true).unwrap();
         assert!(plan.actions.is_empty());
-        append_unreferenced_cas(&mut plan, &store, &[]).unwrap();
+        append_unreferenced_cas(&mut plan, &store, false).unwrap();
         assert_eq!(plan.actions.len(), 1);
         assert_eq!(plan.actions[0].path, store.object_path(&object.digest));
 

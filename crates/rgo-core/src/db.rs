@@ -920,6 +920,17 @@ impl StateDb {
             .map_err(Into::into)
     }
 
+    pub fn has_active_cache_lease(&self) -> Result<bool> {
+        let active: i64 = self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM leases
+             WHERE scope IN ('cache', 'cache_build', 'cache_remote')
+               AND expires_at > ?1)",
+            params![unix_now()],
+            |row| row.get(0),
+        )?;
+        Ok(active != 0)
+    }
+
     /// Cache manifests in eviction order. The manifest remains authoritative
     /// for object references; this index only supplies last-use ordering.
     pub fn cache_lru(&self) -> Result<Vec<(String, u64)>> {
