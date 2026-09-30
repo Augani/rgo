@@ -43,7 +43,7 @@ fn age_finished_cargo_profile_locks(context: &Path) {
 }
 
 #[test]
-fn launcher_does_not_manage_another_cargo_home_or_storage_root() {
+fn launcher_passes_through_foreign_or_unavailable_storage_roots() {
     let first = Sandbox::new().unwrap();
     let second = Sandbox::new().unwrap();
     let rgo = env!("CARGO_BIN_EXE_rgo");
@@ -157,6 +157,33 @@ fn launcher_does_not_manage_another_cargo_home_or_storage_root() {
     assert!(String::from_utf8_lossy(&overridden.stderr).contains("storage root differs"));
     assert!(override_project.join("target/debug").is_dir());
     assert!(first_paths.managed_build_dirs().is_empty());
+    assert_eq!(second_paths.managed_build_dirs().len(), 1);
+
+    std::fs::write(
+        second.cargo_home.join(".rgo-home"),
+        b"relative-broken-pointer\n",
+    )
+    .unwrap();
+    let damaged_project = second.simple_bin("unavailable-storage-root").unwrap();
+    let damaged = second
+        .cmd("cargo")
+        .current_dir(&damaged_project)
+        .env("PATH", &second_path)
+        .env_remove("RGO_HOME")
+        .args(["build", "--offline"])
+        .output()
+        .unwrap();
+    assert!(
+        damaged.status.success(),
+        "{}",
+        String::from_utf8_lossy(&damaged.stderr)
+    );
+    assert!(String::from_utf8_lossy(&damaged.stderr).contains("cannot locate managed storage"));
+    assert!(
+        damaged_project
+            .join("target/debug/unavailable-storage-root")
+            .is_file()
+    );
     assert_eq!(second_paths.managed_build_dirs().len(), 1);
 }
 

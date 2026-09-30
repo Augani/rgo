@@ -54,7 +54,15 @@ pub fn run(
         eprintln!("rgo: Cargo home differs from the owning launcher; using ordinary Cargo storage");
         return exec_real_cargo(real_cargo, &args);
     }
-    let paths = RgoPaths::discover()?;
+    let paths = match RgoPaths::discover() {
+        Ok(paths) => paths,
+        Err(error) => {
+            eprintln!(
+                "rgo: cannot locate managed storage ({error:#}); using ordinary Cargo storage"
+            );
+            return exec_real_cargo(real_cargo, &args);
+        }
+    };
     if expected_rgo_home.is_some_and(|expected| !same_directory(expected, &paths.root)) {
         eprintln!(
             "rgo: storage root differs from the owning launcher; using ordinary Cargo storage"
