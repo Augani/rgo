@@ -3,7 +3,7 @@
 use std::path::{Path, PathBuf};
 use std::process::{Child, Stdio};
 use std::thread;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
 use rgo_core::context;
 use rgo_core::gc;
@@ -40,23 +40,6 @@ fn checkout_executable(project: &Path) -> PathBuf {
         "{}.exe",
         project.file_name().unwrap().to_string_lossy()
     ))
-}
-
-fn age_finished_cargo_profile_locks(context: &Path) {
-    let old = SystemTime::now() - Duration::from_secs(7200);
-    for profile in std::fs::read_dir(context).unwrap().flatten() {
-        if profile.path().is_dir() {
-            let lock = profile.path().join(".cargo-build-lock");
-            if lock.is_file() {
-                std::fs::OpenOptions::new()
-                    .write(true)
-                    .open(lock)
-                    .unwrap()
-                    .set_modified(old)
-                    .unwrap();
-            }
-        }
-    }
 }
 
 #[test]
@@ -447,8 +430,6 @@ fn opted_in_maintenance_reclaims_an_idle_real_cargo_build() {
             .physical_bytes;
     let max_size = other_bytes + context_bytes / 2;
 
-    // Only age Cargo's documented profile lock after its process has exited.
-    age_finished_cargo_profile_locks(context);
     std::fs::write(
         sandbox.rgo_home.join("config.toml"),
         format!("[storage]\nmax_size = '{max_size}B'\nmin_free_space = '0B'\n[gc]\nauto = true\n"),
@@ -501,6 +482,34 @@ fn opted_in_maintenance_reclaims_an_idle_real_cargo_build() {
         status.unmet_budget_reason
     );
 
+    drop(daemon);
+    let mut parked_daemon = StopDaemon(
+        sandbox
+            .cmd(&cli)
+            .args(["daemon", "--foreground"])
+            .env("RGO_DAEMON_POLL_SECS", "3600")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let ready_deadline = Instant::now() + Duration::from_secs(10);
+    while !matches!(
+        ipc::request_with_timeout(
+            &paths.socket_path(),
+            Request::QueryRemoteStatus,
+            Duration::from_millis(100)
+        ),
+        Ok(Response::RemoteStatus(_))
+    ) {
+        assert!(parked_daemon.0.try_wait().unwrap().is_none());
+        assert!(
+            Instant::now() < ready_deadline,
+            "parked daemon did not start"
+        );
+        thread::sleep(Duration::from_millis(25));
+    }
+
     std::fs::write(
         project.join("src/main.rs"),
         "fn main() { println!(\"cycle 2\"); }\n",
@@ -541,35 +550,14 @@ fn opted_in_maintenance_reclaims_an_idle_real_cargo_build() {
         .expect("second project's managed context");
     assert!(context.exists());
     assert!(other_context.exists());
-    let retry_deadline = Instant::now() + Duration::from_secs(15);
-    let deferred = loop {
-        let records = supervision::PendingMaintenanceScanner::default()
-            .scan(&paths, 32)
-            .unwrap();
-        let due = [context.as_path(), other_context.as_path()].map(|dir| {
-            records
-                .iter()
-                .find(|record| record.context == dir && record.retry_after.is_some())
-                .cloned()
-        });
-        if let [Some(first), Some(second)] = due {
-            break [first, second];
-        }
-        assert!(
-            Instant::now() < retry_deadline,
-            "maintenance lost one of two launch signals before profile-lock grace expired"
-        );
-        thread::sleep(Duration::from_millis(50));
-    };
-    drop(daemon);
-    age_finished_cargo_profile_locks(context);
-    age_finished_cargo_profile_locks(&other_context);
-    for record in &deferred {
-        assert!(record.retry_after.unwrap() > context::unix_now());
-        assert!(
-            supervision::defer_pending_maintenance(&paths, record, context::unix_now()).unwrap()
-        );
-    }
+    // Both launches remain pending while the daemon is parked. After restart,
+    // their supervised guards and held-lock checks allow immediate recovery.
+    let records = supervision::PendingMaintenanceScanner::default()
+        .scan(&paths, 32)
+        .unwrap();
+    assert_eq!(records.len(), 2);
+    assert!(records.iter().all(|record| record.retry_after.is_none()));
+    drop(parked_daemon);
     let mut daemon = StopDaemon(
         sandbox
             .cmd(&cli)
