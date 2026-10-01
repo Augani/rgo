@@ -852,12 +852,12 @@ fn status_report(state: &State) -> Result<StatusReport> {
     let last_gc = db.last_gc()?.unwrap_or_default();
     let active_cache_keys = db.active_cache_keys()?;
     let active_cache_lease = db.has_active_cache_lease()?;
-    let cache_lru = db.cache_lru()?;
     drop(db);
     // The remaining status work is a read-only estimate. A later pin or
     // lease may change eligibility, but it must not wait for these filesystem
     // walks; the GC lock keeps daemon-owned deletion out of this snapshot.
     drop(_operation);
+    let cache_lru = state.db.lock().unwrap().cache_lru()?;
     // The profile-lock mtime is only a recency heuristic. A long-running
     // supervised Cargo process can outlive it, so the status preview must
     // observe the same nonblocking lifecycle guard that deletion uses.
@@ -1319,12 +1319,52 @@ fn run_gc(
     // Planning can inspect every context's profile locks and the temporary
     // tree. Admit new builds during that walk, then refresh protections before
     // any CAS action; context actions are checked again before staging.
+    // Measuring protected CAS can traverse every manifest and referenced
+    // object. Do it before admission is locked, then use the result only if
+    // the protected-key set and manifest generation still match.
+    let (estimated_cache_keys, estimated_cache_lease) = {
+        let db = state.db.lock().unwrap();
+        (db.active_cache_keys()?, db.has_active_cache_lease()?)
+    };
+    let protection_revision = state.cas.manifest_revision();
+    let estimated_protected_cas = protected_cas_bytes(
+        &state.cas,
+        &estimated_cache_keys,
+        estimated_cache_lease,
+        cas_bytes,
+    );
+    let preview_cache_lru = if dry_run {
+        state.db.lock().unwrap().cache_lru()?
+    } else {
+        Vec::new()
+    };
     let mut operation = state.operation_lock.lock().unwrap();
     let db = state.db.lock().unwrap();
     let active_cache_keys = db.active_cache_keys()?;
     let active_cache_lease = db.has_active_cache_lease()?;
-    let cache_lru = db.cache_lru()?;
     drop(db);
+    let cas_eviction_deferred_bytes = if estimated_cache_lease == active_cache_lease
+        && estimated_cache_keys.iter().collect::<HashSet<_>>()
+            == active_cache_keys.iter().collect::<HashSet<_>>()
+        && state.cas.manifest_revision() == protection_revision
+    {
+        match estimated_protected_cas {
+            Ok(bytes) => bytes,
+            Err(_) => protected_cas_bytes(
+                &state.cas,
+                &active_cache_keys,
+                active_cache_lease,
+                cas_bytes,
+            )?,
+        }
+    } else {
+        protected_cas_bytes(
+            &state.cas,
+            &active_cache_keys,
+            active_cache_lease,
+            cas_bytes,
+        )?
+    };
     if !active_cache_lease && !sweep_blocked && state.cas.manifest_revision() == sweep_generation {
         plan.actions.extend(unreferenced);
         plan.actions.sort_by_key(|action| action.tier);
@@ -1334,7 +1374,7 @@ fn run_gc(
             &mut plan,
             &inputs,
             &state.cas,
-            &cache_lru,
+            &preview_cache_lru,
             &active_cache_keys,
             active_cache_lease,
             state.cfg.min_free_space,
@@ -1354,12 +1394,7 @@ fn run_gc(
         skipped_pinned: plan.skipped_pinned as u64,
         skipped_unavailable: plan.skipped_unavailable as u64,
         protected_context_bytes: plan.protected_context_bytes,
-        cas_eviction_deferred_bytes: protected_cas_bytes(
-            &state.cas,
-            &active_cache_keys,
-            active_cache_lease,
-            cas_bytes,
-        )?,
+        cas_eviction_deferred_bytes,
         min_free_bytes: state.cfg.min_free_space,
         volume_free_before_bytes: Some(free_bytes),
         remaining_managed_bytes: None,
@@ -1452,15 +1487,14 @@ fn run_gc(
         // a producer, consumer, or upload may have been admitted meanwhile.
         drop(operation);
         let remaining = crate::size::managed_snapshot(&state.paths)?;
-        let (cache_lru, active_cache_keys, active_cache_lease) = {
+        let (active_cache_keys, active_cache_lease) = {
             let _operation = state.operation_lock.lock().unwrap();
             let db = state.db.lock().unwrap();
-            (
-                db.cache_lru()?,
-                db.active_cache_keys()?,
-                db.has_active_cache_lease()?,
-            )
+            (db.active_cache_keys()?, db.has_active_cache_lease()?)
         };
+        // The candidate walk is advisory: deletion rechecks last-use and
+        // active protections under the admission lock for each selection.
+        let cache_lru = state.db.lock().unwrap().cache_lru()?;
         if active_cache_lease {
             report.cas_eviction_deferred_bytes =
                 report.cas_eviction_deferred_bytes.max(remaining.cas_bytes);
