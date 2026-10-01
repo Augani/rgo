@@ -362,9 +362,9 @@ fn require_local_cleanup_volume(root: &Path) -> Result<()> {
         let fs = rustix::fs::statfs(root)
             .with_context(|| format!("checking cleanup filesystem at {}", root.display()))?;
         let kind = fs.f_type as u32;
-        // NFS, SMB, and CIFS/smb3 filesystem magic numbers.
+        // NFS, SMB, CIFS, and SMB2 filesystem magic numbers from linux/magic.h.
         ensure!(
-            !matches!(kind, 0x6969 | 0x517b | 0xff53_4d42),
+            !matches!(kind, 0x6969 | 0x517b | 0xff53_4d42 | 0xfe53_4d42),
             "destructive cleanup is unsupported on a network-mounted storage root at {}",
             root.display()
         );
