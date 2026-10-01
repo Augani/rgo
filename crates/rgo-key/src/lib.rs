@@ -14,7 +14,7 @@ use std::process::Command;
 use blake3::Hasher;
 use serde::{Deserialize, Serialize};
 
-pub const CACHE_SCHEMA_VERSION: u32 = 6;
+pub const CACHE_SCHEMA_VERSION: u32 = 7;
 pub const WORKSPACE_REMAP_PREFIX: &str = "/rgo/workspace";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

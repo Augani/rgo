@@ -120,7 +120,7 @@ done
 mkdir -p "$out"
 printf 'rlib:%s\n' "$name" > "$out/lib$name.rlib"
 printf 'rmeta:%s\n' "$name" > "$out/lib$name.rmeta"
-printf '%s: %s\n' "$name" "$source" > "$out/$name.d"
+printf '%s: %s\n' "$out/$name.d" "$source" > "$out/$name.d"
 if [ -n "$FAKE_RUSTC_OLD_MTIME" ]; then touch -t 202001010000 "$out"/*; fi
 "#,
         )
@@ -471,6 +471,82 @@ if [ -n "$FAKE_RUSTC_OLD_MTIME" ]; then touch -t 202001010000 "$out"/*; fi
     }
 
     #[test]
+    fn real_rustc_hit_relocates_dep_info_targets_to_the_consumer() {
+        let _serial = serial_e2e();
+        ensure_workspace_bins_built().unwrap();
+        let sb = Sandbox::new().unwrap();
+        let fixture = fixture(&sb);
+        let mut daemon = start_daemon(&sb);
+        let compile = |context: &str, bypass: bool| {
+            let mut command = sb.cmd(wrapper_bin());
+            command
+                .env("CARGO_MANIFEST_DIR", &fixture.workspace)
+                .env("RGO_KEY_DEBUG", "1")
+                .arg("rustc")
+                .args(["--crate-name", "demo", "--crate-type=lib"])
+                .arg("--emit=dep-info,metadata,link")
+                .arg("--out-dir")
+                .arg(out_dir(&sb, context))
+                .arg(&fixture.source);
+            if bypass {
+                command.env("RGO_BYPASS", "1");
+            }
+            let output = command.output().unwrap();
+            assert!(
+                output.status.success(),
+                "real rustc compile failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        compile("dep-producer", false);
+        compile("dep-consumer", false);
+        let debug = fs::read_to_string(sb.rgo_home.join("state/key-debug.log")).unwrap_or_default();
+        let key = debug.lines().find_map(|line| {
+            line.split_once(" key=")
+                .and_then(|(_, rest)| rest.split_whitespace().next())
+        });
+        let explain = key.map(|key| {
+            let output = sb
+                .cmd(cargo_bin("rgo"))
+                .args(["cache", "explain", key])
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&output.stdout).into_owned()
+        });
+        assert_eq!(
+            cache_hits(&sb),
+            1,
+            "second build should be a cache hit; events: {}; manifests: {:?}; key debug: {debug}; explain: {explain:?}",
+            cache_events(&sb),
+            fs::read_dir(sb.rgo_home.join("cas/manifests")).map(|entries| entries
+                .flatten()
+                .map(|entry| entry.file_name())
+                .collect::<Vec<_>>())
+        );
+        compile("dep-control", true);
+
+        let dep_info = |context| {
+            fs::read_to_string(out_dir(&sb, context).join("demo.d"))
+                .unwrap()
+                .replace(
+                    &out_dir(&sb, context).to_string_lossy().to_string(),
+                    "<OUT>",
+                )
+        };
+        assert_eq!(
+            dep_info("dep-consumer"),
+            dep_info("dep-control"),
+            "restored dep-info differs from a fresh uncached consumer compile"
+        );
+        assert_eq!(
+            fs::read(out_dir(&sb, "dep-consumer").join("libdemo.rlib")).unwrap(),
+            fs::read(out_dir(&sb, "dep-producer").join("libdemo.rlib")).unwrap()
+        );
+        daemon.kill().unwrap();
+        let _ = daemon.wait();
+    }
+
+    #[test]
     fn hits_are_byte_identical_materially_faster_and_explained() {
         let _serial = serial_e2e();
         ensure_workspace_bins_built().unwrap();
@@ -490,7 +566,8 @@ if [ -n "$FAKE_RUSTC_OLD_MTIME" ]; then touch -t 202001010000 "$out"/*; fi
         let expected = outputs(&sb, "producer");
         assert_eq!(expected.len(), 3, "rlib + rmeta + dep-info expected");
 
-        // The hit must return all outputs byte-identical and faster than compiling.
+        // Compiler artifacts stay byte-identical; dep-info target paths are
+        // rewritten to the consumer's output directory.
         let started = std::time::Instant::now();
         let mut hit_command = command_for(&sb, &fixture, "consumer", &[]);
         hit_command.env("FAKE_RUSTC_SLEEP", "3");
@@ -503,9 +580,23 @@ if [ -n "$FAKE_RUSTC_OLD_MTIME" ]; then touch -t 202001010000 "$out"/*; fi
         );
         assert_eq!(compile_count(&fixture), 1, "consumer should have hit");
         assert_eq!(
-            outputs(&sb, "consumer"),
-            expected,
-            "cache hit outputs differ from the produced outputs"
+            outputs(&sb, "consumer")
+                .into_iter()
+                .filter(|(name, _)| !name.ends_with(".d"))
+                .collect::<Vec<_>>(),
+            expected
+                .into_iter()
+                .filter(|(name, _)| !name.ends_with(".d"))
+                .collect::<Vec<_>>(),
+            "cache hit compiler artifacts differ from the produced outputs"
+        );
+        assert!(
+            fs::read_to_string(out_dir(&sb, "consumer").join("demo.d"))
+                .unwrap()
+                .starts_with(&format!(
+                    "{}: ",
+                    out_dir(&sb, "consumer").join("demo.d").display()
+                ))
         );
         assert!(
             elapsed < Duration::from_secs(2),
@@ -691,7 +782,21 @@ if [ -n "$FAKE_RUSTC_OLD_MTIME" ]; then touch -t 202001010000 "$out"/*; fi
             String::from_utf8_lossy(&output.stderr)
         );
         assert_eq!(compile_count(&fixture), 1, "consumer should have hit");
-        assert_eq!(outputs(&sb, "consumer"), outputs(&sb, "producer"));
+        let artifacts = |context| {
+            outputs(&sb, context)
+                .into_iter()
+                .filter(|(name, _)| !name.ends_with(".d"))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(artifacts("consumer"), artifacts("producer"));
+        assert!(
+            fs::read_to_string(out_dir(&sb, "consumer").join("demo.d"))
+                .unwrap()
+                .starts_with(&format!(
+                    "{}: ",
+                    out_dir(&sb, "consumer").join("demo.d").display()
+                ))
+        );
     }
 
     #[test]
@@ -1948,8 +2053,8 @@ if [ -n "$FAKE_RUSTC_OLD_MTIME" ]; then touch -t 202001010000 "$out"/*; fi
                     output
                 };
 
-                // Whole dep closure: every `lib*` artifact the consumer's deps
-                // dir holds must equal the publisher's bytes.
+                // Whole dep closure: the consumer needs every `lib*` compiler
+                // artifact the publisher produced.
                 let before = contexts(&sb);
                 build(&app("cold"), true);
                 let ctx_cold = new_context(&sb, &before);
@@ -1963,8 +2068,9 @@ if [ -n "$FAKE_RUSTC_OLD_MTIME" ]; then touch -t 202001010000 "$out"/*; fi
                 let ctx_pub = new_context(&sb, &before);
                 let published = artifacts_prefixed(&ctx_pub, "lib");
 
-                // Hit fidelity: every artifact materialized via a cache hit must
-                // reproduce the publisher's bytes verbatim. Missed crates may
+                // Hit fidelity: compiler artifacts materialized via a cache hit
+                // must reproduce publisher bytes; dep-info targets must name
+                // the consumer's files. Missed crates may
                 // legitimately recompile to different bytes (build-script
                 // consumers embed per-context OUT_DIR paths; proc-macro dylibs
                 // carry linker-generated ids), so whole-closure equality is not
@@ -2006,11 +2112,22 @@ if [ -n "$FAKE_RUSTC_OLD_MTIME" ]; then touch -t 202001010000 "$out"/*; fi
                         let name = output["name"].as_str().unwrap();
                         let (p, h) = (find_output(&ctx_pub, name), find_output(&ctx_hit, name));
                         if let (Some(p), Some(h)) = (p, h) {
-                            assert_eq!(
-                                std::fs::read(&p).unwrap(),
-                                std::fs::read(&h).unwrap(),
-                                "{slug}: hit output {name} diverged from publisher bytes"
-                            );
+                            if output["kind"] == "dep-info" {
+                                let text = std::fs::read_to_string(&h).unwrap();
+                                assert!(
+                                    text.lines()
+                                        .filter_map(|line| line.split_once(": "))
+                                        .all(|(target, _)| std::path::Path::new(target)
+                                            .starts_with(&ctx_hit)),
+                                    "{slug}: restored dep-info points outside consumer build context"
+                                );
+                            } else {
+                                assert_eq!(
+                                    std::fs::read(&p).unwrap(),
+                                    std::fs::read(&h).unwrap(),
+                                    "{slug}: hit output {name} diverged from publisher bytes"
+                                );
+                            }
                         }
                     }
                 }

@@ -8,7 +8,7 @@
 //! Phase 3 adds the cacheability classifier + CAS lookup in front of the exec.
 //! Everything here must stay fast: no heavy deps, no network, no blocking on a daemon.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -651,6 +651,7 @@ fn materialize_hit(
     }
     validate_keyed_roots(candidate).map_err(|error| error.to_string())?;
     let mut used = vec![false; candidate.outputs.len()];
+    let mut destinations = Vec::with_capacity(manifest.outputs.len());
     for output in &manifest.outputs {
         let Some((index, spec)) = candidate
             .outputs
@@ -669,6 +670,9 @@ fn materialize_hit(
         } else {
             spec.path.clone()
         };
+        destinations.push((output.name.clone(), destination));
+    }
+    for (output, (_, destination)) in manifest.outputs.iter().zip(&destinations) {
         let object = ObjectRef {
             digest: output.object.digest.clone(),
             size: output.object.size,
@@ -679,15 +683,76 @@ fn materialize_hit(
             .map_err(|error| error.to_string())?;
         materialize(
             &store.object_path(&object.digest),
-            &destination,
+            destination,
             object.mode,
             // A hardlink shares a mutable inode with the CAS object. Clone or
             // copy so edits to the build output cannot corrupt cached bytes.
             false,
         )
         .map_err(|error| error.to_string())?;
+        if output.kind == "dep-info" {
+            let bytes = store
+                .read_object(&object)
+                .map_err(|error| error.to_string())?;
+            let relocated = relocate_dep_info_targets(&bytes, &destinations, false)?;
+            std::fs::write(destination, relocated).map_err(|error| error.to_string())?;
+        }
     }
     Ok(())
+}
+
+/// rustc writes absolute producer output targets into its Makefile-style
+/// dep-info. Cargo reads the dependencies, but external build tools also read
+/// the targets, so a hit must name the consumer's materialized files.
+fn relocate_dep_info_targets(
+    bytes: &[u8],
+    outputs: &[(String, PathBuf)],
+    verify_producer: bool,
+) -> Result<Vec<u8>, String> {
+    let contents = std::str::from_utf8(bytes).map_err(|error| error.to_string())?;
+    let mut by_name = HashMap::new();
+    for (name, path) in outputs {
+        if path.to_str().is_none() || by_name.insert(name.as_str(), path).is_some() {
+            return Err("ambiguous or non-UTF-8 dep-info output path".into());
+        }
+    }
+    let mut seen = HashSet::new();
+    let mut relocated = String::with_capacity(contents.len());
+    for line in contents.split_inclusive('\n') {
+        let (body, ending) = line
+            .strip_suffix('\n')
+            .map_or((line, ""), |body| (body, "\n"));
+        if let Some((target, dependencies)) = body.split_once(": ") {
+            let name = Path::new(target)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .ok_or_else(|| "invalid dep-info target".to_owned())?;
+            let destination = by_name
+                .get(name)
+                .ok_or_else(|| format!("dep-info names an uncollected output: {name}"))?;
+            if verify_producer {
+                let actual = std::fs::canonicalize(target).map_err(|error| error.to_string())?;
+                let expected =
+                    std::fs::canonicalize(destination).map_err(|error| error.to_string())?;
+                if actual != expected {
+                    return Err(format!(
+                        "dep-info output differs from collected file: {name}"
+                    ));
+                }
+            }
+            relocated.push_str(&destination.to_string_lossy());
+            relocated.push_str(": ");
+            relocated.push_str(dependencies);
+            relocated.push_str(ending);
+            seen.insert(name);
+        } else {
+            relocated.push_str(line);
+        }
+    }
+    if seen.is_empty() {
+        return Err("dep-info has no output rule".into());
+    }
+    Ok(relocated.into_bytes())
 }
 
 fn replay_output(store: &Store, object: Option<&CacheObject>, stdout: bool) {
@@ -855,6 +920,18 @@ fn publish_result(
         "compiler result has multiple dep-info files"
     );
     validate_file_inputs(candidate, &dep_info.1)?;
+    let dep_info_bytes = std::fs::read(&dep_info.1)?;
+    let named_outputs = outputs
+        .iter()
+        .map(|(_, path)| {
+            let name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .ok_or_else(|| anyhow::anyhow!("non-UTF-8 compiler output name"))?;
+            Ok((name.to_owned(), path.clone()))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    relocate_dep_info_targets(&dep_info_bytes, &named_outputs, true).map_err(anyhow::Error::msg)?;
     let output_refs = outputs
         .into_iter()
         .map(|(kind, path)| {
