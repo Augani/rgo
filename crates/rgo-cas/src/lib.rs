@@ -53,8 +53,25 @@ impl PreparedManifest {
     pub fn publish(self) -> Result<()> {
         match fs::rename(&self.temp, &self.path) {
             Ok(()) => Ok(()),
-            Err(_error) if self.path.is_file() => Ok(()),
-            Err(error) => Err(error.into()),
+            Err(error) => {
+                // Some platforms cannot replace an existing file with rename.
+                // Treat that as an idempotent publication only when its bytes
+                // are exactly the staged manifest; otherwise the caller must
+                // not index the new manifest as if it had been committed.
+                let regular = fs::symlink_metadata(&self.path)
+                    .is_ok_and(|metadata| metadata.is_file() && !metadata.file_type().is_symlink());
+                let identical = regular
+                    && matches!(
+                        (fs::read(&self.path), fs::read(&self.temp)),
+                        (Ok(existing), Ok(staged)) if existing == staged
+                    );
+                if identical {
+                    Ok(())
+                } else {
+                    Err(error)
+                        .with_context(|| format!("publishing CAS manifest {}", self.path.display()))
+                }
+            }
         }
     }
 }
@@ -454,6 +471,26 @@ mod tests {
             store.read_manifest(&staged_manifest.key).unwrap(),
             Some(staged_manifest)
         );
+        let mut replacement = store.read_manifest(&"a".repeat(64)).unwrap().unwrap();
+        replacement.created_at = 2;
+        match store.write_manifest(&replacement) {
+            Ok(()) => {
+                assert_eq!(
+                    store.read_manifest(&replacement.key).unwrap(),
+                    Some(replacement)
+                );
+            }
+            Err(_) => {
+                assert_eq!(
+                    store
+                        .read_manifest(&"a".repeat(64))
+                        .unwrap()
+                        .unwrap()
+                        .created_at,
+                    1
+                );
+            }
+        }
         assert!(store.read_manifest("../../outside").is_err());
         let mut unsafe_manifest = store.read_manifest(&"a".repeat(64)).unwrap().unwrap();
         unsafe_manifest.key = "../../outside".into();
