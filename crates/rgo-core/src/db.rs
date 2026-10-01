@@ -13,9 +13,7 @@ use fs4::fs_std::FileExt;
 use rgo_protocol::{
     CacheEvent, CacheManifest, CacheStatsReport, LeaseScope, PROTOCOL_VERSION, RemoteStatusReport,
 };
-use rusqlite::{
-    Connection, ErrorCode, OpenFlags, OptionalExtension, Transaction, TransactionBehavior, params,
-};
+use rusqlite::{Connection, ErrorCode, OpenFlags, OptionalExtension, params};
 
 use crate::context;
 use crate::paths::RgoPaths;
@@ -26,6 +24,7 @@ const OPERATION_HISTORY_LIMIT: i64 = 100;
 const REMOTE_TERMINAL_HISTORY_LIMIT: i64 = 1_000;
 const REMOTE_QUEUE_LIMIT: i64 = 1_024;
 const REMOTE_RUNNING_LIMIT: i64 = 4;
+const LEGACY_ACCESS_PRUNE_PER_PASS: i64 = 256;
 const MAX_INCREMENTAL_VACUUM_PAGES: i64 = 256;
 const WAL_SIZE_LIMIT_BYTES: i64 = 8 * 1024 * 1024;
 const LEGACY_VACUUM_FREE_MARGIN_BYTES: u64 = 16 * 1024 * 1024;
@@ -533,9 +532,9 @@ impl StateDb {
     ) -> Result<()> {
         let path = normalize(build_dir);
         let now = unix_now();
-        // A touch updates two related records. Keep them in one short write
-        // transaction so concurrent clients queue for a single writer turn
-        // instead of racing for the WAL lock twice per touch.
+        // Context attribution is the only remaining touch record. Older
+        // versions also wrote access_summary, but nothing reads that table;
+        // maintenance retires its rows in bounded batches.
         // A WAL writer can still receive SQLITE_BUSY while another connection
         // closes/checkpoints or briefly holds the single writer lock. Retry
         // only that transient class, with a finite bound, so attribution is
@@ -543,11 +542,8 @@ impl StateDb {
         let deadline = Instant::now() + Duration::from_secs(30);
         let mut delay = Duration::from_millis(10);
         loop {
-            let result = (|| -> rusqlite::Result<()> {
-                let transaction =
-                    Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
-                transaction.execute(
-                    "INSERT INTO contexts(build_dir, workspace_root, last_seen, last_used, physical_bytes, incremental_bytes)
+            let result = self.connection.execute(
+                "INSERT INTO contexts(build_dir, workspace_root, last_seen, last_used, physical_bytes, incremental_bytes)
                      VALUES(?1, ?2, ?3, ?3, COALESCE(?4, 0), COALESCE(?5, 0))
                      ON CONFLICT(build_dir) DO UPDATE SET
                        workspace_root=COALESCE(excluded.workspace_root, contexts.workspace_root),
@@ -555,23 +551,16 @@ impl StateDb {
                        last_used=excluded.last_used,
                        physical_bytes=COALESCE(?4, contexts.physical_bytes),
                        incremental_bytes=COALESCE(?5, contexts.incremental_bytes)",
-                    params![
-                        path.to_string_lossy(),
-                        workspace_root,
-                        now,
-                        physical_bytes.map(|v| v as i64),
-                        incremental_bytes.map(|v| v as i64),
-                    ],
-                )?;
-                transaction.execute(
-                    "INSERT INTO access_summary(build_dir, touch_count, last_touched) VALUES(?1, 1, ?2)
-                     ON CONFLICT(build_dir) DO UPDATE SET touch_count=touch_count+1, last_touched=excluded.last_touched",
-                    params![path.to_string_lossy(), now],
-                )?;
-                transaction.commit()
-            })();
+                params![
+                    path.to_string_lossy(),
+                    workspace_root,
+                    now,
+                    physical_bytes.map(|v| v as i64),
+                    incremental_bytes.map(|v| v as i64),
+                ],
+            );
             match result {
-                Ok(()) => return Ok(()),
+                Ok(_) => return Ok(()),
                 Err(error) if is_sqlite_busy(&error) && Instant::now() < deadline => {
                     std::thread::sleep(
                         delay.min(deadline.saturating_duration_since(Instant::now())),
@@ -1509,6 +1498,13 @@ impl StateDb {
             "DELETE FROM remote_jobs WHERE status IN ('DONE', 'FAILED')
                 AND job_id <= (SELECT COALESCE(MAX(job_id), 0) FROM remote_jobs) - ?1",
             params![REMOTE_TERMINAL_HISTORY_LIMIT],
+        )?;
+        // Preserve the table for old daemon binaries during upgrades, but no
+        // new daemon writes it. Retire legacy rows without a long transaction.
+        transaction.execute(
+            "DELETE FROM access_summary WHERE rowid IN
+                (SELECT rowid FROM access_summary ORDER BY rowid LIMIT ?1)",
+            params![LEGACY_ACCESS_PRUNE_PER_PASS],
         )?;
         transaction.commit()?;
         Ok(())
@@ -2460,6 +2456,15 @@ mod tests {
                 )
                 .unwrap();
         }
+        for index in 0..600i64 {
+            transaction
+                .execute(
+                    "INSERT INTO access_summary(build_dir, touch_count, last_touched)
+                     VALUES(?1, 1, 1)",
+                    params![format!("legacy-{index}")],
+                )
+                .unwrap();
+        }
         transaction
             .execute(
                 "INSERT INTO remote_jobs(key, kind, status, created_at, updated_at)
@@ -2471,6 +2476,21 @@ mod tests {
 
         db.prune_operational_history().unwrap();
         db.prune_operational_history().unwrap();
+        assert_eq!(
+            db.connection
+                .query_row("SELECT COUNT(*) FROM access_summary", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            600 - 2 * LEGACY_ACCESS_PRUNE_PER_PASS
+        );
+        db.prune_operational_history().unwrap();
+        assert_eq!(
+            db.connection
+                .query_row("SELECT COUNT(*) FROM access_summary", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
         assert_eq!(
             db.connection
                 .query_row("SELECT COUNT(*) FROM cache_events", [], |row| row
@@ -2645,7 +2665,7 @@ mod tests {
         assert_eq!(db.stats().unwrap().active_leases, 0);
         assert!(
             db.connection
-                .query_row::<i64, _, _>("SELECT COUNT(*) FROM access_summary", [], |row| row.get(0))
+                .query_row::<i64, _, _>("SELECT COUNT(*) FROM contexts", [], |row| row.get(0))
                 .unwrap()
                 >= 160
         );
