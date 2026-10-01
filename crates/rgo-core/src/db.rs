@@ -20,7 +20,7 @@ use rusqlite::{
 use crate::context;
 use crate::paths::RgoPaths;
 
-const SCHEMA_VERSION: i64 = 7;
+const SCHEMA_VERSION: i64 = 8;
 const CACHE_EVENT_HISTORY_LIMIT: i64 = 10_000;
 const OPERATION_HISTORY_LIMIT: i64 = 100;
 const REMOTE_TERMINAL_HISTORY_LIMIT: i64 = 1_000;
@@ -67,6 +67,12 @@ pub struct SingleFlightStats {
 
 pub struct StateDb {
     connection: Connection,
+}
+
+pub(crate) fn cache_manifest_digest(manifest: &CacheManifest) -> Result<String> {
+    Ok(blake3::hash(&serde_json::to_vec(manifest)?)
+        .to_hex()
+        .to_string())
 }
 
 impl StateDb {
@@ -289,6 +295,11 @@ impl StateDb {
                 PRIMARY KEY(key, digest),
                 FOREIGN KEY(key) REFERENCES cache_entries(key) ON DELETE CASCADE,
                 FOREIGN KEY(digest) REFERENCES cache_objects(digest) ON DELETE CASCADE
+            );
+            CREATE TABLE IF NOT EXISTS cache_manifest_versions (
+                key TEXT PRIMARY KEY NOT NULL,
+                manifest_digest TEXT NOT NULL,
+                FOREIGN KEY(key) REFERENCES cache_entries(key) ON DELETE CASCADE
             );
             CREATE TABLE IF NOT EXISTS cache_events (
                 event_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1005,6 +1016,26 @@ impl StateDb {
             .map_err(Into::into)
     }
 
+    /// A bounded key-ordered slice for reconciling the cache index without
+    /// holding the daemon admission lock for the entire manifest inventory.
+    pub fn cache_index_batch(
+        &self,
+        after: &str,
+        limit: usize,
+    ) -> Result<Vec<(String, String, Option<String>)>> {
+        let mut statement = self.connection.prepare(
+            "SELECT e.key, e.manifest_path, v.manifest_digest FROM cache_entries e
+             LEFT JOIN cache_manifest_versions v ON v.key = e.key
+             WHERE e.key > ?1 ORDER BY e.key LIMIT ?2",
+        )?;
+        statement
+            .query_map(params![after, limit as i64], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
     pub fn cache_last_used(&self, key: &str) -> Result<Option<u64>> {
         self.connection
             .query_row(
@@ -1528,6 +1559,7 @@ impl StateDb {
         manifest: &CacheManifest,
         manifest_path: &Path,
     ) -> Result<()> {
+        let manifest_digest = cache_manifest_digest(manifest)?;
         let transaction = self.connection.unchecked_transaction()?;
         transaction.execute(
             "INSERT INTO cache_entries(key, manifest_path, created_at, last_used)
@@ -1560,6 +1592,11 @@ impl StateDb {
                 params![manifest.key, object.digest],
             )?;
         }
+        transaction.execute(
+            "INSERT INTO cache_manifest_versions(key, manifest_digest) VALUES(?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET manifest_digest=excluded.manifest_digest",
+            params![manifest.key, manifest_digest],
+        )?;
         transaction.commit()?;
         Ok(())
     }
@@ -2208,6 +2245,62 @@ mod tests {
         assert_eq!(db.next_remote_job().unwrap(), None);
         db.recover_remote_jobs().unwrap();
         assert_eq!(db.next_remote_job().unwrap().as_deref(), Some("key"));
+    }
+
+    #[test]
+    fn cache_manifest_digest_index_migrates_and_tracks_replacements() {
+        let root = tempdir().unwrap();
+        let paths = RgoPaths {
+            root: root.path().join("rgo"),
+        };
+        paths.ensure_layout().unwrap();
+        let db = StateDb::open(&paths).unwrap();
+        let key = "a".repeat(64);
+        let mut manifest = CacheManifest {
+            version: 1,
+            key: key.clone(),
+            outputs: Vec::new(),
+            stdout: None,
+            stderr: None,
+            created_at: 1,
+        };
+        let path = paths
+            .cas_dir()
+            .join("manifests")
+            .join(format!("{key}.json"));
+        db.record_cache_manifest(&manifest, &path).unwrap();
+        db.connection
+            .execute_batch(
+                "DROP TABLE cache_manifest_versions;
+                 UPDATE schema_meta SET value='7' WHERE key='schema_version';",
+            )
+            .unwrap();
+        drop(db);
+
+        let db = StateDb::open(&paths).unwrap();
+        assert_eq!(db.cache_index_batch("", 1).unwrap()[0].2, None);
+        db.record_cache_manifest(&manifest, &path).unwrap();
+        let initial = cache_manifest_digest(&manifest).unwrap();
+        assert_eq!(
+            db.cache_index_batch("", 1).unwrap()[0].2,
+            Some(initial.clone())
+        );
+        manifest.created_at = 2;
+        db.record_cache_manifest(&manifest, &path).unwrap();
+        let replacement = cache_manifest_digest(&manifest).unwrap();
+        assert_ne!(replacement, initial);
+        assert_eq!(db.cache_index_batch("", 1).unwrap()[0].2, Some(replacement));
+        db.forget_cache_entry(&key).unwrap();
+        assert!(db.cache_index_batch("", 1).unwrap().is_empty());
+        for index in 0..33 {
+            manifest.key = format!("b{index:063x}");
+            db.record_cache_manifest(&manifest, &path).unwrap();
+        }
+        let first = db.cache_index_batch("", 32).unwrap();
+        assert_eq!(first.len(), 32);
+        let second = db.cache_index_batch(&first[31].0, 32).unwrap();
+        assert_eq!(second.len(), 1);
+        assert!(second[0].0 > first[31].0);
     }
 
     #[test]

@@ -22,7 +22,7 @@ use rgo_protocol::{
 
 use crate::config::{Resolved, volume_free_bytes, volume_free_bytes_checked};
 use crate::context;
-use crate::db::{CacheBuildDecision, RemoteFetchDecision, StateDb};
+use crate::db::{CacheBuildDecision, RemoteFetchDecision, StateDb, cache_manifest_digest};
 use crate::gc::{self, Inputs};
 use crate::ipc::{self, Connection, Listener};
 use crate::paths::RgoPaths;
@@ -39,6 +39,7 @@ const MAX_EVENT_BATCH_PRUNE_PER_PASS: usize = 64;
 const MAX_LEGACY_METADATA_SCAN_ENTRIES_PER_PASS: usize = 64;
 const MAX_PIN_SCAN_ENTRIES_PER_PASS: usize = 32;
 const MAX_PENDING_MAINTENANCE_ENTRIES_PER_PASS: usize = 128;
+const MAX_CACHE_RECONCILE_BATCH: usize = 32;
 /// Bound on concurrent client connections; excess connections are refused so a flood
 /// of stalled or malformed clients cannot exhaust daemon threads or file descriptors.
 /// Clients see a dropped connection and fall back to ordinary cargo behavior.
@@ -835,6 +836,7 @@ fn status_report(state: &State) -> Result<StatusReport> {
     let snapshot = crate::size::managed_snapshot(&state.paths)?;
     let cache_revision = state.cas.manifest_revision();
     let cache_inventory = state.cas.list_manifests()?;
+    reconcile_cache_inventory(state, cache_revision, &cache_inventory)?;
     // Pins and leases admitted during the scan are included in the database
     // snapshot below, before deriving any eligibility estimates.
     let _operation = state.operation_lock.lock().unwrap();
@@ -843,9 +845,6 @@ fn status_report(state: &State) -> Result<StatusReport> {
     db.expire_leases()?;
     db.prune_failed_cache_builds(Duration::from_secs(7 * 86_400))?;
     db.reconcile_contexts(&state.paths, &contexts)?;
-    state.cas.with_manifest_revision(cache_revision, || {
-        reconcile_cache_manifests(&mut db, &state.cas, &cache_inventory)
-    })?;
     drain_cache_events(&state.paths, &db, &mut state.event_drainer.lock().unwrap())?;
     let pinned = db.pinned_paths()?;
     let mut leased = db.protected_paths(&contexts)?;
@@ -1286,13 +1285,11 @@ fn run_gc(
     let cache_inventory = state.cas.list_manifests()?;
     #[cfg(debug_assertions)]
     pause_after_cas_sweep_for_test(&state.paths.root)?;
+    reconcile_cache_inventory(state, cache_revision, &cache_inventory)?;
     let operation = state.operation_lock.lock().unwrap();
     let mut db = state.db.lock().unwrap();
     db.expire_leases()?;
     db.reconcile_contexts(&state.paths, &contexts)?;
-    state.cas.with_manifest_revision(cache_revision, || {
-        reconcile_cache_manifests(&mut db, &state.cas, &cache_inventory)
-    })?;
     let pinned = db.pinned_paths()?;
     let leased = db.protected_paths(&contexts)?;
     drop(db);
@@ -2338,6 +2335,69 @@ fn process_remote_jobs(state: &State) -> Result<()> {
 fn reconcile_cache(db: &mut StateDb, cas: &Store) -> Result<()> {
     let manifests = cas.list_manifests()?;
     reconcile_cache_manifests(db, cas, &manifests)
+}
+
+fn reconcile_cache_inventory(state: &State, revision: u64, manifests: &[Manifest]) -> Result<()> {
+    let mut by_key = HashMap::with_capacity(manifests.len());
+    for manifest in manifests {
+        by_key.insert(
+            manifest.key.as_str(),
+            (manifest, cache_manifest_digest(&wire_manifest(manifest))?),
+        );
+    }
+    let mut seen = HashSet::new();
+    let mut cursor = String::new();
+    loop {
+        let db = state.db.lock().unwrap();
+        let mut batch = Vec::new();
+        let current = state.cas.with_manifest_revision(revision, || {
+            batch = db.cache_index_batch(&cursor, MAX_CACHE_RECONCILE_BATCH)?;
+            for (key, indexed_path, indexed_digest) in &batch {
+                seen.insert(key.clone());
+                if let Some((manifest, digest)) = by_key.get(key.as_str()) {
+                    let path = state.cas.manifest_path(key);
+                    if indexed_digest.as_deref() != Some(digest.as_str())
+                        || indexed_path.as_str() != path.to_string_lossy().as_ref()
+                    {
+                        db.record_cache_manifest(&wire_manifest(manifest), &path)?;
+                    }
+                } else {
+                    db.forget_cache_entry(key)?;
+                }
+            }
+            Ok(())
+        })?;
+        if !current {
+            return Ok(());
+        }
+        let Some((last, _, _)) = batch.last() else {
+            break;
+        };
+        cursor = last.clone();
+        if batch.len() < MAX_CACHE_RECONCILE_BATCH {
+            break;
+        }
+    }
+    let missing = manifests
+        .iter()
+        .filter(|manifest| !seen.contains(&manifest.key))
+        .collect::<Vec<_>>();
+    for chunk in missing.chunks(MAX_CACHE_RECONCILE_BATCH) {
+        let db = state.db.lock().unwrap();
+        let current = state.cas.with_manifest_revision(revision, || {
+            for manifest in chunk {
+                db.record_cache_manifest(
+                    &wire_manifest(manifest),
+                    &state.cas.manifest_path(&manifest.key),
+                )?;
+            }
+            Ok(())
+        })?;
+        if !current {
+            return Ok(());
+        }
+    }
+    Ok(())
 }
 
 fn reconcile_cache_manifests(db: &mut StateDb, cas: &Store, manifests: &[Manifest]) -> Result<()> {
