@@ -243,6 +243,19 @@ def main() -> None:
         assert missing_link.read_text() == "user-owned command\n"
         missing_link.unlink()
         run([*installer, "--repair"], env=environment)
+        if supervised:
+            shim = cargo_home / "rgo/shims/cargo"
+            shim.unlink()
+            bypassed = environment.copy()
+            bypassed["RGO_BYPASS"] = "1"
+            refused_shim = subprocess.run(
+                [*installer, "--repair"], env=bypassed, text=True, capture_output=True,
+            )
+            assert refused_shim.returncode != 0
+            assert not shim.exists(), "failed repair retained an unverified Cargo launcher"
+            run([*installer, "--repair"], env=environment)
+            assert shim.is_file()
+            assert fresh_shell("cargo --version", login=True).returncode == 0
         pointer = cargo_home / ".rgo-home"
         expected_pointer = f"{rgo_home}\n"
         pointer.write_text("damaged-pointer\n")

@@ -196,8 +196,10 @@ GC guard for that command's lifetime.
   recorded prior or planned value; a later user edit stops automatic recovery.
   Its `--repair` option can restore missing or damaged files in the active
   owned version and missing installer-owned command links from the same
-  verified bundle. It refuses a command path replaced by another file. Full
-  cross-version verification remains release work.
+  verified bundle. In supervised no-service mode it also restores a missing
+  Cargo launcher after checking setup's exact activation plan. It refuses a
+  command path replaced by another file. Full cross-version verification
+  remains release work.
 - Uninstall: the Unix installer's `--uninstall` path handles an owned
   `--no-service` installation and resumes an interrupted removal. It leaves
   versioned binaries for Cargo processes already using their absolute paths,

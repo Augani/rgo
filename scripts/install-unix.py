@@ -24,6 +24,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -567,20 +568,26 @@ def stop_owned_service(label: str, environment: dict[str, str]) -> None:
         )
         if active.returncode == 0:
             run(Path("/bin/launchctl"), "bootout", target, environment=environment)
-            if subprocess.run(
+            deadline = time.monotonic() + 5
+            while subprocess.run(
                 ["/bin/launchctl", "print", target], env=environment, capture_output=True
             ).returncode == 0:
-                raise InstallError(f"launchd service {label} remained active after bootout")
+                if time.monotonic() >= deadline:
+                    raise InstallError(f"launchd service {label} remained active after bootout")
+                time.sleep(0.1)
     else:
         manager = Path("/usr/bin/systemctl")
         if not manager.is_file():
             manager = Path("/bin/systemctl")
         run(manager, "--user", "stop", label, environment=environment)
-        if subprocess.run(
+        deadline = time.monotonic() + 5
+        while subprocess.run(
             [str(manager), "--user", "is-active", "--quiet", label],
             env=environment, capture_output=True,
         ).returncode == 0:
-            raise InstallError(f"systemd service {label} remained active after stop")
+            if time.monotonic() >= deadline:
+                raise InstallError(f"systemd service {label} remained active after stop")
+            time.sleep(0.1)
 
 
 def restore_service_upgrade(
@@ -1151,7 +1158,11 @@ def repair_owned(
     if supervised:
         shim_dir = cargo_home / "rgo/shims"
         verify_environment["PATH"] = f"{shim_dir}{os.pathsep}{environment.get('PATH', '')}"
+        shim_missing = file_snapshot(cargo_home / "rgo/shims/cargo") is None
+    else:
+        shim_missing = False
     restored_links = []
+    setup_rollback = None
     try:
         for link, target in missing_links:
             # Exclusive creation refuses a new user entry that appeared after
@@ -1160,17 +1171,35 @@ def repair_owned(
             restored_links.append((link, target))
         if restored_links:
             sync_directory(bin_dir)
-        if not no_service:
-            setup_args = ["setup"]
-            if supervised:
-                previous_shim = record.get("supervised_cargo")
-                if not isinstance(previous_shim, dict) or not isinstance(previous_shim.get("real_cargo"), str):
-                    raise InstallError("owned supervised Cargo proxy is not recorded")
-                setup_args.extend(["--supervised", "--real-cargo", previous_shim["real_cargo"]])
-            elif record.get("wrapper_binary") is None:
-                setup_args.append("--no-wrapper")
+        if not no_service or shim_missing:
+            setup_args = service_setup_args(record)
+            if no_service:
+                setup_args.append("--no-service")
             run(cli, *setup_args, "--dry-run", environment=environment)
+            if no_service:
+                before = activation_snapshot(activation_paths(cargo_home, install_root, record))
+                plan = json.loads(run(
+                    cli, *setup_args, "--installer-plan-json", environment=environment,
+                ).stdout)
+                after = planned_snapshot(plan, before, state_path, state)
+                if plan.get("service") is not None:
+                    raise InstallError("no-service repair unexpectedly planned a daemon service")
+                after[state_path] = before[state_path]
+                shim_path = cargo_home / "rgo/shims/cargo"
+                recorded_shim = record.get("supervised_cargo")
+                if (
+                    not isinstance(recorded_shim, dict)
+                    or not isinstance(recorded_shim.get("shim_contents"), str)
+                    or after[shim_path] != (recorded_shim["shim_contents"].encode(), 0o755)
+                    or any(after[path] != prior for path, prior in before.items() if path != shim_path)
+                ):
+                    raise InstallError("launcher repair would change other activation files")
+                if activation_snapshot(tuple(before)) != before:
+                    raise InstallError("activation changed while preparing launcher repair")
+                setup_rollback = (before, after)
             run(cli, *setup_args, environment=environment)
+            if setup_rollback is not None and activation_snapshot(tuple(before)) != after:
+                raise InstallError("launcher repair differed from its activation plan")
         doctor = run(cli, "doctor", "--verify", "--json", environment=verify_environment)
         if json.loads(doctor.stdout).get("activation_verified") is not True:
             raise InstallError("repaired binaries did not restore plain Cargo activation")
@@ -1180,10 +1209,14 @@ def repair_owned(
                 link.unlink()
         if restored_links:
             sync_directory(bin_dir)
+        if setup_rollback is not None:
+            restore_activation(cargo_home, root, *setup_rollback)
         if repaired_pointer:
             restore_activation(cargo_home, root, previous_state, expected_state)
         raise
     repaired = replaced + [str(link) for link, _ in restored_links]
+    if shim_missing:
+        repaired.append(str(cargo_home / "rgo/shims/cargo"))
     print(f"repaired {', '.join(repaired) if repaired else 'verified files'} in {version_dir}")
 
 
