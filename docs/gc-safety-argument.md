@@ -41,6 +41,8 @@ also omits its build-directory profile lock on NFS mounts. The profile-lock
 heuristic therefore cannot admit an NFS root to native cleanup. Destructive
 rgo cleanup now rejects known Linux NFS/SMB/CIFS types, macOS non-local
 volumes, and Windows remote drives; a failed volume query also blocks it.
+Supervised setup with `gc.auto = true` performs this volume check before
+writing activation state, and doctor exposes the result independently.
 This is a conservative exclusion, not proof that every unusual filesystem is
 local or that its lock semantics are suitable for automatic deletion.
 Undo removes the active owner record, so a retained storage root cannot be

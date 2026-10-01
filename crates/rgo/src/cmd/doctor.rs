@@ -434,6 +434,10 @@ pub fn run(json: bool, verify: bool) -> Result<()> {
         human(e.cfg.max_size),
         human(e.cfg.soft_watermark)
     ));
+    match rgo_core::paths::check_local_cleanup_volume(&e.paths.root) {
+        Ok(()) => info("cleanup volume: no known network-mount exclusion detected".into()),
+        Err(error) => check(false, format!("cleanup volume is unsupported: {error:#}")),
+    }
     let deletion_problem = e
         .paths
         .require_supervised_deletion()

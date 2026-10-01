@@ -126,7 +126,7 @@ impl RgoPaths {
                 return Err(error).with_context(|| format!("checking {}", config_path.display()));
             }
         }
-        require_local_cleanup_volume(&self.root)?;
+        check_local_cleanup_volume(&self.root)?;
         Ok(())
     }
     /// Parent of every Cargo build-dir rgo manages. Cargo's `{workspace-path-hash}`
@@ -356,10 +356,42 @@ impl RgoPaths {
 /// Cargo omits its profile build lock on NFS. rgo's lifecycle lock also has
 /// no verified cross-host protocol, so never destructively clean a known
 /// network-mounted storage root. A failed volume query is likewise unsafe.
-fn require_local_cleanup_volume(root: &Path) -> Result<()> {
+#[cfg_attr(windows, allow(unsafe_code))]
+pub fn check_local_cleanup_volume(root: &Path) -> Result<()> {
+    let mut probe = root;
+    loop {
+        match std::fs::metadata(probe) {
+            Ok(metadata) if metadata.is_dir() => break,
+            Ok(_) => anyhow::bail!(
+                "cleanup storage path is not a directory: {}",
+                probe.display()
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                // A dangling link does not inherit its parent volume. It
+                // could later resolve to an entirely different filesystem.
+                match std::fs::symlink_metadata(probe) {
+                    Ok(_) => {
+                        anyhow::bail!("cleanup storage path is unavailable: {}", probe.display())
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => {
+                        return Err(error)
+                            .with_context(|| format!("checking cleanup path {}", probe.display()));
+                    }
+                }
+                probe = probe.parent().with_context(|| {
+                    format!("no existing volume ancestor for {}", root.display())
+                })?;
+            }
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("checking cleanup path {}", probe.display()));
+            }
+        }
+    }
     #[cfg(target_os = "linux")]
     {
-        let fs = rustix::fs::statfs(root)
+        let fs = rustix::fs::statfs(probe)
             .with_context(|| format!("checking cleanup filesystem at {}", root.display()))?;
         let kind = fs.f_type as u32;
         // NFS, SMB, CIFS, and SMB2 filesystem magic numbers from linux/magic.h.
@@ -371,7 +403,7 @@ fn require_local_cleanup_volume(root: &Path) -> Result<()> {
     }
     #[cfg(target_os = "macos")]
     {
-        let fs = rustix::fs::statfs(root)
+        let fs = rustix::fs::statfs(probe)
             .with_context(|| format!("checking cleanup filesystem at {}", root.display()))?;
         ensure!(
             fs.f_flags & libc::MNT_LOCAL as u32 != 0,
@@ -387,8 +419,10 @@ fn require_local_cleanup_volume(root: &Path) -> Result<()> {
             DRIVE_NO_ROOT_DIR, DRIVE_REMOTE, DRIVE_UNKNOWN,
         };
 
-        let path: Vec<u16> = root.as_os_str().encode_wide().chain(Some(0)).collect();
+        let path: Vec<u16> = probe.as_os_str().encode_wide().chain(Some(0)).collect();
         let mut volume = vec![0u16; 32_768];
+        // SAFETY: path is NUL-terminated and volume is writable for its
+        // declared 32,768 UTF-16 units.
         let found = unsafe { GetVolumePathNameW(path.as_ptr(), volume.as_mut_ptr(), 32_768) };
         ensure!(
             found != 0,
@@ -396,6 +430,8 @@ fn require_local_cleanup_volume(root: &Path) -> Result<()> {
             root.display(),
             std::io::Error::last_os_error()
         );
+        // SAFETY: GetVolumePathNameW succeeded and wrote a NUL-terminated
+        // volume path into the buffer.
         let kind = unsafe { GetDriveTypeW(volume.as_ptr()) };
         ensure!(
             kind != DRIVE_REMOTE && kind != DRIVE_UNKNOWN && kind != DRIVE_NO_ROOT_DIR,
@@ -507,5 +543,15 @@ mod tests {
             0o755
         );
         assert!(!outside.join("locks").exists());
+    }
+
+    #[test]
+    fn cleanup_volume_preflight_handles_new_roots_and_rejects_dangling_links() {
+        let private = tempfile::tempdir().unwrap();
+        check_local_cleanup_volume(&private.path().join("new").join("root")).unwrap();
+
+        let dangling = private.path().join("dangling");
+        std::os::unix::fs::symlink(private.path().join("missing"), &dangling).unwrap();
+        assert!(check_local_cleanup_volume(&dangling.join("root")).is_err());
     }
 }
