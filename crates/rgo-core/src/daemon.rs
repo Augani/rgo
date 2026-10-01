@@ -381,6 +381,10 @@ fn serve_connection(mut connection: Connection, state: &State) -> Result<()> {
     let request: Request = ipc::read_message(&mut connection)?;
     let shutdown = matches!(request, Request::Shutdown);
     let response = handle_request(state, request);
+    // The short deadline above bounds stalled clients while reading their
+    // request. A GC or status response may take longer to compute; reset the
+    // deadline for its write, especially on Windows where it is absolute.
+    connection.set_timeout(Duration::from_secs(2))?;
     let written = ipc::write_message(&mut connection, &response);
     if shutdown && matches!(response, Response::Ok) {
         // Wake the blocking accept loop after the acknowledgement is sent.
@@ -529,7 +533,7 @@ fn handle_request_result(state: &State, request: Request) -> Result<Response> {
         Request::Clean { build_dir } => {
             validate_managed_path(&state.paths, Path::new(&build_dir))?;
             let _gc = state.gc_lock.lock().unwrap();
-            let _operation = state.operation_lock.lock().unwrap();
+            let operation = state.operation_lock.lock().unwrap();
             state.paths.require_supervised_deletion()?;
             let contexts = context::list(&state.paths)?;
             let db = state.db.lock().unwrap();
@@ -549,7 +553,10 @@ fn handle_request_result(state: &State, request: Request) -> Result<Response> {
             let reclaimed = context.usage.physical_bytes;
             let victim = context.dir.clone();
             drop(db);
-            gc::remove_atomically(&state.paths, &victim)?;
+            let staged = gc::stage_atomically(&state.paths, &victim)?;
+            drop(operation);
+            staged.finish()?;
+            let _operation = state.operation_lock.lock().unwrap();
             let contexts = context::list(&state.paths)?;
             let mut db = state.db.lock().unwrap();
             db.reconcile_contexts(&state.paths, &contexts)?;
