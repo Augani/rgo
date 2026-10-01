@@ -1357,51 +1357,40 @@ fn run_gc(
     // Planning can inspect every context's profile locks and the temporary
     // tree. Admit new builds during that walk, then refresh protections before
     // any CAS action; context actions are checked again before staging.
-    // Measuring protected CAS can traverse every manifest and referenced
-    // object. Do it before admission is locked, then use the result only if
-    // the protected-key set and manifest generation still match.
-    let (estimated_cache_keys, estimated_cache_lease) = {
-        let db = state.db.lock().unwrap();
-        (db.active_cache_keys()?, db.has_active_cache_lease()?)
-    };
-    let protection_revision = state.cas.manifest_revision();
-    let estimated_protected_cas = protected_cas_bytes(
-        &state.cas,
-        &estimated_cache_keys,
-        estimated_cache_lease,
-        cas_bytes,
-    );
     let preview_cache_lru = if dry_run {
         state.db.lock().unwrap().cache_lru()?
     } else {
         Vec::new()
     };
-    let operation = state.operation_lock.lock().unwrap();
-    let db = state.db.lock().unwrap();
-    let active_cache_keys = db.active_cache_keys()?;
-    let active_cache_lease = db.has_active_cache_lease()?;
-    drop(db);
-    let cas_eviction_deferred_bytes = if estimated_cache_lease == active_cache_lease
-        && estimated_cache_keys.iter().collect::<HashSet<_>>()
-            == active_cache_keys.iter().collect::<HashSet<_>>()
-        && state.cas.manifest_revision() == protection_revision
-    {
-        match estimated_protected_cas {
-            Ok(bytes) => bytes,
-            Err(_) => protected_cas_bytes(
-                &state.cas,
-                &active_cache_keys,
-                active_cache_lease,
-                cas_bytes,
-            )?,
+    // A protection change can invalidate an unlocked CAS measurement. Retry
+    // the walk outside admission instead of repeating it while holding the
+    // lock. Under sustained churn, defer this pass rather than blocking new
+    // pins, leases, or cache publications behind a full manifest traversal.
+    let mut protection_attempts = 0;
+    let (cas_eviction_deferred_bytes, active_cache_keys, active_cache_lease, operation) = loop {
+        let (keys, lease) = {
+            let db = state.db.lock().unwrap();
+            (db.active_cache_keys()?, db.has_active_cache_lease()?)
+        };
+        let revision = state.cas.manifest_revision();
+        let measurement = protected_cas_bytes(&state.cas, &keys, lease, cas_bytes);
+        let operation = state.operation_lock.lock().unwrap();
+        let (current_keys, current_lease) = {
+            let db = state.db.lock().unwrap();
+            (db.active_cache_keys()?, db.has_active_cache_lease()?)
+        };
+        if lease == current_lease
+            && keys.iter().collect::<HashSet<_>>() == current_keys.iter().collect::<HashSet<_>>()
+            && state.cas.manifest_revision() == revision
+        {
+            break (measurement?, current_keys, current_lease, operation);
         }
-    } else {
-        protected_cas_bytes(
-            &state.cas,
-            &active_cache_keys,
-            active_cache_lease,
-            cas_bytes,
-        )?
+        drop(operation);
+        protection_attempts += 1;
+        anyhow::ensure!(
+            protection_attempts < 3,
+            "cache protection changed during GC measurement; retry the pass"
+        );
     };
     if !active_cache_lease && !sweep_blocked && state.cas.manifest_revision() == sweep_generation {
         plan.actions.extend(unreferenced);
