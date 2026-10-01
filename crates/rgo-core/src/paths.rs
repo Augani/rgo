@@ -394,10 +394,26 @@ pub fn check_local_cleanup_volume(root: &Path) -> Result<()> {
         let fs = rustix::fs::statfs(probe)
             .with_context(|| format!("checking cleanup filesystem at {}", root.display()))?;
         let kind = fs.f_type as u32;
-        // NFS, SMB, CIFS, and SMB2 filesystem magic numbers from linux/magic.h.
+        // Network, clustered, and userspace filesystem magic numbers from
+        // linux/magic.h. FUSE can be local, but its lock semantics depend on
+        // the implementation and cannot be assumed safe for this protocol.
         ensure!(
-            !matches!(kind, 0x6969 | 0x517b | 0xff53_4d42 | 0xfe53_4d42),
-            "destructive cleanup is unsupported on a network-mounted storage root at {}",
+            !matches!(
+                kind,
+                0x6969 // NFS
+                    | 0x517b // SMB
+                    | 0xff53_4d42 // CIFS
+                    | 0xfe53_4d42 // SMB2
+                    | 0x00c3_6400 // Ceph
+                    | 0x5346_414f // AFS
+                    | 0x6b41_4653 // AFS (alternate)
+                    | 0x7375_7245 // Coda
+                    | 0x564c // NCP
+                    | 0x0102_1997 // 9p
+                    | 0x7461_636f // OCFS2
+                    | 0x6573_5546 // FUSE
+            ),
+            "destructive cleanup is unsupported on this network, clustered, or userspace storage filesystem at {}",
             root.display()
         );
     }

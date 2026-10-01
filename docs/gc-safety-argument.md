@@ -39,8 +39,10 @@ that all direct Cargo launches are safe.
 Cargo's [current layout source](https://doc.rust-lang.org/nightly/nightly-rustc/src/cargo/compiler/layout.rs.html)
 also omits its build-directory profile lock on NFS mounts. The profile-lock
 heuristic therefore cannot admit an NFS root to native cleanup. Destructive
-rgo cleanup now rejects known Linux NFS/SMB/CIFS types, macOS non-local
-volumes, and Windows remote drives; a failed volume query also blocks it.
+rgo cleanup now rejects known Linux network, clustered, and FUSE filesystem
+types (including NFS, SMB/CIFS, Ceph, AFS, Coda, NCP, 9p, and OCFS2), macOS
+non-local volumes, and Windows remote drives; a failed volume query also
+blocks it. Linux identifiers come from the [kernel magic header](https://github.com/torvalds/linux/blob/master/include/uapi/linux/magic.h).
 Supervised setup with `gc.auto = true` performs this volume check before
 writing activation state, and doctor exposes the result independently.
 The GC executor repeats the check immediately before staging each deletion;
