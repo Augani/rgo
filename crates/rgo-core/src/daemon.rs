@@ -105,6 +105,9 @@ struct State {
     cfg: Resolved,
     db: Arc<Mutex<StateDb>>,
     cas: Store,
+    // Serialize inventories with daemon-owned deletion without blocking pin
+    // and lease admission during the initial filesystem walk.
+    gc_lock: Arc<Mutex<()>>,
     operation_lock: Arc<Mutex<()>>,
     pin_pruner: Arc<Mutex<context::PinPruneScanner>>,
     pending_scanner: Arc<Mutex<crate::supervision::PendingMaintenanceScanner>>,
@@ -247,6 +250,7 @@ pub fn run(paths: RgoPaths, cfg: Resolved) -> Result<()> {
         cfg,
         db,
         cas,
+        gc_lock: Arc::new(Mutex::new(())),
         operation_lock: Arc::new(Mutex::new(())),
         pin_pruner: Arc::new(Mutex::new(context::PinPruneScanner::default())),
         pending_scanner: Arc::new(Mutex::new(
@@ -523,6 +527,7 @@ fn handle_request_result(state: &State, request: Request) -> Result<Response> {
         }
         Request::Clean { build_dir } => {
             validate_managed_path(&state.paths, Path::new(&build_dir))?;
+            let _gc = state.gc_lock.lock().unwrap();
             let _operation = state.operation_lock.lock().unwrap();
             state.paths.require_supervised_deletion()?;
             let contexts = context::list(&state.paths)?;
@@ -826,8 +831,11 @@ fn handle_request_result(state: &State, request: Request) -> Result<Response> {
 }
 
 fn status_report(state: &State) -> Result<StatusReport> {
-    let _operation = state.operation_lock.lock().unwrap();
+    let _gc = state.gc_lock.lock().unwrap();
     let snapshot = crate::size::managed_snapshot(&state.paths)?;
+    // Pins and leases admitted during the scan are included in the database
+    // snapshot below, before deriving any eligibility estimates.
+    let _operation = state.operation_lock.lock().unwrap();
     let contexts = snapshot.contexts;
     let mut db = state.db.lock().unwrap();
     db.expire_leases()?;
@@ -1203,11 +1211,16 @@ fn run_gc(
     auto: bool,
     target_bytes: Option<u64>,
 ) -> Result<GcReport> {
-    let _operation = state.operation_lock.lock().unwrap();
     if !dry_run {
         state.paths.require_supervised_deletion()?;
     }
+    let _gc = state.gc_lock.lock().unwrap();
     let snapshot = crate::size::managed_snapshot(&state.paths)?;
+    // Only the initial inventory runs without the admission lock. Once held,
+    // every pin/lease/cache admission is ordered before the deletion plan or
+    // after its guarded execution. The GC lock excludes another daemon-owned
+    // deletion while this inventory is in progress.
+    let _operation = state.operation_lock.lock().unwrap();
     let managed_bytes = snapshot.total_bytes();
     let contexts = snapshot.contexts;
     let build_bytes = snapshot.build_bytes;
@@ -2566,6 +2579,7 @@ mod tests {
             cfg,
             db: Arc::new(Mutex::new(db)),
             cas,
+            gc_lock: Arc::new(Mutex::new(())),
             operation_lock: Arc::new(Mutex::new(())),
             pin_pruner: Arc::new(Mutex::new(context::PinPruneScanner::default())),
             pending_scanner: Arc::new(Mutex::new(
