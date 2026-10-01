@@ -748,8 +748,9 @@ mod tests {
         std::fs::write(staged.join("output"), vec![b'a'; 8192]).unwrap();
         let unknown = paths.tmp_dir().join("active-unknown");
         std::fs::write(&unknown, vec![b'b'; 8192]).unwrap();
-        let quarantined = paths.quarantine_dir().join("corrupt-object.bad");
-        std::fs::write(&quarantined, vec![b'c'; 8192]).unwrap();
+        let quarantined = paths.quarantine_dir().join("metadata-corrupt-123");
+        std::fs::create_dir(&quarantined).unwrap();
+        std::fs::write(quarantined.join("meta.sqlite"), vec![b'c'; 8192]).unwrap();
         let auxiliary = crate::size::auxiliary_usage(&paths).unwrap().physical_bytes;
         let mut cfg = test_cfg();
         cfg.max_size = u64::MAX;

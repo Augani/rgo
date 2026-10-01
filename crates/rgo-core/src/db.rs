@@ -102,34 +102,50 @@ impl StateDb {
                 if !is_sqlite_corruption(&first_error) {
                     return Err(first_error).context("opening rgo metadata database");
                 }
-                let stamp = unix_now();
+                // Keep the broken database and its WAL together for diagnosis,
+                // but in the owned quarantine domain so GC can eventually
+                // reclaim their bytes. A unique directory also prevents two
+                // recoveries in the same second from replacing an older copy.
+                paths.ensure_layout()?;
+                let nonce = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos();
+                let staging = paths
+                    .tmp_dir()
+                    .join(format!("metadata-corrupt-{}-{nonce}", std::process::id()));
                 let corrupt = paths
-                    .state_dir()
-                    .join(format!("meta.sqlite.corrupt-{stamp}"));
-                for (source, destination) in [
-                    (paths.db_file(), corrupt.clone()),
-                    (
-                        paths.state_dir().join("meta.sqlite-wal"),
-                        paths
-                            .state_dir()
-                            .join(format!("meta.sqlite-wal.corrupt-{stamp}")),
-                    ),
-                    (
-                        paths.state_dir().join("meta.sqlite-shm"),
-                        paths
-                            .state_dir()
-                            .join(format!("meta.sqlite-shm.corrupt-{stamp}")),
-                    ),
-                ] {
-                    if source.exists() {
-                        std::fs::rename(&source, &destination).with_context(|| {
-                            format!(
-                                "moving corrupt database artifact to {} after: {first_error:#}",
-                                destination.display()
-                            )
-                        })?;
-                    }
+                    .quarantine_dir()
+                    .join(staging.file_name().expect("staging bundle has a name"));
+                std::fs::create_dir(&staging).with_context(|| {
+                    format!("creating corrupt metadata bundle {}", staging.display())
+                })?;
+                for name in ["meta.sqlite", "meta.sqlite-wal", "meta.sqlite-shm"] {
+                    let source = paths.state_dir().join(name);
+                    let metadata = match std::fs::symlink_metadata(&source) {
+                        Ok(metadata) => metadata,
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                        Err(error) => {
+                            return Err(error)
+                                .with_context(|| format!("checking {}", source.display()));
+                        }
+                    };
+                    anyhow::ensure!(
+                        metadata.is_file() && !metadata.file_type().is_symlink(),
+                        "unsafe corrupt database artifact {}",
+                        source.display()
+                    );
+                    let destination = staging.join(name);
+                    std::fs::rename(&source, &destination).with_context(|| {
+                        format!(
+                            "moving corrupt database artifact to {} after: {first_error:#}",
+                            destination.display()
+                        )
+                    })?;
                 }
+                std::fs::rename(&staging, &corrupt).with_context(|| {
+                    format!("publishing corrupt metadata bundle {}", corrupt.display())
+                })?;
                 let db = Self::open_initialized(&paths.db_file())
                     .context("rebuilding SQLite metadata database")?;
                 tracing::warn!(path = %corrupt.display(), error = %first_error, "rebuilt corrupt rgo database");
@@ -1976,14 +1992,20 @@ mod tests {
         std::fs::write(paths.db_file(), b"not sqlite").unwrap();
         let _db = StateDb::open(&paths).unwrap();
         assert!(paths.db_file().exists());
+        let bundles: Vec<_> = std::fs::read_dir(paths.quarantine_dir())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        assert_eq!(bundles.len(), 1);
+        assert_eq!(
+            std::fs::read(bundles[0].join("meta.sqlite")).unwrap(),
+            b"not sqlite"
+        );
         assert!(
             std::fs::read_dir(paths.state_dir())
                 .unwrap()
                 .flatten()
-                .any(|entry| entry
-                    .file_name()
-                    .to_string_lossy()
-                    .starts_with("meta.sqlite.corrupt-"))
+                .all(|entry| !entry.file_name().to_string_lossy().contains(".corrupt-"))
         );
     }
 
