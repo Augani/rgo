@@ -160,7 +160,11 @@ process-level session guard.
   context. The [Cargo 1.91 boundary matrix](https://github.com/Augani/rgo/actions/runs/36537118268)
   also found that package clean preserved the sidecar, full clean removed the
   context, and the next native build restored attribution on Linux, macOS, and
-  Windows. Interrupted clean and cross-version pin semantics remain open.
+  Windows. The [new Cargo 1.91 boundary matrix](https://github.com/Augani/rgo/actions/runs/36799141501)
+  repeats those operations through the supervised launcher on all three OSes:
+  `clean -p` retains the sidecar, full `clean` retains the durable pin outside
+  the removed context, and a rebuild restores attribution and pin visibility.
+  Interrupted clean and clean behavior on later Cargo versions remain open.
 - A required [CI matrix](https://github.com/Augani/rgo/actions/runs/36783276609)
   passes across Linux, macOS, and Windows. It is a regression signal for
   existing fixtures, not a full lifecycle proof.
