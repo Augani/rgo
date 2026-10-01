@@ -336,6 +336,85 @@ fn setup_activates_unchanged_cargo_exe_and_undo_restores_direct_cargo() {
 }
 
 #[test]
+fn cargo_clean_preserves_pins_across_partial_and_full_cleanup() {
+    let sandbox = Sandbox::new().unwrap();
+    let project = sandbox.simple_bin("windows-clean-pin").unwrap();
+    let real_cargo = PathBuf::from(std::env::var_os("CARGO").unwrap());
+    let cli = PathBuf::from(env!("CARGO_BIN_EXE_rgo"));
+    let setup = sandbox
+        .cmd(&cli)
+        .args(["setup", "--supervised", "--no-service", "--real-cargo"])
+        .arg(&real_cargo)
+        .output()
+        .unwrap();
+    assert!(
+        setup.status.success(),
+        "{}",
+        String::from_utf8_lossy(&setup.stderr)
+    );
+
+    let shim = sandbox.cargo_home.join(format!(
+        "rgo/shims/v{}/cargo.exe",
+        env!("CARGO_PKG_VERSION")
+    ));
+    let path = std::env::join_paths(std::iter::once(shim.parent().unwrap().to_path_buf()).chain(
+        std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()),
+    ))
+    .unwrap();
+    let run = |args: &[&str]| {
+        sandbox
+            .cmd("cmd.exe")
+            .current_dir(&project)
+            .env("PATH", &path)
+            .args(["/C", "cargo"])
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let build = run(&["build", "--offline"]);
+    assert!(
+        build.status.success(),
+        "{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let paths = RgoPaths {
+        root: sandbox.rgo_home.clone(),
+    };
+    let contexts = paths.checked_managed_build_dirs().unwrap();
+    assert_eq!(contexts.len(), 1);
+    let context = &contexts[0];
+    context::write_durable_pin(&paths, context).unwrap();
+
+    let partial = run(&["clean", "-p", "windows-clean-pin", "--offline"]);
+    assert!(
+        partial.status.success(),
+        "{}",
+        String::from_utf8_lossy(&partial.stderr)
+    );
+    assert!(context::read_sidecar(context).is_some());
+    assert!(context::is_pinned(&paths, context));
+
+    let full = run(&["clean", "--offline"]);
+    assert!(
+        full.status.success(),
+        "{}",
+        String::from_utf8_lossy(&full.stderr)
+    );
+    assert!(!context.exists());
+    assert!(context::is_pinned(&paths, context));
+
+    let rebuilt = run(&["build", "--offline"]);
+    assert!(
+        rebuilt.status.success(),
+        "{}",
+        String::from_utf8_lossy(&rebuilt.stderr)
+    );
+    assert!(context::read_sidecar(context).is_some());
+    assert!(context.join(".rgo-pin").is_file());
+    assert!(gc::remove_atomically(&paths, context).is_err());
+}
+
+#[test]
 fn opted_in_maintenance_reclaims_an_idle_real_cargo_build() {
     struct StopDaemon(Child);
     impl Drop for StopDaemon {
