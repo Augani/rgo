@@ -1079,6 +1079,68 @@ fn manual_daemon_startup_preserves_legacy_pin_intent() {
 }
 
 #[test]
+fn automatic_maintenance_reclaims_an_orphan_without_storage_pressure() {
+    struct StopDaemon(Child);
+    impl Drop for StopDaemon {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    let sb = Sandbox::new().unwrap();
+    let paths = rgo_core::paths::RgoPaths {
+        root: sb.rgo_home.clone(),
+    };
+    paths.ensure_layout().unwrap();
+    let project = sb.simple_bin("age-orphan").unwrap();
+    let context = paths.builds_dir().join("aa/orphan");
+    std::fs::create_dir_all(&context).unwrap();
+    std::fs::write(context.join("intermediates"), vec![0u8; 1024 * 1024]).unwrap();
+    rgo_core::context::write_supervised_sidecar(
+        &context,
+        &project,
+        &project.join("Cargo.toml"),
+        true,
+    )
+    .unwrap();
+    std::fs::remove_file(project.join("Cargo.toml")).unwrap();
+    assert!(rgo_core::context::list(&paths).unwrap()[0].is_orphan());
+
+    let budget = 1_000_000_000_000u64;
+    assert!(
+        rgo_core::size::managed_snapshot(&paths)
+            .unwrap()
+            .total_bytes()
+            < budget / 2
+    );
+    std::fs::write(paths.state_dir().join("storage-mode"), b"supervised\n").unwrap();
+    std::fs::write(
+        paths.state_dir().join("owner-cargo-home"),
+        format!("{}\n", sb.cargo_home.display()),
+    )
+    .unwrap();
+    std::fs::write(
+        paths.config_file(),
+        format!(
+            "[storage]\nmax_size = '{budget}B'\nmin_free_space = '0B'\n[gc]\nauto = true\norphan_grace = '0s'\n"
+        ),
+    )
+    .unwrap();
+
+    let mut daemon = StopDaemon(start_daemon_with_poll(&sb, Some("1")));
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while context.exists() && Instant::now() < deadline {
+        assert!(daemon.0.try_wait().unwrap().is_none());
+        thread::sleep(Duration::from_millis(100));
+    }
+    assert!(
+        !context.exists(),
+        "age maintenance did not reclaim the orphan"
+    );
+}
+
+#[test]
 fn opted_in_maintenance_reclaims_idle_bytes_and_reports_pinned_excess() {
     struct StopDaemon(Child);
     impl Drop for StopDaemon {

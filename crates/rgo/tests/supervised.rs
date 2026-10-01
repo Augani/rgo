@@ -1399,7 +1399,9 @@ fn shimmed_cargo_isolated_from_direct_cargo_and_holds_gc_lock_through_run() {
         .stderr(std::fs::File::create(&run_log).unwrap())
         .spawn()
         .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(30);
+    // The run recompiles a changed fixture while other integration tests may
+    // compile at the same time on a shared CI runner.
+    let deadline = Instant::now() + Duration::from_secs(90);
     while !ready.is_file() && Instant::now() < deadline {
         if child.try_wait().unwrap().is_some() {
             break;
