@@ -1444,16 +1444,18 @@ fn run_gc(
             sweep_generation,
             &mut execution,
         )?;
+        let context_index = contexts
+            .iter()
+            .enumerate()
+            .map(|(index, context)| (context.dir.clone(), index))
+            .collect::<HashMap<_, _>>();
         let mut operation = state.operation_lock.lock().unwrap();
         for action in plan
             .actions
             .iter()
             .filter(|action| action.path.starts_with(state.paths.builds_dir()))
         {
-            let Some(context) = contexts
-                .iter()
-                .find(|context| action.path.starts_with(&context.dir))
-            else {
+            let Some(context) = context_for_action(&contexts, &context_index, &action.path) else {
                 let error = anyhow::anyhow!("planned build path has no inventoried context");
                 execution.note_skip(&action.path, action.bytes, &error);
                 continue;
@@ -1703,14 +1705,17 @@ fn run_gc(
             report
                 .actions
                 .extend(pressure_plan.actions.iter().map(wire_gc_action));
+            let context_index = contexts
+                .iter()
+                .enumerate()
+                .map(|(index, context)| (context.dir.clone(), index))
+                .collect::<HashMap<_, _>>();
             let mut operation = state.operation_lock.lock().unwrap();
             for action in &pressure_plan.actions {
                 // A pin or lease may have been admitted while the previous
                 // staged tree was being removed. Recheck before each rename;
                 // the filesystem lifecycle guard remains held through finish.
-                let Some(context) = contexts
-                    .iter()
-                    .find(|context| action.path.starts_with(&context.dir))
+                let Some(context) = context_for_action(&contexts, &context_index, &action.path)
                 else {
                     let error = anyhow::anyhow!("planned build path has no inventoried context");
                     execution.note_skip(&action.path, action.bytes, &error);
@@ -2920,6 +2925,16 @@ fn validate_managed_path(paths: &RgoPaths, path: &Path) -> Result<()> {
 fn same_path(left: &Path, right: &Path) -> bool {
     std::fs::canonicalize(left).unwrap_or_else(|_| left.to_path_buf())
         == std::fs::canonicalize(right).unwrap_or_else(|_| right.to_path_buf())
+}
+
+fn context_for_action<'a>(
+    contexts: &'a [context::BuildContext],
+    by_dir: &HashMap<PathBuf, usize>,
+    action_path: &Path,
+) -> Option<&'a context::BuildContext> {
+    action_path
+        .ancestors()
+        .find_map(|parent| by_dir.get(parent).map(|&index| &contexts[index]))
 }
 
 fn same_path_in(paths: &[PathBuf], wanted: &Path) -> bool {

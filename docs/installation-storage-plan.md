@@ -385,6 +385,8 @@ Cache-stat requests and full status now measure CAS object bytes outside the sha
 
 Lease expansion now indexes inventoried contexts by workspace root once per database query. During context and pressure removal, GC maps only the selected context before each staged rename, while still checking current pins, leases, and sidecars under admission. This removes repeated whole-inventory workspace matching from each deletion and preserves workspace-lease protection for every context in that workspace. The pass still performs individual SQLite and filesystem checks and is not yet a bounded total pass.
 
+The GC executor also indexes the inventoried context paths before entering each deletion phase. It resolves a planned path through its ancestors, so nested documented incremental actions find their owning context without searching every context for every action under admission. The selected context's sidecar and protections are still rechecked immediately before staging. Other per-action lock-held checks remain.
+
 CAS manifest reads/listing now reject malformed object digests before constructing object paths. The wrapper materializes cache hits with clone/copy rather than hardlinks. Neither change completes the broader P6 cache-soundness gate.
 
 **Exit evidence:** the F3 fixture can reclaim to its target; CAS-only growth triggers cleanup; expired orphans disappear below the soft watermark; protected state is preserved; reported reclamation distinguishes estimates from actual frees. After builds become idle, a supported fixture reaches the configured target within two configured maintenance cycles unless protected bytes prevent it.
