@@ -571,7 +571,7 @@ The [eighteenth public run](https://github.com/Augani/rgo/actions/runs/364799485
 **Purpose:** deliver the Go-like reuse experience without returning stale artifacts.
 **Primary areas:** `rgo-key`, wrapper, CAS/materialization, daemon, protocol, cache corpus and audit docs.
 
-- [x] Fix the reproduced arbitrary compile-time environment input collision. The interim schema-v3 key hashes every inherited environment variable, including names and values; missing versus present values differ. This is conservative and reduces cross-context hits. Dynamic-input validation and useful reuse remain separate unchecked P6 gates.
+- [x] Fix the reproduced arbitrary compile-time environment input collision. The interim schema-v4 key hashes every inherited environment variable, including names and values; missing versus present values differ. This is conservative and reduces cross-context hits. Dynamic-input validation and useful reuse remain separate unchecked P6 gates.
 - [ ] Preserve path suffixes and distinct argument values during normalization. Add collision tests for different files beneath the same root, target JSON content, linker/config changes, source remaps, and non-UTF-8 arguments.
 - [ ] Audit compiler identity beyond a version banner where custom toolchains/sysroots are possible; require a defensible identity or bypass.
 - [ ] Track actual file inputs, external includes, and compiler-observed dep-info; validate them before every hit, not only after a miss. Account for dep-info paths and `env!`, `option_env!`, `include!`, and `include_bytes!` semantics.
@@ -587,6 +587,8 @@ The [eighteenth public run](https://github.com/Augani/rgo/actions/runs/364799485
 - [ ] Compare outputs against a fresh uncached **consumer** build, including executable behavior and diagnostics. Publisher-byte fidelity remains an integrity check; it is not the semantic oracle.
 - [ ] Benchmark rgo's native cache against sccache and emerging upstream Cargo on the same fixtures. Count disk growth and cold-build hashing overhead, not just hit latency.
 - [ ] Decide whether native caching earns its maintenance cost before promoting it. Document supported classes, expected reuse limits, kill switch, and rollout/rollback gates.
+
+**P6 implementation note:** schema v4 also bypasses target JSON files and explicit sysroots, and includes the resolved sysroot, Rustup distribution manifest, and compiler executable bytes in the compiler identity. This invalidates schema-v3 keys but does not establish full compiler-library or dynamic-input coverage. The cache remains off by default.
 
 **Exit evidence:** zero known wrong hits; all negative cases pass; consumer behavior matches uncached controls; supported cache classes show useful end-to-end benefit; cache GC stays within the storage contract. Keep remote cache and broader cache classes opt-in until they independently pass the same input and lifecycle rules.
 

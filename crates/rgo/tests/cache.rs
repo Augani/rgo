@@ -93,6 +93,10 @@ if [ "$1" = "-vV" ]; then
   printf 'rustc 1.85.0 (rgo fake)\n'
   exit 0
 fi
+if [ "$1" = "--print" ] && [ "$2" = "sysroot" ]; then
+  printf '%s/fake-sysroot\n' "$(dirname "$0")"
+  exit 0
+fi
 printf 'compile\n' >> "$FAKE_RUSTC_LOG"
 fail_once=
 if [ -n "$FAKE_RUSTC_FAIL_ONCE_FILE" ] && [ ! -e "$FAKE_RUSTC_FAIL_ONCE_FILE" ]; then
@@ -120,6 +124,15 @@ if [ -n "$FAKE_RUSTC_OLD_MTIME" ]; then touch -t 202001010000 "$out"/*; fi
         )
         .unwrap();
         fs::set_permissions(&fake_rustc, fs::Permissions::from_mode(0o755)).unwrap();
+        let fake_sysroot = sb.projects.join("fake-sysroot");
+        fs::create_dir_all(fake_sysroot.join("bin")).unwrap();
+        fs::create_dir_all(fake_sysroot.join("lib/rustlib")).unwrap();
+        fs::write(
+            fake_sysroot.join("lib/rustlib/multirust-channel-manifest.toml"),
+            "fake test toolchain\n",
+        )
+        .unwrap();
+        fs::copy(&fake_rustc, fake_sysroot.join("bin/rustc")).unwrap();
         Fixture {
             fake_rustc,
             log,

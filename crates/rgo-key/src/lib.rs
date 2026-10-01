@@ -13,7 +13,7 @@ use std::process::Command;
 use blake3::Hasher;
 use serde::{Deserialize, Serialize};
 
-pub const CACHE_SCHEMA_VERSION: u32 = 3;
+pub const CACHE_SCHEMA_VERSION: u32 = 4;
 pub const WORKSPACE_REMAP_PREFIX: &str = "/rgo/workspace";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -40,6 +40,8 @@ pub enum BypassReason {
     UnsupportedWorkspaceSource,
     InvalidOutDir,
     UnsupportedEncoding,
+    CustomTarget,
+    CustomSysroot,
 }
 
 impl std::fmt::Display for BypassReason {
@@ -66,6 +68,8 @@ impl std::fmt::Display for BypassReason {
             Self::UnsupportedWorkspaceSource => "unsupported_workspace_source",
             Self::InvalidOutDir => "invalid_out_dir",
             Self::UnsupportedEncoding => "unsupported_encoding",
+            Self::CustomTarget => "custom_target",
+            Self::CustomSysroot => "custom_sysroot",
         };
         f.write_str(value)
     }
@@ -163,6 +167,18 @@ pub fn classify(
         })
     {
         return Classification::Bypass(BypassReason::UnsupportedEmit);
+    }
+    // A target JSON file can change without its argument changing. Likewise an
+    // explicit sysroot can replace compiler libraries behind the same rustc banner.
+    // Neither is covered by the current key's file-input model.
+    if has_custom_target(args) {
+        return Classification::Bypass(BypassReason::CustomTarget);
+    }
+    if args.iter().any(|arg| {
+        let arg = arg.to_string_lossy();
+        arg == "--sysroot" || arg.starts_with("--sysroot=")
+    }) {
+        return Classification::Bypass(BypassReason::CustomSysroot);
     }
 
     let Some(source) = source_argument(args) else {
@@ -438,7 +454,31 @@ pub fn compiler_identity(rustc: &Path) -> std::io::Result<String> {
     if !output.status.success() {
         return Err(std::io::Error::other("rustc -vV failed"));
     }
-    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    let sysroot_output = Command::new(rustc).args(["--print", "sysroot"]).output()?;
+    if !sysroot_output.status.success() {
+        return Err(std::io::Error::other("rustc --print sysroot failed"));
+    }
+    let sysroot_text = std::str::from_utf8(&sysroot_output.stdout)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    let sysroot = fs::canonicalize(sysroot_text.trim())?;
+    let manifest = sysroot.join("lib/rustlib/multirust-channel-manifest.toml");
+    // Toolchains without a Rustup distribution manifest have no verified
+    // compiler-library identity and must bypass for now.
+    let manifest_bytes = fs::read(manifest)?;
+    let compiler_bytes = fs::read(
+        sysroot
+            .join("bin")
+            .join(format!("rustc{}", std::env::consts::EXE_SUFFIX)),
+    )?;
+    let mut hasher = Hasher::new();
+    hash_field(&mut hasher, &output.stdout);
+    hash_field(
+        &mut hasher,
+        sysroot.as_os_str().to_string_lossy().as_bytes(),
+    );
+    hash_field(&mut hasher, &manifest_bytes);
+    hash_field(&mut hasher, &compiler_bytes);
+    Ok(hasher.finalize().to_hex().to_string())
 }
 
 struct KeyInputs<'a> {
@@ -773,6 +813,21 @@ fn target_triple(args: &[OsString]) -> Option<String> {
     None
 }
 
+fn has_custom_target(args: &[OsString]) -> bool {
+    args.iter().enumerate().any(|(index, arg)| {
+        let arg = arg.to_string_lossy();
+        let target = if arg == "--target" {
+            args.get(index + 1).map(|value| value.to_string_lossy())
+        } else {
+            arg.strip_prefix("--target=")
+                .map(std::borrow::Cow::Borrowed)
+        };
+        target.is_some_and(|value| {
+            value.ends_with(".json") || value.contains('/') || value.contains('\\')
+        })
+    })
+}
+
 fn output_specs(args: &[OsString]) -> Vec<OutputSpec> {
     let out_dir = arg_value(args, "--out-dir").map(PathBuf::from);
     let mut specs = Vec::new();
@@ -990,6 +1045,40 @@ mod tests {
         assert_eq!(
             normalize_path_token("--extern=dep=/work/a/libdep.rlib", "/work/a", "<SRC>"),
             "--extern=dep=<SRC>/libdep.rlib"
+        );
+    }
+
+    #[test]
+    fn mutable_target_spec_and_explicit_sysroot_bypass_cache() {
+        let (dir, root, source) = fixture();
+        let base = vec![
+            "--crate-name".into(),
+            "demo".into(),
+            "--crate-type=lib".into(),
+            "--emit=metadata".into(),
+            "--out-dir".into(),
+            root.as_os_str().to_owned(),
+            source.into_os_string(),
+        ];
+        let roots = AllowedRoots {
+            build_root: root.clone(),
+            source_roots: vec![root.parent().unwrap().to_path_buf()],
+            workspace_roots: Vec::new(),
+            remap_workspace_paths: false,
+        };
+        let target = dir.path().join("target.json");
+        fs::write(&target, r#"{"llvm-target":"x86_64-unknown-linux-gnu"}"#).unwrap();
+        let mut with_target = base.clone();
+        with_target.extend(["--target".into(), target.into_os_string()]);
+        assert_eq!(
+            classify(Path::new("rustc"), &with_target, &[], &roots),
+            Classification::Bypass(BypassReason::CustomTarget)
+        );
+        let mut with_sysroot = base;
+        with_sysroot.push("--sysroot=/tmp/alternate-toolchain".into());
+        assert_eq!(
+            classify(Path::new("rustc"), &with_sysroot, &[], &roots),
+            Classification::Bypass(BypassReason::CustomSysroot)
         );
     }
 

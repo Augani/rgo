@@ -2,7 +2,7 @@
 
 The dependency cache (`[cache] enabled = true`) is opt-in and conservatively
 scoped. Every artifact key is a BLAKE3 digest over a fixed, length-delimited
-field list. The key schema is `rgo-cache-v3`. The classifier still has
+field list. The key schema is `rgo-cache-v4`. The classifier still has
 unverified dynamic-input classes, so caching remains experimental and disabled
 by default. A key collision can return incorrect output.
 
@@ -11,7 +11,7 @@ by default. A key collision can return incorrect output.
 | Field | Source | Notes |
 |---|---|---|
 | schema tag | `rgo-cache-v{N}` constant | versioned; a format change rotates all keys |
-| compiler identity | full `rustc -vV` output | version, commit, host, LLVM — not just a version number |
+| compiler identity | `rustc -vV`, canonical sysroot path, Rustup distribution manifest, and sysroot compiler executable bytes | toolchains without the manifest bypass; dynamically loaded compiler libraries are not yet content-verified |
 | normalized args | all rustc args after normalization | managed paths rewritten relative to the validated build context, preserving the profile/artifact suffix; ordering preserved |
 | source digest | BLAKE3 over `(relpath, bytes)` for every file in the package source root, sorted | strict mode: any symlink fails the digest → bypass |
 | source kind | Registry / Git / Workspace | registry and git checkout contents are digested; workspace members are handled separately |
@@ -39,13 +39,14 @@ a failure. Reasons are stable strings, recorded in `state/cache-events.log`.
 | `-Cincremental`, `-Csave-temps` | `incremental`, `save_temps` |
 | `-Z` flag not on the allowlist | `unstable_flag` |
 | `-Zembed-metadata` (nightly cargo default) | keyed like any other arg — allowlisted because cargo emits it on every nightly invocation |
+| target JSON file/path, explicit `--sysroot` | `custom_target`, `custom_sysroot` |
 | `-l`, `-Lnative=`, `-Clinker=`, `-Clink-arg*`, `-Clink-self-contained` | `native_input` |
 | `-L` path outside build root / sysroot, or unresolvable `--extern` | `external_extern` |
 | `OUT_DIR` outside the managed build root | `build_script_output` |
 | `OUT_DIR` undigestable (symlinks, unreadable entries) | `invalid_out_dir` |
 | source not under an allowed root | `source_outside_cache` |
 | source path is a symlink / unreadable | `unsafe_path` / `missing_source` |
-| `rustc -vV` fails | `compiler_identity` |
+| compiler version/sysroot probe fails, or toolchain lacks Rustup manifest/compiler executable | `compiler_identity` |
 | no `--out-dir` derivable output | `missing_output_directory` |
 | conflicting/multiple workspace remaps | `remap_conflict` |
 | non-UTF-8 argument or environment name/value | `unsupported_encoding` |
