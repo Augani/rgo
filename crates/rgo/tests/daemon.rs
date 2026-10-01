@@ -276,6 +276,123 @@ fn staged_context_removal_admits_a_late_lease(mode: &str) {
 
 #[cfg(debug_assertions)]
 #[test]
+fn gc_plan_admits_a_late_context_lease_before_deletion() {
+    struct StopDaemon {
+        child: Child,
+        release: PathBuf,
+    }
+    impl Drop for StopDaemon {
+        fn drop(&mut self) {
+            let _ = std::fs::write(&self.release, b"release");
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+
+    let sb = Sandbox::new().unwrap();
+    let paths = rgo_core::paths::RgoPaths {
+        root: sb.rgo_home.clone(),
+    };
+    paths.ensure_layout().unwrap();
+    std::fs::write(paths.state_dir().join("storage-mode"), b"supervised\n").unwrap();
+    std::fs::write(
+        paths.state_dir().join("owner-cargo-home"),
+        format!("{}\n", sb.cargo_home.display()),
+    )
+    .unwrap();
+    std::fs::write(
+        paths.config_file(),
+        "[storage]\nmax_size = '1B'\nmin_free_space = '0B'\n[gc]\ncontext_retention = '0s'\n",
+    )
+    .unwrap();
+    let workspace = sb.simple_bin("late-lease").unwrap();
+    let context = paths.builds_dir().join("aa/late-lease");
+    std::fs::create_dir_all(&context).unwrap();
+    std::fs::write(context.join("payload"), vec![b'x'; 1024 * 1024]).unwrap();
+    rgo_core::context::write_supervised_sidecar(
+        &context,
+        &workspace,
+        &workspace.join("Cargo.toml"),
+        true,
+    )
+    .unwrap();
+    let marker = sb.home.join("gc-planned");
+    let release = sb.home.join("gc-plan-release");
+    let mut daemon = StopDaemon {
+        child: sb
+            .cmd(cargo_bin("rgo"))
+            .args(["daemon", "--foreground"])
+            .env("RGO_TEST_GC_PLANNED_MARKER", &marker)
+            .env("RGO_TEST_GC_PLANNED_RELEASE", &release)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+        release,
+    };
+    let socket = paths.socket_path();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !matches!(
+        ipc::request_with_timeout(
+            &socket,
+            Request::QueryRemoteStatus,
+            Duration::from_millis(250)
+        ),
+        Ok(Response::RemoteStatus(_))
+    ) {
+        assert!(daemon.child.try_wait().unwrap().is_none());
+        assert!(Instant::now() < deadline, "daemon did not become ready");
+        thread::sleep(Duration::from_millis(25));
+    }
+    let gc_socket = socket.clone();
+    let gc = thread::spawn(move || {
+        ipc::request_with_timeout(
+            &gc_socket,
+            Request::TriggerGc {
+                dry_run: false,
+                aggressive: false,
+                auto: false,
+                target_bytes: Some(0),
+            },
+            Duration::from_secs(45),
+        )
+    });
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !marker.is_file() {
+        assert!(daemon.child.try_wait().unwrap().is_none());
+        assert!(
+            Instant::now() < deadline,
+            "GC did not plan a context action"
+        );
+        thread::sleep(Duration::from_millis(25));
+    }
+    assert_eq!(
+        PathBuf::from(std::fs::read_to_string(&marker).unwrap()),
+        context
+    );
+    let lease = ipc::request_with_timeout(
+        &socket,
+        Request::AcquireLease {
+            scope: rgo_protocol::LeaseScope::Context {
+                build_dir: context.to_string_lossy().into_owned(),
+            },
+            pid: std::process::id(),
+            ttl_secs: 30,
+        },
+        Duration::from_secs(3),
+    )
+    .unwrap();
+    assert!(matches!(lease, Response::Lease { .. }));
+    std::fs::write(&daemon.release, b"release").unwrap();
+    let Response::Gc(report) = gc.join().unwrap().unwrap() else {
+        panic!("GC did not return a report");
+    };
+    assert!(context.exists());
+    assert!(report.skipped_execution_actions >= 1);
+}
+
+#[cfg(debug_assertions)]
+#[test]
 fn cas_selection_admits_a_late_lease_and_preserves_the_manifest() {
     struct StopDaemon {
         child: Child,

@@ -1286,15 +1286,15 @@ fn run_gc(
     };
     #[cfg(debug_assertions)]
     pause_after_cas_sweep_for_test(&state.paths.root)?;
-    let mut operation = state.operation_lock.lock().unwrap();
+    let operation = state.operation_lock.lock().unwrap();
     let mut db = state.db.lock().unwrap();
     db.expire_leases()?;
     db.reconcile_contexts(&state.paths, &contexts)?;
     reconcile_cache(&mut db, &state.cas)?;
     let pinned = db.pinned_paths()?;
     let leased = db.protected_paths(&contexts)?;
-    let active_cache_keys = db.active_cache_keys()?;
-    let active_cache_lease = db.has_active_cache_lease()?;
+    drop(db);
+    drop(operation);
     let inputs = Inputs {
         paths: &state.paths,
         cfg: &state.cfg,
@@ -1309,6 +1309,23 @@ fn run_gc(
         target_bytes,
     };
     let mut plan = gc::plan(&inputs)?;
+    #[cfg(debug_assertions)]
+    if let Some(action) = plan
+        .actions
+        .iter()
+        .find(|action| action.path.starts_with(state.paths.builds_dir()))
+    {
+        pause_after_gc_plan_for_test(&action.path)?;
+    }
+    // Planning can inspect every context's profile locks and the temporary
+    // tree. Admit new builds during that walk, then refresh protections before
+    // any CAS action; context actions are checked again before staging.
+    let mut operation = state.operation_lock.lock().unwrap();
+    let db = state.db.lock().unwrap();
+    let active_cache_keys = db.active_cache_keys()?;
+    let active_cache_lease = db.has_active_cache_lease()?;
+    let cache_lru = db.cache_lru()?;
+    drop(db);
     if !active_cache_lease
         && !sweep_blocked
         && state.manifest_generation.load(Ordering::Acquire) == sweep_generation
@@ -1316,8 +1333,6 @@ fn run_gc(
         plan.actions.extend(unreferenced);
         plan.actions.sort_by_key(|action| action.tier);
     }
-    let cache_lru = db.cache_lru()?;
-    drop(db);
     if dry_run {
         extend_gc_preview(
             &mut plan,
@@ -1402,6 +1417,11 @@ fn run_gc(
             };
             if protected {
                 let error = anyhow::anyhow!("context gained a pin or lease during GC");
+                execution.note_skip(&action.path, action.bytes, &error);
+                continue;
+            }
+            if context::read_sidecar(&context.dir) != context.sidecar {
+                let error = anyhow::anyhow!("context changed during GC planning");
                 execution.note_skip(&action.path, action.bytes, &error);
                 continue;
             }
@@ -1603,6 +1623,15 @@ fn run_gc(
                     execution.note_skip(&action.path, action.bytes, &error);
                     continue;
                 }
+                if contexts
+                    .iter()
+                    .find(|context| action.path.starts_with(&context.dir))
+                    .is_none_or(|context| context::read_sidecar(&context.dir) != context.sidecar)
+                {
+                    let error = anyhow::anyhow!("context changed during GC planning");
+                    execution.note_skip(&action.path, action.bytes, &error);
+                    continue;
+                }
                 match gc::stage_atomically(&state.paths, &action.path) {
                     Ok(staged) => {
                         drop(operation);
@@ -1689,6 +1718,30 @@ fn pause_after_context_stage_for_test(victim: &Path) -> Result<()> {
     while !release.is_file() {
         if Instant::now() >= deadline {
             bail!("timed out at the staged context cleanup test point");
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    Ok(())
+}
+
+/// Test lease admission after an initial context action is planned.
+#[cfg(debug_assertions)]
+fn pause_after_gc_plan_for_test(victim: &Path) -> Result<()> {
+    use std::time::Instant;
+
+    let Some(marker) = std::env::var_os("RGO_TEST_GC_PLANNED_MARKER") else {
+        return Ok(());
+    };
+    let marker = PathBuf::from(marker);
+    let release = PathBuf::from(
+        std::env::var_os("RGO_TEST_GC_PLANNED_RELEASE")
+            .context("RGO_TEST_GC_PLANNED_RELEASE is required with the marker")?,
+    );
+    std::fs::write(&marker, victim.to_string_lossy().as_bytes())?;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !release.is_file() {
+        if Instant::now() >= deadline {
+            bail!("timed out at the GC planning test point");
         }
         thread::sleep(Duration::from_millis(10));
     }
