@@ -119,18 +119,27 @@ pub fn run(
     };
     let paths = RgoPaths::discover()?;
     paths.validate_root()?;
-    if !undo
-        && rgo_core::config::Config::load(&paths.config_file())?
+    if !undo {
+        let auto_gc = rgo_core::config::Config::load(&paths.config_file())?
             .gc
-            .auto
-    {
-        if !supervised {
+            .auto;
+        if auto_gc && !supervised {
             bail!(
                 "native Cargo setup cannot safely run automatic GC; use `rgo setup --supervised` with a fresh RGO_HOME or set [gc].auto = false"
             );
         }
-        // Refuse an unsupported cleanup volume before writing activation state.
-        rgo_core::paths::check_local_cleanup_volume(&paths.root)?;
+        if supervised {
+            // Refuse an unsupported cleanup volume before writing activation
+            // state when GC is enabled; otherwise make the limitation visible.
+            if let Err(error) = rgo_core::paths::check_local_cleanup_volume(&paths.root) {
+                if auto_gc {
+                    return Err(error);
+                }
+                eprintln!(
+                    "rgo: destructive cleanup unavailable on this storage root ({error:#}); choose a local RGO_HOME for bounded storage"
+                );
+            }
+        }
     }
     let _root_setup_lock = if dry_run {
         None
