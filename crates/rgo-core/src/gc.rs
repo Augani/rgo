@@ -371,6 +371,43 @@ fn stage_and_remove(paths: &RgoPaths, victim: &Path) -> Result<()> {
     stage_and_remove_with(paths, victim, |_| {})
 }
 
+/// A victim has been atomically moved out of its managed path. Keep both
+/// lifecycle guards alive through the potentially slow recursive removal so
+/// a waiting Cargo process cannot enter the old tree while it is removed.
+pub struct StagedRemoval {
+    paths: RgoPaths,
+    victim: PathBuf,
+    staged: PathBuf,
+    context: Option<PathBuf>,
+    _lifecycle: crate::supervision::GcGuards,
+    _cas_staging: Option<std::fs::File>,
+}
+
+impl StagedRemoval {
+    pub fn finish(self) -> Result<()> {
+        let removed = if self.staged.is_dir() {
+            std::fs::remove_dir_all(&self.staged)
+        } else {
+            std::fs::remove_file(&self.staged)
+        };
+        let prune_error = (removed.is_ok()
+            && self.context.as_deref() == Some(self.victim.as_path()))
+        .then(|| crate::context::prune_unpin_decision_guarded(&self.paths, &self.victim))
+        .and_then(Result::err);
+        if let Some(error) = prune_error {
+            warn!(path = %self.victim.display(), %error, "deferred unpin record pruning");
+        }
+        removed.with_context(|| format!("removing {}", self.staged.display()))
+    }
+}
+
+/// Stage one validated victim while the caller orders daemon pin and lease
+/// admission, then let the caller remove it after releasing that admission
+/// lock. The returned handle retains the Cargo and CAS lifecycle guards.
+pub fn stage_atomically(paths: &RgoPaths, victim: &Path) -> Result<StagedRemoval> {
+    stage_atomically_with(paths, victim, |_| {})
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DeletePhase {
     Locked,
@@ -380,12 +417,20 @@ enum DeletePhase {
 fn stage_and_remove_with(
     paths: &RgoPaths,
     victim: &Path,
-    mut after_phase: impl FnMut(DeletePhase),
+    after_phase: impl FnMut(DeletePhase),
 ) -> Result<()> {
+    stage_atomically_with(paths, victim, after_phase)?.finish()
+}
+
+fn stage_atomically_with(
+    paths: &RgoPaths,
+    victim: &Path,
+    mut after_phase: impl FnMut(DeletePhase),
+) -> Result<StagedRemoval> {
     let context = managed_context_for_victim(paths, victim)?;
-    let _lifecycle = crate::supervision::try_lock_gc(paths, context.as_deref())?
+    let lifecycle = crate::supervision::try_lock_gc(paths, context.as_deref())?
         .context("a supervised Cargo invocation is using managed storage")?;
-    let _cas_staging = if victim.parent() == Some(paths.cas_dir().as_path()) && is_cas_stage(victim)
+    let cas_staging = if victim.parent() == Some(paths.cas_dir().as_path()) && is_cas_stage(victim)
     {
         Some(
             rgo_cas::try_lock_staging_cleanup(&paths.cas_dir())?
@@ -433,18 +478,14 @@ fn stage_and_remove_with(
     ));
     std::fs::rename(victim, &staged).with_context(|| format!("staging {}", victim.display()))?;
     after_phase(DeletePhase::Staged);
-    let removed = if staged.is_dir() {
-        std::fs::remove_dir_all(&staged)
-    } else {
-        std::fs::remove_file(&staged)
-    };
-    let prune_error = (removed.is_ok() && context.as_deref() == Some(victim))
-        .then(|| crate::context::prune_unpin_decision_guarded(paths, victim))
-        .and_then(Result::err);
-    if let Some(error) = prune_error {
-        warn!(path = %victim.display(), %error, "deferred unpin record pruning");
-    }
-    removed.with_context(|| format!("removing {}", staged.display()))
+    Ok(StagedRemoval {
+        paths: paths.clone(),
+        victim: victim.to_path_buf(),
+        staged,
+        context,
+        _lifecycle: lifecycle,
+        _cas_staging: cas_staging,
+    })
 }
 
 /// A debug-build fault point for a real-Cargo race fixture. GC holds the

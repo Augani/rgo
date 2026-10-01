@@ -1400,7 +1400,7 @@ fn run_gc(
         // during this scan are read again before pressure-context selection.
         drop(_operation);
         let remaining = crate::size::managed_snapshot(&state.paths)?;
-        let _operation = state.operation_lock.lock().unwrap();
+        let mut operation = state.operation_lock.lock().unwrap();
         let remaining_total = remaining.total_bytes();
         let contexts = remaining.contexts;
         let remaining_cas_bytes = remaining.cas_bytes;
@@ -1450,12 +1450,51 @@ fn run_gc(
             report
                 .actions
                 .extend(pressure_plan.actions.iter().map(wire_gc_action));
-            execution.absorb(gc::execute(&state.paths, &pressure_plan, false)?);
+            for action in &pressure_plan.actions {
+                // A pin or lease may have been admitted while the previous
+                // staged tree was being removed. Recheck before each rename;
+                // the filesystem lifecycle guard remains held through finish.
+                let protected = {
+                    let db = state.db.lock().unwrap();
+                    same_path_in(&db.pinned_paths()?, &action.path)
+                        || same_path_in(&db.protected_paths(&contexts)?, &action.path)
+                };
+                if protected {
+                    let error = anyhow::anyhow!("context gained a pin or lease during GC");
+                    execution.note_skip(&action.path, action.bytes, &error);
+                    continue;
+                }
+                match gc::stage_atomically(&state.paths, &action.path) {
+                    Ok(staged) => {
+                        drop(operation);
+                        #[cfg(debug_assertions)]
+                        let pause = pause_after_pressure_stage_for_test(&action.path);
+                        let removed = staged.finish();
+                        operation = state.operation_lock.lock().unwrap();
+                        #[cfg(debug_assertions)]
+                        pause?;
+                        match removed {
+                            Ok(()) => {
+                                execution.reclaimed_bytes =
+                                    execution.reclaimed_bytes.saturating_add(action.bytes);
+                            }
+                            Err(error) => {
+                                tracing::warn!(path = %action.path.display(), %error, "skipped pressure removal");
+                                execution.note_skip(&action.path, action.bytes, &error);
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        tracing::warn!(path = %action.path.display(), %error, "skipped pressure removal");
+                        execution.note_skip(&action.path, action.bytes, &error);
+                    }
+                }
+            }
         }
         // All destructive actions have finished. Keep other GC/clean passes
         // excluded, but allow pin and lease admission while measuring the
         // resulting tree; reacquire admission ordering for the database update.
-        drop(_operation);
+        drop(operation);
         let remaining = crate::size::managed_snapshot(&state.paths)?;
         let contexts = remaining.contexts;
         let remaining_build_bytes = remaining.build_bytes;
@@ -1488,6 +1527,33 @@ fn run_gc(
     let db = state.db.lock().unwrap();
     db.record_gc(dry_run, aggressive, &report, None)?;
     Ok(report)
+}
+
+/// Debug-only pause after pressure staging. The operation lock is released,
+/// but StagedRemoval still owns Cargo's lifecycle guard until finish returns.
+#[cfg(debug_assertions)]
+fn pause_after_pressure_stage_for_test(victim: &Path) -> Result<()> {
+    use std::time::Instant;
+
+    let Some(marker) = std::env::var_os("RGO_TEST_PRESSURE_STAGED_MARKER") else {
+        return Ok(());
+    };
+    let marker = PathBuf::from(marker);
+    let release = PathBuf::from(
+        std::env::var_os("RGO_TEST_PRESSURE_STAGED_RELEASE")
+            .context("RGO_TEST_PRESSURE_STAGED_RELEASE is required with the marker")?,
+    );
+    let staging = marker.with_extension("tmp");
+    std::fs::write(&staging, victim.to_string_lossy().as_bytes())?;
+    std::fs::rename(staging, &marker)?;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !release.is_file() {
+        if Instant::now() >= deadline {
+            bail!("timed out at the staged pressure cleanup test point");
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    Ok(())
 }
 
 fn append_pressure_for_preview(
