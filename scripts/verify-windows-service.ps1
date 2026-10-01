@@ -143,7 +143,14 @@ try {
         if ($supervisedSetup -notmatch 'daemon service: healthy') {
             throw "Supervised setup did not verify a healthy scheduled daemon: $supervisedSetup"
         }
-        Invoke-Checked 'schtasks.exe' @('/Query', '/TN', $supervisedTask, '/XML', '/HRESULT') | Out-Null
+        $taskXml = [xml](Invoke-Checked 'schtasks.exe' @('/Query', '/TN', $supervisedTask, '/XML', '/HRESULT'))
+        $restart = $taskXml.SelectSingleNode('//*[local-name()="RestartOnFailure"]')
+        if (-not $restart -or
+            $restart.SelectSingleNode('./*[local-name()="Interval"]').InnerText -ne 'PT1M' -or
+            $restart.SelectSingleNode('./*[local-name()="Count"]').InnerText -ne '255') {
+            throw 'Supervised task omitted its bounded crash-restart policy'
+        }
+        $supervisedDaemonPid = Get-OwnedDaemonPid $cli $supervisedRgoHome
         $record = Get-Content -LiteralPath (Join-Path $supervisedCargoHome '.rgo-install.json') -Raw -Encoding UTF8 | ConvertFrom-Json
         $shimDir = Split-Path -Parent $record.supervised_cargo.shim_path
         $env:PATH = "$shimDir;$priorPath"
@@ -155,6 +162,33 @@ try {
         $doctor = Invoke-Checked $cli @('doctor', '--verify', '--json') | ConvertFrom-Json
         if ($doctor.activation_verified -ne $true) {
             throw 'Supervised service activation did not verify plain Cargo'
+        }
+        # A killed service action must recover through Task Scheduler without
+        # a new setup, status, or Cargo command starting the daemon for it.
+        Stop-Process -Id $supervisedDaemonPid -Force
+        $restartDeadline = (Get-Date).AddSeconds(95)
+        $restartedDaemonPid = $null
+        while ((Get-Date) -lt $restartDeadline) {
+            $daemons = @(Get-CimInstance Win32_Process -Filter "Name = 'rgo.exe'" | Where-Object {
+                $_.ExecutablePath -and
+                [string]::Equals($_.ExecutablePath, $cli, [StringComparison]::OrdinalIgnoreCase) -and
+                $_.CommandLine -and $_.CommandLine.Contains('daemon --foreground --home') -and
+                $_.CommandLine.Contains($supervisedRgoHome)
+            })
+            if ($daemons.Count -eq 1 -and [int]$daemons[0].ProcessId -ne $supervisedDaemonPid) {
+                $restartedDaemonPid = [int]$daemons[0].ProcessId
+                break
+            }
+            Start-Sleep -Milliseconds 500
+        }
+        if (-not $restartedDaemonPid) {
+            throw 'Task Scheduler did not restart the crashed supervised daemon'
+        }
+        $recoveredDoctor = Invoke-Checked $cli @('doctor', '--json') | ConvertFrom-Json
+        if (-not @($recoveredDoctor.entries | Where-Object {
+            $_.level -eq 'ok' -and $_.message -like 'daemon responds with protocol*'
+        }).Count) {
+            throw 'Restarted supervised daemon did not answer the protocol health check'
         }
         Invoke-Checked $cli @('setup', '--undo') | Out-Null
         $null = & schtasks.exe /Query /TN $supervisedTask /HRESULT 2>&1
