@@ -55,9 +55,9 @@ pub struct Plan {
     pub skipped_live: usize,
     /// Contexts protected by daemon leases and therefore never considered.
     pub skipped_leased: usize,
-    /// Contexts protected by a pin or unavailable workspace, regardless of
-    /// whether another protection also applies.
+    /// Contexts protected by a pin, regardless of other protections.
     pub skipped_pinned: usize,
+    /// Contexts with unverified workspace availability or supervised origin.
     pub skipped_unavailable: usize,
     /// Allocated context bytes that cannot be selected for cleanup now.
     pub protected_context_bytes: u64,
@@ -100,6 +100,9 @@ pub struct Inputs<'a> {
     pub paths: &'a RgoPaths,
     pub cfg: &'a Resolved,
     pub contexts: &'a [BuildContext],
+    /// An activated supervised installation must not reclaim contexts first
+    /// written by Cargo outside its lifecycle guard.
+    pub require_supervised_origin: bool,
     /// Managed storage outside build contexts: CAS plus temporary, quarantine,
     /// and operational files. The caller owns non-context eviction policy.
     pub other_managed_bytes: u64,
@@ -156,11 +159,22 @@ pub fn plan(inp: &Inputs) -> Result<Plan> {
     let skipped_unavailable = inp
         .contexts
         .iter()
-        .filter(|c| c.workspace_unavailable())
+        .filter(|c| {
+            c.workspace_unavailable()
+                || (inp.require_supervised_origin
+                    && !c
+                        .sidecar
+                        .as_ref()
+                        .is_some_and(|sidecar| sidecar.supervised_origin))
+        })
         .count();
     let eligible = |c: &BuildContext| {
         !crate::context::is_pinned(inp.paths, &c.dir)
             && !c.workspace_unavailable()
+            && (!inp.require_supervised_origin
+                || c.sidecar
+                    .as_ref()
+                    .is_some_and(|sidecar| sidecar.supervised_origin))
             && !inp.pinned.iter().any(|path| same_path(path, &c.dir))
             && !inp.leased.iter().any(|path| same_path(path, &c.dir))
             && !lock_protected.contains(c.dir.as_path())
@@ -315,6 +329,11 @@ pub fn pressure_candidates(inp: &Inputs) -> Result<Vec<Action>> {
         if context.is_orphan()
             || crate::context::is_pinned(inp.paths, &context.dir)
             || context.workspace_unavailable()
+            || (inp.require_supervised_origin
+                && !context
+                    .sidecar
+                    .as_ref()
+                    .is_some_and(|sidecar| sidecar.supervised_origin))
             || inp.pinned.iter().any(|path| same_path(path, &context.dir))
             || inp.leased.iter().any(|path| same_path(path, &context.dir))
         {
@@ -458,15 +477,24 @@ fn stage_atomically_with(
     {
         anyhow::bail!("pinned build context at {}", victim.display());
     }
-    if context.as_ref().is_some_and(|context| {
-        crate::context::read_sidecar(context).is_none_or(|sidecar| {
-            crate::context::workspace_state(&sidecar) == crate::context::WorkspaceState::Unavailable
-        })
-    }) {
-        anyhow::bail!(
-            "workspace attribution or availability is unverified for {}",
+    if let Some(context) = &context {
+        let sidecar = crate::context::read_sidecar(context).context(format!(
+            "workspace attribution is unverified for {}",
             victim.display()
-        );
+        ))?;
+        if crate::context::workspace_state(&sidecar) == crate::context::WorkspaceState::Unavailable
+        {
+            anyhow::bail!(
+                "workspace availability is unverified for {}",
+                victim.display()
+            );
+        }
+        if !sidecar.supervised_origin {
+            anyhow::bail!(
+                "build context at {} lacks verified supervised origin",
+                victim.display()
+            );
+        }
     }
     if context
         .as_ref()
@@ -762,7 +790,7 @@ mod tests {
     fn attribute_context(workspace: &Path, dir: &Path) {
         let manifest = workspace.join("Cargo.toml");
         std::fs::write(&manifest, "[workspace]\n").unwrap();
-        crate::context::write_sidecar(dir, workspace, &manifest, None).unwrap();
+        crate::context::write_supervised_sidecar(dir, workspace, &manifest, true).unwrap();
     }
 
     #[test]
@@ -782,6 +810,7 @@ mod tests {
             paths: &paths,
             cfg: &cfg,
             contexts: &[],
+            require_supervised_origin: false,
             other_managed_bytes: 0,
             pinned: &[],
             leased: &[],
@@ -827,6 +856,7 @@ mod tests {
                 paths: &paths,
                 cfg: &cfg,
                 contexts: &[],
+                require_supervised_origin: false,
                 other_managed_bytes: auxiliary,
                 pinned: &[],
                 leased: &[],
@@ -923,6 +953,7 @@ mod tests {
             paths: &paths,
             cfg: &test_cfg(),
             contexts: &[],
+            require_supervised_origin: false,
             other_managed_bytes: 0,
             pinned: &[],
             leased: &[],
@@ -952,6 +983,7 @@ mod tests {
             paths: &paths,
             cfg: &test_cfg(),
             contexts: &[],
+            require_supervised_origin: false,
             other_managed_bytes: 0,
             pinned: &[],
             leased: &[],
@@ -979,6 +1011,7 @@ mod tests {
             paths: &paths,
             cfg: &test_cfg(),
             contexts: &[],
+            require_supervised_origin: false,
             other_managed_bytes: 0,
             pinned: &[],
             leased: &[],
@@ -1030,6 +1063,7 @@ mod tests {
             paths: &paths,
             cfg: &cfg,
             contexts: &contexts,
+            require_supervised_origin: false,
             other_managed_bytes: 0,
             pinned: &[],
             leased: &[],
@@ -1175,6 +1209,7 @@ mod tests {
             paths: &paths,
             cfg: &test_cfg(),
             contexts: &contexts,
+            require_supervised_origin: false,
             other_managed_bytes: auxiliary,
             pinned: &[],
             leased: &[],
@@ -1205,6 +1240,52 @@ mod tests {
         crate::context::write_pin_marker(&context).unwrap();
         assert!(remove_atomically(&paths, &context).is_err());
         assert!(context.join("output").is_file());
+    }
+
+    #[test]
+    fn supervised_gc_reclaims_other_data_but_never_a_native_origin_context() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = RgoPaths {
+            root: root.path().join("rgo"),
+        };
+        paths.ensure_layout().unwrap();
+        let native = paths.builds_dir().join("aa/native");
+        let supervised = paths.builds_dir().join("bb/supervised");
+        for context in [&native, &supervised] {
+            std::fs::create_dir_all(context).unwrap();
+            std::fs::write(context.join("output"), b"build data").unwrap();
+        }
+        let manifest = root.path().join("Cargo.toml");
+        std::fs::write(&manifest, "[workspace]\n").unwrap();
+        crate::context::write_sidecar(&native, root.path(), &manifest, None).unwrap();
+        crate::context::write_supervised_sidecar(&supervised, root.path(), &manifest, true)
+            .unwrap();
+
+        let contexts = crate::context::list(&paths).unwrap();
+        let cfg = test_cfg();
+        let plan = plan(&Inputs {
+            paths: &paths,
+            cfg: &cfg,
+            contexts: &contexts,
+            require_supervised_origin: true,
+            other_managed_bytes: 0,
+            pinned: &[],
+            leased: &[],
+            now: SystemTime::now(),
+            aggressive: true,
+            age_maintenance: false,
+            allow_pressure_contexts: true,
+            target_bytes: Some(0),
+        })
+        .unwrap();
+        assert!(plan.actions.iter().any(|action| action.path == supervised));
+        assert!(plan.actions.iter().all(|action| action.path != native));
+        assert_eq!(plan.skipped_unavailable, 1);
+        assert!(remove_atomically(&paths, &native).is_err());
+        let result = execute(&paths, &plan, false).unwrap();
+        assert!(result.reclaimed_bytes > 0);
+        assert!(native.join("output").is_file());
+        assert!(!supervised.exists());
     }
 
     #[test]
@@ -1251,6 +1332,7 @@ mod tests {
             paths: &paths,
             cfg: &test_cfg(),
             contexts: &contexts,
+            require_supervised_origin: false,
             other_managed_bytes: 0,
             pinned: &[],
             leased: &[],
@@ -1279,6 +1361,7 @@ mod tests {
             paths: &paths,
             cfg: &test_cfg(),
             contexts: &remaining,
+            require_supervised_origin: false,
             other_managed_bytes: 0,
             pinned: &[],
             leased: &[],
@@ -1319,6 +1402,7 @@ mod tests {
             paths: &paths,
             cfg: &cfg,
             contexts: &contexts,
+            require_supervised_origin: false,
             other_managed_bytes: 0,
             pinned: &[],
             leased: &[],
@@ -1565,6 +1649,7 @@ mod tests {
             paths: &paths,
             cfg: &cfg,
             contexts: &[context],
+            require_supervised_origin: false,
             other_managed_bytes: 0,
             pinned: &[],
             leased: &[],
@@ -1648,6 +1733,7 @@ mod tests {
             paths: &paths,
             cfg: &cfg,
             contexts: &contexts,
+            require_supervised_origin: false,
             other_managed_bytes: 0,
             pinned: &[],
             leased: &[leased_dir],
@@ -1731,6 +1817,7 @@ mod tests {
             paths: &paths,
             cfg: &cfg,
             contexts: &contexts,
+            require_supervised_origin: false,
             other_managed_bytes: 0,
             pinned: &[],
             leased: &[],
@@ -1822,6 +1909,7 @@ mod tests {
             paths: &paths,
             cfg: &cfg,
             contexts: &contexts,
+            require_supervised_origin: false,
             other_managed_bytes: 0,
             pinned: std::slice::from_ref(&pinned_dir),
             leased: &[],
@@ -1889,6 +1977,7 @@ mod tests {
             paths: &paths,
             cfg: &cfg,
             contexts: &contexts,
+            require_supervised_origin: false,
             other_managed_bytes: 0,
             pinned: &[],
             leased: &[],
@@ -1942,6 +2031,7 @@ mod tests {
             paths: &paths,
             cfg: &cfg,
             contexts: &[context],
+            require_supervised_origin: false,
             other_managed_bytes: 0,
             pinned: &[],
             leased: &[],

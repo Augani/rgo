@@ -998,18 +998,32 @@ impl StateDb {
 
     pub fn set_pin(&self, path: &Path, pinned: bool) -> Result<()> {
         let path = normalize(path);
-        if pinned {
-            self.connection.execute(
-                "INSERT OR IGNORE INTO pins(build_dir, created_at) VALUES(?1, ?2)",
-                params![path.to_string_lossy(), unix_now()],
-            )?;
-        } else {
-            self.connection.execute(
-                "DELETE FROM pins WHERE build_dir = ?1",
-                params![path.to_string_lossy()],
-            )?;
+        for attempt in 0..4 {
+            let result = if pinned {
+                self.connection.execute(
+                    "INSERT OR IGNORE INTO pins(build_dir, created_at) VALUES(?1, ?2)",
+                    params![path.to_string_lossy(), unix_now()],
+                )
+            } else {
+                self.connection.execute(
+                    "DELETE FROM pins WHERE build_dir = ?1",
+                    params![path.to_string_lossy()],
+                )
+            };
+            match result {
+                Ok(_) => return Ok(()),
+                Err(rusqlite::Error::SqliteFailure(info, _))
+                    if matches!(
+                        info.code,
+                        ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked
+                    ) && attempt < 3 =>
+                {
+                    std::thread::sleep(Duration::from_millis(25 * (attempt + 1)));
+                }
+                Err(error) => return Err(error.into()),
+            }
         }
-        Ok(())
+        unreachable!("the final pin write attempt returns success or an error")
     }
 
     pub fn stats(&self) -> Result<DbStats> {

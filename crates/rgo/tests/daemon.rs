@@ -1100,7 +1100,13 @@ fn opted_in_maintenance_reclaims_idle_bytes_and_reports_pinned_excess() {
     for (dir, project) in [(&pinned, &pinned_project), (&idle, &idle_project)] {
         std::fs::create_dir_all(dir).unwrap();
         std::fs::write(dir.join("intermediates"), vec![0u8; 2 * 1024 * 1024]).unwrap();
-        rgo_core::context::write_sidecar(dir, project, &project.join("Cargo.toml"), None).unwrap();
+        rgo_core::context::write_supervised_sidecar(
+            dir,
+            project,
+            &project.join("Cargo.toml"),
+            true,
+        )
+        .unwrap();
     }
     rgo_core::context::write_durable_pin(&paths, &pinned).unwrap();
 

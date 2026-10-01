@@ -143,11 +143,11 @@ fn terminal_ctrl_c_keeps_a_surviving_cargo_descendant_protected() {
     let idle = paths.builds_dir().join("bb/interrupt-idle");
     std::fs::create_dir_all(&idle).unwrap();
     std::fs::write(idle.join("unused"), b"reclaim").unwrap();
-    context::write_sidecar(
+    context::write_supervised_sidecar(
         &idle,
         &other_project,
         &other_project.join("Cargo.toml"),
-        None,
+        true,
     )
     .unwrap();
     let gc = sandbox

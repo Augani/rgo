@@ -72,7 +72,7 @@ pub fn run(dry_run: bool, aggressive: bool, auto: bool, target: Option<String>) 
     }
     if report.skipped_unavailable > 0 {
         println!(
-            "{} context(s) skipped: workspace attribution or availability unverified",
+            "{} context(s) skipped: workspace attribution, availability, or supervised origin unverified",
             report.skipped_unavailable
         );
     }

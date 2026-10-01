@@ -135,11 +135,11 @@ mod tests {
     let idle = paths.builds_dir().join("bb/idle-test");
     std::fs::create_dir_all(&idle).unwrap();
     std::fs::write(idle.join("unused"), vec![b'x'; 8192]).unwrap();
-    context::write_sidecar(
+    context::write_supervised_sidecar(
         &idle,
         &other_workspace,
         &other_workspace.join("Cargo.toml"),
-        None,
+        true,
     )
     .unwrap();
 
@@ -372,11 +372,11 @@ fn running_build_script_keeps_its_context_while_gc_reclaims_an_idle_one() {
     let idle = paths.builds_dir().join("bb/idle-build-script");
     std::fs::create_dir_all(&idle).unwrap();
     std::fs::write(idle.join("unused"), vec![b'x'; 8192]).unwrap();
-    context::write_sidecar(
+    context::write_supervised_sidecar(
         &idle,
         &idle_workspace,
         &idle_workspace.join("Cargo.toml"),
-        None,
+        true,
     )
     .unwrap();
 
@@ -505,11 +505,11 @@ fn running_rustdoc_keeps_its_context_while_gc_reclaims_an_idle_one() {
     let idle = paths.builds_dir().join("bb/idle-rustdoc");
     std::fs::create_dir_all(&idle).unwrap();
     std::fs::write(idle.join("unused"), vec![b'x'; 8192]).unwrap();
-    context::write_sidecar(
+    context::write_supervised_sidecar(
         &idle,
         &idle_workspace,
         &idle_workspace.join("Cargo.toml"),
-        None,
+        true,
     )
     .unwrap();
 

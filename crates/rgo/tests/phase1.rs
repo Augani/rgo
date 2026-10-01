@@ -243,7 +243,7 @@ fn pressure_gc_reclaims_idle_unpinned_only_contexts_in_private_home() {
         let dir = paths.builds_dir().join(format!("{index:02x}/context"));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("data"), vec![index as u8 + 1; 2 * 1024 * 1024]).unwrap();
-        context::write_sidecar(&dir, &workspace, &manifest, None).unwrap();
+        context::write_supervised_sidecar(&dir, &workspace, &manifest, true).unwrap();
     }
 
     let automatic = sandbox
@@ -295,7 +295,8 @@ fn explicit_clean_reports_a_locked_context_instead_of_claiming_removal() {
     let context_dir = paths.builds_dir().join("aa/context");
     std::fs::create_dir_all(&context_dir).unwrap();
     std::fs::write(context_dir.join("output"), b"keep").unwrap();
-    context::write_sidecar(&context_dir, &project, &project.join("Cargo.toml"), None).unwrap();
+    context::write_supervised_sidecar(&context_dir, &project, &project.join("Cargo.toml"), true)
+        .unwrap();
 
     let guard = supervision::lock_cargo_session(&paths, Some(&context_dir)).unwrap();
     let blocked = sandbox

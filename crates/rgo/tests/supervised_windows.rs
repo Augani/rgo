@@ -637,7 +637,8 @@ fn plain_cargo_starts_opted_in_maintenance_without_rgo_commands() {
     let idle = paths.builds_dir().join("aa/idle");
     std::fs::create_dir_all(&idle).unwrap();
     std::fs::write(idle.join("unused"), vec![0u8; 8192]).unwrap();
-    context::write_sidecar(&idle, &idle_project, &idle_project.join("Cargo.toml"), None).unwrap();
+    context::write_supervised_sidecar(&idle, &idle_project, &idle_project.join("Cargo.toml"), true)
+        .unwrap();
     assert!(
         ipc::request_with_timeout(
             &paths.socket_path(),
@@ -710,11 +711,11 @@ fn plain_cargo_starts_opted_in_maintenance_without_rgo_commands() {
     let second_idle = paths.builds_dir().join("bb/idle-after-outage");
     std::fs::create_dir_all(&second_idle).unwrap();
     std::fs::write(second_idle.join("unused"), vec![0u8; 8192]).unwrap();
-    context::write_sidecar(
+    context::write_supervised_sidecar(
         &second_idle,
         &idle_project,
         &idle_project.join("Cargo.toml"),
-        None,
+        true,
     )
     .unwrap();
     let rebuild = sandbox
@@ -1261,8 +1262,13 @@ fn main() {
         let idle = paths.builds_dir().join("bb/idle");
         std::fs::create_dir_all(&idle).unwrap();
         std::fs::write(idle.join("output"), b"reclaim").unwrap();
-        context::write_sidecar(&idle, &idle_project, &idle_project.join("Cargo.toml"), None)
-            .unwrap();
+        context::write_supervised_sidecar(
+            &idle,
+            &idle_project,
+            &idle_project.join("Cargo.toml"),
+            true,
+        )
+        .unwrap();
         gc::remove_atomically(&paths, &idle).unwrap();
         assert!(!idle.exists());
         assert!(contexts[0].exists());

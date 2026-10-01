@@ -212,11 +212,11 @@ fn plain_cargo_starts_opted_in_maintenance_without_rgo_commands() {
     let idle = paths.builds_dir().join("aa/idle");
     std::fs::create_dir_all(&idle).unwrap();
     std::fs::write(idle.join("unused"), vec![0u8; 8192]).unwrap();
-    context::write_sidecar(
+    context::write_supervised_sidecar(
         &idle,
         &idle_workspace,
         &idle_workspace.join("Cargo.toml"),
-        None,
+        true,
     )
     .unwrap();
     assert!(!paths.socket_path().exists());
@@ -706,11 +706,11 @@ fn concurrent_cargo_clean_protects_its_context_but_allows_other_gc() {
     let other = paths.builds_dir().join("bb/other");
     std::fs::create_dir_all(&other).unwrap();
     std::fs::write(other.join("unused"), vec![b'x'; 8192]).unwrap();
-    context::write_sidecar(
+    context::write_supervised_sidecar(
         &other,
         &other_project,
         &other_project.join("Cargo.toml"),
-        None,
+        true,
     )
     .unwrap();
 
@@ -842,11 +842,11 @@ fn nested_cargo_build_keeps_both_contexts_safe_while_gc_reclaims_an_idle_one() {
     let idle = paths.builds_dir().join("cc/idle");
     std::fs::create_dir_all(&idle).unwrap();
     std::fs::write(idle.join("unused"), vec![b'i'; 8192]).unwrap();
-    context::write_sidecar(
+    context::write_supervised_sidecar(
         &idle,
         &idle_workspace,
         &idle_workspace.join("Cargo.toml"),
-        None,
+        true,
     )
     .unwrap();
 
@@ -1315,7 +1315,8 @@ fn shimmed_cargo_isolated_from_direct_cargo_and_holds_gc_lock_through_run() {
     let unknown_victim = paths.builds_dir().join("bb/unknown-victim");
     std::fs::create_dir_all(&unknown_victim).unwrap();
     std::fs::write(unknown_victim.join("unused"), b"data").unwrap();
-    context::write_sidecar(&unknown_victim, &project, &project.join("Cargo.toml"), None).unwrap();
+    context::write_supervised_sidecar(&unknown_victim, &project, &project.join("Cargo.toml"), true)
+        .unwrap();
     let mut unknown = sandbox
         .cmd("cargo")
         .current_dir(&project)
@@ -1341,7 +1342,8 @@ fn shimmed_cargo_isolated_from_direct_cargo_and_holds_gc_lock_through_run() {
     std::fs::remove_file(&hold_ready).unwrap();
     std::fs::create_dir_all(&unknown_victim).unwrap();
     std::fs::write(unknown_victim.join("unused"), b"data").unwrap();
-    context::write_sidecar(&unknown_victim, &project, &project.join("Cargo.toml"), None).unwrap();
+    context::write_supervised_sidecar(&unknown_victim, &project, &project.join("Cargo.toml"), true)
+        .unwrap();
     let mut bypassed = sandbox
         .cmd("cargo")
         .current_dir(&project)
@@ -1442,7 +1444,7 @@ fn shimmed_cargo_isolated_from_direct_cargo_and_holds_gc_lock_through_run() {
     let other = paths.builds_dir().join("bb/other");
     std::fs::create_dir_all(&other).unwrap();
     std::fs::write(other.join("unused"), b"reclaim").unwrap();
-    context::write_sidecar(&other, &project, &project.join("Cargo.toml"), None).unwrap();
+    context::write_supervised_sidecar(&other, &project, &project.join("Cargo.toml"), true).unwrap();
     let gc_pass = started.then(|| {
         sandbox
             .cmd(rgo)
