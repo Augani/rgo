@@ -40,7 +40,7 @@ pub fn run(dry_run: bool, aggressive: bool, auto: bool, target: Option<String>) 
     if !daemon::ensure_running(&e.paths) {
         bail!("rgo daemon is unavailable; refusing to run coordinated GC");
     }
-    let report = match ipc::request_with_timeout(
+    let report = match ipc::request_with_response_timeout(
         &e.paths.socket_path(),
         Request::TriggerGc {
             dry_run,
@@ -49,6 +49,7 @@ pub fn run(dry_run: bool, aggressive: bool, auto: bool, target: Option<String>) 
             target_bytes,
         },
         std::time::Duration::from_secs(30),
+        std::time::Duration::from_secs(10 * 60),
     )? {
         Response::Gc(report) => report,
         Response::Error { code, message } => bail!("GC failed ({code}): {message}"),

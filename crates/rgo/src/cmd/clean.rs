@@ -19,12 +19,13 @@ pub fn run(id: &str) -> Result<()> {
     if !daemon::ensure_running(&e.paths) {
         bail!("rgo daemon is unavailable; refusing coordinated clean");
     }
-    let response = ipc::request_with_timeout(
+    let response = ipc::request_with_response_timeout(
         &e.paths.socket_path(),
         Request::Clean {
             build_dir: c.dir.to_string_lossy().into_owned(),
         },
         std::time::Duration::from_secs(30),
+        std::time::Duration::from_secs(10 * 60),
     )?;
     let n = match response {
         Response::Gc(report) => report.reclaimed_bytes,

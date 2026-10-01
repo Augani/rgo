@@ -195,7 +195,18 @@ pub fn request(path: &Path, message: Request) -> Result<Response> {
 }
 
 pub fn request_with_timeout(path: &Path, message: Request, timeout: Duration) -> Result<Response> {
-    let mut connection = connect(path, timeout)?;
+    request_with_response_timeout(path, message, timeout, timeout)
+}
+
+/// Keep connection and handshake failures prompt without timing out a long
+/// coordinated operation while the daemon is still computing its response.
+pub fn request_with_response_timeout(
+    path: &Path,
+    message: Request,
+    connection_timeout: Duration,
+    response_timeout: Duration,
+) -> Result<Response> {
+    let mut connection = connect(path, connection_timeout)?;
     write_message(
         &mut connection,
         &Request::Hello {
@@ -212,6 +223,9 @@ pub fn request_with_timeout(path: &Path, message: Request, timeout: Duration) ->
         other => bail!("invalid daemon handshake response: {other:?}"),
     }
     write_message(&mut connection, &message)?;
+    if response_timeout != connection_timeout {
+        connection.set_timeout(response_timeout)?;
+    }
     read_message(&mut connection)
 }
 
