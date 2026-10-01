@@ -32,8 +32,17 @@ def run(args: list[str], *, cwd: Path, env: dict[str, str]) -> subprocess.Comple
     return result
 
 
-def probe(mode: str, rustup_home: str, toolchain: str, expect_profile_lock: bool) -> None:
-    with tempfile.TemporaryDirectory(prefix=f"rgo-{mode}-") as raw:
+def probe(
+    mode: str,
+    rustup_home: str,
+    toolchain: str,
+    expect_profile_lock: bool,
+    supervised: bool = False,
+) -> None:
+    label = f"{mode}-{'supervised' if supervised else 'native'}"
+    # macOS Unix-domain socket paths are short; the nested daemon.sock path
+    # must still fit under the system temporary directory.
+    with tempfile.TemporaryDirectory(prefix=f"r-{mode[0]}{'s' if supervised else 'n'}-") as raw:
         root = Path(raw)
         home = root / "home"
         project = root / "project"
@@ -65,7 +74,12 @@ def probe(mode: str, rustup_home: str, toolchain: str, expect_profile_lock: bool
         ):
             env.pop(variable, None)
 
-        run([str(RGO), "setup", "--no-service"], cwd=project, env=env)
+        setup = [str(RGO), "setup", "--no-service"]
+        if supervised:
+            setup.append("--supervised")
+        run(setup, cwd=project, env=env)
+        if supervised:
+            env["PATH"] = str(cargo_home / "rgo" / "shims") + os.pathsep + env["PATH"]
         command = ["cargo"]
         if mode == "new-layout":
             command.extend(["-Z", "build-dir-new-layout"])
@@ -93,6 +107,9 @@ def probe(mode: str, rustup_home: str, toolchain: str, expect_profile_lock: bool
         if len(sidecars) != 1:
             raise RuntimeError(f"{mode}: expected one rgo-owned context sidecar, found {sidecars}")
         context = sidecars[0].parent.resolve()
+        sidecar = json.loads(sidecars[0].read_text())
+        if sidecar.get("supervised_origin") is not supervised:
+            raise RuntimeError(f"{label}: context origin did not match Cargo activation")
         if not all(path.is_relative_to(context) for path in out_dirs):
             raise RuntimeError(f"{mode}: Cargo output escaped the attributed context")
         profile = context / "debug"
@@ -151,13 +168,16 @@ def probe(mode: str, rustup_home: str, toolchain: str, expect_profile_lock: bool
             if "1 context(s) skipped: recently changed or held Cargo profile lock" not in locked_plan:
                 raise RuntimeError(f"{mode}: rgo did not protect the held profile lock:\n{locked_plan}")
             idle_plan = run(gc_args, cwd=project, env=env).stdout
-            if (
+            if supervised:
+                if "planned estimate" not in idle_plan or "nothing to reclaim" in idle_plan:
+                    raise RuntimeError(f"{label}: idle supervised context was not reclaimable:\n{idle_plan}")
+            elif (
                 "1 context(s) skipped: workspace attribution, availability, or supervised origin unverified"
                 not in idle_plan
                 or "nothing to reclaim" not in idle_plan
                 or not context.is_dir()
             ):
-                raise RuntimeError(f"{mode}: native-origin context was not protected:\n{idle_plan}")
+                raise RuntimeError(f"{label}: native-origin context was not protected:\n{idle_plan}")
         else:
             # Older Cargo still relocates its intermediates, but rgo must not
             # infer a safe native deletion protocol from an unfamiliar lock.
@@ -193,11 +213,17 @@ def main() -> None:
     ).stdout.strip()
     for mode in ("default", "new-layout"):
         probe(mode, rustup_home, args.toolchain, not args.without_profile_lock)
-    print(
-        f"{version}: relocation, final outputs, incremental state, and "
-        f"{'held-lock detection and native-origin protection' if not args.without_profile_lock else 'native deletion refusal without a supported profile lock'} "
-        "verified in both layout modes"
-    )
+    if not args.without_profile_lock:
+        probe("new-layout", rustup_home, args.toolchain, True, supervised=True)
+    result = "relocation, final outputs, and incremental state verified in both layouts; "
+    if args.without_profile_lock:
+        result += "native deletion refused without a supported profile lock in both layouts"
+    else:
+        result += (
+            "held-lock detection and native-origin protection verified in both layouts; "
+            "supervised new-layout selection verified"
+        )
+    print(f"{version}: {result}")
 
 
 if __name__ == "__main__":

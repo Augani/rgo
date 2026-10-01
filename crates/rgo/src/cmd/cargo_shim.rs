@@ -344,21 +344,7 @@ fn select_context(
     args: &[OsString],
     paths: &RgoPaths,
 ) -> Result<Option<(PathBuf, PathBuf)>> {
-    if workspace_command(args).is_none()
-        || args
-            .iter()
-            .take_while(|arg| arg.as_os_str() != OsStr::new("--"))
-            .any(|arg| {
-                arg.to_str().is_some_and(|text| {
-                    text == "--config"
-                        || text.starts_with("--config=")
-                        || text == "-C"
-                        || text.starts_with("-C")
-                        || text == "-Z"
-                        || text.starts_with("-Z")
-                })
-            })
-    {
+    if workspace_command(args).is_none() || has_unmanaged_global_option(args) {
         return Ok(None);
     }
     // An unreadable or vanished working directory cannot prove where Cargo
@@ -423,6 +409,38 @@ fn select_context(
     Ok(Some((dir, root.to_path_buf())))
 }
 
+/// The nightly layout flag changes Cargo's private contents inside a build
+/// directory, not its selected directory. Keep all other unstable options
+/// unmanaged because their effect on build-path selection is not verified.
+#[cfg(any(unix, windows))]
+fn has_unmanaged_global_option(args: &[OsString]) -> bool {
+    let mut args = args.iter().map(OsString::as_os_str);
+    while let Some(arg) = args.next() {
+        if arg == "--" {
+            break;
+        }
+        if arg == "-Z" {
+            if args.next() != Some(OsStr::new("build-dir-new-layout")) {
+                return true;
+            }
+            continue;
+        }
+        if arg == "-Zbuild-dir-new-layout" {
+            continue;
+        }
+        if arg.to_str().is_some_and(|text| {
+            text == "--config"
+                || text.starts_with("--config=")
+                || text == "-C"
+                || text.starts_with("-C")
+                || text.starts_with("-Z")
+        }) {
+            return true;
+        }
+    }
+    false
+}
+
 #[cfg(any(unix, windows))]
 fn config_may_override_build_dir() -> Result<bool> {
     if std::env::var_os("CARGO_BUILD_BUILD_DIR").is_some() {
@@ -464,6 +482,13 @@ fn workspace_command(args: &[OsString]) -> Option<&str> {
     let mut index = 0;
     while let Some(argument) = args.get(index).and_then(|value| value.to_str()) {
         match argument {
+            "-Z" if args
+                .get(index + 1)
+                .is_some_and(|arg| arg == "build-dir-new-layout") =>
+            {
+                index += 2
+            }
+            "-Zbuild-dir-new-layout" => index += 1,
             "--locked" | "--offline" | "--frozen" | "-q" | "--quiet" | "-v" | "--verbose" => {
                 index += 1
             }
