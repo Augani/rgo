@@ -150,6 +150,11 @@ try {
             $restart.SelectSingleNode('./*[local-name()="Count"]').InnerText -ne '255') {
             throw 'Supervised task omitted its bounded crash-restart policy'
         }
+        $registration = $taskXml.SelectSingleNode('//*[local-name()="RegistrationTrigger"]')
+        if (-not $registration -or
+            $registration.SelectSingleNode('./*[local-name()="Repetition"]/*[local-name()="Interval"]').InnerText -ne 'PT1M') {
+            throw 'Supervised task omitted its recurring recovery trigger'
+        }
         $supervisedDaemonPid = Get-OwnedDaemonPid $cli $supervisedRgoHome
         $record = Get-Content -LiteralPath (Join-Path $supervisedCargoHome '.rgo-install.json') -Raw -Encoding UTF8 | ConvertFrom-Json
         $shimDir = Split-Path -Parent $record.supervised_cargo.shim_path
@@ -182,7 +187,8 @@ try {
             Start-Sleep -Milliseconds 500
         }
         if (-not $restartedDaemonPid) {
-            throw 'Task Scheduler did not restart the crashed supervised daemon'
+            $taskState = Get-ScheduledTaskInfo -TaskPath '\rgo\' -TaskName ($supervisedTask -replace '^rgo\\', '')
+            throw "Task Scheduler did not restart the crashed supervised daemon; last result $($taskState.LastTaskResult), next run $($taskState.NextRunTime)"
         }
         $recoveredDoctor = Invoke-Checked $cli @('doctor', '--json') | ConvertFrom-Json
         if (-not @($recoveredDoctor.entries | Where-Object {
