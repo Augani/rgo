@@ -851,6 +851,10 @@ fn status_report(state: &State) -> Result<StatusReport> {
     let active_cache_lease = db.has_active_cache_lease()?;
     let cache_lru = db.cache_lru()?;
     drop(db);
+    // The remaining status work is a read-only estimate. A later pin or
+    // lease may change eligibility, but it must not wait for these filesystem
+    // walks; the GC lock keeps daemon-owned deletion out of this snapshot.
+    drop(_operation);
     // The profile-lock mtime is only a recency heuristic. A long-running
     // supervised Cargo process can outlive it, so the status preview must
     // observe the same nonblocking lifecycle guard that deletion uses.
@@ -1323,7 +1327,24 @@ fn run_gc(
             }
         }
         forget_removed_object_rows(state, &plan.actions)?;
+        // The first deletion phase is complete. Measure outside the admission
+        // lock, then refresh cache protections before considering manifests:
+        // a producer, consumer, or upload may have been admitted meanwhile.
+        drop(_operation);
         let remaining = crate::size::managed_snapshot(&state.paths)?;
+        let _operation = state.operation_lock.lock().unwrap();
+        let (cache_lru, active_cache_keys, active_cache_lease) = {
+            let db = state.db.lock().unwrap();
+            (
+                db.cache_lru()?,
+                db.active_cache_keys()?,
+                db.has_active_cache_lease()?,
+            )
+        };
+        if active_cache_lease {
+            report.cas_eviction_deferred_bytes =
+                report.cas_eviction_deferred_bytes.max(remaining.cas_bytes);
+        }
         let remaining_total = remaining.total_bytes();
         let needed = remaining_total.saturating_sub(plan.target_bytes).max(
             state
@@ -1375,7 +1396,11 @@ fn run_gc(
             execution.absorb(gc::execute(&state.paths, &post, false)?);
             forget_removed_object_rows(state, &post.actions)?;
         }
+        // The CAS phase is complete. New context pins and leases admitted
+        // during this scan are read again before pressure-context selection.
+        drop(_operation);
         let remaining = crate::size::managed_snapshot(&state.paths)?;
+        let _operation = state.operation_lock.lock().unwrap();
         let remaining_total = remaining.total_bytes();
         let contexts = remaining.contexts;
         let remaining_cas_bytes = remaining.cas_bytes;
@@ -1427,6 +1452,10 @@ fn run_gc(
                 .extend(pressure_plan.actions.iter().map(wire_gc_action));
             execution.absorb(gc::execute(&state.paths, &pressure_plan, false)?);
         }
+        // All destructive actions have finished. Keep other GC/clean passes
+        // excluded, but allow pin and lease admission while measuring the
+        // resulting tree; reacquire admission ordering for the database update.
+        drop(_operation);
         let remaining = crate::size::managed_snapshot(&state.paths)?;
         let contexts = remaining.contexts;
         let remaining_build_bytes = remaining.build_bytes;
@@ -1445,6 +1474,7 @@ fn run_gc(
         report.skipped_execution_actions = execution.skipped_actions;
         report.skipped_execution_bytes = execution.skipped_bytes;
         report.first_execution_skip = execution.first_skip;
+        let _operation = state.operation_lock.lock().unwrap();
         let mut db = state.db.lock().unwrap();
         db.reconcile_contexts(&state.paths, &contexts)?;
         db.record_gc(
