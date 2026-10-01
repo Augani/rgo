@@ -193,17 +193,25 @@ fn main() {
     };
     match acquire_cache_role(&candidate) {
         Some(CacheRole::Ready { manifest, lease_id }) => {
-            if materialize_hit(&store, &candidate, &manifest).is_ok() {
+            let restore_leases = [context_lease_id, lease_id]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>();
+            let (restore_stop, restore_heartbeat) = start_lease_heartbeats(restore_leases);
+            #[cfg(debug_assertions)]
+            pause_at_cache_stage("RGO_TEST_CACHE_RESTORE_PAUSE");
+            let restored = materialize_hit(&store, &candidate, &manifest).is_ok();
+            if restored {
                 replay_output(&store, manifest.stdout.as_ref(), true);
                 replay_output(&store, manifest.stderr.as_ref(), false);
                 record_event(Some(candidate.key.to_string()), "hit", 0, None);
-                if let Some(id) = lease_id {
-                    let _ = request(Request::ReleaseLease { lease_id: id });
-                }
-                finish_success(context_lease_id);
             }
+            stop_lease_heartbeats(restore_stop, restore_heartbeat);
             if let Some(id) = lease_id {
                 let _ = request(Request::ReleaseLease { lease_id: id });
+            }
+            if restored {
+                finish_success(context_lease_id);
             }
             record_event(
                 Some(candidate.key.to_string()),
@@ -362,7 +370,7 @@ fn run_cache_producer(
     let (publication_stop, publication_heartbeat) = start_lease_heartbeats(publication_leases);
     #[cfg(debug_assertions)]
     if result.status.success() && cache_lease_id.is_some() {
-        pause_before_cache_publication();
+        pause_at_cache_stage("RGO_TEST_CACHE_PUBLICATION_PAUSE");
     }
     if let Some(lease_id) = cache_lease_id {
         if result.status.success() {
@@ -814,8 +822,8 @@ fn stop_lease_heartbeats(
 }
 
 #[cfg(debug_assertions)]
-fn pause_before_cache_publication() {
-    let Some(dir) = std::env::var_os("RGO_TEST_CACHE_PUBLICATION_PAUSE") else {
+fn pause_at_cache_stage(env_var: &str) {
+    let Some(dir) = std::env::var_os(env_var) else {
         return;
     };
     let dir = PathBuf::from(dir);

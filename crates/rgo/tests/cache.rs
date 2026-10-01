@@ -612,6 +612,89 @@ if [ -n "$FAKE_RUSTC_OLD_MTIME" ]; then touch -t 202001010000 "$out"/*; fi
     }
 
     #[test]
+    fn restore_keeps_cache_and_context_leases_past_the_ttl() {
+        let _serial = serial_e2e();
+        ensure_workspace_bins_built().unwrap();
+        let sb = Sandbox::new().unwrap();
+        let fixture = fixture(&sb);
+        let paths = RgoPaths {
+            root: sb.rgo_home.clone(),
+        };
+        paths.ensure_layout().unwrap();
+        fs::write(paths.state_dir().join("storage-mode"), b"supervised\n").unwrap();
+        fs::write(
+            paths.state_dir().join("owner-cargo-home"),
+            format!("{}\n", sb.cargo_home.display()),
+        )
+        .unwrap();
+        let mut daemon = start_daemon(&sb);
+        let pause = sb.projects.join("restore-pause");
+        fs::create_dir_all(&pause).unwrap();
+        let produced = command_for(&sb, &fixture, "producer", &[])
+            .env("RGO_TEST_CACHE_RESTORE_PAUSE", &pause)
+            .output()
+            .unwrap();
+        assert!(
+            produced.status.success(),
+            "{}",
+            String::from_utf8_lossy(&produced.stderr)
+        );
+        let mut command = command_for(&sb, &fixture, "consumer", &[]);
+        command
+            .env("RGO_TEST_CACHE_RESTORE_PAUSE", &pause)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let child = command.spawn().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !pause.join("ready").exists() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(25));
+        }
+        if !pause.join("ready").exists() {
+            fs::write(pause.join("release"), b"").unwrap();
+            let output = child.wait_with_output().unwrap();
+            panic!(
+                "wrapper never entered restore: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        thread::sleep(Duration::from_secs(35));
+        let active_leases = StateDb::open_read_only(&paths)
+            .unwrap()
+            .stats()
+            .unwrap()
+            .active_leases;
+        let gc = sb
+            .cmd(cargo_bin("rgo"))
+            .args(["gc", "--target", "0"])
+            .output()
+            .unwrap();
+        let context_survived = sb.rgo_home.join("builds/aa/consumer").is_dir();
+        fs::write(pause.join("release"), b"").unwrap();
+        let output = child.wait_with_output().unwrap();
+        let _ = daemon.kill();
+        let _ = daemon.wait();
+
+        assert!(
+            active_leases >= 2,
+            "restore leases expired: {active_leases}"
+        );
+        assert!(
+            gc.status.success(),
+            "{}",
+            String::from_utf8_lossy(&gc.stderr)
+        );
+        assert!(context_survived, "GC removed the active restore context");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(compile_count(&fixture), 1, "consumer should have hit");
+        assert_eq!(outputs(&sb, "consumer"), outputs(&sb, "producer"));
+    }
+
+    #[test]
     fn daemon_loss_before_commit_does_not_publish_a_cache_hit() {
         let _serial = serial_e2e();
         ensure_workspace_bins_built().unwrap();

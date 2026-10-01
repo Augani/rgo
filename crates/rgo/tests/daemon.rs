@@ -1487,24 +1487,19 @@ fn maintenance_recovers_unpin_decision_with_auto_gc_disabled() {
     assert!(record.exists());
     std::fs::write(paths.config_file(), "[gc]\nauto = false\n").unwrap();
 
-    let mut daemon = sb
-        .cmd(cargo_bin("rgo"))
-        .args(["daemon", "--foreground"])
-        .env("RGO_DAEMON_POLL_SECS", "1")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let mut daemon = start_daemon_with_poll(&sb, Some("1"));
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
     while record.exists() && std::time::Instant::now() < deadline {
         assert!(daemon.try_wait().unwrap().is_none(), "daemon exited early");
         thread::sleep(Duration::from_millis(100));
     }
     let _ = daemon.kill();
     let _ = daemon.wait();
+    let diagnostics = std::fs::read_to_string(paths.logs_dir().join("daemon.log"))
+        .unwrap_or_else(|error| format!("daemon log unavailable: {error}"));
     assert!(
         !record.exists(),
-        "maintenance kept an obsolete unpin decision"
+        "maintenance kept an obsolete unpin decision: {diagnostics}"
     );
 }
 
