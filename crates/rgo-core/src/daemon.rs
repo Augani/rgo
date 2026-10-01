@@ -534,13 +534,18 @@ fn handle_request_result(state: &State, request: Request) -> Result<Response> {
             validate_managed_path(&state.paths, Path::new(&build_dir))
                 .context("validating clean path")?;
             let _gc = state.gc_lock.lock().unwrap();
+            let contexts =
+                context::list(&state.paths).context("inventorying contexts before clean")?;
+            #[cfg(debug_assertions)]
+            pause_after_clean_inventory_for_test(Path::new(&build_dir))?;
+            // The GC lock excludes another daemon-owned deletion during this
+            // scan. Refresh mode, pins, and leases only after taking admission,
+            // so a change that arrived while scanning still wins.
             let operation = state.operation_lock.lock().unwrap();
             state
                 .paths
                 .require_supervised_deletion()
                 .context("checking clean mode")?;
-            let contexts =
-                context::list(&state.paths).context("inventorying contexts before clean")?;
             let db = state.db.lock().unwrap();
             db.expire_leases().context("expiring leases before clean")?;
             let pinned = db.pinned_paths().context("reading pins before clean")?;
@@ -1821,6 +1826,30 @@ fn run_gc(
     let db = state.db.lock().unwrap();
     db.record_gc(dry_run, aggressive, &report, None)?;
     Ok(report)
+}
+
+/// Test pin and lease admission after clean inventories a context.
+#[cfg(debug_assertions)]
+fn pause_after_clean_inventory_for_test(victim: &Path) -> Result<()> {
+    use std::time::Instant;
+
+    let Some(marker) = std::env::var_os("RGO_TEST_CLEAN_INVENTORIED_MARKER") else {
+        return Ok(());
+    };
+    let marker = PathBuf::from(marker);
+    let release = PathBuf::from(
+        std::env::var_os("RGO_TEST_CLEAN_INVENTORIED_RELEASE")
+            .context("RGO_TEST_CLEAN_INVENTORIED_RELEASE is required with the marker")?,
+    );
+    std::fs::write(&marker, victim.to_string_lossy().as_bytes())?;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !release.is_file() {
+        if Instant::now() >= deadline {
+            bail!("timed out at the clean inventory test point");
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    Ok(())
 }
 
 /// Debug-only pause after context staging. The operation lock is released,
