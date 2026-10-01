@@ -6,7 +6,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -109,6 +109,9 @@ struct State {
     // and lease admission during the initial filesystem walk.
     gc_lock: Arc<Mutex<()>>,
     operation_lock: Arc<Mutex<()>>,
+    // Publications are ordered with GC by operation_lock. A scan done without
+    // that lock is only safe to sweep if no manifest was published meanwhile.
+    manifest_generation: Arc<AtomicU64>,
     pin_pruner: Arc<Mutex<context::PinPruneScanner>>,
     pending_scanner: Arc<Mutex<crate::supervision::PendingMaintenanceScanner>>,
     trigger_scan: Arc<Mutex<crate::size::TriggerScan>>,
@@ -252,6 +255,7 @@ pub fn run(paths: RgoPaths, cfg: Resolved) -> Result<()> {
         cas,
         gc_lock: Arc::new(Mutex::new(())),
         operation_lock: Arc::new(Mutex::new(())),
+        manifest_generation: Arc::new(AtomicU64::new(0)),
         pin_pruner: Arc::new(Mutex::new(context::PinPruneScanner::default())),
         pending_scanner: Arc::new(Mutex::new(
             crate::supervision::PendingMaintenanceScanner::default(),
@@ -726,6 +730,7 @@ fn handle_request_result(state: &State, request: Request) -> Result<Response> {
                 db.fail_cache_build(&key, lease_id, &format!("publish: {error:#}"))?;
                 return Err(error);
             }
+            state.manifest_generation.fetch_add(1, Ordering::AcqRel);
             db.record_cache_manifest(
                 &wire_manifest(&manifest),
                 &state.cas.manifest_path(&manifest.key),
@@ -1152,6 +1157,7 @@ fn remote_fetch_worker_result(state: &State, key: &str, lease_id: u64) -> Result
         db.remote_fetch_fallback(key, lease_id, &format!("publish: {error:#}"))?;
         return Err(error);
     }
+    state.manifest_generation.fetch_add(1, Ordering::AcqRel);
     let wire = wire_manifest(&manifest);
     db.record_cache_manifest(&wire, &state.cas.manifest_path(key))?;
     db.record_remote_counter("hit", manifest_bytes.len() as u64)?;
@@ -1242,11 +1248,9 @@ fn run_gc(
     }
     let _gc = state.gc_lock.lock().unwrap();
     let snapshot = crate::size::managed_snapshot(&state.paths)?;
-    // The initial inventory runs without the admission lock. Planning and
-    // staging run under that lock; context removal can release it while a
-    // stable Cargo lifecycle guard remains held. The GC lock excludes another
-    // daemon-owned deletion throughout the pass.
-    let mut operation = state.operation_lock.lock().unwrap();
+    // The initial inventory runs without the admission lock. The GC lock
+    // excludes another daemon-owned deletion throughout the pass.
+    let operation = state.operation_lock.lock().unwrap();
     let managed_bytes = snapshot.total_bytes();
     let contexts = snapshot.contexts;
     let build_bytes = snapshot.build_bytes;
@@ -1272,6 +1276,17 @@ fn run_gc(
             ..Default::default()
         });
     }
+    let sweep_generation = state.manifest_generation.load(Ordering::Acquire);
+    let sweep_blocked = state.db.lock().unwrap().has_active_cache_lease()?;
+    drop(operation);
+    let unreferenced = if sweep_blocked {
+        Vec::new()
+    } else {
+        unreferenced_cas_actions(&state.cas, &[])?
+    };
+    #[cfg(debug_assertions)]
+    pause_after_cas_sweep_for_test(&state.paths.root)?;
+    let mut operation = state.operation_lock.lock().unwrap();
     let mut db = state.db.lock().unwrap();
     db.expire_leases()?;
     db.reconcile_contexts(&state.paths, &contexts)?;
@@ -1294,7 +1309,13 @@ fn run_gc(
         target_bytes,
     };
     let mut plan = gc::plan(&inputs)?;
-    append_unreferenced_cas(&mut plan, &state.cas, active_cache_lease)?;
+    if !active_cache_lease
+        && !sweep_blocked
+        && state.manifest_generation.load(Ordering::Acquire) == sweep_generation
+    {
+        plan.actions.extend(unreferenced);
+        plan.actions.sort_by_key(|action| action.tier);
+    }
     let cache_lru = db.cache_lru()?;
     drop(db);
     if dry_run {
@@ -1484,9 +1505,20 @@ fn run_gc(
                 }
             }
         }
-        if !current_cache_lease {
+        let post_sweep_generation = state.manifest_generation.load(Ordering::Acquire);
+        drop(_operation);
+        let post_candidates = if current_cache_lease {
+            Vec::new()
+        } else {
+            unreferenced_cas_actions(&state.cas, &[])?
+        };
+        let _operation = state.operation_lock.lock().unwrap();
+        let post_sweep_safe = !current_cache_lease
+            && !state.db.lock().unwrap().has_active_cache_lease()?
+            && state.manifest_generation.load(Ordering::Acquire) == post_sweep_generation;
+        if post_sweep_safe {
             let mut post = gc::Plan::default();
-            for action in unreferenced_cas_actions(&state.cas, &[])? {
+            for action in post_candidates {
                 if !plan
                     .actions
                     .iter()
@@ -1664,6 +1696,30 @@ fn pause_after_context_stage_for_test(victim: &Path) -> Result<()> {
 }
 
 /// Test the admission gap between the CAS inventory and its final checks.
+#[cfg(debug_assertions)]
+fn pause_after_cas_sweep_for_test(root: &Path) -> Result<()> {
+    use std::time::Instant;
+
+    let Some(marker) = std::env::var_os("RGO_TEST_CAS_SWEPT_MARKER") else {
+        return Ok(());
+    };
+    let marker = PathBuf::from(marker);
+    let release = PathBuf::from(
+        std::env::var_os("RGO_TEST_CAS_SWEPT_RELEASE")
+            .context("RGO_TEST_CAS_SWEPT_RELEASE is required with the marker")?,
+    );
+    std::fs::write(&marker, root.to_string_lossy().as_bytes())?;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !release.is_file() {
+        if Instant::now() >= deadline {
+            bail!("timed out at the CAS sweep test point");
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    Ok(())
+}
+
+/// Test the admission gap between manifest selection and its final checks.
 #[cfg(debug_assertions)]
 fn pause_after_cas_selection_for_test(victim: &Path) -> Result<()> {
     use std::time::Instant;
@@ -2847,6 +2903,7 @@ mod tests {
             cas,
             gc_lock: Arc::new(Mutex::new(())),
             operation_lock: Arc::new(Mutex::new(())),
+            manifest_generation: Arc::new(AtomicU64::new(0)),
             pin_pruner: Arc::new(Mutex::new(context::PinPruneScanner::default())),
             pending_scanner: Arc::new(Mutex::new(
                 crate::supervision::PendingMaintenanceScanner::default(),

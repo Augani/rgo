@@ -397,6 +397,141 @@ fn cas_selection_admits_a_late_lease_and_preserves_the_manifest() {
     assert!(report.skipped_execution_actions >= 1);
 }
 
+#[cfg(debug_assertions)]
+#[test]
+fn cas_sweep_ignores_an_object_committed_during_its_inventory() {
+    struct StopDaemon {
+        child: Child,
+        release: PathBuf,
+    }
+    impl Drop for StopDaemon {
+        fn drop(&mut self) {
+            let _ = std::fs::write(&self.release, b"release");
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+
+    let sb = Sandbox::new().unwrap();
+    let paths = rgo_core::paths::RgoPaths {
+        root: sb.rgo_home.clone(),
+    };
+    paths.ensure_layout().unwrap();
+    std::fs::write(paths.state_dir().join("storage-mode"), b"supervised\n").unwrap();
+    std::fs::write(
+        paths.state_dir().join("owner-cargo-home"),
+        format!("{}\n", sb.cargo_home.display()),
+    )
+    .unwrap();
+    std::fs::write(
+        paths.config_file(),
+        "[storage]\nmin_free_space = '0B'\n[cache]\nenabled = true\n",
+    )
+    .unwrap();
+    let cas = rgo_cas::Store::new(paths.cas_dir(), paths.quarantine_dir()).unwrap();
+    let object = cas.put_bytes(&vec![b'x'; 1024 * 1024], 0o444).unwrap();
+    let key = "d".repeat(64);
+    let marker = sb.home.join("cas-swept");
+    let release = sb.home.join("cas-sweep-release");
+    let mut daemon = StopDaemon {
+        child: sb
+            .cmd(cargo_bin("rgo"))
+            .args(["daemon", "--foreground"])
+            .env("RGO_TEST_CAS_SWEPT_MARKER", &marker)
+            .env("RGO_TEST_CAS_SWEPT_RELEASE", &release)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+        release,
+    };
+    let socket = paths.socket_path();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !matches!(
+        ipc::request_with_timeout(
+            &socket,
+            Request::QueryRemoteStatus,
+            Duration::from_millis(250)
+        ),
+        Ok(Response::RemoteStatus(_))
+    ) {
+        assert!(daemon.child.try_wait().unwrap().is_none());
+        assert!(Instant::now() < deadline, "daemon did not become ready");
+        thread::sleep(Duration::from_millis(25));
+    }
+    let gc_socket = socket.clone();
+    let gc = thread::spawn(move || {
+        ipc::request_with_timeout(
+            &gc_socket,
+            Request::TriggerGc {
+                dry_run: true,
+                aggressive: false,
+                auto: false,
+                target_bytes: Some(u64::MAX),
+            },
+            Duration::from_secs(45),
+        )
+    });
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !marker.is_file() {
+        assert!(daemon.child.try_wait().unwrap().is_none());
+        assert!(Instant::now() < deadline, "GC did not inventory CAS");
+        thread::sleep(Duration::from_millis(25));
+    }
+    let acquired = ipc::request_with_timeout(
+        &socket,
+        Request::CacheAcquire {
+            key: key.clone(),
+            pid: std::process::id(),
+            ttl_secs: 30,
+        },
+        Duration::from_secs(3),
+    )
+    .unwrap();
+    let Response::CacheProducer { lease_id, .. } = acquired else {
+        panic!("cache producer not admitted during CAS scan: {acquired:?}");
+    };
+    let committed = ipc::request_with_timeout(
+        &socket,
+        Request::CacheCommit {
+            key: key.clone(),
+            lease_id,
+            manifest: rgo_protocol::CacheManifest {
+                version: rgo_cas::MANIFEST_VERSION,
+                key: key.clone(),
+                outputs: vec![rgo_protocol::CacheOutput {
+                    kind: "rlib".into(),
+                    name: "libprobe.rlib".into(),
+                    object: rgo_protocol::CacheObject {
+                        digest: object.digest.clone(),
+                        size: object.size,
+                        mode: object.mode,
+                    },
+                }],
+                stdout: None,
+                stderr: None,
+                created_at: rgo_core::context::unix_now(),
+            },
+        },
+        Duration::from_secs(3),
+    )
+    .unwrap();
+    assert!(matches!(
+        committed,
+        Response::CacheCommitted { accepted: true }
+    ));
+    std::fs::write(&daemon.release, b"release").unwrap();
+    let Response::Gc(report) = gc.join().unwrap().unwrap() else {
+        panic!("GC did not return a report");
+    };
+    assert!(!report
+        .actions
+        .iter()
+        .any(|action| action.path == cas.object_path(&object.digest).to_string_lossy().as_ref()));
+    assert!(cas.manifest_path(&key).exists());
+    assert!(cas.object_path(&object.digest).exists());
+}
+
 #[test]
 fn manual_daemon_startup_preserves_legacy_pin_intent() {
     let sb = Sandbox::new().unwrap();
