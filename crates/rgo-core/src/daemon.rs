@@ -765,9 +765,13 @@ fn handle_request_result(state: &State, request: Request) -> Result<Response> {
             Ok(Response::Ok)
         }
         Request::QueryCacheStats => {
+            drain_cache_events(
+                &state.paths,
+                state.db.as_ref(),
+                &mut state.event_drainer.lock().unwrap(),
+            )?;
             let object_bytes = state.cas.object_bytes()?;
             let db = state.db.lock().unwrap();
-            drain_cache_events(&state.paths, &db, &mut state.event_drainer.lock().unwrap())?;
             let mut report = db.cache_stats(state.cfg.cache.enabled, object_bytes)?;
             report.remote = remote_status_from_db(state, &db)?;
             drop(db);
@@ -846,6 +850,11 @@ fn status_report(state: &State) -> Result<StatusReport> {
     let cache_revision = state.cas.manifest_revision();
     let cache_inventory = state.cas.list_manifests()?;
     reconcile_cache_inventory(state, cache_revision, &cache_inventory)?;
+    drain_cache_events(
+        &state.paths,
+        state.db.as_ref(),
+        &mut state.event_drainer.lock().unwrap(),
+    )?;
     // Pins and leases admitted during the scan are included in the database
     // snapshot below, before deriving any eligibility estimates.
     let _operation = state.operation_lock.lock().unwrap();
@@ -854,7 +863,6 @@ fn status_report(state: &State) -> Result<StatusReport> {
     db.expire_leases()?;
     db.prune_failed_cache_builds(Duration::from_secs(7 * 86_400))?;
     db.reconcile_contexts(&state.paths, &contexts)?;
-    drain_cache_events(&state.paths, &db, &mut state.event_drainer.lock().unwrap())?;
     let pinned = db.pinned_paths()?;
     let mut leased = db.protected_paths(&contexts)?;
     let stats = db.stats()?;
@@ -2358,13 +2366,17 @@ fn select_cas_manifests(
 }
 
 fn maintenance(state: &State) -> Result<()> {
+    drain_cache_events(
+        &state.paths,
+        state.db.as_ref(),
+        &mut state.event_drainer.lock().unwrap(),
+    )?;
     let migrated = {
         let _operation = state.operation_lock.lock().unwrap();
         let free_bytes = volume_free_bytes_checked(&state.paths.root)?;
         let db = state.db.lock().unwrap();
         db.expire_leases()?;
         db.prune_failed_cache_builds(Duration::from_secs(7 * 86_400))?;
-        drain_cache_events(&state.paths, &db, &mut state.event_drainer.lock().unwrap())?;
         db.prune_missing_cache_event_batches(
             &state.paths.state_dir(),
             &mut state.batch_prune_cursor.lock().unwrap(),
@@ -2728,9 +2740,34 @@ impl CacheEventDrainScanner {
     }
 }
 
+trait CacheEventRecorder {
+    fn record_batch(&self, name: &str, events: &[rgo_protocol::CacheEvent]) -> Result<()>;
+    fn forget_batch(&self, name: &str) -> Result<()>;
+}
+
+impl CacheEventRecorder for StateDb {
+    fn record_batch(&self, name: &str, events: &[rgo_protocol::CacheEvent]) -> Result<()> {
+        self.record_cache_event_batch(name, events)
+    }
+
+    fn forget_batch(&self, name: &str) -> Result<()> {
+        self.forget_cache_event_batch(name)
+    }
+}
+
+impl CacheEventRecorder for Mutex<StateDb> {
+    fn record_batch(&self, name: &str, events: &[rgo_protocol::CacheEvent]) -> Result<()> {
+        self.lock().unwrap().record_cache_event_batch(name, events)
+    }
+
+    fn forget_batch(&self, name: &str) -> Result<()> {
+        self.lock().unwrap().forget_cache_event_batch(name)
+    }
+}
+
 fn drain_cache_events(
     paths: &RgoPaths,
-    db: &StateDb,
+    db: &impl CacheEventRecorder,
     scanner: &mut CacheEventDrainScanner,
 ) -> Result<()> {
     let state = paths.state_dir();
@@ -2809,9 +2846,9 @@ fn drain_cache_events(
                 .file_name()
                 .and_then(|name| name.to_str())
                 .context("drained cache event filename is not UTF-8")?;
-            db.record_cache_event_batch(name, &events)?;
+            db.record_batch(name, &events)?;
             std::fs::remove_file(&drained)?;
-            if let Err(error) = db.forget_cache_event_batch(name) {
+            if let Err(error) = db.forget_batch(name) {
                 tracing::warn!(%error, name, "could not clear processed cache-event batch marker");
             }
             Ok(())
