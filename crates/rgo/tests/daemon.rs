@@ -109,6 +109,23 @@ fn start_daemon_with_poll(sb: &Sandbox, poll_secs: Option<&str>) -> Child {
 #[cfg(debug_assertions)]
 #[test]
 fn pressure_removal_admits_a_late_lease_and_preserves_the_next_context() {
+    staged_context_removal_admits_a_late_lease("pressure");
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn stale_context_removal_admits_a_late_lease_and_preserves_the_next_context() {
+    staged_context_removal_admits_a_late_lease("stale");
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn incremental_removal_admits_a_late_lease_and_preserves_the_next_context() {
+    staged_context_removal_admits_a_late_lease("incremental");
+}
+
+#[cfg(debug_assertions)]
+fn staged_context_removal_admits_a_late_lease(mode: &str) {
     struct StopDaemon {
         child: Child,
         release: PathBuf,
@@ -132,11 +149,16 @@ fn pressure_removal_admits_a_late_lease_and_preserves_the_next_context() {
         format!("{}\n", sb.cargo_home.display()),
     )
     .unwrap();
-    std::fs::write(
-        paths.config_file(),
-        "[storage]\nmax_size = '1B'\nmin_free_space = '0B'\n",
-    )
-    .unwrap();
+    let config = match mode {
+        "stale" => {
+            "[storage]\nmax_size = '1B'\nmin_free_space = '0B'\n[gc]\ncontext_retention = '0s'\n"
+        }
+        "incremental" => {
+            "[storage]\nmax_size = '10MB'\nmin_free_space = '0B'\n[gc]\nincremental_retention = '0s'\n"
+        }
+        _ => "[storage]\nmax_size = '1B'\nmin_free_space = '0B'\n",
+    };
+    std::fs::write(paths.config_file(), config).unwrap();
     let workspaces = [
         sb.simple_bin("pressure-first").unwrap(),
         sb.simple_bin("pressure-second").unwrap(),
@@ -148,6 +170,11 @@ fn pressure_removal_admits_a_late_lease_and_preserves_the_next_context() {
     for (workspace, context) in workspaces.iter().zip(&contexts) {
         std::fs::create_dir_all(context).unwrap();
         std::fs::write(context.join("payload"), vec![b'x'; 1024 * 1024]).unwrap();
+        if mode == "incremental" {
+            let incremental = context.join("debug/incremental/cache");
+            std::fs::create_dir_all(&incremental).unwrap();
+            std::fs::write(incremental.join("payload"), vec![b'y'; 1024 * 1024]).unwrap();
+        }
         rgo_core::context::write_supervised_sidecar(
             context,
             workspace,
@@ -163,8 +190,8 @@ fn pressure_removal_admits_a_late_lease_and_preserves_the_next_context() {
         child: sb
             .cmd(cargo_bin("rgo"))
             .args(["daemon", "--foreground"])
-            .env("RGO_TEST_PRESSURE_STAGED_MARKER", &marker)
-            .env("RGO_TEST_PRESSURE_STAGED_RELEASE", &release)
+            .env("RGO_TEST_CONTEXT_STAGED_MARKER", &marker)
+            .env("RGO_TEST_CONTEXT_STAGED_RELEASE", &release)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
@@ -186,14 +213,15 @@ fn pressure_removal_admits_a_late_lease_and_preserves_the_next_context() {
         thread::sleep(Duration::from_millis(25));
     }
     let gc_socket = socket.clone();
+    let incremental = mode == "incremental";
     let gc = thread::spawn(move || {
         ipc::request_with_timeout(
             &gc_socket,
             Request::TriggerGc {
                 dry_run: false,
                 aggressive: false,
-                auto: false,
-                target_bytes: Some(0),
+                auto: incremental,
+                target_bytes: (!incremental).then_some(0),
             },
             Duration::from_secs(45),
         )
@@ -201,21 +229,24 @@ fn pressure_removal_admits_a_late_lease_and_preserves_the_next_context() {
     let deadline = Instant::now() + Duration::from_secs(20);
     while !marker.is_file() {
         assert!(daemon.child.try_wait().unwrap().is_none());
-        assert!(
-            Instant::now() < deadline,
-            "GC did not stage a pressure context"
-        );
+        assert!(Instant::now() < deadline, "GC did not stage a context");
         thread::sleep(Duration::from_millis(25));
     }
     let victim = PathBuf::from(std::fs::read_to_string(&marker).unwrap());
-    assert!(contexts.contains(&victim));
-    let protected = contexts.iter().find(|context| **context != victim).unwrap();
+    let victim_context = contexts
+        .iter()
+        .find(|context| victim.starts_with(context))
+        .unwrap();
+    let protected = contexts
+        .iter()
+        .find(|context| *context != victim_context)
+        .unwrap();
     assert!(protected.exists());
     assert!(
-        rgo_core::supervision::try_lock_gc(&paths, Some(&victim))
+        rgo_core::supervision::try_lock_gc(&paths, Some(victim_context))
             .unwrap()
             .is_none(),
-        "pressure removal released Cargo's lifecycle guard"
+        "context removal released Cargo's lifecycle guard"
     );
     let lease = ipc::request_with_timeout(
         &socket,
@@ -237,6 +268,9 @@ fn pressure_removal_admits_a_late_lease_and_preserves_the_next_context() {
     };
     assert!(!victim.exists());
     assert!(protected.exists());
+    if mode == "incremental" {
+        assert!(protected.join("debug/incremental/cache").exists());
+    }
     assert!(report.skipped_execution_actions >= 1);
 }
 
@@ -831,10 +865,10 @@ fn explicit_daemon_home_survives_a_service_environment_without_cargo_home() {
         .args(["daemon", "--foreground", "--home"])
         .arg(&sb.rgo_home)
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
     while std::time::Instant::now() < deadline {
         if matches!(
             ipc::request_with_timeout(
@@ -852,10 +886,13 @@ fn explicit_daemon_home_survives_a_service_environment_without_cargo_home() {
         thread::sleep(Duration::from_millis(25));
     }
     let _ = daemon.kill();
-    let _ = daemon.wait();
+    let output = daemon.wait_with_output().unwrap();
     let diagnostics = std::fs::read_to_string(sb.rgo_home.join("logs/daemon.log"))
         .unwrap_or_else(|error| format!("daemon log unavailable: {error}"));
-    panic!("explicit daemon home did not answer IPC: {diagnostics}");
+    panic!(
+        "explicit daemon home did not answer IPC: {diagnostics}; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[test]

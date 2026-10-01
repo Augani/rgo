@@ -1220,11 +1220,11 @@ fn run_gc(
     }
     let _gc = state.gc_lock.lock().unwrap();
     let snapshot = crate::size::managed_snapshot(&state.paths)?;
-    // Only the initial inventory runs without the admission lock. Once held,
-    // every pin/lease/cache admission is ordered before the deletion plan or
-    // after its guarded execution. The GC lock excludes another daemon-owned
-    // deletion while this inventory is in progress.
-    let _operation = state.operation_lock.lock().unwrap();
+    // The initial inventory runs without the admission lock. Planning and
+    // staging run under that lock; context removal can release it while a
+    // stable Cargo lifecycle guard remains held. The GC lock excludes another
+    // daemon-owned deletion throughout the pass.
+    let mut operation = state.operation_lock.lock().unwrap();
     let managed_bytes = snapshot.total_bytes();
     let contexts = snapshot.contexts;
     let build_bytes = snapshot.build_bytes;
@@ -1317,7 +1317,19 @@ fn run_gc(
     };
     if !dry_run {
         let mut execution = gc::Execution::default();
-        match gc::execute(&state.paths, &plan, false) {
+        // Finish non-context cleanup first while admission is serialized.
+        // In particular, CAS objects selected from the initial reference
+        // inventory must not wait across the unlocked context-removal gaps.
+        let non_context_plan = gc::Plan {
+            actions: plan
+                .actions
+                .iter()
+                .filter(|action| !action.path.starts_with(state.paths.builds_dir()))
+                .cloned()
+                .collect(),
+            ..Default::default()
+        };
+        match gc::execute(&state.paths, &non_context_plan, false) {
             Ok(outcome) => execution.absorb(outcome),
             Err(error) => {
                 let message = format!("{error:#}");
@@ -1326,11 +1338,60 @@ fn run_gc(
                 return Err(error);
             }
         }
-        forget_removed_object_rows(state, &plan.actions)?;
+        forget_removed_object_rows(state, &non_context_plan.actions)?;
+        for action in plan
+            .actions
+            .iter()
+            .filter(|action| action.path.starts_with(state.paths.builds_dir()))
+        {
+            let Some(context) = contexts
+                .iter()
+                .find(|context| action.path.starts_with(&context.dir))
+            else {
+                let error = anyhow::anyhow!("planned build path has no inventoried context");
+                execution.note_skip(&action.path, action.bytes, &error);
+                continue;
+            };
+            let protected = {
+                let db = state.db.lock().unwrap();
+                same_path_in(&db.pinned_paths()?, &context.dir)
+                    || same_path_in(&db.protected_paths(&contexts)?, &context.dir)
+            };
+            if protected {
+                let error = anyhow::anyhow!("context gained a pin or lease during GC");
+                execution.note_skip(&action.path, action.bytes, &error);
+                continue;
+            }
+            match gc::stage_atomically(&state.paths, &action.path) {
+                Ok(staged) => {
+                    drop(operation);
+                    #[cfg(debug_assertions)]
+                    let pause = pause_after_context_stage_for_test(&action.path);
+                    let removed = staged.finish();
+                    operation = state.operation_lock.lock().unwrap();
+                    #[cfg(debug_assertions)]
+                    pause?;
+                    match removed {
+                        Ok(()) => {
+                            execution.reclaimed_bytes =
+                                execution.reclaimed_bytes.saturating_add(action.bytes);
+                        }
+                        Err(error) => {
+                            tracing::warn!(path = %action.path.display(), %error, "skipped context removal");
+                            execution.note_skip(&action.path, action.bytes, &error);
+                        }
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(path = %action.path.display(), %error, "skipped context removal");
+                    execution.note_skip(&action.path, action.bytes, &error);
+                }
+            }
+        }
         // The first deletion phase is complete. Measure outside the admission
         // lock, then refresh cache protections before considering manifests:
         // a producer, consumer, or upload may have been admitted meanwhile.
-        drop(_operation);
+        drop(operation);
         let remaining = crate::size::managed_snapshot(&state.paths)?;
         let _operation = state.operation_lock.lock().unwrap();
         let (cache_lru, active_cache_keys, active_cache_lease) = {
@@ -1468,7 +1529,7 @@ fn run_gc(
                     Ok(staged) => {
                         drop(operation);
                         #[cfg(debug_assertions)]
-                        let pause = pause_after_pressure_stage_for_test(&action.path);
+                        let pause = pause_after_context_stage_for_test(&action.path);
                         let removed = staged.finish();
                         operation = state.operation_lock.lock().unwrap();
                         #[cfg(debug_assertions)]
@@ -1529,19 +1590,19 @@ fn run_gc(
     Ok(report)
 }
 
-/// Debug-only pause after pressure staging. The operation lock is released,
+/// Debug-only pause after context staging. The operation lock is released,
 /// but StagedRemoval still owns Cargo's lifecycle guard until finish returns.
 #[cfg(debug_assertions)]
-fn pause_after_pressure_stage_for_test(victim: &Path) -> Result<()> {
+fn pause_after_context_stage_for_test(victim: &Path) -> Result<()> {
     use std::time::Instant;
 
-    let Some(marker) = std::env::var_os("RGO_TEST_PRESSURE_STAGED_MARKER") else {
+    let Some(marker) = std::env::var_os("RGO_TEST_CONTEXT_STAGED_MARKER") else {
         return Ok(());
     };
     let marker = PathBuf::from(marker);
     let release = PathBuf::from(
-        std::env::var_os("RGO_TEST_PRESSURE_STAGED_RELEASE")
-            .context("RGO_TEST_PRESSURE_STAGED_RELEASE is required with the marker")?,
+        std::env::var_os("RGO_TEST_CONTEXT_STAGED_RELEASE")
+            .context("RGO_TEST_CONTEXT_STAGED_RELEASE is required with the marker")?,
     );
     let staging = marker.with_extension("tmp");
     std::fs::write(&staging, victim.to_string_lossy().as_bytes())?;
@@ -1549,7 +1610,7 @@ fn pause_after_pressure_stage_for_test(victim: &Path) -> Result<()> {
     let deadline = Instant::now() + Duration::from_secs(30);
     while !release.is_file() {
         if Instant::now() >= deadline {
-            bail!("timed out at the staged pressure cleanup test point");
+            bail!("timed out at the staged context cleanup test point");
         }
         thread::sleep(Duration::from_millis(10));
     }
