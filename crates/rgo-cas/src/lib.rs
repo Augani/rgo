@@ -41,6 +41,30 @@ pub struct Store {
     quarantine: PathBuf,
 }
 
+/// A verified, synced manifest waiting for its final atomic publication.
+/// The staging lock remains held until publication or cancellation.
+pub struct PreparedManifest {
+    path: PathBuf,
+    temp: PathBuf,
+    _publication: File,
+}
+
+impl PreparedManifest {
+    pub fn publish(self) -> Result<()> {
+        match fs::rename(&self.temp, &self.path) {
+            Ok(()) => Ok(()),
+            Err(_error) if self.path.is_file() => Ok(()),
+            Err(error) => Err(error.into()),
+        }
+    }
+}
+
+impl Drop for PreparedManifest {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.temp);
+    }
+}
+
 impl Store {
     pub fn new(root: impl Into<PathBuf>, quarantine: impl Into<PathBuf>) -> Result<Self> {
         let store = Self {
@@ -156,6 +180,10 @@ impl Store {
     }
 
     pub fn write_manifest(&self, manifest: &Manifest) -> Result<()> {
+        self.prepare_manifest(manifest)?.publish()
+    }
+
+    pub fn prepare_manifest(&self, manifest: &Manifest) -> Result<PreparedManifest> {
         if !valid_key(&manifest.key) {
             bail!("invalid cache key")
         }
@@ -171,29 +199,22 @@ impl Store {
         if let Some(stderr) = &manifest.stderr {
             self.verify_object(stderr)?;
         }
-        let path = self.manifest_path(&manifest.key);
-        let _publication = self.lock_staging_publication()?;
-        let temp = self.temp_path("manifest");
+        let publication = self.lock_staging_publication()?;
+        let prepared = PreparedManifest {
+            path: self.manifest_path(&manifest.key),
+            temp: self.temp_path("manifest"),
+            _publication: publication,
+        };
         let bytes = serde_json::to_vec_pretty(manifest)?;
         {
             let mut file = OpenOptions::new()
                 .write(true)
                 .create_new(true)
-                .open(&temp)?;
+                .open(&prepared.temp)?;
             file.write_all(&bytes)?;
             file.sync_all()?;
         }
-        match fs::rename(&temp, &path) {
-            Ok(()) => Ok(()),
-            Err(_error) if path.is_file() => {
-                let _ = fs::remove_file(temp);
-                Ok(())
-            }
-            Err(error) => {
-                let _ = fs::remove_file(temp);
-                Err(error.into())
-            }
-        }
+        Ok(prepared)
     }
 
     pub fn read_manifest(&self, key: &str) -> Result<Option<Manifest>> {
@@ -406,6 +427,32 @@ mod tests {
         assert_eq!(
             store.read_manifest(&"a".repeat(64)).unwrap(),
             Some(manifest)
+        );
+        let mut staged_manifest = store.read_manifest(&"a".repeat(64)).unwrap().unwrap();
+        staged_manifest.key = "b".repeat(64);
+        let prepared = store.prepare_manifest(&staged_manifest).unwrap();
+        assert!(!store.manifest_path(&staged_manifest.key).exists());
+        drop(prepared);
+        assert!(!store.manifest_path(&staged_manifest.key).exists());
+        assert_eq!(
+            fs::read_dir(store.root())
+                .unwrap()
+                .filter_map(|entry| entry.ok())
+                .filter(|entry| entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".manifest."))
+                .count(),
+            0
+        );
+        store
+            .prepare_manifest(&staged_manifest)
+            .unwrap()
+            .publish()
+            .unwrap();
+        assert_eq!(
+            store.read_manifest(&staged_manifest.key).unwrap(),
+            Some(staged_manifest)
         );
         assert!(store.read_manifest("../../outside").is_err());
         let mut unsafe_manifest = store.read_manifest(&"a".repeat(64)).unwrap().unwrap();

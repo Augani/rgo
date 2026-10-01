@@ -751,6 +751,19 @@ impl StateDb {
         Ok(changed != 0)
     }
 
+    pub fn remote_fetch_is_current(&self, key: &str, lease_id: u64) -> Result<bool> {
+        let current: i64 = self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM cache_builds b JOIN leases l
+             ON l.lease_id = b.owner_lease_id
+             WHERE b.key = ?1 AND b.state = 'REMOTE_FETCHING'
+               AND b.owner_lease_id = ?2 AND b.expires_at > ?3
+               AND l.scope = 'cache_remote' AND l.expires_at > ?3)",
+            params![key, lease_id as i64, unix_now()],
+            |row| row.get(0),
+        )?;
+        Ok(current != 0)
+    }
+
     /// Make a failed remote fetch immediately available to the normal local producer path.
     pub fn remote_fetch_fallback(&self, key: &str, lease_id: u64, reason: &str) -> Result<()> {
         let transaction = self.connection.unchecked_transaction()?;
@@ -989,6 +1002,18 @@ impl StateDb {
                 ))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    pub fn cache_last_used(&self, key: &str) -> Result<Option<u64>> {
+        self.connection
+            .query_row(
+                "SELECT last_used FROM cache_entries WHERE key = ?1",
+                params![key],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map(|value| value.map(|at| at.max(0) as u64))
             .map_err(Into::into)
     }
 
@@ -2122,6 +2147,31 @@ mod tests {
             )
             .unwrap();
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn expired_remote_fetch_cannot_publish_a_manifest() {
+        let root = tempdir().unwrap();
+        let paths = RgoPaths {
+            root: root.path().join("rgo"),
+        };
+        paths.ensure_layout().unwrap();
+        let db = StateDb::open(&paths).unwrap();
+        let lease_id = match db
+            .acquire_remote_fetch("key", std::process::id(), 30)
+            .unwrap()
+        {
+            RemoteFetchDecision::Started { lease_id } => lease_id,
+            decision => panic!("expected a new remote fetch, got {decision:?}"),
+        };
+        assert!(db.remote_fetch_is_current("key", lease_id).unwrap());
+        db.connection
+            .execute(
+                "UPDATE leases SET expires_at = 0 WHERE lease_id = ?1",
+                params![lease_id as i64],
+            )
+            .unwrap();
+        assert!(!db.remote_fetch_is_current("key", lease_id).unwrap());
     }
 
     #[test]

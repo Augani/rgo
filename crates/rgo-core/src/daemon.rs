@@ -1128,9 +1128,31 @@ fn remote_fetch_worker_result(state: &State, key: &str, lease_id: u64) -> Result
             .unwrap()
             .record_remote_counter("download", bytes.len() as u64)?;
     }
-    state.cas.write_manifest(&manifest)?;
-    let wire = wire_manifest(&manifest);
+    // Verify objects and sync the staging file before taking the admission
+    // lock. Only the final rename and index update need to be ordered with
+    // GC; a fetch may also have lost its lease while doing that slow work.
+    let prepared = match state.cas.prepare_manifest(&manifest) {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            state.db.lock().unwrap().remote_fetch_fallback(
+                key,
+                lease_id,
+                &format!("publish: {error:#}"),
+            )?;
+            return Err(error);
+        }
+    };
+    let _operation = state.operation_lock.lock().unwrap();
     let db = state.db.lock().unwrap();
+    if !db.remote_fetch_is_current(key, lease_id)? {
+        db.remote_fetch_fallback(key, lease_id, "remote_fetch_lease_expired")?;
+        return Ok(());
+    }
+    if let Err(error) = prepared.publish() {
+        db.remote_fetch_fallback(key, lease_id, &format!("publish: {error:#}"))?;
+        return Err(error);
+    }
+    let wire = wire_manifest(&manifest);
     db.record_cache_manifest(&wire, &state.cas.manifest_path(key))?;
     db.record_remote_counter("hit", manifest_bytes.len() as u64)?;
     db.record_remote_counter("download", manifest_bytes.len() as u64)?;
@@ -1393,8 +1415,8 @@ fn run_gc(
         // a producer, consumer, or upload may have been admitted meanwhile.
         drop(operation);
         let remaining = crate::size::managed_snapshot(&state.paths)?;
-        let _operation = state.operation_lock.lock().unwrap();
         let (cache_lru, active_cache_keys, active_cache_lease) = {
+            let _operation = state.operation_lock.lock().unwrap();
             let db = state.db.lock().unwrap();
             (
                 db.cache_lru()?,
@@ -1422,9 +1444,32 @@ fn run_gc(
             state.cfg.gc.cache_retention,
             crate::context::unix_now(),
         )?;
+        #[cfg(debug_assertions)]
+        if let Some(item) = selected.first() {
+            pause_after_cas_selection_for_test(&item.action.path)?;
+        }
+        // Selection may enumerate every CAS manifest and referenced object.
+        // Admission remains open during that walk; refresh all protections
+        // and verify each selected manifest after reacquiring the lock.
+        let _operation = state.operation_lock.lock().unwrap();
+        let (current_cache_keys, current_cache_lease) = {
+            let db = state.db.lock().unwrap();
+            (db.active_cache_keys()?, db.has_active_cache_lease()?)
+        };
+        if current_cache_lease {
+            report.cas_eviction_deferred_bytes =
+                report.cas_eviction_deferred_bytes.max(remaining.cas_bytes);
+        }
         for item in selected {
             report.planned_bytes = report.planned_bytes.saturating_add(item.action.bytes);
             report.actions.push(wire_gc_action(&item.action));
+            if let Err(error) =
+                can_evict_cas_manifest(state, &item, &current_cache_keys, current_cache_lease)
+            {
+                tracing::debug!(key = %item.key, %error, "CAS manifest changed during GC selection");
+                execution.note_skip(&item.action.path, item.action.bytes, &error);
+                continue;
+            }
             match gc::remove_atomically(&state.paths, &item.action.path) {
                 Ok(()) => {
                     execution.reclaimed_bytes =
@@ -1439,7 +1484,7 @@ fn run_gc(
                 }
             }
         }
-        if !active_cache_lease {
+        if !current_cache_lease {
             let mut post = gc::Plan::default();
             for action in unreferenced_cas_actions(&state.cas, &[])? {
                 if !plan
@@ -1612,6 +1657,30 @@ fn pause_after_context_stage_for_test(victim: &Path) -> Result<()> {
     while !release.is_file() {
         if Instant::now() >= deadline {
             bail!("timed out at the staged context cleanup test point");
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    Ok(())
+}
+
+/// Test the admission gap between the CAS inventory and its final checks.
+#[cfg(debug_assertions)]
+fn pause_after_cas_selection_for_test(victim: &Path) -> Result<()> {
+    use std::time::Instant;
+
+    let Some(marker) = std::env::var_os("RGO_TEST_CAS_SELECTED_MARKER") else {
+        return Ok(());
+    };
+    let marker = PathBuf::from(marker);
+    let release = PathBuf::from(
+        std::env::var_os("RGO_TEST_CAS_SELECTED_RELEASE")
+            .context("RGO_TEST_CAS_SELECTED_RELEASE is required with the marker")?,
+    );
+    std::fs::write(&marker, victim.to_string_lossy().as_bytes())?;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !release.is_file() {
+        if Instant::now() >= deadline {
+            bail!("timed out at the CAS selection test point");
         }
         thread::sleep(Duration::from_millis(10));
     }
@@ -1849,7 +1918,45 @@ fn unreferenced_cas_actions(cas: &Store, excluded_manifests: &[String]) -> Resul
 
 struct CasManifestEviction {
     key: String,
+    manifest: Manifest,
+    indexed_last_used: Option<u64>,
     action: gc::Action,
+}
+
+fn unchanged_cas_manifest(item: &CasManifestEviction) -> Result<bool> {
+    let metadata = std::fs::symlink_metadata(&item.action.path)?;
+    anyhow::ensure!(
+        metadata.is_file() && !metadata.file_type().is_symlink(),
+        "unsafe CAS manifest {}",
+        item.action.path.display()
+    );
+    let bytes = std::fs::read(&item.action.path)?;
+    Ok(serde_json::from_slice::<Manifest>(&bytes)? == item.manifest)
+}
+
+/// Called only while the daemon admission lock is held. The selected manifest
+/// may have been touched, replaced, or protected during the unlocked scan.
+fn can_evict_cas_manifest(
+    state: &State,
+    item: &CasManifestEviction,
+    protected_keys: &[String],
+    active_cache_lease: bool,
+) -> Result<()> {
+    anyhow::ensure!(!active_cache_lease, "active cache publication or consumer");
+    anyhow::ensure!(
+        !protected_keys.contains(&item.key),
+        "running upload protects CAS manifest"
+    );
+    let indexed_last_used = state.db.lock().unwrap().cache_last_used(&item.key)?;
+    anyhow::ensure!(
+        indexed_last_used == item.indexed_last_used,
+        "CAS manifest use changed during GC selection"
+    );
+    anyhow::ensure!(
+        unchanged_cas_manifest(item)?,
+        "CAS manifest was replaced during GC selection"
+    );
+    Ok(())
 }
 
 fn select_cas_manifests(
@@ -1901,9 +2008,8 @@ fn select_cas_manifests(
         if protected.contains(manifest.key.as_str()) {
             continue;
         }
-        let used = last_used
-            .get(manifest.key.as_str())
-            .copied()
+        let indexed_last_used = last_used.get(manifest.key.as_str()).copied();
+        let used = indexed_last_used
             .filter(|at| *at > 0)
             .unwrap_or(manifest.created_at);
         let expired = now.saturating_sub(used) >= retention.as_secs();
@@ -1928,7 +2034,9 @@ fn select_cas_manifests(
             }
         }
         selected.push(CasManifestEviction {
-            key: manifest.key,
+            key: manifest.key.clone(),
+            indexed_last_used,
+            manifest,
             action: gc::Action {
                 tier: gc::Tier::Pressure,
                 path,
