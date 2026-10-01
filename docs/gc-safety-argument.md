@@ -43,6 +43,8 @@ rgo cleanup now rejects known Linux NFS/SMB/CIFS types, macOS non-local
 volumes, and Windows remote drives; a failed volume query also blocks it.
 Supervised setup with `gc.auto = true` performs this volume check before
 writing activation state, and doctor exposes the result independently.
+The GC executor repeats the check immediately before staging each deletion;
+this narrows, but cannot eliminate, a mount change between check and rename.
 This is a conservative exclusion, not proof that every unusual filesystem is
 local or that its lock semantics are suitable for automatic deletion.
 Undo removes the active owner record, so a retained storage root cannot be

@@ -503,6 +503,9 @@ fn stage_atomically_with(
         anyhow::bail!("live Cargo build lock detected near {}", victim.display());
     }
     validate_managed_directory(&paths.tmp_dir())?;
+    // Planning may have taken time. Recheck the storage mount at the last
+    // possible point before moving a victim into the deletion staging area.
+    crate::paths::check_local_cleanup_volume(&paths.root)?;
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
