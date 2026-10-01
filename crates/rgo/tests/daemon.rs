@@ -647,6 +647,13 @@ fn cas_sweep_ignores_an_object_committed_during_its_inventory() {
         .any(|action| action.path == cas.object_path(&object.digest).to_string_lossy().as_ref()));
     assert!(cas.manifest_path(&key).exists());
     assert!(cas.object_path(&object.digest).exists());
+    let stats =
+        ipc::request_with_timeout(&socket, Request::QueryCacheStats, Duration::from_secs(3))
+            .unwrap();
+    let Response::CacheStats(stats) = stats else {
+        panic!("cache stats unavailable after concurrent publication: {stats:?}");
+    };
+    assert_eq!(stats.manifests, 1);
 }
 
 #[test]

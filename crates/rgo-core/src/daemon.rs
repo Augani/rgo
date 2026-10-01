@@ -6,7 +6,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -109,9 +109,6 @@ struct State {
     // and lease admission during the initial filesystem walk.
     gc_lock: Arc<Mutex<()>>,
     operation_lock: Arc<Mutex<()>>,
-    // Publications are ordered with GC by operation_lock. A scan done without
-    // that lock is only safe to sweep if no manifest was published meanwhile.
-    manifest_generation: Arc<AtomicU64>,
     pin_pruner: Arc<Mutex<context::PinPruneScanner>>,
     pending_scanner: Arc<Mutex<crate::supervision::PendingMaintenanceScanner>>,
     trigger_scan: Arc<Mutex<crate::size::TriggerScan>>,
@@ -255,7 +252,6 @@ pub fn run(paths: RgoPaths, cfg: Resolved) -> Result<()> {
         cas,
         gc_lock: Arc::new(Mutex::new(())),
         operation_lock: Arc::new(Mutex::new(())),
-        manifest_generation: Arc::new(AtomicU64::new(0)),
         pin_pruner: Arc::new(Mutex::new(context::PinPruneScanner::default())),
         pending_scanner: Arc::new(Mutex::new(
             crate::supervision::PendingMaintenanceScanner::default(),
@@ -730,7 +726,6 @@ fn handle_request_result(state: &State, request: Request) -> Result<Response> {
                 db.fail_cache_build(&key, lease_id, &format!("publish: {error:#}"))?;
                 return Err(error);
             }
-            state.manifest_generation.fetch_add(1, Ordering::AcqRel);
             db.record_cache_manifest(
                 &wire_manifest(&manifest),
                 &state.cas.manifest_path(&manifest.key),
@@ -838,6 +833,8 @@ fn handle_request_result(state: &State, request: Request) -> Result<Response> {
 fn status_report(state: &State) -> Result<StatusReport> {
     let _gc = state.gc_lock.lock().unwrap();
     let snapshot = crate::size::managed_snapshot(&state.paths)?;
+    let cache_revision = state.cas.manifest_revision();
+    let cache_inventory = state.cas.list_manifests()?;
     // Pins and leases admitted during the scan are included in the database
     // snapshot below, before deriving any eligibility estimates.
     let _operation = state.operation_lock.lock().unwrap();
@@ -846,7 +843,9 @@ fn status_report(state: &State) -> Result<StatusReport> {
     db.expire_leases()?;
     db.prune_failed_cache_builds(Duration::from_secs(7 * 86_400))?;
     db.reconcile_contexts(&state.paths, &contexts)?;
-    reconcile_cache(&mut db, &state.cas)?;
+    state.cas.with_manifest_revision(cache_revision, || {
+        reconcile_cache_manifests(&mut db, &state.cas, &cache_inventory)
+    })?;
     drain_cache_events(&state.paths, &db, &mut state.event_drainer.lock().unwrap())?;
     let pinned = db.pinned_paths()?;
     let mut leased = db.protected_paths(&contexts)?;
@@ -1157,7 +1156,6 @@ fn remote_fetch_worker_result(state: &State, key: &str, lease_id: u64) -> Result
         db.remote_fetch_fallback(key, lease_id, &format!("publish: {error:#}"))?;
         return Err(error);
     }
-    state.manifest_generation.fetch_add(1, Ordering::AcqRel);
     let wire = wire_manifest(&manifest);
     db.record_cache_manifest(&wire, &state.cas.manifest_path(key))?;
     db.record_remote_counter("hit", manifest_bytes.len() as u64)?;
@@ -1276,7 +1274,7 @@ fn run_gc(
             ..Default::default()
         });
     }
-    let sweep_generation = state.manifest_generation.load(Ordering::Acquire);
+    let sweep_generation = state.cas.manifest_revision();
     let sweep_blocked = state.db.lock().unwrap().has_active_cache_lease()?;
     drop(operation);
     let unreferenced = if sweep_blocked {
@@ -1284,13 +1282,17 @@ fn run_gc(
     } else {
         unreferenced_cas_actions(&state.cas, &[])?
     };
+    let cache_revision = state.cas.manifest_revision();
+    let cache_inventory = state.cas.list_manifests()?;
     #[cfg(debug_assertions)]
     pause_after_cas_sweep_for_test(&state.paths.root)?;
     let operation = state.operation_lock.lock().unwrap();
     let mut db = state.db.lock().unwrap();
     db.expire_leases()?;
     db.reconcile_contexts(&state.paths, &contexts)?;
-    reconcile_cache(&mut db, &state.cas)?;
+    state.cas.with_manifest_revision(cache_revision, || {
+        reconcile_cache_manifests(&mut db, &state.cas, &cache_inventory)
+    })?;
     let pinned = db.pinned_paths()?;
     let leased = db.protected_paths(&contexts)?;
     drop(db);
@@ -1326,10 +1328,7 @@ fn run_gc(
     let active_cache_lease = db.has_active_cache_lease()?;
     let cache_lru = db.cache_lru()?;
     drop(db);
-    if !active_cache_lease
-        && !sweep_blocked
-        && state.manifest_generation.load(Ordering::Acquire) == sweep_generation
-    {
+    if !active_cache_lease && !sweep_blocked && state.cas.manifest_revision() == sweep_generation {
         plan.actions.extend(unreferenced);
         plan.actions.sort_by_key(|action| action.tier);
     }
@@ -1525,7 +1524,7 @@ fn run_gc(
                 }
             }
         }
-        let post_sweep_generation = state.manifest_generation.load(Ordering::Acquire);
+        let post_sweep_generation = state.cas.manifest_revision();
         drop(_operation);
         let post_candidates = if current_cache_lease {
             Vec::new()
@@ -1535,7 +1534,7 @@ fn run_gc(
         let _operation = state.operation_lock.lock().unwrap();
         let post_sweep_safe = !current_cache_lease
             && !state.db.lock().unwrap().has_active_cache_lease()?
-            && state.manifest_generation.load(Ordering::Acquire) == post_sweep_generation;
+            && state.cas.manifest_revision() == post_sweep_generation;
         if post_sweep_safe {
             let mut post = gc::Plan::default();
             for action in post_candidates {
@@ -2338,6 +2337,10 @@ fn process_remote_jobs(state: &State) -> Result<()> {
 
 fn reconcile_cache(db: &mut StateDb, cas: &Store) -> Result<()> {
     let manifests = cas.list_manifests()?;
+    reconcile_cache_manifests(db, cas, &manifests)
+}
+
+fn reconcile_cache_manifests(db: &mut StateDb, cas: &Store, manifests: &[Manifest]) -> Result<()> {
     let present = manifests
         .iter()
         .map(|manifest| manifest.key.as_str())
@@ -2348,7 +2351,7 @@ fn reconcile_cache(db: &mut StateDb, cas: &Store) -> Result<()> {
         }
     }
     for manifest in manifests {
-        db.record_cache_manifest(&wire_manifest(&manifest), &cas.manifest_path(&manifest.key))?;
+        db.record_cache_manifest(&wire_manifest(manifest), &cas.manifest_path(&manifest.key))?;
     }
     Ok(())
 }
@@ -2956,7 +2959,6 @@ mod tests {
             cas,
             gc_lock: Arc::new(Mutex::new(())),
             operation_lock: Arc::new(Mutex::new(())),
-            manifest_generation: Arc::new(AtomicU64::new(0)),
             pin_pruner: Arc::new(Mutex::new(context::PinPruneScanner::default())),
             pending_scanner: Arc::new(Mutex::new(
                 crate::supervision::PendingMaintenanceScanner::default(),

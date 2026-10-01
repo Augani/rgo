@@ -3,6 +3,8 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
@@ -39,6 +41,8 @@ pub struct Manifest {
 pub struct Store {
     root: PathBuf,
     quarantine: PathBuf,
+    manifest_revision: Arc<AtomicU64>,
+    manifest_mutation: Arc<Mutex<()>>,
 }
 
 /// A verified, synced manifest waiting for its final atomic publication.
@@ -46,13 +50,19 @@ pub struct Store {
 pub struct PreparedManifest {
     path: PathBuf,
     temp: PathBuf,
+    manifest_revision: Arc<AtomicU64>,
+    manifest_mutation: Arc<Mutex<()>>,
     _publication: File,
 }
 
 impl PreparedManifest {
     pub fn publish(self) -> Result<()> {
+        let _mutation = self.manifest_mutation.lock().unwrap();
         match fs::rename(&self.temp, &self.path) {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                self.manifest_revision.fetch_add(1, Ordering::AcqRel);
+                Ok(())
+            }
             Err(error) => {
                 // Some platforms cannot replace an existing file with rename.
                 // Treat that as an idempotent publication only when its bytes
@@ -66,6 +76,7 @@ impl PreparedManifest {
                         (Ok(existing), Ok(staged)) if existing == staged
                     );
                 if identical {
+                    self.manifest_revision.fetch_add(1, Ordering::AcqRel);
                     Ok(())
                 } else {
                     Err(error)
@@ -87,6 +98,8 @@ impl Store {
         let store = Self {
             root: root.into(),
             quarantine: quarantine.into(),
+            manifest_revision: Arc::new(AtomicU64::new(0)),
+            manifest_mutation: Arc::new(Mutex::new(())),
         };
         fs::create_dir_all(&store.root)?;
         open_staging_lock(&store.root)?;
@@ -98,6 +111,27 @@ impl Store {
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// Changes made through this store while the daemon is running. Clone
+    /// instances share the counter; other processes must not publish manifests.
+    pub fn manifest_revision(&self) -> u64 {
+        self.manifest_revision.load(Ordering::Acquire)
+    }
+
+    /// Apply an inventory only while its revision is still current. The
+    /// callback must not publish or remove a manifest through this store.
+    pub fn with_manifest_revision(
+        &self,
+        expected: u64,
+        apply: impl FnOnce() -> Result<()>,
+    ) -> Result<bool> {
+        let _mutation = self.manifest_mutation.lock().unwrap();
+        if self.manifest_revision() != expected {
+            return Ok(false);
+        }
+        apply()?;
+        Ok(true)
     }
 
     pub fn object_path(&self, digest: &str) -> PathBuf {
@@ -220,6 +254,8 @@ impl Store {
         let prepared = PreparedManifest {
             path: self.manifest_path(&manifest.key),
             temp: self.temp_path("manifest"),
+            manifest_revision: self.manifest_revision.clone(),
+            manifest_mutation: self.manifest_mutation.clone(),
             _publication: publication,
         };
         let bytes = serde_json::to_vec_pretty(manifest)?;
@@ -242,7 +278,8 @@ impl Store {
         if !path.is_file() {
             return Ok(None);
         }
-        let manifest: Manifest = serde_json::from_slice(&fs::read(&path)?)
+        let bytes = fs::read(&path)?;
+        let manifest: Manifest = serde_json::from_slice(&bytes)
             .with_context(|| format!("parsing {}", path.display()))?;
         if manifest.version != MANIFEST_VERSION
             || manifest.key != key
@@ -258,7 +295,14 @@ impl Store {
             .chain(manifest.stderr.iter());
         for object in objects {
             if let Err(error) = self.verify_object(object) {
-                let _ = fs::remove_file(&path);
+                let _mutation = self.manifest_mutation.lock().unwrap();
+                // A different publisher may have replaced this manifest while
+                // object verification ran. Never remove its newer bytes.
+                if fs::read(&path).ok().as_deref() == Some(bytes.as_slice())
+                    && fs::remove_file(&path).is_ok()
+                {
+                    self.manifest_revision.fetch_add(1, Ordering::AcqRel);
+                }
                 return Err(error);
             }
         }
@@ -272,7 +316,12 @@ impl Store {
             if path.extension().and_then(|v| v.to_str()) != Some("json") {
                 continue;
             }
-            match serde_json::from_slice::<Manifest>(&fs::read(&path)?) {
+            let bytes = match fs::read(&path) {
+                Ok(bytes) => bytes,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error).context("reading CAS manifest"),
+            };
+            match serde_json::from_slice::<Manifest>(&bytes) {
                 Ok(manifest)
                     if manifest.version == MANIFEST_VERSION
                         && valid_key(&manifest.key)
@@ -440,7 +489,9 @@ mod tests {
             stderr: None,
             created_at: 1,
         };
+        assert_eq!(store.manifest_revision(), 0);
         store.write_manifest(&manifest).unwrap();
+        assert_eq!(store.clone().manifest_revision(), 1);
         assert_eq!(
             store.read_manifest(&"a".repeat(64)).unwrap(),
             Some(manifest)
@@ -469,7 +520,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             store.read_manifest(&staged_manifest.key).unwrap(),
-            Some(staged_manifest)
+            Some(staged_manifest.clone())
         );
         let mut replacement = store.read_manifest(&"a".repeat(64)).unwrap().unwrap();
         replacement.created_at = 2;
@@ -495,6 +546,19 @@ mod tests {
         let mut unsafe_manifest = store.read_manifest(&"a".repeat(64)).unwrap().unwrap();
         unsafe_manifest.key = "../../outside".into();
         assert!(store.write_manifest(&unsafe_manifest).is_err());
+        let revision = store.manifest_revision();
+        let object_path = store.object_path(&object.digest);
+        #[cfg(windows)]
+        #[allow(clippy::permissions_set_readonly_false)]
+        {
+            let mut permissions = fs::metadata(&object_path).unwrap().permissions();
+            permissions.set_readonly(false);
+            fs::set_permissions(&object_path, permissions).unwrap();
+        }
+        fs::remove_file(&object_path).unwrap();
+        assert!(store.read_manifest(&staged_manifest.key).is_err());
+        assert!(!store.manifest_path(&staged_manifest.key).exists());
+        assert_eq!(store.manifest_revision(), revision + 1);
     }
 
     #[test]
