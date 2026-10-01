@@ -207,8 +207,13 @@ source installation still require publication in dependency order. The
 checkout initially had no Git remote and its declared repository URL was
 unavailable. On 2026-09-28 an owned public [Augani/rgo](https://github.com/Augani/rgo)
 repository was created and configured as `origin`. The guarded implementation
-was subsequently pushed to `master`; public CI and release artifact verification
-remain open.
+was subsequently pushed to `master`. The [15-job public CI matrix](https://github.com/Augani/rgo/actions/runs/36799141501)
+passed on Linux, macOS, and Windows, including the Cargo 1.91 supervised
+clean-and-pin probe. A [branch-only release run](https://github.com/Augani/rgo/actions/runs/36798553223)
+built all four platform archives and the complete bundle; a downloaded copy
+passed all six SHA-256 checks and all six workflow/source-commit attestation
+checks. A tagged release, public installer endpoint, clean-machine bootstrap,
+and unattended-GC safety remain unverified.
 
 Service ownership follow-up: the original fixed launchd/systemd/Task Scheduler
 name let distinct storage roots contend for one per-user registration. The
