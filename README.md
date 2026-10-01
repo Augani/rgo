@@ -162,6 +162,8 @@ Run `rgo doctor --json` from a project to see build-directory overrides in
 its current-directory config chain and any direct project target-directory
 setting. `doctor --verify` tests a disposable project, so it checks installation
 activation rather than that project's effective build location.
+Its version-2 JSON reports `activation_verified` separately from nullable
+`profile_locks_observed`; an observed lock does not establish safe unattended GC.
 
 `RGO_BYPASS=1` bypasses rgo's wrapper behavior; it does not disable Cargo's
 configured build directory or a running maintenance service. To put one project

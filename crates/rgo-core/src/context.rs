@@ -63,8 +63,9 @@ impl BuildContext {
         now.duration_since(self.last_used).unwrap_or_default()
     }
 
-    /// Cargo holds `<build-dir>/<profile>/.cargo-build-lock` for the duration of a build.
-    /// Planning protects recent, held, or uninspectable locks; deletion repeats
+    /// Some Cargo versions create `<build-dir>/<profile>/.cargo-build-lock`.
+    /// Planning protects recent, held, or uninspectable documented locks;
+    /// absence is not proof that a Cargo session is idle. Deletion repeats
     /// the held-lock check after taking its stable context guard.
     pub fn recently_locked(&self, within: Duration, now: SystemTime) -> bool {
         self.recently_locked_checked(within, now).unwrap_or(true)

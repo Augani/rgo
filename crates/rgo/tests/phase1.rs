@@ -98,7 +98,8 @@ fn doctor_does_not_start_daemon_and_emits_structured_output() {
         .unwrap();
     assert!(json.status.success());
     let report: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
-    assert_eq!(report["schema_version"], 1);
+    assert_eq!(report["schema_version"], 2);
+    assert!(report["profile_locks_observed"].is_null());
     assert!(
         report["entries"]
             .as_array()

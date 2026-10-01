@@ -122,7 +122,13 @@ def probe(mode: str, rustup_home: str, toolchain: str, expect_profile_lock: bool
                 None,
             )
             expected_level = "ok" if expect_profile_lock else "warning"
-            if doctor["activation_verified"] is not True or lock_entry is None or lock_entry["level"] != expected_level:
+            if (
+                doctor["schema_version"] != 2
+                or doctor["activation_verified"] is not True
+                or doctor["profile_locks_observed"] is not expect_profile_lock
+                or lock_entry is None
+                or lock_entry["level"] != expected_level
+            ):
                 raise RuntimeError(f"{mode}: doctor misreported Cargo's lock capability: {doctor}")
         status = run([str(RGO), "status"], cwd=project, env=env).stdout
         incremental_line = next(

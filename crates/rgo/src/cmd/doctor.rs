@@ -19,6 +19,7 @@ struct DoctorReport {
     schema_version: u32,
     warnings: usize,
     activation_verified: Option<bool>,
+    profile_locks_observed: Option<bool>,
     entries: Vec<DoctorEntry>,
 }
 
@@ -74,7 +75,7 @@ impl DoctorReport {
 pub fn run(json: bool, verify: bool) -> Result<()> {
     let e = env()?;
     let report = RefCell::new(DoctorReport {
-        schema_version: 1,
+        schema_version: 2,
         ..DoctorReport::default()
     });
     let mut check = |ok: bool, msg: String| report.borrow_mut().check(ok, msg);
@@ -527,6 +528,7 @@ pub fn run(json: bool, verify: bool) -> Result<()> {
         report.activation_verified = Some(result.is_ok());
         match &result {
             Ok(probe) => {
+                report.profile_locks_observed = Some(probe.profile_locks_observed);
                 report.check(
                     true,
                     "plain Cargo debug/release builds use one discoverable managed context; configured wrapper attribution was also verified when present".into(),
