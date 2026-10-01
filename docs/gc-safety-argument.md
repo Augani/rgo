@@ -36,6 +36,11 @@ ordinary directory permissions. The release contract must either exclude
 direct invocations explicitly pointed at rgo's managed namespace or obtain a
 cooperative Cargo lifecycle hook; this boundary is unresolved, not evidence
 that all direct Cargo launches are safe.
+Cargo's [current layout source](https://doc.rust-lang.org/nightly/nightly-rustc/src/cargo/compiler/layout.rs.html)
+also omits its build-directory profile lock on NFS mounts. The profile-lock
+heuristic therefore cannot admit an NFS root to native cleanup; the supervised
+lock protocol and filesystem capability need their own validation before any
+network-mounted root can enter automatic deletion.
 Undo removes the active owner record, so a retained storage root cannot be
 destructively cleaned through `rgo gc` after uninstall; a separately reviewed
 offline purge remains release work.
@@ -114,7 +119,8 @@ process-level session guard.
 - A focused origin fixture requires a native-origin context to stay protected
   while a supervised neighbor is reclaimed under pressure. It also calls the
   deletion executor on the native context and requires refusal. The local
-  full suite passes; platform CI for this change is pending. The marker
+  full suite and the [18-job platform matrix](https://github.com/Augani/rgo/actions/runs/36890331922)
+  passed. The marker
   cannot prove that no later direct Cargo invocation wrote the same context.
 - A private-home Unix real-Cargo race pauses an explicit context clean after
   GC takes its stable guard. A newly started unchanged `cargo build` reaches
