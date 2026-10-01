@@ -526,10 +526,20 @@ pub fn run(json: bool, verify: bool) -> Result<()> {
         };
         report.activation_verified = Some(result.is_ok());
         match &result {
-            Ok(()) => report.check(
-                true,
-                "plain Cargo debug/release builds use one discoverable managed context; configured wrapper attribution was also verified when present".into(),
-            ),
+            Ok(probe) => {
+                report.check(
+                    true,
+                    "plain Cargo debug/release builds use one discoverable managed context; configured wrapper attribution was also verified when present".into(),
+                );
+                report.check(
+                    probe.profile_locks_observed,
+                    if probe.profile_locks_observed {
+                        "active Cargo created documented debug/release profile build locks in the disposable project".into()
+                    } else {
+                        "active Cargo did not create both documented profile build locks in the disposable project; native lock-based cleanup is unverified for this toolchain".into()
+                    },
+                );
+            }
             Err(error) => report.check(
                 false,
                 format!("plain Cargo activation probe failed: {error:#}"),
@@ -636,10 +646,14 @@ fn check_project_configs(
     }
 }
 
+pub(super) struct ActivationProbe {
+    profile_locks_observed: bool,
+}
+
 pub(super) fn verify_plain_cargo(
     paths: &rgo_core::paths::RgoPaths,
     wrapper: Option<&str>,
-) -> Result<()> {
+) -> Result<ActivationProbe> {
     if let Some(wrapper) = wrapper {
         anyhow::ensure!(
             Path::new(wrapper).is_file(),
@@ -715,6 +729,10 @@ pub(super) fn verify_plain_cargo(
             "Cargo reached the managed build root but rgo's configured wrapper did not attribute this context"
         );
     }
+    let profile_locks_observed = ["debug", "release"].iter().all(|profile| {
+        std::fs::symlink_metadata(context.join(profile).join(".cargo-build-lock"))
+            .is_ok_and(|metadata| metadata.file_type().is_file())
+    });
     // This private, randomly named workspace has no remaining Cargo process.
     // Its checked context belongs only to the probe and should not consume
     // the user's budget or appear as an orphan after setup/doctor.
@@ -725,7 +743,9 @@ pub(super) fn verify_plain_cargo(
             let _ = std::fs::remove_dir(shard);
         }
     }
-    Ok(())
+    Ok(ActivationProbe {
+        profile_locks_observed,
+    })
 }
 
 fn check_toolchains(

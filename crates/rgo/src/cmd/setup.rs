@@ -924,7 +924,7 @@ pub fn run(
     // with unchanged activation needs no additional builds.
     let activation_probe =
         if !undo && !dry_run && !supervised && (old_record.is_none() || next != current) {
-            doctor::verify_plain_cargo(&paths, managed_wrapper.as_deref())
+            doctor::verify_plain_cargo(&paths, managed_wrapper.as_deref()).map(|_| ())
         } else {
             Ok(())
         };

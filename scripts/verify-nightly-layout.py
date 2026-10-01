@@ -1,19 +1,24 @@
 #!/usr/bin/env python3
-"""Probe nightly Cargo build layouts in private rgo homes on Unix.
+"""Probe nightly Cargo build layouts in private rgo homes.
 
-This checks relocation, final outputs, rgo's incremental tier, and its
-profile-lock heuristic. It is not evidence that whole-context GC is safe.
-CI runs it only in advisory Unix nightly lanes; it never touches the
-developer's Cargo configuration or installs a service.
+This checks relocation, final outputs, rgo's incremental tier, and whether
+the documented profile-lock heuristic is available. It is not evidence that
+whole-context GC is safe.
+The held-lock check requires Unix; the exact-version no-lock capability check
+also runs on Windows. It never touches the developer's Cargo configuration or
+installs a service.
 """
 
-import fcntl
+import argparse
 import json
 import os
 import subprocess
 import tempfile
 import time
 from pathlib import Path
+
+if os.name != "nt":
+    import fcntl
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -27,7 +32,7 @@ def run(args: list[str], *, cwd: Path, env: dict[str, str]) -> subprocess.Comple
     return result
 
 
-def probe(mode: str, rustup_home: str) -> None:
+def probe(mode: str, rustup_home: str, toolchain: str, expect_profile_lock: bool) -> None:
     with tempfile.TemporaryDirectory(prefix=f"rgo-{mode}-") as raw:
         root = Path(raw)
         home = root / "home"
@@ -49,7 +54,7 @@ def probe(mode: str, rustup_home: str) -> None:
             CARGO_HOME=str(cargo_home),
             RGO_HOME=str(rgo_home),
             RUSTUP_HOME=rustup_home,
-            RUSTUP_TOOLCHAIN="nightly",
+            RUSTUP_TOOLCHAIN=toolchain,
             CARGO_INCREMENTAL="1",
         )
         for variable in (
@@ -95,8 +100,30 @@ def probe(mode: str, rustup_home: str) -> None:
         lock = profile / ".cargo-build-lock"
         if not incremental.is_dir() or not any(incremental.iterdir()):
             raise RuntimeError(f"{mode}: documented debug incremental tier is missing or empty")
-        if not lock.is_file():
-            raise RuntimeError(f"{mode}: documented debug Cargo build lock is missing")
+        if expect_profile_lock and not lock.is_file():
+            raise RuntimeError(
+                f"{mode}: documented debug Cargo build lock is missing; "
+                f"profile entries: {[entry.name for entry in profile.iterdir()]}"
+            )
+        if not expect_profile_lock and lock.exists():
+            raise RuntimeError(f"{mode}: profile lock appeared; update the pinned capability fixture")
+        if mode == "default":
+            doctor = json.loads(
+                run([str(RGO), "doctor", "--verify", "--json"], cwd=project, env=env).stdout
+            )
+            lock_entry = next(
+                (
+                    entry
+                    for entry in doctor["entries"]
+                    if "documented profile build locks in the disposable project" in entry["message"]
+                    or "documented debug/release profile build locks in the disposable project"
+                    in entry["message"]
+                ),
+                None,
+            )
+            expected_level = "ok" if expect_profile_lock else "warning"
+            if doctor["activation_verified"] is not True or lock_entry is None or lock_entry["level"] != expected_level:
+                raise RuntimeError(f"{mode}: doctor misreported Cargo's lock capability: {doctor}")
         status = run([str(RGO), "status"], cwd=project, env=env).stdout
         incremental_line = next(
             (line for line in status.splitlines() if line.strip().startswith("incremental state")),
@@ -105,42 +132,60 @@ def probe(mode: str, rustup_home: str) -> None:
         if not incremental_line or float(incremental_line.split()[-2]) <= 0:
             raise RuntimeError(f"{mode}: rgo did not count incremental state:\n{status}")
 
-        # The native relocation pilot cannot delete contexts automatically,
-        # but its dry-run planner must still recognize a held Cargo profile
-        # lock. Age the completed build's timestamp to isolate the held-lock
-        # check from the separate conservative recency heuristic.
-        old = time.time() - 7200
-        os.utime(lock, (old, old))
-        gc_args = [str(RGO), "gc", "--dry-run", "--aggressive", "--target", "0"]
-        with lock.open("r+b") as lock_file:
-            fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            locked_plan = run(gc_args, cwd=project, env=env).stdout
-            fcntl.flock(lock_file, fcntl.LOCK_UN)
-        if "1 context(s) skipped: recently changed or held Cargo profile lock" not in locked_plan:
-            raise RuntimeError(f"{mode}: rgo did not protect the held profile lock:\n{locked_plan}")
-        idle_plan = run(gc_args, cwd=project, env=env).stdout
-        if "would unlink approximately" not in idle_plan:
-            raise RuntimeError(f"{mode}: idle context was not reclaimable:\n{idle_plan}")
+        if expect_profile_lock:
+            # Age the completed build's lock timestamp to isolate the held
+            # lock check from the separate conservative recency heuristic.
+            old = time.time() - 7200
+            os.utime(lock, (old, old))
+            gc_args = [str(RGO), "gc", "--dry-run", "--aggressive", "--target", "0"]
+            with lock.open("r+b") as lock_file:
+                fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                locked_plan = run(gc_args, cwd=project, env=env).stdout
+                fcntl.flock(lock_file, fcntl.LOCK_UN)
+            if "1 context(s) skipped: recently changed or held Cargo profile lock" not in locked_plan:
+                raise RuntimeError(f"{mode}: rgo did not protect the held profile lock:\n{locked_plan}")
+            idle_plan = run(gc_args, cwd=project, env=env).stdout
+            if "would unlink approximately" not in idle_plan:
+                raise RuntimeError(f"{mode}: idle context was not reclaimable:\n{idle_plan}")
+        else:
+            # Older Cargo still relocates its intermediates, but rgo must not
+            # infer a safe native deletion protocol from an unfamiliar lock.
+            deletion = subprocess.run(
+                [str(RGO), "gc", "--aggressive", "--target", "0"],
+                cwd=project,
+                env=env,
+                text=True,
+                capture_output=True,
+            )
+            if deletion.returncode == 0 or not context.is_dir():
+                raise RuntimeError(f"{mode}: native deletion was not refused:\n{deletion.stdout}\n{deletion.stderr}")
         run([str(RGO), "setup", "--undo", "--no-service"], cwd=project, env=env)
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--toolchain", default="nightly")
+    parser.add_argument("--without-profile-lock", action="store_true")
+    args = parser.parse_args()
+    if os.name == "nt" and not args.without_profile_lock:
+        raise RuntimeError("held profile-lock verification requires Unix")
     if not RGO.is_file():
         raise RuntimeError("build the workspace before running the nightly layout probe")
     rustup_home = subprocess.run(
         ["rustup", "show", "home"], check=True, capture_output=True, text=True
     ).stdout.strip()
     version = subprocess.run(
-        ["cargo", "+nightly", "--version"],
+        ["cargo", f"+{args.toolchain}", "--version"],
         check=True,
         capture_output=True,
         text=True,
     ).stdout.strip()
     for mode in ("default", "new-layout"):
-        probe(mode, rustup_home)
+        probe(mode, rustup_home, args.toolchain, not args.without_profile_lock)
     print(
-        f"{version}: relocation, final outputs, incremental state, and held-lock "
-        "planning verified in both layout modes"
+        f"{version}: relocation, final outputs, incremental state, and "
+        f"{'held-lock planning' if not args.without_profile_lock else 'native deletion refusal without a supported profile lock'} "
+        "verified in both layout modes"
     )
 
 

@@ -112,6 +112,26 @@ jobs:
       - name: Verify rejection, relocation, and undo in private homes
         run: python scripts/verify-cargo-boundary.py
 
+  pinned-nightly-layout:
+    name: Pinned nightly layout / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Build rgo with the supported source toolchain
+        run: cargo build --workspace --locked
+      - name: Install exact nightly layout boundary
+        run: rustup toolchain install nightly-2026-01-28 --profile minimal
+      - name: Verify relocation and fail-closed native deletion in both layouts
+        run: python scripts/verify-nightly-layout.py --toolchain nightly-2026-01-28 --without-profile-lock
+
   btrfs-smoke:
     name: Linux btrfs smoke
     runs-on: ubuntu-latest
