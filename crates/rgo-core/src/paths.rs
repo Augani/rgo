@@ -318,6 +318,38 @@ impl RgoPaths {
         }
         Ok(contexts)
     }
+
+    /// Validate one existing managed build directory without enumerating
+    /// unrelated shards. Pin admission uses this while holding the daemon's
+    /// operation lock, so a large build tree cannot delay other clients.
+    pub fn checked_existing_managed_build_dir(&self, path: &Path) -> Result<bool> {
+        let root = self.builds_dir();
+        let relative = path.strip_prefix(&root)?;
+        let mut components = relative.components();
+        let valid_shape = matches!(components.next(), Some(Component::Normal(_)))
+            && matches!(components.next(), Some(Component::Normal(_)))
+            && components.next().is_none();
+        ensure!(
+            valid_shape,
+            "invalid managed build context {}",
+            path.display()
+        );
+        let shard = path.parent().context("managed context has no shard")?;
+        for directory in [root.as_path(), shard, path] {
+            match std::fs::symlink_metadata(directory) {
+                Ok(metadata) => ensure!(
+                    metadata.is_dir() && !metadata.file_type().is_symlink(),
+                    "unsafe managed build context path {}",
+                    directory.display()
+                ),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+                Err(error) => {
+                    return Err(error).with_context(|| format!("checking {}", directory.display()));
+                }
+            }
+        }
+        Ok(true)
+    }
 }
 
 fn refuse_symlink(path: &Path) -> Result<()> {

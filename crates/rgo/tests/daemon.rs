@@ -1762,6 +1762,27 @@ fn daemon_coordinates_builds_and_pins_contexts() {
         root: sb.rgo_home.clone(),
     };
     let context = paths.builds_dir().join(&id);
+    // An unrelated malformed shard must not prevent pinning this valid
+    // context; pin admission checks only the selected root/shard/context.
+    let unrelated_shard = paths.builds_dir().join("zz");
+    std::fs::write(&unrelated_shard, b"not a shard").unwrap();
+    let repin = ipc::request(
+        &paths.socket_path(),
+        Request::Pin {
+            build_dir: context.display().to_string(),
+        },
+    )
+    .unwrap();
+    assert!(matches!(repin, Response::Ok));
+    let reunpin = ipc::request(
+        &paths.socket_path(),
+        Request::Unpin {
+            build_dir: context.display().to_string(),
+        },
+    )
+    .unwrap();
+    assert!(matches!(reunpin, Response::Ok));
+    std::fs::remove_file(&unrelated_shard).unwrap();
     std::fs::remove_dir_all(&context).unwrap();
     let stale_pin = ipc::request(
         &paths.socket_path(),
