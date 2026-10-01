@@ -2,7 +2,7 @@
 
 The dependency cache (`[cache] enabled = true`) is opt-in and conservatively
 scoped. Every artifact key is a BLAKE3 digest over a fixed, length-delimited
-field list. The key schema is `rgo-cache-v4`. The classifier still has
+field list. The key schema is `rgo-cache-v5`. The classifier still has
 unverified dynamic-input classes, so caching remains experimental and disabled
 by default. A key collision can return incorrect output.
 
@@ -11,11 +11,11 @@ by default. A key collision can return incorrect output.
 | Field | Source | Notes |
 |---|---|---|
 | schema tag | `rgo-cache-v{N}` constant | versioned; a format change rotates all keys |
-| compiler identity | `rustc -vV`, canonical sysroot path, Rustup distribution manifest, and sysroot compiler executable bytes | toolchains without the manifest bypass; dynamically loaded compiler libraries are not yet content-verified |
+| compiler identity | `rustc -vV`, canonical sysroot path, Rustup distribution manifest, sysroot compiler bytes, and the resolved invoked compiler's path and bytes | toolchains without the manifest bypass; dynamically loaded compiler libraries are not yet content-verified |
 | normalized args | all rustc args after normalization | managed paths rewritten relative to the validated build context, preserving the profile/artifact suffix; ordering preserved |
 | source digest | BLAKE3 over `(relpath, bytes)` for every file in the package source root, sorted | strict mode: any symlink fails the digest → bypass |
 | source kind | Registry / Git / Workspace | registry and git checkout contents are digested; workspace members are handled separately |
-| extern inputs | `(name=file, file-content digest)` for every `--extern` | externs must resolve inside managed roots, else bypass; bare `--extern proc_macro` (no path) records `sysroot` — it is pinned by compiler identity. Newer cargo may pass the same crate twice (`.rlib` and `.rmeta` externs); each artifact's digest is keyed separately |
+| extern inputs | `(name=file, file-content digest)` for cacheable `--extern` artifacts | externs must resolve inside managed roots, else bypass; dynamic libraries bypass because proc macros may read untracked inputs while executing. Bare `--extern proc_macro` (no path) records `sysroot` — it is pinned by compiler identity. Newer cargo may pass the same crate twice (`.rlib` and `.rmeta` externs); each artifact's digest is keyed separately |
 | env digest | `(name, BLAKE3(value))` for every inherited environment variable | conservative response to arbitrary `env!` and `option_env!`; missing versus present values differ; plus `OUT_DIR_CONTENTS` digest when `OUT_DIR` is set. Environment churn can reduce hits. |
 | target triple | `--target` value when present | cross builds never collide with host builds |
 | remap prefix | `(from, to)` of the applied `--remap-path-prefix` | source path normalization preserves relative suffixes; environment-dependent absolute paths can still distinguish worktrees |
@@ -40,6 +40,7 @@ a failure. Reasons are stable strings, recorded in `state/cache-events.log`.
 | `-Z` flag not on the allowlist | `unstable_flag` |
 | `-Zembed-metadata` (nightly cargo default) | keyed like any other arg — allowlisted because cargo emits it on every nightly invocation |
 | target JSON file/path, explicit `--sysroot` | `custom_target`, `custom_sysroot` |
+| `--extern` dynamic library (`.so`, `.dylib`, `.dll`) | `dynamic_extern`; a proc-macro consumer may read inputs absent from the compiler key |
 | `-l`, `-Lnative=`, `-Clinker=`, `-Clink-arg*`, `-Clink-self-contained` | `native_input` |
 | `-L` path outside build root / sysroot, or unresolvable `--extern` | `external_extern` |
 | `OUT_DIR` outside the managed build root | `build_script_output` |

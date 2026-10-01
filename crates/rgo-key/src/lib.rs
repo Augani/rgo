@@ -5,6 +5,7 @@
 //! stable key from inputs that are observable without modifying Cargo's build directory.
 
 use std::collections::BTreeMap;
+use std::env;
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -13,7 +14,7 @@ use std::process::Command;
 use blake3::Hasher;
 use serde::{Deserialize, Serialize};
 
-pub const CACHE_SCHEMA_VERSION: u32 = 4;
+pub const CACHE_SCHEMA_VERSION: u32 = 5;
 pub const WORKSPACE_REMAP_PREFIX: &str = "/rgo/workspace";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -42,6 +43,7 @@ pub enum BypassReason {
     UnsupportedEncoding,
     CustomTarget,
     CustomSysroot,
+    DynamicExtern,
 }
 
 impl std::fmt::Display for BypassReason {
@@ -70,6 +72,7 @@ impl std::fmt::Display for BypassReason {
             Self::UnsupportedEncoding => "unsupported_encoding",
             Self::CustomTarget => "custom_target",
             Self::CustomSysroot => "custom_sysroot",
+            Self::DynamicExtern => "dynamic_extern",
         };
         f.write_str(value)
     }
@@ -265,6 +268,9 @@ pub fn classify(
             let Some(value) = args.get(i + 1).map(|v| v.to_string_lossy().into_owned()) else {
                 return Classification::Bypass(BypassReason::ExternalExtern);
             };
+            if dynamic_extern(&value) {
+                return Classification::Bypass(BypassReason::DynamicExtern);
+            }
             if !record_extern(&value, roots, &mut extern_paths) {
                 return Classification::Bypass(BypassReason::ExternalExtern);
             }
@@ -272,6 +278,9 @@ pub fn classify(
             continue;
         }
         if let Some(value) = arg.strip_prefix("--extern=") {
+            if dynamic_extern(value) {
+                return Classification::Bypass(BypassReason::DynamicExtern);
+            }
             if !record_extern(value, roots, &mut extern_paths) {
                 return Classification::Bypass(BypassReason::ExternalExtern);
             }
@@ -461,6 +470,9 @@ pub fn compiler_identity(rustc: &Path) -> std::io::Result<String> {
     let sysroot_text = std::str::from_utf8(&sysroot_output.stdout)
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
     let sysroot = fs::canonicalize(sysroot_text.trim())?;
+    let sysroot_name = sysroot
+        .to_str()
+        .ok_or_else(|| std::io::Error::other("non-UTF-8 sysroot"))?;
     let manifest = sysroot.join("lib/rustlib/multirust-channel-manifest.toml");
     // Toolchains without a Rustup distribution manifest have no verified
     // compiler-library identity and must bypass for now.
@@ -470,15 +482,50 @@ pub fn compiler_identity(rustc: &Path) -> std::io::Result<String> {
             .join("bin")
             .join(format!("rustc{}", std::env::consts::EXE_SUFFIX)),
     )?;
+    let invoked_compiler = resolve_compiler(rustc)?;
+    let invoked_name = invoked_compiler
+        .to_str()
+        .ok_or_else(|| std::io::Error::other("non-UTF-8 compiler path"))?;
+    let invoked_bytes = fs::read(&invoked_compiler)?;
     let mut hasher = Hasher::new();
     hash_field(&mut hasher, &output.stdout);
-    hash_field(
-        &mut hasher,
-        sysroot.as_os_str().to_string_lossy().as_bytes(),
-    );
+    hash_field(&mut hasher, sysroot_name.as_bytes());
     hash_field(&mut hasher, &manifest_bytes);
     hash_field(&mut hasher, &compiler_bytes);
+    hash_field(&mut hasher, invoked_name.as_bytes());
+    hash_field(&mut hasher, &invoked_bytes);
     Ok(hasher.finalize().to_hex().to_string())
+}
+
+fn resolve_compiler(rustc: &Path) -> std::io::Result<PathBuf> {
+    let executable = |path: PathBuf| {
+        #[cfg(windows)]
+        let path = if path.extension().is_none() {
+            path.with_extension("exe")
+        } else {
+            path
+        };
+        let metadata = fs::metadata(&path).ok()?;
+        if !metadata.is_file() {
+            return None;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if metadata.permissions().mode() & 0o111 == 0 {
+                return None;
+            }
+        }
+        fs::canonicalize(path).ok()
+    };
+    if rustc.is_absolute() || rustc.components().count() > 1 {
+        return executable(rustc.to_path_buf())
+            .ok_or_else(|| std::io::Error::other("compiler executable unavailable"));
+    }
+    let path = env::var_os("PATH").ok_or_else(|| std::io::Error::other("PATH unavailable"))?;
+    env::split_paths(&path)
+        .find_map(|directory| executable(directory.join(rustc)))
+        .ok_or_else(|| std::io::Error::other("compiler executable unavailable"))
 }
 
 struct KeyInputs<'a> {
@@ -700,6 +747,15 @@ fn record_extern(value: &str, roots: &AllowedRoots, output: &mut BTreeMap<String
         .unwrap_or_else(|| name.to_owned());
     output.insert(label, blake3::hash(&bytes).to_hex().to_string());
     true
+}
+
+fn dynamic_extern(value: &str) -> bool {
+    value.split_once('=').is_some_and(|(_, path)| {
+        Path::new(path)
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| matches!(extension, "so" | "dylib" | "dll"))
+    })
 }
 
 /// `-Z` options cargo passes by default on nightly toolchains. An allowlisted
@@ -1082,6 +1138,31 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn changed_invoked_compiler_changes_identity_with_the_same_version_banner() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let compiler = dir.path().join("fake-rustc");
+        let sysroot = dir.path().join("sysroot");
+        fs::create_dir_all(sysroot.join("bin")).unwrap();
+        fs::create_dir_all(sysroot.join("lib/rustlib")).unwrap();
+        fs::write(sysroot.join("bin/rustc"), b"sysroot compiler").unwrap();
+        fs::write(
+            sysroot.join("lib/rustlib/multirust-channel-manifest.toml"),
+            b"test manifest",
+        )
+        .unwrap();
+        let script = "#!/bin/sh\nif [ \"$1\" = '-vV' ]; then echo fixed-version; else printf '%s/sysroot\\n' \"$(dirname \"$0\")\"; fi\n";
+        fs::write(&compiler, script).unwrap();
+        fs::set_permissions(&compiler, fs::Permissions::from_mode(0o755)).unwrap();
+        let before = compiler_identity(&compiler).unwrap();
+        fs::write(&compiler, format!("{script}# changed compiler body\n")).unwrap();
+        let after = compiler_identity(&compiler).unwrap();
+        assert_ne!(before, after);
+    }
+
     #[test]
     fn widened_workspace_classes_require_safe_inputs() {
         let dir = tempfile::tempdir().unwrap();
@@ -1343,6 +1424,18 @@ mod tests {
                 Classification::Bypass(expected)
             );
         }
+
+        // The dylib's bytes do not describe files or environment read while a
+        // proc macro runs inside the consumer's compilation.
+        let macro_library = build.join("libmacro.so");
+        fs::write(&macro_library, b"proc macro fixture").unwrap();
+        let mut args = base();
+        args.push("--extern".into());
+        args.push(format!("macro_dep={}", macro_library.display()).into());
+        assert_eq!(
+            classify(Path::new("rustc"), &args, &[], &roots),
+            Classification::Bypass(BypassReason::DynamicExtern)
+        );
 
         let outside = tempfile::tempdir().unwrap();
         let out_dir = outside.path().join("out");
