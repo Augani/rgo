@@ -1494,7 +1494,10 @@ fn run_gc(
         };
         // The candidate walk is advisory: deletion rechecks last-use and
         // active protections under the admission lock for each selection.
-        let cache_lru = state.db.lock().unwrap().cache_lru()?;
+        let (cache_lru, mut selection_db_changes) = {
+            let db = state.db.lock().unwrap();
+            (db.cache_lru()?, db.change_count())
+        };
         if active_cache_lease {
             report.cas_eviction_deferred_bytes =
                 report.cas_eviction_deferred_bytes.max(remaining.cas_bytes);
@@ -1506,6 +1509,7 @@ fn run_gc(
                 .min_free_space
                 .saturating_sub(volume_free_bytes_checked(&state.paths.root)?),
         );
+        let selection_cas_revision = state.cas.manifest_revision();
         let selected = select_cas_manifests(
             &state.cas,
             &cache_lru,
@@ -1522,18 +1526,31 @@ fn run_gc(
         // Selection may enumerate every CAS manifest and referenced object.
         // Admission remains open during that walk; refresh all protections
         // and verify each selected manifest after reacquiring the lock.
-        let _operation = state.operation_lock.lock().unwrap();
-        let (current_cache_keys, current_cache_lease) = {
-            let db = state.db.lock().unwrap();
-            (db.active_cache_keys()?, db.has_active_cache_lease()?)
-        };
-        if current_cache_lease {
-            report.cas_eviction_deferred_bytes =
-                report.cas_eviction_deferred_bytes.max(remaining.cas_bytes);
-        }
+        let mut operation = state.operation_lock.lock().unwrap();
         for item in selected {
             report.planned_bytes = report.planned_bytes.saturating_add(item.action.bytes);
             report.actions.push(wire_gc_action(&item.action));
+            // Admission is reopened after each staged removal. Refresh the
+            // protections before considering the next manifest.
+            let (current_cache_keys, current_cache_lease, current_db_changes) = {
+                let db = state.db.lock().unwrap();
+                (
+                    db.active_cache_keys()?,
+                    db.has_active_cache_lease()?,
+                    db.change_count(),
+                )
+            };
+            if current_cache_lease {
+                report.cas_eviction_deferred_bytes =
+                    report.cas_eviction_deferred_bytes.max(remaining.cas_bytes);
+            }
+            if current_db_changes != selection_db_changes
+                || state.cas.manifest_revision() != selection_cas_revision
+            {
+                let error = anyhow::anyhow!("cache changed during GC manifest selection");
+                execution.note_skip(&item.action.path, item.action.bytes, &error);
+                continue;
+            }
             if let Err(error) =
                 can_evict_cas_manifest(state, &item, &current_cache_keys, current_cache_lease)
             {
@@ -1541,13 +1558,36 @@ fn run_gc(
                 execution.note_skip(&item.action.path, item.action.bytes, &error);
                 continue;
             }
-            match gc::remove_atomically(&state.paths, &item.action.path) {
-                Ok(()) => {
-                    execution.reclaimed_bytes =
-                        execution.reclaimed_bytes.saturating_add(item.action.bytes);
-                    let db = state.db.lock().unwrap();
-                    db.retire_queued_remote_job(&item.key)?;
-                    db.forget_cache_entry(&item.key)?;
+            match gc::stage_atomically(&state.paths, &item.action.path) {
+                Ok(staged) => {
+                    // The authoritative manifest path is already gone. Retire
+                    // its index before another producer can publish this key.
+                    let index_result = {
+                        let db = state.db.lock().unwrap();
+                        let result = db
+                            .retire_queued_remote_job(&item.key)
+                            .and_then(|()| db.forget_cache_entry(&item.key));
+                        selection_db_changes = db.change_count();
+                        result
+                    };
+                    drop(operation);
+                    #[cfg(debug_assertions)]
+                    let pause = pause_after_cas_stage_for_test(&item.action.path);
+                    let removed = staged.finish();
+                    operation = state.operation_lock.lock().unwrap();
+                    #[cfg(debug_assertions)]
+                    pause?;
+                    index_result?;
+                    match removed {
+                        Ok(()) => {
+                            execution.reclaimed_bytes =
+                                execution.reclaimed_bytes.saturating_add(item.action.bytes);
+                        }
+                        Err(error) => {
+                            tracing::warn!(key = %item.key, %error, "skipped CAS manifest eviction");
+                            execution.note_skip(&item.action.path, item.action.bytes, &error);
+                        }
+                    }
                 }
                 Err(error) => {
                     tracing::warn!(key = %item.key, %error, "skipped CAS manifest eviction");
@@ -1556,14 +1596,15 @@ fn run_gc(
             }
         }
         let post_sweep_generation = state.cas.manifest_revision();
-        drop(_operation);
-        let post_candidates = if current_cache_lease {
+        let post_sweep_blocked = state.db.lock().unwrap().has_active_cache_lease()?;
+        drop(operation);
+        let post_candidates = if post_sweep_blocked {
             Vec::new()
         } else {
             unreferenced_cas_actions(&state.cas, &[])?
         };
         let _operation = state.operation_lock.lock().unwrap();
-        let post_sweep_safe = !current_cache_lease
+        let post_sweep_safe = !post_sweep_blocked
             && !state.db.lock().unwrap().has_active_cache_lease()?
             && state.cas.manifest_revision() == post_sweep_generation;
         if post_sweep_safe {
@@ -1772,6 +1813,30 @@ fn pause_after_gc_plan_for_test(victim: &Path) -> Result<()> {
     while !release.is_file() {
         if Instant::now() >= deadline {
             bail!("timed out at the GC planning test point");
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    Ok(())
+}
+
+/// Test lease admission between two selected CAS manifest removals.
+#[cfg(debug_assertions)]
+fn pause_after_cas_stage_for_test(victim: &Path) -> Result<()> {
+    use std::time::Instant;
+
+    let Some(marker) = std::env::var_os("RGO_TEST_CAS_STAGED_MARKER") else {
+        return Ok(());
+    };
+    let marker = PathBuf::from(marker);
+    let release = PathBuf::from(
+        std::env::var_os("RGO_TEST_CAS_STAGED_RELEASE")
+            .context("RGO_TEST_CAS_STAGED_RELEASE is required with the marker")?,
+    );
+    std::fs::write(&marker, victim.to_string_lossy().as_bytes())?;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !release.is_file() {
+        if Instant::now() >= deadline {
+            bail!("timed out at the staged CAS cleanup test point");
         }
         thread::sleep(Duration::from_millis(10));
     }

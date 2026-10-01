@@ -1016,6 +1016,12 @@ impl StateDb {
             .map_err(Into::into)
     }
 
+    /// Connection-local mutation count for validating an eviction snapshot.
+    /// All daemon index writes use this single connection under its mutex.
+    pub fn change_count(&self) -> u64 {
+        self.connection.total_changes()
+    }
+
     /// A bounded key-ordered slice for reconciling the cache index without
     /// holding the daemon admission lock for the entire manifest inventory.
     pub fn cache_index_batch(
