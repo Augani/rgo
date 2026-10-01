@@ -180,8 +180,12 @@ pub fn connect(path: &Path, timeout: Duration) -> Result<Connection> {
     #[cfg(unix)]
     {
         use interprocess::local_socket::traits::Stream as _;
-        stream.set_recv_timeout(Some(timeout))?;
-        stream.set_send_timeout(Some(timeout))?;
+        stream
+            .set_recv_timeout(Some(timeout))
+            .context("setting IPC receive timeout")?;
+        stream
+            .set_send_timeout(Some(timeout))
+            .context("setting IPC send timeout")?;
     }
     Ok(Connection {
         stream,
@@ -224,7 +228,9 @@ pub fn request_with_response_timeout(
     }
     write_message(&mut connection, &message)?;
     if response_timeout != connection_timeout {
-        connection.set_timeout(response_timeout)?;
+        connection
+            .set_timeout(response_timeout)
+            .context("setting IPC response timeout")?;
     }
     read_message(&mut connection)
 }

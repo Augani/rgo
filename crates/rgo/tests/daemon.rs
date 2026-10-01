@@ -394,6 +394,12 @@ fn gc_plan_admits_a_late_context_lease_before_deletion() {
 #[cfg(debug_assertions)]
 #[test]
 fn cas_selection_admits_a_late_lease_and_preserves_the_manifest() {
+    cas_selection_lease_case(false);
+    cas_selection_lease_case(true);
+}
+
+#[cfg(debug_assertions)]
+fn cas_selection_lease_case(dry_run: bool) {
     struct StopDaemon {
         child: Child,
         release: PathBuf,
@@ -472,7 +478,7 @@ fn cas_selection_admits_a_late_lease_and_preserves_the_manifest() {
         ipc::request_with_timeout(
             &gc_socket,
             Request::TriggerGc {
-                dry_run: false,
+                dry_run,
                 aggressive: false,
                 auto: false,
                 target_bytes: Some(0),
@@ -511,7 +517,11 @@ fn cas_selection_admits_a_late_lease_and_preserves_the_manifest() {
     };
     assert!(manifest.exists());
     assert!(cas.object_path(&object.digest).exists());
-    assert!(report.skipped_execution_actions >= 1);
+    if dry_run {
+        assert!(report.dry_run);
+    } else {
+        assert!(report.skipped_execution_actions >= 1);
+    }
 }
 
 #[cfg(debug_assertions)]

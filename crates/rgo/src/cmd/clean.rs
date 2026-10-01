@@ -1,4 +1,4 @@
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use rgo_core::context;
 use rgo_core::ipc;
 use rgo_protocol::{Request, Response};
@@ -6,16 +6,22 @@ use rgo_protocol::{Request, Response};
 use super::{daemon, env, human, workspace_matches};
 
 pub fn run(id: &str) -> Result<()> {
-    let e = env()?;
-    let Some(c) = context::list(&e.paths)?.into_iter().find(|c| {
-        c.id() == id
-            || c.sidecar
-                .as_ref()
-                .is_some_and(|s| workspace_matches(&s.workspace_root, id))
-    }) else {
+    let e = env().context("resolving clean environment")?;
+    let Some(c) = context::list(&e.paths)
+        .context("inventorying contexts for clean")?
+        .into_iter()
+        .find(|c| {
+            c.id() == id
+                || c.sidecar
+                    .as_ref()
+                    .is_some_and(|s| workspace_matches(&s.workspace_root, id))
+        })
+    else {
         bail!("no managed context {id:?}; see `rgo ls`");
     };
-    e.paths.require_supervised_deletion()?;
+    e.paths
+        .require_supervised_deletion()
+        .context("checking clean mode")?;
     if !daemon::ensure_running(&e.paths) {
         bail!("rgo daemon is unavailable; refusing coordinated clean");
     }
@@ -26,7 +32,8 @@ pub fn run(id: &str) -> Result<()> {
         },
         std::time::Duration::from_secs(30),
         std::time::Duration::from_secs(10 * 60),
-    )?;
+    )
+    .context("requesting coordinated clean")?;
     let n = match response {
         Response::Gc(report) => report.reclaimed_bytes,
         Response::Error { code, message } => bail!("clean failed ({code}): {message}"),

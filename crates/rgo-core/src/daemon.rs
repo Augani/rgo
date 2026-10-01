@@ -531,15 +531,22 @@ fn handle_request_result(state: &State, request: Request) -> Result<Response> {
             Ok(Response::Ok)
         }
         Request::Clean { build_dir } => {
-            validate_managed_path(&state.paths, Path::new(&build_dir))?;
+            validate_managed_path(&state.paths, Path::new(&build_dir))
+                .context("validating clean path")?;
             let _gc = state.gc_lock.lock().unwrap();
             let operation = state.operation_lock.lock().unwrap();
-            state.paths.require_supervised_deletion()?;
-            let contexts = context::list(&state.paths)?;
+            state
+                .paths
+                .require_supervised_deletion()
+                .context("checking clean mode")?;
+            let contexts =
+                context::list(&state.paths).context("inventorying contexts before clean")?;
             let db = state.db.lock().unwrap();
-            db.expire_leases()?;
-            let pinned = db.pinned_paths()?;
-            let leased = db.protected_paths(&contexts)?;
+            db.expire_leases().context("expiring leases before clean")?;
+            let pinned = db.pinned_paths().context("reading pins before clean")?;
+            let leased = db
+                .protected_paths(&contexts)
+                .context("reading leases before clean")?;
             let path = Path::new(&build_dir);
             if same_path_in(&pinned, path) || context::is_pinned(&state.paths, path) {
                 bail!("context is pinned; unpin it before cleaning");
@@ -553,13 +560,16 @@ fn handle_request_result(state: &State, request: Request) -> Result<Response> {
             let reclaimed = context.usage.physical_bytes;
             let victim = context.dir.clone();
             drop(db);
-            let staged = gc::stage_atomically(&state.paths, &victim)?;
+            let staged =
+                gc::stage_atomically(&state.paths, &victim).context("staging context for clean")?;
             drop(operation);
-            staged.finish()?;
+            staged.finish().context("removing staged clean context")?;
             let _operation = state.operation_lock.lock().unwrap();
-            let contexts = context::list(&state.paths)?;
+            let contexts =
+                context::list(&state.paths).context("inventorying contexts after clean")?;
             let mut db = state.db.lock().unwrap();
-            db.reconcile_contexts(&state.paths, &contexts)?;
+            db.reconcile_contexts(&state.paths, &contexts)
+                .context("reconciling metadata after clean")?;
             Ok(Response::Gc(GcReport {
                 reclaimed_bytes: reclaimed,
                 planned_bytes: reclaimed,
@@ -1388,6 +1398,15 @@ fn run_gc(
         plan.actions.extend(unreferenced);
         plan.actions.sort_by_key(|action| action.tier);
     }
+    // A preview never deletes. Its CAS selection and unreferenced-object walk
+    // can be large, so let new pins and leases enter while it finishes.
+    // Destructive passes retain admission until their per-action guards take over.
+    let operation = if dry_run {
+        drop(operation);
+        None
+    } else {
+        Some(operation)
+    };
     if dry_run {
         extend_gc_preview(
             &mut plan,
@@ -2004,6 +2023,10 @@ fn extend_gc_preview(
         inputs.cfg.gc.cache_retention,
         crate::context::unix_now(),
     )?;
+    #[cfg(debug_assertions)]
+    if let Some(first) = selected.first() {
+        pause_after_cas_selection_for_test(&first.action.path)?;
+    }
     if !selected.is_empty() {
         let keys = selected
             .iter()
