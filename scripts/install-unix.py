@@ -1091,9 +1091,12 @@ def repair_owned(
     ):
         raise InstallError("repair requires the recorded Cargo-home owner and storage mode")
     environment["RGO_HOME"] = str(root)
+    missing_links = []
     for name, target in (("rgo", cli), ("rgo-rustc-wrapper", wrapper)):
         link = bin_dir / name
-        if not link.is_symlink() or link.resolve() != target.resolve():
+        if not link.exists() and not link.is_symlink():
+            missing_links.append((link, target))
+        elif not link.is_symlink() or link.resolve() != target.resolve():
             raise InstallError(f"repair command link is not owned by this version: {link}")
     expected_names = {member.name for member in stage.iterdir()}
     existing_names = {member.name for member in version_dir.iterdir()}
@@ -1148,7 +1151,15 @@ def repair_owned(
     if supervised:
         shim_dir = cargo_home / "rgo/shims"
         verify_environment["PATH"] = f"{shim_dir}{os.pathsep}{environment.get('PATH', '')}"
+    restored_links = []
     try:
+        for link, target in missing_links:
+            # Exclusive creation refuses a new user entry that appeared after
+            # the ownership check. A retry can finish an interrupted repair.
+            link.symlink_to(target)
+            restored_links.append((link, target))
+        if restored_links:
+            sync_directory(bin_dir)
         if not no_service:
             setup_args = ["setup"]
             if supervised:
@@ -1164,10 +1175,16 @@ def repair_owned(
         if json.loads(doctor.stdout).get("activation_verified") is not True:
             raise InstallError("repaired binaries did not restore plain Cargo activation")
     except Exception:
+        for link, target in restored_links:
+            if link.is_symlink() and link.resolve() == target.resolve():
+                link.unlink()
+        if restored_links:
+            sync_directory(bin_dir)
         if repaired_pointer:
             restore_activation(cargo_home, root, previous_state, expected_state)
         raise
-    print(f"repaired {', '.join(replaced) if replaced else 'verified files'} in {version_dir}")
+    repaired = replaced + [str(link) for link, _ in restored_links]
+    print(f"repaired {', '.join(repaired) if repaired else 'verified files'} in {version_dir}")
 
 
 def resume_service_install(

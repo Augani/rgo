@@ -190,13 +190,14 @@ GC guard for that command's lifetime.
 ## Upgrade / uninstall
 
 - Upgrade of development builds: run `rgo setup --undo` with the working pair,
-  replace both binaries together, then rerun setup. The Unix installer has a
-  private `--no-service` upgrade/rollback pilot. It can recover an interrupted
-  setup when every tracked file still matches its recorded prior or planned
-  value; a later user edit stops automatic recovery. Its `--repair` option can
-  restore missing or damaged files in the active owned version from the same
-  verified bundle. Service-managed upgrades and
-  cross-version verification remain release work.
+  replace both binaries together, then rerun setup. The Unix installer has
+  private no-service and macOS service-managed upgrade/rollback pilots. It can
+  recover an interrupted setup when every tracked file still matches its
+  recorded prior or planned value; a later user edit stops automatic recovery.
+  Its `--repair` option can restore missing or damaged files in the active
+  owned version and missing installer-owned command links from the same
+  verified bundle. It refuses a command path replaced by another file. Full
+  cross-version verification remains release work.
 - Uninstall: the Unix installer's `--uninstall` path handles an owned
   `--no-service` installation and resumes an interrupted removal. It leaves
   versioned binaries for Cargo processes already using their absolute paths,

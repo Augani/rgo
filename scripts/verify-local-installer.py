@@ -229,6 +229,20 @@ def main() -> None:
         assert "differs from the verified archive" in refused.stderr or "unexpected contents" in refused.stderr
         run([*installer, "--repair"], env=environment)
         assert missing_binary.is_file()
+        missing_link = cargo_home / "bin/rgo-rustc-wrapper"
+        missing_link.unlink()
+        run([*installer, "--repair"], env=environment)
+        assert missing_link.is_symlink()
+        assert missing_link.resolve() == Path(active["rgo_binary"]).parent / "rgo-rustc-wrapper"
+        missing_link.unlink()
+        missing_link.write_text("user-owned command\n")
+        refused_link = subprocess.run(
+            [*installer, "--repair"], env=environment, text=True, capture_output=True,
+        )
+        assert refused_link.returncode != 0
+        assert missing_link.read_text() == "user-owned command\n"
+        missing_link.unlink()
+        run([*installer, "--repair"], env=environment)
         pointer = cargo_home / ".rgo-home"
         expected_pointer = f"{rgo_home}\n"
         pointer.write_text("damaged-pointer\n")
