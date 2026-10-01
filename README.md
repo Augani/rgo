@@ -181,7 +181,7 @@ GC guard for that command's lifetime.
 | Unix supervised `rgo` executable missing | the owned PATH launcher forwards `cargo` to the recorded real Cargo proxy until the verified same-version installer is rerun with `--repair` and the original service/supervised options |
 | One project misbehaves | set `build.build-dir`/`target-dir` in its `.cargo/config.toml` |
 | Daemon unavailable | inspect `rgo doctor` and the service logs, then rerun `rgo setup` for this installation; native `--no-service` provides no automatic maintenance |
-| Metadata database corrupt | confirmed SQLite corruption is moved to `state/meta.sqlite.corrupt-*` and the index is rebuilt; other open errors are reported |
+| Metadata database corrupt | confirmed SQLite corruption is bundled in `quarantine/metadata-corrupt-*` and the index is rebuilt; quarantine follows the age and pressure cleanup policy; other open errors are reported |
 | CAS object corrupt | quarantined automatically to `~/.rgo/quarantine/`; next build misses cleanly |
 | Remove an installer-owned Unix activation | run the same installer's `--uninstall` option; it stops an owned service when present, restores Cargo settings, removes owned command links and supervised shell PATH blocks, and retains versioned binaries and managed data for explicit later cleanup |
 | Remove an installer-owned Windows activation | run `scripts/install-windows.ps1 -Uninstall` with the same destination options; it verifies ownership, undoes Cargo setup, removes owned command copies and its PATH entry, and retains versioned binaries and managed data |

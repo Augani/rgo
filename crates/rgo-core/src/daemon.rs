@@ -36,6 +36,7 @@ const MAX_AUTO_SCAN_ENTRIES_PER_PASS: usize = 8192;
 const MAX_EVENT_DRAINS_PER_PASS: usize = 4;
 const MAX_EVENT_SCAN_ENTRIES_PER_PASS: usize = 256;
 const MAX_EVENT_BATCH_PRUNE_PER_PASS: usize = 64;
+const MAX_LEGACY_METADATA_SCAN_ENTRIES_PER_PASS: usize = 64;
 const MAX_PIN_SCAN_ENTRIES_PER_PASS: usize = 32;
 const MAX_PENDING_MAINTENANCE_ENTRIES_PER_PASS: usize = 128;
 /// Bound on concurrent client connections; excess connections are refused so a flood
@@ -109,6 +110,7 @@ struct State {
     pending_scanner: Arc<Mutex<crate::supervision::PendingMaintenanceScanner>>,
     trigger_scan: Arc<Mutex<crate::size::TriggerScan>>,
     event_drainer: Arc<Mutex<CacheEventDrainScanner>>,
+    legacy_metadata_scanner: Arc<Mutex<LegacyMetadataScanner>>,
     batch_prune_cursor: Arc<Mutex<i64>>,
     pid: u32,
     remote: Option<RemoteClient>,
@@ -252,6 +254,7 @@ pub fn run(paths: RgoPaths, cfg: Resolved) -> Result<()> {
         )),
         trigger_scan: Arc::new(Mutex::new(crate::size::TriggerScan::default())),
         event_drainer: Arc::new(Mutex::new(event_drainer)),
+        legacy_metadata_scanner: Arc::new(Mutex::new(LegacyMetadataScanner::default())),
         batch_prune_cursor: Arc::new(Mutex::new(batch_prune_cursor)),
         pid: std::process::id(),
         remote,
@@ -1801,6 +1804,16 @@ fn maintenance(state: &State) -> Result<()> {
         };
         db.reclaim_unused_pages()?;
         drop(db);
+        match state
+            .legacy_metadata_scanner
+            .lock()
+            .unwrap()
+            .scan(&state.paths, MAX_LEGACY_METADATA_SCAN_ENTRIES_PER_PASS)
+        {
+            Ok(0) => {}
+            Ok(migrated) => tracing::debug!(migrated, "migrated legacy corrupt metadata"),
+            Err(error) => tracing::warn!(%error, "legacy corrupt metadata migration failed"),
+        }
         // This metadata-only recovery runs even while automatic destructive GC is
         // disabled. A nonblocking lifecycle guard defers active Cargo sessions.
         // Keep the probe under the operation lock so explicit clean cannot
@@ -1950,6 +1963,77 @@ fn reconcile_cache(db: &mut StateDb, cas: &Store) -> Result<()> {
         db.record_cache_manifest(&wire_manifest(&manifest), &cas.manifest_path(&manifest.key))?;
     }
     Ok(())
+}
+
+#[derive(Default)]
+struct LegacyMetadataScanner {
+    entries: Option<std::fs::ReadDir>,
+}
+
+impl LegacyMetadataScanner {
+    fn scan(&mut self, paths: &RgoPaths, limit: usize) -> Result<usize> {
+        if self.entries.is_none() {
+            self.entries = Some(std::fs::read_dir(paths.state_dir())?);
+        }
+        let quarantine = paths.quarantine_dir();
+        let metadata = std::fs::symlink_metadata(&quarantine)?;
+        anyhow::ensure!(
+            metadata.is_dir() && !metadata.file_type().is_symlink(),
+            "unsafe quarantine directory {}",
+            quarantine.display()
+        );
+        let mut migrated = 0;
+        for _ in 0..limit {
+            let Some(entry) = self.entries.as_mut().unwrap().next() else {
+                self.entries = None;
+                break;
+            };
+            let entry = entry.context("reading legacy metadata directory")?;
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            if !is_legacy_corrupt_metadata_name(name) {
+                continue;
+            }
+            anyhow::ensure!(
+                entry.file_type()?.is_file(),
+                "unsafe legacy corrupt metadata artifact {}",
+                entry.path().display()
+            );
+            let nonce = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos();
+            let destination =
+                quarantine.join(format!("legacy-{name}-{}-{nonce}", std::process::id()));
+            match std::fs::symlink_metadata(&destination) {
+                Ok(_) => bail!(
+                    "legacy metadata destination already exists: {}",
+                    destination.display()
+                ),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error).context("checking legacy metadata destination"),
+            }
+            std::fs::rename(entry.path(), &destination).with_context(|| {
+                format!(
+                    "moving legacy corrupt metadata to {}",
+                    destination.display()
+                )
+            })?;
+            migrated += 1;
+        }
+        Ok(migrated)
+    }
+}
+
+fn is_legacy_corrupt_metadata_name(name: &str) -> bool {
+    [
+        "meta.sqlite.corrupt-",
+        "meta.sqlite-wal.corrupt-",
+        "meta.sqlite-shm.corrupt-",
+    ]
+    .iter()
+    .filter_map(|prefix| name.strip_prefix(prefix))
+    .any(|stamp| !stamp.is_empty() && stamp.bytes().all(|byte| byte.is_ascii_digit()))
 }
 
 #[derive(Default)]
@@ -2208,6 +2292,42 @@ mod tests {
     use std::io::Write;
 
     #[test]
+    fn legacy_corrupt_metadata_moves_incrementally_to_quarantine() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = RgoPaths {
+            root: temp.path().join("rgo"),
+        };
+        paths.ensure_layout().unwrap();
+        for index in 0..140 {
+            std::fs::write(paths.state_dir().join(format!("unrelated-{index}")), b"").unwrap();
+        }
+        for name in [
+            "meta.sqlite.corrupt-123",
+            "meta.sqlite-wal.corrupt-123",
+            "meta.sqlite-shm.corrupt-123",
+        ] {
+            std::fs::write(paths.state_dir().join(name), name.as_bytes()).unwrap();
+        }
+        let unrelated = paths.state_dir().join("meta.sqlite.corrupt-not-a-stamp");
+        std::fs::write(&unrelated, b"keep").unwrap();
+        let mut scanner = LegacyMetadataScanner::default();
+        let moved: usize = (0..8).map(|_| scanner.scan(&paths, 32).unwrap()).sum();
+        assert_eq!(moved, 3);
+        assert!(unrelated.exists());
+        for name in [
+            "meta.sqlite.corrupt-123",
+            "meta.sqlite-wal.corrupt-123",
+            "meta.sqlite-shm.corrupt-123",
+        ] {
+            assert!(!paths.state_dir().join(name).exists());
+        }
+        assert_eq!(
+            std::fs::read_dir(paths.quarantine_dir()).unwrap().count(),
+            3
+        );
+    }
+
+    #[test]
     fn interrupted_event_drain_replays_without_duplicate_counters() {
         let temp = tempfile::tempdir().unwrap();
         let paths = RgoPaths {
@@ -2453,6 +2573,7 @@ mod tests {
             )),
             trigger_scan: Arc::new(Mutex::new(crate::size::TriggerScan::default())),
             event_drainer: Arc::new(Mutex::new(CacheEventDrainScanner::default())),
+            legacy_metadata_scanner: Arc::new(Mutex::new(LegacyMetadataScanner::default())),
             batch_prune_cursor: Arc::new(Mutex::new(0)),
             pid: std::process::id(),
             remote: None,
