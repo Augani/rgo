@@ -382,16 +382,7 @@ fn stage_and_remove_with(
     victim: &Path,
     mut after_phase: impl FnMut(DeletePhase),
 ) -> Result<()> {
-    let context = paths
-        .checked_managed_build_dirs()?
-        .into_iter()
-        .find(|context| victim == context || victim.starts_with(context));
-    if victim.starts_with(paths.builds_dir()) && context.is_none() {
-        anyhow::bail!(
-            "cannot identify the managed build context containing {}",
-            victim.display()
-        );
-    }
+    let context = managed_context_for_victim(paths, victim)?;
     let _lifecycle = crate::supervision::try_lock_gc(paths, context.as_deref())?
         .context("a supervised Cargo invocation is using managed storage")?;
     let _cas_staging = if victim.parent() == Some(paths.cas_dir().as_path()) && is_cas_stage(victim)
@@ -424,7 +415,10 @@ fn stage_and_remove_with(
             victim.display()
         );
     }
-    if is_live_managed_path(paths, victim)? {
+    if context
+        .as_ref()
+        .is_some_and(|context| crate::context::lock_files_for_safety(context))
+    {
         anyhow::bail!("live Cargo build lock detected near {}", victim.display());
     }
     validate_managed_directory(&paths.tmp_dir())?;
@@ -657,12 +651,35 @@ fn is_gc_stage(path: &Path) -> bool {
         && matches!(parts.next(), Some(name) if !name.is_empty())
 }
 
-fn is_live_managed_path(paths: &RgoPaths, victim: &Path) -> Result<bool> {
-    Ok(paths
-        .checked_managed_build_dirs()?
-        .into_iter()
-        .find(|context| victim == context || victim.starts_with(context))
-        .is_some_and(|context| crate::context::lock_files_for_safety(&context)))
+/// Resolve only the selected build context. A full managed-tree enumeration
+/// here costs one walk per deletion (and used to run twice per deletion).
+/// Every component of the selected path is checked again after acquiring the
+/// stable lifecycle guard, before the rename.
+fn managed_context_for_victim(paths: &RgoPaths, victim: &Path) -> Result<Option<PathBuf>> {
+    let builds = paths.builds_dir();
+    let Ok(relative) = victim.strip_prefix(&builds) else {
+        return Ok(None);
+    };
+    let mut components = relative.components();
+    let (Some(Component::Normal(shard)), Some(Component::Normal(id))) =
+        (components.next(), components.next())
+    else {
+        anyhow::bail!(
+            "cannot identify the managed build context containing {}",
+            victim.display()
+        );
+    };
+    anyhow::ensure!(
+        components.all(|component| matches!(component, Component::Normal(_))),
+        "invalid managed build path {}",
+        victim.display()
+    );
+    let shard = builds.join(shard);
+    let context = shard.join(id);
+    validate_managed_directory(&builds)?;
+    validate_managed_directory(&shard)?;
+    validate_managed_directory(&context)?;
+    Ok(Some(context))
 }
 
 fn trunc(d: Duration) -> Duration {
@@ -993,6 +1010,32 @@ mod tests {
         std::fs::write(unknown.join("output"), b"preserve").unwrap();
         assert!(remove_atomically(&paths, &unknown).is_err());
         assert_eq!(std::fs::read(unknown.join("output")).unwrap(), b"preserve");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deletion_validates_the_selected_context_without_following_other_shards() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let paths = RgoPaths {
+            root: root.path().join("rgo"),
+        };
+        paths.ensure_layout().unwrap();
+        let context = paths.builds_dir().join("aa/context");
+        std::fs::create_dir_all(&context).unwrap();
+        std::fs::write(context.join("output"), b"managed").unwrap();
+        attribute_context(root.path(), &context);
+
+        let outside = root.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("keep"), b"preserve").unwrap();
+        symlink(&outside, paths.builds_dir().join("bb")).unwrap();
+
+        remove_atomically(&paths, &context).unwrap();
+        assert!(!context.exists());
+        assert!(remove_atomically(&paths, &paths.builds_dir().join("bb/keep")).is_err());
+        assert_eq!(std::fs::read(outside.join("keep")).unwrap(), b"preserve");
     }
 
     #[cfg(unix)]
