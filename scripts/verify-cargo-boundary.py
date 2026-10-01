@@ -7,6 +7,7 @@ Cargo invocations below use private homes and the exact toolchain under test.
 
 import json
 import os
+import shutil
 import subprocess
 import tempfile
 from pathlib import Path
@@ -27,8 +28,8 @@ def run(args: list[str], *, cwd: Path, env: dict[str, str], succeeds: bool = Tru
     return result
 
 
-def build_out_dirs(project: Path, env: dict[str, str]) -> list[Path]:
-    build = run(["cargo", "build", "--offline", "--message-format=json"], cwd=project, env=env)
+def build_out_dirs(project: Path, env: dict[str, str], cargo: str = "cargo") -> list[Path]:
+    build = run([cargo, "build", "--offline", "--message-format=json"], cwd=project, env=env)
     return [
         Path(message["out_dir"]).resolve()
         for line in build.stdout.splitlines()
@@ -36,6 +37,53 @@ def build_out_dirs(project: Path, env: dict[str, str]) -> list[Path]:
         for message in [json.loads(line)]
         if message.get("reason") == "build-script-executed"
     ]
+
+
+def supervised_clean_probe(project: Path, env: dict[str, str]) -> None:
+    real_cargo = shutil.which("cargo")
+    if real_cargo is None:
+        raise RuntimeError("the real Cargo proxy is missing from PATH")
+    managed = env.copy()
+    managed["RGO_HOME"] = str(Path(env["HOME"]).parent / "r")
+    expected_root = (Path(managed["RGO_HOME"]) / "builds").resolve()
+    run(
+        [str(RGO), "setup", "--supervised", "--real-cargo", real_cargo, "--no-service"],
+        cwd=project,
+        env=managed,
+    )
+    version = run([str(RGO), "--version"], cwd=project, env=managed).stdout.strip().removeprefix("rgo ")
+    shim_dir = env["CARGO_HOME"] + (f"/rgo/shims/v{version}" if os.name == "nt" else "/rgo/shims")
+    shim = Path(shim_dir) / ("cargo.exe" if os.name == "nt" else "cargo")
+    if not shim.is_file():
+        raise RuntimeError(f"supervised Cargo shim is missing: {shim}")
+    managed["PATH"] = str(shim.parent) + os.pathsep + env["PATH"]
+    out_dirs = build_out_dirs(project, managed, str(shim))
+    if not out_dirs or not all(path.is_relative_to(expected_root) for path in out_dirs):
+        raise RuntimeError(f"supervised Cargo 1.91 did not relocate intermediates: {out_dirs}")
+    sidecars = list(expected_root.rglob(".rgo-context.json"))
+    if len(sidecars) != 1:
+        raise RuntimeError(f"expected one supervised Cargo 1.91 context; got {sidecars}")
+    sidecar = sidecars[0]
+    context = sidecar.parent
+    context_id = context.relative_to(expected_root).as_posix()
+    run([str(RGO), "pin", context_id], cwd=project, env=managed)
+    run([str(shim), "clean", "-p", "rgo_boundary_probe", "--offline"], cwd=project, env=managed)
+    if not sidecar.is_file():
+        raise RuntimeError("supervised Cargo 1.91 clean -p removed the context sidecar")
+    run([str(shim), "clean", "--offline"], cwd=project, env=managed)
+    if context.exists():
+        raise RuntimeError("supervised Cargo 1.91 full clean retained its context")
+    listing = run([str(RGO), "ls"], cwd=project, env=managed).stdout
+    if context_id not in listing or "(context absent; pin retained)" not in listing:
+        raise RuntimeError(f"supervised clean lost its durable pin:\n{listing}")
+    run([str(shim), "build", "--offline"], cwd=project, env=managed)
+    if not sidecar.is_file():
+        raise RuntimeError("supervised Cargo 1.91 rebuild did not restore the sidecar")
+    listing = run([str(RGO), "ls"], cwd=project, env=managed).stdout
+    if not any(context_id in line and "PIN" in line for line in listing.splitlines()):
+        raise RuntimeError(f"supervised Cargo 1.91 rebuild lost its pin:\n{listing}")
+    run([str(RGO), "unpin", context_id], cwd=project, env=managed)
+    run([str(RGO), "setup", "--undo", "--no-service"], cwd=project, env=managed)
 
 
 def probe(version: str, rustup_home: str) -> None:
@@ -133,6 +181,7 @@ def probe(version: str, rustup_home: str) -> None:
             local_root = (project / "target").resolve()
             if not local_out_dirs or not all(path.is_relative_to(local_root) for path in local_out_dirs):
                 raise RuntimeError("plain Cargo did not return to local intermediates after undo")
+            supervised_clean_probe(project, env)
 
 
 def main() -> None:
@@ -143,7 +192,7 @@ def main() -> None:
     ).stdout.strip()
     for version in ("1.90.0", "1.91.0"):
         probe(version, rustup_home)
-    print("Cargo 1.90 rejects activation; Cargo 1.91 relocates, preserves pins through clean and rebuild, and reverses with unchanged Cargo commands")
+    print("Cargo 1.90 rejects activation; Cargo 1.91 native and supervised modes preserve pins through clean and rebuild")
 
 
 if __name__ == "__main__":
