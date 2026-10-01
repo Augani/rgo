@@ -451,21 +451,10 @@ fn handle_request_result(state: &State, request: Request) -> Result<Response> {
             db.release(lease_id)?;
             Ok(Response::Ok)
         }
-        Request::Touch {
-            build_dir,
-            workspace_root,
-            physical_bytes,
-            incremental_bytes,
-        } => {
-            let db = state.db.lock().unwrap();
-            db.touch(
-                Path::new(&build_dir),
-                workspace_root.as_deref(),
-                physical_bytes,
-                incremental_bytes,
-            )?;
-            Ok(Response::Ok)
-        }
+        // Retain the old wire request for mixed-version clients. Sidecars and
+        // checked inventory supply context attribution; no SQLite reader uses
+        // the former per-compile touch record.
+        Request::Touch { .. } => Ok(Response::Ok),
         Request::QueryStatus => Ok(Response::Status(status_report(state)?)),
         Request::TriggerGc {
             dry_run,
@@ -568,17 +557,7 @@ fn handle_request_result(state: &State, request: Request) -> Result<Response> {
             let staged =
                 gc::stage_atomically(&state.paths, &victim).context("staging context for clean")?;
             drop(operation);
-            staged
-                .finish_then(|| {
-                    let _operation = state.operation_lock.lock().unwrap();
-                    state
-                        .db
-                        .lock()
-                        .unwrap()
-                        .forget_removed_context(&victim)
-                        .context("forgetting removed clean context")
-                })
-                .context("finishing staged clean context")?;
+            staged.finish().context("finishing staged clean context")?;
             Ok(Response::Gc(GcReport {
                 reclaimed_bytes: reclaimed,
                 planned_bytes: reclaimed,
@@ -881,7 +860,7 @@ fn status_report(state: &State) -> Result<StatusReport> {
     let mut db = state.db.lock().unwrap();
     db.expire_leases()?;
     db.prune_failed_cache_builds(Duration::from_secs(7 * 86_400))?;
-    db.reconcile_contexts(&state.paths, &contexts)?;
+    db.reconcile_pins(&state.paths, &contexts)?;
     let pinned = db.pinned_paths()?;
     let mut leased = db.protected_paths(&contexts)?;
     let stats = db.stats()?;
@@ -1327,7 +1306,7 @@ fn run_gc(
     let operation = state.operation_lock.lock().unwrap();
     let mut db = state.db.lock().unwrap();
     db.expire_leases()?;
-    db.reconcile_contexts(&state.paths, &contexts)?;
+    db.reconcile_pins(&state.paths, &contexts)?;
     let pinned = db.pinned_paths()?;
     let leased = db.protected_paths(&contexts)?;
     drop(db);
@@ -1807,7 +1786,7 @@ fn run_gc(
         report.first_execution_skip = execution.first_skip;
         let _operation = state.operation_lock.lock().unwrap();
         let mut db = state.db.lock().unwrap();
-        db.reconcile_contexts(&state.paths, &contexts)?;
+        db.reconcile_pins(&state.paths, &contexts)?;
         db.record_gc(
             dry_run,
             aggressive,

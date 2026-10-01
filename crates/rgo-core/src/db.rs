@@ -1,12 +1,11 @@
 //! Rebuildable SQLite metadata for the local daemon.
 //!
-//! The filesystem remains authoritative for Cargo state. SQLite stores attribution, leases,
-//! pins, and accounting so the daemon can coordinate concurrent clients without scanning the
-//! entire managed tree for every heartbeat.
+//! The filesystem and sidecars remain authoritative for Cargo build contexts.
+//! SQLite stores leases, a rebuildable pin index, and cache/operation accounting.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use fs4::fs_std::FileExt;
@@ -25,6 +24,7 @@ const REMOTE_TERMINAL_HISTORY_LIMIT: i64 = 1_000;
 const REMOTE_QUEUE_LIMIT: i64 = 1_024;
 const REMOTE_RUNNING_LIMIT: i64 = 4;
 const LEGACY_ACCESS_PRUNE_PER_PASS: i64 = 256;
+const LEGACY_CONTEXT_PRUNE_PER_PASS: i64 = 256;
 const MAX_INCREMENTAL_VACUUM_PAGES: i64 = 256;
 const WAL_SIZE_LIMIT_BYTES: i64 = 8 * 1024 * 1024;
 const LEGACY_VACUUM_FREE_MARGIN_BYTES: u64 = 16 * 1024 * 1024;
@@ -423,10 +423,10 @@ impl StateDb {
 
     pub fn reconcile(&mut self, paths: &RgoPaths) -> Result<()> {
         let contexts = context::list(paths)?;
-        self.reconcile_contexts(paths, &contexts)
+        self.reconcile_pins(paths, &contexts)
     }
 
-    pub fn reconcile_contexts(
+    pub fn reconcile_pins(
         &mut self,
         paths: &RgoPaths,
         contexts: &[context::BuildContext],
@@ -440,51 +440,6 @@ impl StateDb {
             }
         }
         let transaction = self.connection.transaction()?;
-        let mut current = HashSet::new();
-        for item in contexts {
-            let path = normalize(&item.dir);
-            current.insert(path.to_string_lossy().into_owned());
-            let (workspace_root, manifest_path) = item
-                .sidecar
-                .as_ref()
-                .map(|s| {
-                    (
-                        Some(s.workspace_root.as_str()),
-                        Some(s.manifest_path.as_str()),
-                    )
-                })
-                .unwrap_or((None, None));
-            transaction.execute(
-                "INSERT INTO contexts(build_dir, workspace_root, manifest_path, last_seen, last_used, physical_bytes, incremental_bytes)
-                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)
-                 ON CONFLICT(build_dir) DO UPDATE SET
-                   workspace_root=excluded.workspace_root,
-                   manifest_path=excluded.manifest_path,
-                   last_seen=excluded.last_seen,
-                   last_used=excluded.last_used,
-                   physical_bytes=excluded.physical_bytes,
-                   incremental_bytes=excluded.incremental_bytes",
-                params![
-                    path.to_string_lossy(),
-                    workspace_root,
-                    manifest_path,
-                    unix_time(item.last_used),
-                    unix_time(item.last_used),
-                    item.usage.physical_bytes as i64,
-                    item.incremental_usage.physical_bytes as i64,
-                ],
-            )?;
-        }
-        let mut statement = transaction.prepare("SELECT build_dir FROM contexts")?;
-        let old: Vec<String> = statement
-            .query_map([], |row| row.get(0))?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        drop(statement);
-        for path in old {
-            if !current.contains(&path) {
-                transaction.execute("DELETE FROM contexts WHERE build_dir = ?1", params![path])?;
-            }
-        }
         // The table is a derived index of durable pin records and legacy
         // in-context markers. Cargo may delete the latter during `clean`.
         let marked: HashSet<String> = contexts
@@ -510,66 +465,6 @@ impl StateDb {
         }
         transaction.commit()?;
         Ok(())
-    }
-
-    /// Remove one context whose build tree was deleted while its stable Cargo
-    /// lifecycle guard remains held. Other contexts may change concurrently.
-    pub fn forget_removed_context(&self, build_dir: &Path) -> Result<()> {
-        let path = normalize(build_dir);
-        self.connection.execute(
-            "DELETE FROM contexts WHERE build_dir = ?1",
-            params![path.to_string_lossy()],
-        )?;
-        Ok(())
-    }
-
-    pub fn touch(
-        &self,
-        build_dir: &Path,
-        workspace_root: Option<&str>,
-        physical_bytes: Option<u64>,
-        incremental_bytes: Option<u64>,
-    ) -> Result<()> {
-        let path = normalize(build_dir);
-        let now = unix_now();
-        // Context attribution is the only remaining touch record. Older
-        // versions also wrote access_summary, but nothing reads that table;
-        // maintenance retires its rows in bounded batches.
-        // A WAL writer can still receive SQLITE_BUSY while another connection
-        // closes/checkpoints or briefly holds the single writer lock. Retry
-        // only that transient class, with a finite bound, so attribution is
-        // not silently lost under concurrent Cargo clients.
-        let deadline = Instant::now() + Duration::from_secs(30);
-        let mut delay = Duration::from_millis(10);
-        loop {
-            let result = self.connection.execute(
-                "INSERT INTO contexts(build_dir, workspace_root, last_seen, last_used, physical_bytes, incremental_bytes)
-                     VALUES(?1, ?2, ?3, ?3, COALESCE(?4, 0), COALESCE(?5, 0))
-                     ON CONFLICT(build_dir) DO UPDATE SET
-                       workspace_root=COALESCE(excluded.workspace_root, contexts.workspace_root),
-                       last_seen=excluded.last_seen,
-                       last_used=excluded.last_used,
-                       physical_bytes=COALESCE(?4, contexts.physical_bytes),
-                       incremental_bytes=COALESCE(?5, contexts.incremental_bytes)",
-                params![
-                    path.to_string_lossy(),
-                    workspace_root,
-                    now,
-                    physical_bytes.map(|v| v as i64),
-                    incremental_bytes.map(|v| v as i64),
-                ],
-            );
-            match result {
-                Ok(_) => return Ok(()),
-                Err(error) if is_sqlite_busy(&error) && Instant::now() < deadline => {
-                    std::thread::sleep(
-                        delay.min(deadline.saturating_duration_since(Instant::now())),
-                    );
-                    delay = (delay * 2).min(Duration::from_millis(100));
-                }
-                Err(error) => return Err(error.into()),
-            }
-        }
     }
 
     pub fn acquire(&self, scope: &LeaseScope, pid: u32, ttl_secs: u32) -> Result<(u64, u32)> {
@@ -1506,6 +1401,13 @@ impl StateDb {
                 (SELECT rowid FROM access_summary ORDER BY rowid LIMIT ?1)",
             params![LEGACY_ACCESS_PRUNE_PER_PASS],
         )?;
+        // The old SQLite context copy has no production reader. Sidecars are
+        // authoritative, so retire its historical rows without a long pass.
+        transaction.execute(
+            "DELETE FROM contexts WHERE rowid IN
+                (SELECT rowid FROM contexts ORDER BY rowid LIMIT ?1)",
+            params![LEGACY_CONTEXT_PRUNE_PER_PASS],
+        )?;
         transaction.commit()?;
         Ok(())
     }
@@ -1802,14 +1704,6 @@ fn is_sqlite_corruption(error: &anyhow::Error) -> bool {
             )) if matches!(info.code, ErrorCode::DatabaseCorrupt | ErrorCode::NotADatabase)
         )
     })
-}
-
-fn is_sqlite_busy(error: &rusqlite::Error) -> bool {
-    matches!(
-        error,
-        rusqlite::Error::SqliteFailure(info, _)
-            if matches!(info.code, ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked)
-    )
 }
 
 fn normalize(path: &Path) -> PathBuf {
@@ -2464,6 +2358,12 @@ mod tests {
                     params![format!("legacy-{index}")],
                 )
                 .unwrap();
+            transaction
+                .execute(
+                    "INSERT INTO contexts(build_dir) VALUES(?1)",
+                    params![format!("legacy-{index}")],
+                )
+                .unwrap();
         }
         transaction
             .execute(
@@ -2483,10 +2383,24 @@ mod tests {
                 .unwrap(),
             600 - 2 * LEGACY_ACCESS_PRUNE_PER_PASS
         );
+        assert_eq!(
+            db.connection
+                .query_row("SELECT COUNT(*) FROM contexts", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            600 - 2 * LEGACY_CONTEXT_PRUNE_PER_PASS
+        );
         db.prune_operational_history().unwrap();
         assert_eq!(
             db.connection
                 .query_row("SELECT COUNT(*) FROM access_summary", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            db.connection
+                .query_row("SELECT COUNT(*) FROM contexts", [], |row| row
                     .get::<_, i64>(0))
                 .unwrap(),
             0
@@ -2646,13 +2560,11 @@ mod tests {
                 barrier.wait();
                 let db = StateDb::open(&paths).unwrap();
                 for round in 0..20 {
-                    db.touch(
+                    db.set_pin(
                         &paths
                             .builds_dir()
                             .join(format!("aa/context-{index}-{round}")),
-                        None,
-                        Some((index + round + 1) as u64),
-                        None,
+                        true,
                     )
                     .unwrap();
                 }
@@ -2665,7 +2577,7 @@ mod tests {
         assert_eq!(db.stats().unwrap().active_leases, 0);
         assert!(
             db.connection
-                .query_row::<i64, _, _>("SELECT COUNT(*) FROM contexts", [], |row| row.get(0))
+                .query_row::<i64, _, _>("SELECT COUNT(*) FROM pins", [], |row| row.get(0))
                 .unwrap()
                 >= 160
         );
