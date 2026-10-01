@@ -108,17 +108,19 @@ if [ -n "$fail_once" ]; then exit 1; fi
 if [ -n "$FAKE_RUSTC_NO_OUTPUT" ]; then exit 0; fi
 out=
 name=demo
+source=
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --crate-name) name="$2"; shift 2 ;;
     --out-dir) out="$2"; shift 2 ;;
+    *.rs) source="$1"; shift ;;
     *) shift ;;
   esac
 done
 mkdir -p "$out"
 printf 'rlib:%s\n' "$name" > "$out/lib$name.rlib"
 printf 'rmeta:%s\n' "$name" > "$out/lib$name.rmeta"
-printf 'dep:%s\n' "$name" > "$out/$name.d"
+printf '%s: %s\n' "$name" "$source" > "$out/$name.d"
 if [ -n "$FAKE_RUSTC_OLD_MTIME" ]; then touch -t 202001010000 "$out"/*; fi
 "#,
         )
@@ -419,6 +421,51 @@ if [ -n "$FAKE_RUSTC_OLD_MTIME" ]; then touch -t 202001010000 "$out"/*; fi
             b"rlib:demo\n"
         );
 
+        daemon.kill().unwrap();
+        let _ = daemon.wait();
+    }
+
+    #[test]
+    fn real_rustc_external_include_never_publishes_a_hit() {
+        let _serial = serial_e2e();
+        ensure_workspace_bins_built().unwrap();
+        let sb = Sandbox::new().unwrap();
+        let fixture = fixture(&sb);
+        let external = sb.projects.join("outside-package.txt");
+        fs::write(&external, "first").unwrap();
+        fs::write(
+            &fixture.source,
+            format!(
+                "pub const VALUE: &str = include_str!({:?});\n",
+                external.to_string_lossy()
+            ),
+        )
+        .unwrap();
+        let mut daemon = start_daemon(&sb);
+        let compile = |context: &str| {
+            let output = sb
+                .cmd(wrapper_bin())
+                .env("CARGO_MANIFEST_DIR", &fixture.workspace)
+                .arg("rustc")
+                .args(["--crate-name", "demo", "--crate-type=lib"])
+                .arg("--emit=dep-info,metadata,link")
+                .arg("--out-dir")
+                .arg(out_dir(&sb, context))
+                .arg(&fixture.source)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "real rustc compile failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            fs::read(out_dir(&sb, context).join("libdemo.rlib")).unwrap()
+        };
+        let first = compile("external-first");
+        fs::write(&external, "second").unwrap();
+        let second = compile("external-second");
+        assert_ne!(first, second, "external include edit must recompile");
+        assert_eq!(cache_hits(&sb), 0);
         daemon.kill().unwrap();
         let _ = daemon.wait();
     }
@@ -996,10 +1043,16 @@ if [ -n "$FAKE_RUSTC_OLD_MTIME" ]; then touch -t 202001010000 "$out"/*; fi
             4,
             "remapped worktrees with different environments must not collide"
         );
+        let artifacts = |context| {
+            outputs(&sb, context)
+                .into_iter()
+                .filter(|(name, _)| !name.ends_with(".d"))
+                .collect::<Vec<_>>()
+        };
         assert_eq!(
-            outputs(&sb, "remapped-b"),
-            outputs(&sb, "remapped-a"),
-            "equivalent fixture compiles should produce the same outputs"
+            artifacts("remapped-b"),
+            artifacts("remapped-a"),
+            "equivalent fixture compiles should produce the same artifacts"
         );
 
         daemon.kill().unwrap();

@@ -20,7 +20,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use fs4::fs_std::FileExt;
 use rgo_cas::{MANIFEST_VERSION, Manifest, ManifestOutput, ObjectRef, Store};
-use rgo_key::{AllowedRoots, BypassReason, Candidate, Classification, classify};
+use rgo_key::{
+    AllowedRoots, BypassReason, Candidate, Classification, classify, validate_file_inputs,
+    validate_keyed_roots,
+};
 use rgo_materialize::materialize;
 use rgo_protocol::{
     BYPASS_ENV, CACHE_EVENT_LOG_FILE, CACHE_EVENT_LOG_LOCK, CACHE_EVENT_LOG_MAX_BYTES,
@@ -638,6 +641,7 @@ fn materialize_hit(
     if manifest.key != candidate.key.as_str() {
         return Err("cache manifest key mismatch".into());
     }
+    validate_keyed_roots(candidate).map_err(|error| error.to_string())?;
     let mut used = vec![false; candidate.outputs.len()];
     for output in &manifest.outputs {
         let Some((index, spec)) = candidate
@@ -834,6 +838,15 @@ fn publish_result(
             "eligible rustc invocation produced no new or detectably changed cacheable outputs"
         );
     }
+    let mut dep_infos = outputs.iter().filter(|(kind, _)| kind == "dep-info");
+    let dep_info = dep_infos
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("compiler result has no fresh dep-info"))?;
+    anyhow::ensure!(
+        dep_infos.next().is_none(),
+        "compiler result has multiple dep-info files"
+    );
+    validate_file_inputs(candidate, &dep_info.1)?;
     let output_refs = outputs
         .into_iter()
         .map(|(kind, path)| {

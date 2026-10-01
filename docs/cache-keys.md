@@ -2,7 +2,7 @@
 
 The dependency cache (`[cache] enabled = true`) is opt-in and conservatively
 scoped. Every artifact key is a BLAKE3 digest over a fixed, length-delimited
-field list. The key schema is `rgo-cache-v5`. The classifier still has
+field list. The key schema is `rgo-cache-v6`. The classifier still has
 unverified dynamic-input classes, so caching remains experimental and disabled
 by default. A key collision can return incorrect output.
 
@@ -20,6 +20,14 @@ by default. A key collision can return incorrect output.
 | target triple | `--target` value when present | cross builds never collide with host builds |
 | remap prefix | `(from, to)` of the applied `--remap-path-prefix` | source path normalization preserves relative suffixes; environment-dependent absolute paths can still distinguish worktrees |
 | OUT_DIR digest | content digest of the build-script output dir | build-script-produced inputs change the key |
+
+Before publication, rgo requires a fresh rustc dep-info output. Every listed
+file must resolve inside the already-hashed package source or `OUT_DIR`; an
+external include or an unrecognized dep-info record prevents publication.
+The source and `OUT_DIR` digests are rechecked after compilation and immediately
+before a hit is materialized. This follows [rustc's dep-info contract](https://doc.rust-lang.org/rustc/command-line-arguments.html#--emit-specifies-the-types-of-output-files-to-generate),
+but does not cover arbitrary file reads by a compiler plugin or establish a
+complete freshness proof for restored outputs.
 
 ## Classifier table
 
@@ -41,6 +49,7 @@ a failure. Reasons are stable strings, recorded in `state/cache-events.log`.
 | `-Zembed-metadata` (nightly cargo default) | keyed like any other arg — allowlisted because cargo emits it on every nightly invocation |
 | target JSON file/path, explicit `--sysroot` | `custom_target`, `custom_sysroot` |
 | `--extern` dynamic library (`.so`, `.dylib`, `.dll`) | `dynamic_extern`; a proc-macro consumer may read inputs absent from the compiler key |
+| eligible emit set without `dep-info` | `missing_dep_info` |
 | `-l`, `-Lnative=`, `-Clinker=`, `-Clink-arg*`, `-Clink-self-contained` | `native_input` |
 | `-L` path outside build root / sysroot, or unresolvable `--extern` | `external_extern` |
 | `OUT_DIR` outside the managed build root | `build_script_output` |

@@ -14,7 +14,7 @@ use std::process::Command;
 use blake3::Hasher;
 use serde::{Deserialize, Serialize};
 
-pub const CACHE_SCHEMA_VERSION: u32 = 5;
+pub const CACHE_SCHEMA_VERSION: u32 = 6;
 pub const WORKSPACE_REMAP_PREFIX: &str = "/rgo/workspace";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -44,6 +44,7 @@ pub enum BypassReason {
     CustomTarget,
     CustomSysroot,
     DynamicExtern,
+    MissingDepInfo,
 }
 
 impl std::fmt::Display for BypassReason {
@@ -73,6 +74,7 @@ impl std::fmt::Display for BypassReason {
             Self::CustomTarget => "custom_target",
             Self::CustomSysroot => "custom_sysroot",
             Self::DynamicExtern => "dynamic_extern",
+            Self::MissingDepInfo => "missing_dep_info",
         };
         f.write_str(value)
     }
@@ -112,6 +114,7 @@ pub struct Candidate {
     pub compiler_args: Vec<OsString>,
     pub remap_path_prefix: Option<(String, String)>,
     pub out_dir_digest: Option<String>,
+    pub out_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -354,6 +357,15 @@ pub fn classify(
         None
     };
 
+    if !emits.iter().any(|value| {
+        value
+            .split_once('=')
+            .map_or(value.as_str(), |(kind, _)| kind)
+            == "dep-info"
+    }) {
+        return Classification::Bypass(BypassReason::MissingDepInfo);
+    }
+
     let source_digest = match digest_tree_strict(&source_root) {
         Ok(digest) => digest,
         Err(_) => return Classification::Bypass(BypassReason::SourceOutsideCache),
@@ -418,7 +430,82 @@ pub fn classify(
         compiler_args,
         remap_path_prefix,
         out_dir_digest,
+        out_dir,
     }))
+}
+
+/// Reject a compiler result unless rustc's observed file inputs are covered by
+/// the source or OUT_DIR digests in this candidate's key. Rehashing after rustc
+/// exits also prevents publication under a key computed before an input edit.
+pub fn validate_file_inputs(candidate: &Candidate, dep_info: &Path) -> std::io::Result<()> {
+    let contents = fs::read_to_string(dep_info)?;
+    let mut rule = None;
+    for line in contents.lines() {
+        if line.is_empty() || line.starts_with("# env-dep:") {
+            continue;
+        }
+        if line.starts_with('#') {
+            return Err(std::io::Error::other("unrecognized dep-info input"));
+        }
+        if rule.is_none() {
+            if let Some((_, dependencies)) = line.split_once(": ") {
+                rule = Some(dependencies);
+            }
+        }
+    }
+    let dependencies = rule.ok_or_else(|| std::io::Error::other("missing dep-info rule"))?;
+    let cwd = env::current_dir()?;
+    let out_dir = candidate
+        .out_dir
+        .as_ref()
+        .map(fs::canonicalize)
+        .transpose()?;
+    let mut words = dependencies.split_whitespace();
+    let mut found_input = false;
+    while let Some(word) = words.next() {
+        let mut path = word.to_owned();
+        while path.ends_with('\\') {
+            path.pop();
+            path.push(' ');
+            path.push_str(
+                words
+                    .next()
+                    .ok_or_else(|| std::io::Error::other("trailing dep-info escape"))?,
+            );
+        }
+        let canonical = fs::canonicalize(cwd.join(&path))?;
+        if !canonical.is_file()
+            || !(canonical.starts_with(&candidate.source_root)
+                || out_dir
+                    .as_ref()
+                    .is_some_and(|root| canonical.starts_with(root)))
+        {
+            return Err(std::io::Error::other("dep-info input outside keyed roots"));
+        }
+        found_input = true;
+    }
+    if !found_input {
+        return Err(std::io::Error::other("empty dep-info rule"));
+    }
+    validate_keyed_roots(candidate)
+}
+
+/// Recheck hashed roots immediately before a hit is materialized or a producer
+/// publishes under the candidate's key.
+pub fn validate_keyed_roots(candidate: &Candidate) -> std::io::Result<()> {
+    if digest_tree_strict(&candidate.source_root)? != candidate.source_digest {
+        return Err(std::io::Error::other(
+            "source changed since key calculation",
+        ));
+    }
+    if let (Some(out_dir), Some(expected)) = (&candidate.out_dir, &candidate.out_dir_digest) {
+        if digest_tree_strict(out_dir)? != *expected {
+            return Err(std::io::Error::other(
+                "OUT_DIR changed since key calculation",
+            ));
+        }
+    }
+    Ok(())
 }
 
 pub fn digest_tree(root: &Path) -> std::io::Result<String> {
@@ -1004,7 +1091,7 @@ mod tests {
                 "--crate-name".into(),
                 "member".into(),
                 "--crate-type=lib".into(),
-                "--emit=metadata".into(),
+                "--emit=dep-info,metadata".into(),
                 "--out-dir".into(),
                 build.as_os_str().to_owned(),
                 root.join("src/lib.rs").into_os_string(),
@@ -1065,7 +1152,7 @@ mod tests {
             "--crate-name".into(),
             "demo".into(),
             "--crate-type=lib".into(),
-            "--emit=metadata".into(),
+            "--emit=dep-info,metadata".into(),
             "--out-dir".into(),
             root.as_os_str().to_owned(),
             source.into_os_string(),
@@ -1111,7 +1198,7 @@ mod tests {
             "--crate-name".into(),
             "demo".into(),
             "--crate-type=lib".into(),
-            "--emit=metadata".into(),
+            "--emit=dep-info,metadata".into(),
             "--out-dir".into(),
             root.as_os_str().to_owned(),
             source.into_os_string(),
@@ -1164,6 +1251,51 @@ mod tests {
     }
 
     #[test]
+    fn dep_info_rejects_external_inputs_and_mid_compile_source_edits() {
+        let (_dir, root, source) = fixture();
+        let build = root.parent().unwrap().join("build");
+        fs::create_dir_all(&build).unwrap();
+        let candidate = match classify(
+            Path::new("rustc"),
+            &[
+                "--crate-name".into(),
+                "demo".into(),
+                "--crate-type=lib".into(),
+                "--emit=dep-info,metadata".into(),
+                "--out-dir".into(),
+                build.as_os_str().to_owned(),
+                source.as_os_str().to_owned(),
+            ],
+            &[],
+            &AllowedRoots {
+                build_root: build.clone(),
+                source_roots: vec![root.parent().unwrap().to_path_buf()],
+                workspace_roots: Vec::new(),
+                remap_workspace_paths: false,
+            },
+        ) {
+            Classification::Cacheable(candidate) => candidate,
+            other => panic!("expected cacheable candidate: {other:?}"),
+        };
+        let dep_info = build.join("demo.d");
+        fs::write(&dep_info, format!("demo: {}\n", source.display())).unwrap();
+        validate_file_inputs(&candidate, &dep_info).unwrap();
+
+        let external = root.parent().unwrap().join("outside.txt");
+        fs::write(&external, b"external input").unwrap();
+        fs::write(
+            &dep_info,
+            format!("demo: {} {}\n", source.display(), external.display()),
+        )
+        .unwrap();
+        assert!(validate_file_inputs(&candidate, &dep_info).is_err());
+
+        fs::write(&dep_info, format!("demo: {}\n", source.display())).unwrap();
+        fs::write(&source, b"pub fn changed() {}\n").unwrap();
+        assert!(validate_file_inputs(&candidate, &dep_info).is_err());
+    }
+
+    #[test]
     fn widened_workspace_classes_require_safe_inputs() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("workspace/member");
@@ -1196,11 +1328,11 @@ mod tests {
             )
         };
         assert!(matches!(
-            classify_type("bin", "metadata", &[]),
+            classify_type("bin", "dep-info,metadata", &[]),
             Classification::Cacheable(_)
         ));
         assert!(matches!(
-            classify_type("proc-macro", "metadata,link", &[]),
+            classify_type("proc-macro", "dep-info,metadata,link", &[]),
             Classification::Cacheable(_)
         ));
 
@@ -1213,7 +1345,7 @@ mod tests {
         .unwrap();
         let env = vec![(OsString::from("OUT_DIR"), out_dir.into_os_string())];
         assert!(matches!(
-            classify_type("lib", "metadata", &env),
+            classify_type("lib", "dep-info,metadata", &env),
             Classification::Cacheable(_)
         ));
     }
@@ -1360,7 +1492,7 @@ mod tests {
             Path::new("rustc"),
             &[
                 "--crate-type=lib".into(),
-                "--emit=metadata,link".into(),
+                "--emit=dep-info,metadata,link".into(),
                 "-Cextra-filename=-deadbeef".into(),
                 "--out-dir".into(),
                 build.as_os_str().to_owned(),
@@ -1393,7 +1525,7 @@ mod tests {
                 "--crate-name".into(),
                 "demo".into(),
                 "--crate-type=lib".into(),
-                "--emit=metadata,link".into(),
+                "--emit=dep-info,metadata,link".into(),
                 "--out-dir".into(),
                 build.as_os_str().to_owned(),
                 source.as_os_str().to_owned(),
@@ -1480,7 +1612,7 @@ mod tests {
             "--crate-name".into(),
             "member".into(),
             "--crate-type=lib".into(),
-            "--emit=metadata".into(),
+            "--emit=dep-info,metadata".into(),
             "--out-dir".into(),
             build.as_os_str().to_owned(),
             source.as_os_str().to_owned(),
