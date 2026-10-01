@@ -1762,33 +1762,39 @@ fn daemon_coordinates_builds_and_pins_contexts() {
         root: sb.rgo_home.clone(),
     };
     let context = paths.builds_dir().join(&id);
+    // These are durable filesystem writes. Match the CLI's pin deadline,
+    // rather than the 150 ms timeout used by best-effort daemon probes.
+    let pin_timeout = Duration::from_secs(5);
     // An unrelated malformed shard must not prevent pinning this valid
     // context; pin admission checks only the selected root/shard/context.
     let unrelated_shard = paths.builds_dir().join("zz");
     std::fs::write(&unrelated_shard, b"not a shard").unwrap();
-    let repin = ipc::request(
+    let repin = ipc::request_with_timeout(
         &paths.socket_path(),
         Request::Pin {
             build_dir: context.display().to_string(),
         },
+        pin_timeout,
     )
     .unwrap();
     assert!(matches!(repin, Response::Ok));
-    let reunpin = ipc::request(
+    let reunpin = ipc::request_with_timeout(
         &paths.socket_path(),
         Request::Unpin {
             build_dir: context.display().to_string(),
         },
+        pin_timeout,
     )
     .unwrap();
     assert!(matches!(reunpin, Response::Ok));
     std::fs::remove_file(&unrelated_shard).unwrap();
     std::fs::remove_dir_all(&context).unwrap();
-    let stale_pin = ipc::request(
+    let stale_pin = ipc::request_with_timeout(
         &paths.socket_path(),
         Request::Pin {
             build_dir: context.display().to_string(),
         },
+        pin_timeout,
     )
     .unwrap();
     assert!(matches!(stale_pin, Response::Error { .. }));
@@ -1798,11 +1804,12 @@ fn daemon_coordinates_builds_and_pins_contexts() {
         let outside = sb.home.join("outside-pin-target");
         std::fs::create_dir(&outside).unwrap();
         std::os::unix::fs::symlink(&outside, &context).unwrap();
-        let symlink_pin = ipc::request(
+        let symlink_pin = ipc::request_with_timeout(
             &paths.socket_path(),
             Request::Pin {
                 build_dir: context.display().to_string(),
             },
+            pin_timeout,
         )
         .unwrap();
         assert!(matches!(symlink_pin, Response::Error { .. }));
