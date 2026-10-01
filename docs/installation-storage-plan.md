@@ -381,6 +381,8 @@ The later CAS manifest-selection walk now runs outside the operation lock. Befor
 
 Temporary/quarantine cleanup and both unreferenced-CAS execution phases now stage one action under admission, release admission for physical removal, then recheck the next action. Every orphan object repeats the cache-lease and manifest-revision checks immediately before staging; a publication between two staged objects invalidates the remaining stale object choices. A focused two-object race fixture commits a manifest for the second object while the first is staged and requires that referenced object to survive. The inventory lock still serializes whole GC passes, and individual deletion checks remain; this is not yet a bounded total pass.
 
+Cache-stat requests and full status now measure CAS object bytes outside the shared SQLite mutex; bounded cache-log completeness checks also run outside that mutex. This keeps a large object tree from delaying lease and commit database access solely because a report is being assembled. Event draining still performs bounded file/database work while holding the mutex.
+
 CAS manifest reads/listing now reject malformed object digests before constructing object paths. The wrapper materializes cache hits with clone/copy rather than hardlinks. Neither change completes the broader P6 cache-soundness gate.
 
 **Exit evidence:** the F3 fixture can reclaim to its target; CAS-only growth triggers cleanup; expired orphans disappear below the soft watermark; protected state is preserved; reported reclamation distinguishes estimates from actual frees. After builds become idle, a supported fixture reaches the configured target within two configured maintenance cycles unless protected bytes prevent it.

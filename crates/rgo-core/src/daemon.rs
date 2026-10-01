@@ -765,11 +765,13 @@ fn handle_request_result(state: &State, request: Request) -> Result<Response> {
             Ok(Response::Ok)
         }
         Request::QueryCacheStats => {
+            let object_bytes = state.cas.object_bytes()?;
             let db = state.db.lock().unwrap();
             drain_cache_events(&state.paths, &db, &mut state.event_drainer.lock().unwrap())?;
-            let mut report = db.cache_stats(state.cfg.cache.enabled, state.cas.object_bytes()?)?;
-            report.observations_incomplete = cache_event_log_truncated(&state.paths);
+            let mut report = db.cache_stats(state.cfg.cache.enabled, object_bytes)?;
             report.remote = remote_status_from_db(state, &db)?;
+            drop(db);
+            report.observations_incomplete = cache_event_log_truncated(&state.paths);
             Ok(Response::CacheStats(report))
         }
         Request::QueryRemoteStatus => Ok(Response::RemoteStatus(remote_status(state)?)),
@@ -944,10 +946,12 @@ fn status_report(state: &State) -> Result<StatusReport> {
     } else {
         None
     };
+    let object_bytes = state.cas.object_bytes()?;
+    let observations_incomplete = cache_event_log_truncated(&state.paths);
     let cache = {
         let db = state.db.lock().unwrap();
-        let mut report = db.cache_stats(state.cfg.cache.enabled, state.cas.object_bytes()?)?;
-        report.observations_incomplete = cache_event_log_truncated(&state.paths);
+        let mut report = db.cache_stats(state.cfg.cache.enabled, object_bytes)?;
+        report.observations_incomplete = observations_incomplete;
         report.remote = remote_status_from_db(state, &db)?;
         report
     };
