@@ -568,13 +568,17 @@ fn handle_request_result(state: &State, request: Request) -> Result<Response> {
             let staged =
                 gc::stage_atomically(&state.paths, &victim).context("staging context for clean")?;
             drop(operation);
-            staged.finish().context("removing staged clean context")?;
-            let _operation = state.operation_lock.lock().unwrap();
-            let contexts =
-                context::list(&state.paths).context("inventorying contexts after clean")?;
-            let mut db = state.db.lock().unwrap();
-            db.reconcile_contexts(&state.paths, &contexts)
-                .context("reconciling metadata after clean")?;
+            staged
+                .finish_then(|| {
+                    let _operation = state.operation_lock.lock().unwrap();
+                    state
+                        .db
+                        .lock()
+                        .unwrap()
+                        .forget_removed_context(&victim)
+                        .context("forgetting removed clean context")
+                })
+                .context("finishing staged clean context")?;
             Ok(Response::Gc(GcReport {
                 reclaimed_bytes: reclaimed,
                 planned_bytes: reclaimed,

@@ -513,6 +513,17 @@ impl StateDb {
         Ok(())
     }
 
+    /// Remove one context whose build tree was deleted while its stable Cargo
+    /// lifecycle guard remains held. Other contexts may change concurrently.
+    pub fn forget_removed_context(&self, build_dir: &Path) -> Result<()> {
+        let path = normalize(build_dir);
+        self.connection.execute(
+            "DELETE FROM contexts WHERE build_dir = ?1",
+            params![path.to_string_lossy()],
+        )?;
+        Ok(())
+    }
+
     pub fn touch(
         &self,
         build_dir: &Path,

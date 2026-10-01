@@ -385,6 +385,13 @@ pub struct StagedRemoval {
 
 impl StagedRemoval {
     pub fn finish(self) -> Result<()> {
+        self.finish_then(|| Ok(()))
+    }
+
+    /// Keep the victim's lifecycle guard through a short metadata update after
+    /// physical removal. A waiting Cargo session must not reuse the path
+    /// between removal and that update.
+    pub fn finish_then<T>(self, after_remove: impl FnOnce() -> Result<T>) -> Result<T> {
         let removed = if self.staged.is_dir() {
             std::fs::remove_dir_all(&self.staged)
         } else {
@@ -397,7 +404,8 @@ impl StagedRemoval {
         if let Some(error) = prune_error {
             warn!(path = %self.victim.display(), %error, "deferred unpin record pruning");
         }
-        removed.with_context(|| format!("removing {}", self.staged.display()))
+        removed.with_context(|| format!("removing {}", self.staged.display()))?;
+        after_remove()
     }
 }
 
