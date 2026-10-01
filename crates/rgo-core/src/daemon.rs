@@ -1457,11 +1457,11 @@ fn run_gc(
             execution.absorb(gc::execute(&state.paths, &post, false)?);
             forget_removed_object_rows(state, &post.actions)?;
         }
-        // The CAS phase is complete. New context pins and leases admitted
-        // during this scan are read again before pressure-context selection.
+        // The CAS phase is complete. Inventory and pressure candidate checks
+        // can run without blocking pin and lease admission; every selected
+        // context is rechecked under the admission lock before staging.
         drop(_operation);
         let remaining = crate::size::managed_snapshot(&state.paths)?;
-        let mut operation = state.operation_lock.lock().unwrap();
         let remaining_total = remaining.total_bytes();
         let contexts = remaining.contexts;
         let remaining_cas_bytes = remaining.cas_bytes;
@@ -1511,6 +1511,7 @@ fn run_gc(
             report
                 .actions
                 .extend(pressure_plan.actions.iter().map(wire_gc_action));
+            let mut operation = state.operation_lock.lock().unwrap();
             for action in &pressure_plan.actions {
                 // A pin or lease may have been admitted while the previous
                 // staged tree was being removed. Recheck before each rename;
@@ -1551,11 +1552,11 @@ fn run_gc(
                     }
                 }
             }
+            drop(operation);
         }
         // All destructive actions have finished. Keep other GC/clean passes
         // excluded, but allow pin and lease admission while measuring the
         // resulting tree; reacquire admission ordering for the database update.
-        drop(operation);
         let remaining = crate::size::managed_snapshot(&state.paths)?;
         let contexts = remaining.contexts;
         let remaining_build_bytes = remaining.build_bytes;
