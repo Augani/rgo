@@ -45,10 +45,13 @@ documented [build-directory configuration](https://doc.rust-lang.org/cargo/refer
 establishes where intermediates go; it does not give rgo a context-wide
 ownership lock. The profile `.cargo-build-lock` probe is only an additional
 liveness heuristic. Fresh contexts created by supervised Cargo carry a
-`supervised_origin` sidecar field; GC can skip the ten-minute timestamp grace
-for those contexts, while still refusing a held or unreadable profile lock and
-holding rgo's lifecycle guard through deletion. Existing and uncertain
-contexts retain that grace. This does not make an unsupervised override safe.
+`supervised_origin` sidecar field. The supervised GC planner protects contexts
+without that origin for orphan, age, incremental, and pressure cleanup; its
+executor checks the origin again after acquiring the lifecycle guard. For
+eligible supervised contexts, GC can skip the ten-minute timestamp grace while
+still refusing a held or unreadable profile lock and holding rgo's guard
+through deletion. This does not detect direct Cargo writing into an already
+supervised context without running the wrapper.
 
 ## Proposed exclusion protocol
 
@@ -83,12 +86,13 @@ contexts retain that grace. This does not make an unsupervised override safe.
    creation](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-updateprocthreadattribute),
    [kill-on-close](https://learn.microsoft.com/en-us/windows/win32/api/winnt/ns-winnt-jobobject_extended_limit_information),
    and the [active-process count](https://learn.microsoft.com/en-us/windows/win32/api/winnt/ns-winnt-jobobject_basic_accounting_information).
-5. Deletion rechecks ownership, the top-level sidecar, pin state, workspace
-   availability, and the documented Cargo profile lock after acquiring its
-   guard. A missing or unreadable sidecar, lock state, or workspace identity
-   prevents context deletion. Pin decisions live outside the evictable tree so
-   a full `cargo clean` cannot silently erase intent. New pin/unpin decisions
-   replace their record through a synced staging file under the decision lock;
+5. Deletion rechecks ownership, the top-level sidecar's supervised origin,
+   pin state, workspace availability, and the documented Cargo profile lock
+   after acquiring its guard. A missing or unreadable sidecar, native origin,
+   lock state, or workspace identity prevents context deletion. Pin decisions
+   live outside the evictable tree so a full `cargo clean` cannot silently erase
+   intent. New pin/unpin decisions replace their record through a synced staging
+   file under the decision lock;
    a failed write leaves the prior decision intact. GC stages by same-volume
    rename into its owned temporary domain before recursive removal.
 
@@ -107,6 +111,11 @@ process-level session guard.
   rename-pause run](https://github.com/Augani/rgo/actions/runs/36513462716)
   checked that a new session waits at GC's locked and staged points and can
   recreate a fresh context only after removal.
+- A focused origin fixture requires a native-origin context to stay protected
+  while a supervised neighbor is reclaimed under pressure. It also calls the
+  deletion executor on the native context and requires refusal. The local
+  full suite passes; platform CI for this change is pending. The marker
+  cannot prove that no later direct Cargo invocation wrote the same context.
 - A private-home Unix real-Cargo race pauses an explicit context clean after
   GC takes its stable guard. A newly started unchanged `cargo build` reaches
   its session lock but cannot enter Cargo until deletion finishes; it then
@@ -173,7 +182,7 @@ process-level session guard.
 
 | Condition | Current treatment | Release work |
 |---|---|---|
-| Native setup or an external Cargo/IDE launch with a managed build-dir override | The rgo lock does not cover it. `gc.auto` stays off. Supervised cleanup now refuses Cargo-home config drift, but cannot exclude project, environment, or CLI overrides from another process. | Prevent managed-namespace bypass in the supported activation contract or obtain an upstream Cargo lifecycle hook. |
+| Native setup or an external Cargo/IDE launch with a managed build-dir override | The rgo lock does not cover it. Native `gc.auto` stays off; supervised cleanup excludes native-origin sidecars and refuses Cargo-home config drift. It cannot detect a direct process writing a context already marked supervised. | Prevent managed-namespace bypass in the supported activation contract or obtain an upstream Cargo lifecycle hook. |
 | A build-script or test descendant escapes the inherited Unix descriptor, or a Windows process starts through an external broker such as WMI | The parent can finish while an external writer remains. | Run real process-tree fixtures, define supported launch semantics, and refuse unattended deletion where exclusion cannot be guaranteed. |
 | Same-user replacement of the lock directory or, on Unix, a lock file after its final identity check | Existing holders could lock different file identities even though pre-acquisition checks passed. Windows now denies direct lock-file rename/delete while its handle is open; ancestor mutation remains unproven. | Define and enforce private lock-directory ownership/mutation rules; exercise replacement at every pause point. |
 | Unsupported filesystem locking, unreadable state, daemon outage, or failed Windows job creation | Error/guard contention skips GC; supervised launch should use ordinary Cargo storage if it cannot establish protection. | Prove fallback before any managed write on each platform and with service restart/interruption. |

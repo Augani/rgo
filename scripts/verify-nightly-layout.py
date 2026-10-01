@@ -151,8 +151,13 @@ def probe(mode: str, rustup_home: str, toolchain: str, expect_profile_lock: bool
             if "1 context(s) skipped: recently changed or held Cargo profile lock" not in locked_plan:
                 raise RuntimeError(f"{mode}: rgo did not protect the held profile lock:\n{locked_plan}")
             idle_plan = run(gc_args, cwd=project, env=env).stdout
-            if "would unlink approximately" not in idle_plan:
-                raise RuntimeError(f"{mode}: idle context was not reclaimable:\n{idle_plan}")
+            if (
+                "1 context(s) skipped: workspace attribution, availability, or supervised origin unverified"
+                not in idle_plan
+                or "nothing to reclaim" not in idle_plan
+                or not context.is_dir()
+            ):
+                raise RuntimeError(f"{mode}: native-origin context was not protected:\n{idle_plan}")
         else:
             # Older Cargo still relocates its intermediates, but rgo must not
             # infer a safe native deletion protocol from an unfamiliar lock.
@@ -190,7 +195,7 @@ def main() -> None:
         probe(mode, rustup_home, args.toolchain, not args.without_profile_lock)
     print(
         f"{version}: relocation, final outputs, incremental state, and "
-        f"{'held-lock planning' if not args.without_profile_lock else 'native deletion refusal without a supported profile lock'} "
+        f"{'held-lock detection and native-origin protection' if not args.without_profile_lock else 'native deletion refusal without a supported profile lock'} "
         "verified in both layout modes"
     )
 

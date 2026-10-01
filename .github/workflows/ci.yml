@@ -36,6 +36,10 @@ jobs:
         with:
           toolchain: ${{ matrix.toolchain }}
           components: rustfmt, clippy
+      - name: Record exact Cargo and rustc versions
+        run: |
+          cargo --version --verbose
+          rustc --version --verbose
       - name: Build workspace
         run: cargo build --workspace
       - name: Probe Windows scheduled service in a private Cargo home
