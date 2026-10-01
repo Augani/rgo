@@ -984,6 +984,18 @@ impl StateDb {
         Ok(paths)
     }
 
+    /// Check a selected context without reading every pin row during GC
+    /// admission. Pin writes and reconciliation store normalized paths.
+    pub fn has_pin(&self, path: &Path) -> Result<bool> {
+        self.connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM pins WHERE build_dir = ?1)",
+                params![normalize(path).to_string_lossy()],
+                |row| row.get(0),
+            )
+            .map_err(Into::into)
+    }
+
     pub fn set_pin(&self, path: &Path, pinned: bool) -> Result<()> {
         let path = normalize(path);
         if pinned {

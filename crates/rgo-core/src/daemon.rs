@@ -1453,7 +1453,7 @@ fn run_gc(
             };
             let protected = {
                 let db = state.db.lock().unwrap();
-                same_path_in(&db.pinned_paths()?, &context.dir)
+                db.has_pin(&context.dir)?
                     || same_path_in(
                         &db.protected_paths(std::slice::from_ref(context))?,
                         &context.dir,
@@ -1714,7 +1714,7 @@ fn run_gc(
                 };
                 let protected = {
                     let db = state.db.lock().unwrap();
-                    same_path_in(&db.pinned_paths()?, &action.path)
+                    db.has_pin(&context.dir)?
                         || same_path_in(
                             &db.protected_paths(std::slice::from_ref(context))?,
                             &action.path,
