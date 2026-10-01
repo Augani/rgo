@@ -126,6 +126,7 @@ impl RgoPaths {
                 return Err(error).with_context(|| format!("checking {}", config_path.display()));
             }
         }
+        require_local_cleanup_volume(&self.root)?;
         Ok(())
     }
     /// Parent of every Cargo build-dir rgo manages. Cargo's `{workspace-path-hash}`
@@ -350,6 +351,59 @@ impl RgoPaths {
         }
         Ok(true)
     }
+}
+
+/// Cargo omits its profile build lock on NFS. rgo's lifecycle lock also has
+/// no verified cross-host protocol, so never destructively clean a known
+/// network-mounted storage root. A failed volume query is likewise unsafe.
+fn require_local_cleanup_volume(root: &Path) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        let fs = rustix::fs::statfs(root)
+            .with_context(|| format!("checking cleanup filesystem at {}", root.display()))?;
+        let kind = fs.f_type as u32;
+        // NFS, SMB, and CIFS/smb3 filesystem magic numbers.
+        ensure!(
+            !matches!(kind, 0x6969 | 0x517b | 0xff53_4d42),
+            "destructive cleanup is unsupported on a network-mounted storage root at {}",
+            root.display()
+        );
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let fs = rustix::fs::statfs(root)
+            .with_context(|| format!("checking cleanup filesystem at {}", root.display()))?;
+        ensure!(
+            fs.f_flags & libc::MNT_LOCAL as u32 != 0,
+            "destructive cleanup is unsupported on a network-mounted storage root at {}",
+            root.display()
+        );
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Storage::FileSystem::{GetDriveTypeW, GetVolumePathNameW};
+        use windows_sys::Win32::System::WindowsProgramming::{
+            DRIVE_NO_ROOT_DIR, DRIVE_REMOTE, DRIVE_UNKNOWN,
+        };
+
+        let path: Vec<u16> = root.as_os_str().encode_wide().chain(Some(0)).collect();
+        let mut volume = vec![0u16; 32_768];
+        let found = unsafe { GetVolumePathNameW(path.as_ptr(), volume.as_mut_ptr(), 32_768) };
+        ensure!(
+            found != 0,
+            "cannot identify cleanup volume at {}: {}",
+            root.display(),
+            std::io::Error::last_os_error()
+        );
+        let kind = unsafe { GetDriveTypeW(volume.as_ptr()) };
+        ensure!(
+            kind != DRIVE_REMOTE && kind != DRIVE_UNKNOWN && kind != DRIVE_NO_ROOT_DIR,
+            "destructive cleanup requires a verified local storage volume at {}",
+            root.display()
+        );
+    }
+    Ok(())
 }
 
 fn refuse_symlink(path: &Path) -> Result<()> {

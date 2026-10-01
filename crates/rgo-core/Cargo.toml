@@ -25,6 +25,7 @@ directories.workspace = true
 walkdir.workspace = true
 fs4.workspace = true
 rustix.workspace = true
+libc.workspace = true
 rusqlite.workspace = true
 interprocess.workspace = true
 
@@ -35,6 +36,7 @@ roxmltree = "0.21.1"
 [target.'cfg(windows)'.dependencies]
 roxmltree = "0.21.1"
 rgo-winpipe.workspace = true
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_WindowsProgramming"] }
 
 [lints]
 workspace = true

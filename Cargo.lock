@@ -667,6 +667,7 @@ dependencies = [
  "fs4",
  "humantime",
  "interprocess",
+ "libc",
  "rgo-cas",
  "rgo-protocol",
  "rgo-remote",
@@ -682,6 +683,7 @@ dependencies = [
  "toml_edit",
  "tracing",
  "walkdir",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

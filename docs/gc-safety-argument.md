@@ -38,9 +38,11 @@ cooperative Cargo lifecycle hook; this boundary is unresolved, not evidence
 that all direct Cargo launches are safe.
 Cargo's [current layout source](https://doc.rust-lang.org/nightly/nightly-rustc/src/cargo/compiler/layout.rs.html)
 also omits its build-directory profile lock on NFS mounts. The profile-lock
-heuristic therefore cannot admit an NFS root to native cleanup; the supervised
-lock protocol and filesystem capability need their own validation before any
-network-mounted root can enter automatic deletion.
+heuristic therefore cannot admit an NFS root to native cleanup. Destructive
+rgo cleanup now rejects known Linux NFS/SMB/CIFS types, macOS non-local
+volumes, and Windows remote drives; a failed volume query also blocks it.
+This is a conservative exclusion, not proof that every unusual filesystem is
+local or that its lock semantics are suitable for automatic deletion.
 Undo removes the active owner record, so a retained storage root cannot be
 destructively cleaned through `rgo gc` after uninstall; a separately reviewed
 offline purge remains release work.
