@@ -56,6 +56,14 @@ fn damaged_lifecycle_lock_keeps_plain_cargo_build_available() {
     let locks = paths.state_dir().join("locks");
     std::fs::rename(&locks, paths.state_dir().join("locks-disabled")).unwrap();
     std::fs::write(&locks, b"unavailable").unwrap();
+    let version = sandbox
+        .cmd(&shim)
+        .env_remove("RGO_HOME")
+        .arg("--version")
+        .output()
+        .unwrap();
+    assert!(version.status.success());
+    assert!(String::from_utf8_lossy(&version.stdout).starts_with("cargo "));
     let fallback_project = sandbox.simple_bin("lock-probe-fallback").unwrap();
     let fallback = sandbox
         .cmd(&shim)

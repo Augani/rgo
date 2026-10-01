@@ -91,6 +91,10 @@ pub fn run(
                 );
                 return exec_real_cargo_in_checkout(real_cargo, &args, root);
             }
+            if is_inert_query(cargo_args) {
+                eprintln!("rgo: lifecycle lock unavailable ({error:#}); forwarding Cargo query");
+                return exec_real_cargo(real_cargo, &args);
+            }
             return Err(error);
         }
     };
@@ -323,6 +327,14 @@ fn split_toolchain(args: &[OsString]) -> (Option<&OsStr>, &[OsString]) {
     } else {
         (None, args)
     }
+}
+
+#[cfg(any(unix, windows))]
+fn is_inert_query(args: &[OsString]) -> bool {
+    args.len() == 1
+        && args[0]
+            .to_str()
+            .is_some_and(|arg| matches!(arg, "--version" | "-V" | "--help" | "-h" | "--list"))
 }
 
 #[cfg(any(unix, windows))]
