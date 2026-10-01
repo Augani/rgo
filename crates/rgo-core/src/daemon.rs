@@ -1461,7 +1461,10 @@ fn run_gc(
             let protected = {
                 let db = state.db.lock().unwrap();
                 same_path_in(&db.pinned_paths()?, &context.dir)
-                    || same_path_in(&db.protected_paths(&contexts)?, &context.dir)
+                    || same_path_in(
+                        &db.protected_paths(std::slice::from_ref(context))?,
+                        &context.dir,
+                    )
             };
             if protected {
                 let error = anyhow::anyhow!("context gained a pin or lease during GC");
@@ -1705,21 +1708,28 @@ fn run_gc(
                 // A pin or lease may have been admitted while the previous
                 // staged tree was being removed. Recheck before each rename;
                 // the filesystem lifecycle guard remains held through finish.
+                let Some(context) = contexts
+                    .iter()
+                    .find(|context| action.path.starts_with(&context.dir))
+                else {
+                    let error = anyhow::anyhow!("planned build path has no inventoried context");
+                    execution.note_skip(&action.path, action.bytes, &error);
+                    continue;
+                };
                 let protected = {
                     let db = state.db.lock().unwrap();
                     same_path_in(&db.pinned_paths()?, &action.path)
-                        || same_path_in(&db.protected_paths(&contexts)?, &action.path)
+                        || same_path_in(
+                            &db.protected_paths(std::slice::from_ref(context))?,
+                            &action.path,
+                        )
                 };
                 if protected {
                     let error = anyhow::anyhow!("context gained a pin or lease during GC");
                     execution.note_skip(&action.path, action.bytes, &error);
                     continue;
                 }
-                if contexts
-                    .iter()
-                    .find(|context| action.path.starts_with(&context.dir))
-                    .is_none_or(|context| context::read_sidecar(&context.dir) != context.sidecar)
-                {
+                if context::read_sidecar(&context.dir) != context.sidecar {
                     let error = anyhow::anyhow!("context changed during GC planning");
                     execution.note_skip(&action.path, action.bytes, &error);
                     continue;

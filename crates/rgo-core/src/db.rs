@@ -4,7 +4,7 @@
 //! pins, and accounting so the daemon can coordinate concurrent clients without scanning the
 //! entire managed tree for every heartbeat.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -943,6 +943,15 @@ impl StateDb {
 
     pub fn protected_paths(&self, contexts: &[context::BuildContext]) -> Result<Vec<PathBuf>> {
         let mut paths = HashSet::new();
+        let mut by_workspace: HashMap<&str, Vec<&Path>> = HashMap::new();
+        for context in contexts {
+            if let Some(sidecar) = &context.sidecar {
+                by_workspace
+                    .entry(&sidecar.workspace_root)
+                    .or_default()
+                    .push(&context.dir);
+            }
+        }
         let mut query = self
             .connection
             .prepare("SELECT build_dir, workspace_root FROM leases WHERE expires_at > ?1")?;
@@ -958,14 +967,8 @@ impl StateDb {
                 paths.insert(normalize(Path::new(&dir)));
             }
             if let Some(root) = workspace_root {
-                for context in contexts {
-                    if context
-                        .sidecar
-                        .as_ref()
-                        .is_some_and(|sidecar| sidecar.workspace_root == root)
-                    {
-                        paths.insert(normalize(&context.dir));
-                    }
+                if let Some(context_dirs) = by_workspace.get(root.as_str()) {
+                    paths.extend(context_dirs.iter().map(|dir| normalize(dir)));
                 }
             }
         }
@@ -2006,6 +2009,60 @@ mod tests {
         assert_eq!(db.stats().unwrap().pinned_contexts, 1);
         db.set_pin(Path::new("/tmp/build"), false).unwrap();
         assert_eq!(db.stats().unwrap().pinned_contexts, 0);
+    }
+
+    #[test]
+    fn workspace_lease_maps_to_each_selected_context() {
+        let root = tempdir().unwrap();
+        let paths = RgoPaths {
+            root: root.path().join("rgo"),
+        };
+        paths.ensure_layout().unwrap();
+        let db = StateDb::open(&paths).unwrap();
+        let dirs =
+            ["first", "second", "other"].map(|name| paths.builds_dir().join("ab").join(name));
+        let contexts = dirs
+            .iter()
+            .enumerate()
+            .map(|(index, dir)| {
+                std::fs::create_dir_all(dir).unwrap();
+                context::BuildContext {
+                    dir: dir.clone(),
+                    sidecar: Some(rgo_protocol::ContextSidecar {
+                        version: 1,
+                        workspace_verified: true,
+                        supervised_origin: true,
+                        workspace_root: if index < 2 { "shared" } else { "other" }.into(),
+                        manifest_path: String::new(),
+                        workspace_device: None,
+                        workspace_mount_id: None,
+                        toolchain: None,
+                        first_seen: 0,
+                        last_seen: 0,
+                    }),
+                    last_used: SystemTime::now(),
+                    usage: crate::size::Usage::default(),
+                    incremental_usage: crate::size::Usage::default(),
+                }
+            })
+            .collect::<Vec<_>>();
+        db.acquire(
+            &LeaseScope::Workspace {
+                workspace_root: "shared".into(),
+            },
+            1,
+            60,
+        )
+        .unwrap();
+        let all = db.protected_paths(&contexts).unwrap();
+        assert!(all.contains(&normalize(&dirs[0])));
+        assert!(all.contains(&normalize(&dirs[1])));
+        assert!(!all.contains(&normalize(&dirs[2])));
+        assert!(
+            db.protected_paths(&contexts[1..2])
+                .unwrap()
+                .contains(&normalize(&dirs[1]))
+        );
     }
 
     #[test]
