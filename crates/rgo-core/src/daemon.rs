@@ -1345,7 +1345,7 @@ fn run_gc(
     } else {
         Vec::new()
     };
-    let mut operation = state.operation_lock.lock().unwrap();
+    let operation = state.operation_lock.lock().unwrap();
     let db = state.db.lock().unwrap();
     let active_cache_keys = db.active_cache_keys()?;
     let active_cache_lease = db.has_active_cache_lease()?;
@@ -1413,9 +1413,9 @@ fn run_gc(
     };
     if !dry_run {
         let mut execution = gc::Execution::default();
-        // Finish non-context cleanup first while admission is serialized.
-        // In particular, CAS objects selected from the initial reference
-        // inventory must not wait across the unlocked context-removal gaps.
+        // Finish non-context cleanup before the context-removal phase. Each
+        // CAS object is revalidated and staged under admission; physical
+        // removal happens outside it.
         let non_context_plan = gc::Plan {
             actions: plan
                 .actions
@@ -1425,16 +1425,14 @@ fn run_gc(
                 .collect(),
             ..Default::default()
         };
-        match gc::execute(&state.paths, &non_context_plan, false) {
-            Ok(outcome) => execution.absorb(outcome),
-            Err(error) => {
-                let message = format!("{error:#}");
-                let db = state.db.lock().unwrap();
-                db.record_gc(dry_run, aggressive, &report, Some(&message))?;
-                return Err(error);
-            }
-        }
-        forget_removed_object_rows(state, &non_context_plan.actions)?;
+        drop(operation);
+        execute_staged_non_context_actions(
+            state,
+            &non_context_plan.actions,
+            sweep_generation,
+            &mut execution,
+        )?;
+        let mut operation = state.operation_lock.lock().unwrap();
         for action in plan
             .actions
             .iter()
@@ -1614,6 +1612,7 @@ fn run_gc(
         let post_sweep_safe = !post_sweep_blocked
             && !state.db.lock().unwrap().has_active_cache_lease()?
             && state.cas.manifest_revision() == post_sweep_generation;
+        drop(_operation);
         if post_sweep_safe {
             let mut post = gc::Plan::default();
             for action in post_candidates {
@@ -1629,13 +1628,16 @@ fn run_gc(
             report
                 .actions
                 .extend(post.actions.iter().map(wire_gc_action));
-            execution.absorb(gc::execute(&state.paths, &post, false)?);
-            forget_removed_object_rows(state, &post.actions)?;
+            execute_staged_non_context_actions(
+                state,
+                &post.actions,
+                post_sweep_generation,
+                &mut execution,
+            )?;
         }
         // The CAS phase is complete. Inventory and pressure candidate checks
         // can run without blocking pin and lease admission; every selected
         // context is rechecked under the admission lock before staging.
-        drop(_operation);
         let remaining = crate::size::managed_snapshot(&state.paths)?;
         let remaining_total = remaining.total_bytes();
         let contexts = remaining.contexts;
@@ -1850,6 +1852,30 @@ fn pause_after_cas_stage_for_test(victim: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Test publication after one orphan object has been staged.
+#[cfg(debug_assertions)]
+fn pause_after_cas_object_stage_for_test(victim: &Path) -> Result<()> {
+    use std::time::Instant;
+
+    let Some(marker) = std::env::var_os("RGO_TEST_CAS_OBJECT_STAGED_MARKER") else {
+        return Ok(());
+    };
+    let marker = PathBuf::from(marker);
+    let release = PathBuf::from(
+        std::env::var_os("RGO_TEST_CAS_OBJECT_STAGED_RELEASE")
+            .context("RGO_TEST_CAS_OBJECT_STAGED_RELEASE is required with the marker")?,
+    );
+    std::fs::write(&marker, victim.to_string_lossy().as_bytes())?;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !release.is_file() {
+        if Instant::now() >= deadline {
+            bail!("timed out at the staged CAS object test point");
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    Ok(())
+}
+
 /// Test the admission gap between the CAS inventory and its final checks.
 #[cfg(debug_assertions)]
 fn pause_after_cas_sweep_for_test(root: &Path) -> Result<()> {
@@ -1985,6 +2011,69 @@ fn wire_gc_action(action: &gc::Action) -> GcAction {
         bytes: action.bytes,
         reason: action.reason.clone(),
     }
+}
+
+/// Each action is staged under admission, then removed while new requests may
+/// enter. CAS object choices become stale if a lease or manifest is published
+/// between actions, so revalidate them before every rename.
+fn execute_staged_non_context_actions(
+    state: &State,
+    actions: &[gc::Action],
+    manifest_revision: u64,
+    execution: &mut gc::Execution,
+) -> Result<()> {
+    let objects = state.cas.root().join("objects");
+    for action in actions {
+        anyhow::ensure!(
+            !action.path.starts_with(state.paths.builds_dir()),
+            "context removal needs its own pin and lease checks"
+        );
+        let operation = state.operation_lock.lock().unwrap();
+        let is_object = action.path.starts_with(&objects);
+        if is_object
+            && (state.cas.manifest_revision() != manifest_revision
+                || state.db.lock().unwrap().has_active_cache_lease()?)
+        {
+            let error = anyhow::anyhow!("CAS object gained a lease or manifest during GC");
+            execution.note_skip(&action.path, action.bytes, &error);
+            continue;
+        }
+        match gc::stage_atomically(&state.paths, &action.path) {
+            Ok(staged) => {
+                let index_result = if is_object {
+                    forget_removed_object_rows(state, std::slice::from_ref(action))
+                } else {
+                    Ok(())
+                };
+                drop(operation);
+                #[cfg(debug_assertions)]
+                let pause = if is_object {
+                    pause_after_cas_object_stage_for_test(&action.path)
+                } else {
+                    Ok(())
+                };
+                let removed = staged.finish();
+                #[cfg(debug_assertions)]
+                pause?;
+                index_result?;
+                match removed {
+                    Ok(()) => {
+                        execution.reclaimed_bytes =
+                            execution.reclaimed_bytes.saturating_add(action.bytes);
+                    }
+                    Err(error) => {
+                        tracing::warn!(path = %action.path.display(), %error, "skipped GC action");
+                        execution.note_skip(&action.path, action.bytes, &error);
+                    }
+                }
+            }
+            Err(error) => {
+                tracing::warn!(path = %action.path.display(), %error, "skipped GC action");
+                execution.note_skip(&action.path, action.bytes, &error);
+            }
+        }
+    }
+    Ok(())
 }
 
 fn forget_removed_object_rows(state: &State, actions: &[gc::Action]) -> Result<()> {
