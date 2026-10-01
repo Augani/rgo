@@ -6,10 +6,12 @@ import json
 import os
 import platform
 import shutil
+import signal
 import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 from pathlib import Path
 
 
@@ -18,6 +20,36 @@ ROOT = Path(__file__).resolve().parents[1]
 
 def run(command: list[str], environment: dict[str, str], cwd: Path | None = None) -> None:
     subprocess.run(command, env=environment, cwd=cwd, check=True, timeout=120)
+
+
+def verify_launchd_restart(cli: Path, rgo_home: Path, environment: dict[str, str]) -> None:
+    pid_file = rgo_home / "state/daemon.pid"
+    original = int(pid_file.read_text().strip())
+    os.kill(original, signal.SIGKILL)
+    deadline = time.monotonic() + 45
+    while time.monotonic() < deadline:
+        try:
+            current = int(pid_file.read_text().strip())
+        except (FileNotFoundError, ValueError):
+            current = original
+        if current != original:
+            doctor = subprocess.run(
+                [str(cli), "doctor", "--json"], env=environment,
+                text=True, capture_output=True, timeout=15,
+            )
+            if doctor.returncode == 0:
+                entries = json.loads(doctor.stdout)["entries"]
+                if any(
+                    entry["level"] == "ok" and entry["message"].startswith("daemon responds")
+                    for entry in entries
+                ) and any(
+                    entry["message"].startswith(f"daemon pid {current}:")
+                    for entry in entries
+                ):
+                    print(f"launchd restarted private daemon {original} -> {current}")
+                    return
+        time.sleep(0.5)
+    raise RuntimeError("launchd did not restart the private rgo daemon after SIGKILL")
 
 
 def main() -> None:
@@ -80,6 +112,7 @@ def main() -> None:
         run(["cargo", "build", "--offline"], fresh, project)
         assert list((rgo_home / "builds").glob("*/*/.rgo-context.json"))
         active_cli = Path(record["rgo_binary"])
+        verify_launchd_restart(active_cli, rgo_home, fresh)
         active_cli.unlink()
         run([*installer, "--repair"], environment)
         assert active_cli.is_file()
