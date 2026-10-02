@@ -152,7 +152,14 @@ fn terminal_ctrl_c_keeps_a_surviving_cargo_descendant_protected() {
         assert_eq!(unsafe { libc::kill(-cargo_pid, libc::SIGCONT) }, 0);
     }
     let interrupted = unsafe { libc::kill(-cargo_pid, libc::SIGINT) };
-    assert_eq!(interrupted, 0);
+    let interrupt_error = std::io::Error::last_os_error();
+    assert_eq!(
+        interrupted,
+        0,
+        "Ctrl-C could not reach launcher group {cargo_pid}: {interrupt_error}; status {:?}; stderr {}",
+        running.child.try_wait().unwrap(),
+        std::fs::read_to_string(&log).unwrap_or_default()
+    );
     let deadline = Instant::now() + Duration::from_secs(10);
     while running.child.try_wait().unwrap().is_none() && Instant::now() < deadline {
         thread::sleep(Duration::from_millis(25));

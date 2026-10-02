@@ -523,8 +523,9 @@ before its first unlink and keeps it through the unload acknowledgement.
   recovery path, including a full filesystem failure/cancellation matrix.
 - [ ] Prove ownership of the currently loaded definition before unloading a
   job whose registration may have been replaced externally.
-- [ ] Validate the final batch in the platform matrix and record optimized
-  terminal-path timing before considering normal activation.
+- [x] Record optimized terminal-path timing for this batch.
+- [ ] Resolve the observed macOS stable interrupt failure and complete platform
+  validation before considering normal activation.
 
 The journal holds at most four known entries, regular reads remain bounded to
 16 KiB, and the journal is limited to 64 KiB. Removal steps are bounded; the
@@ -532,9 +533,33 @@ same two-second helper deadline and exclusive scope guards remain in force.
 The two existing local cases passed schema 3, journal replay, the reply/signal
 wakeup, the silent running background handoff, and terminal recovery on macOS
 27.2 arm64 (16.25 s and 2.83 s). All-bin build, zero-warning all-target Clippy,
-format and diff checks passed. Platform CI is pending. Launch-overhead gates
-remain open; optimized paired measurements will assess the effect of overlapping
-flushes and waking replies without skipping startup durability.
+format and diff checks passed.
+
+The first [platform attempt](https://github.com/Augani/rgo/actions/runs/37031117420/attempts/1)
+at `779397e` passed 18 jobs, including Intel and the full macOS beta/nightly
+suites. macOS stable passed its coalition/terminal fixture, but the existing
+interrupt case failed when sending Ctrl-C immediately after resume: its
+launcher group was no longer reachable. The initial assertion recorded no
+errno, exit status, or stderr, so the cause is unresolved. A focused local run
+and eight bounded repeats passed; the fixture now includes those diagnostics
+without weakening its assertions. Only the failed CI job is being rerun. CI
+also supports a manual, focused run of these same two cases on `macos-14` or
+`macos-15-intel`; normal push/PR runs keep the full matrix. This lets subsequent
+signal diagnostics target the affected runtime without repeating unrelated
+platform suites. This failure remains evidence and an open activation gate.
+
+The optimized [24 no-op/12 edit-build paired samples](benchmarks/2026-10-02-macos-arm64-cargo-guardian-job-recovery.json)
+used clean source `779397e`, Cargo/rustc 1.98.0, registered stock zsh 5.9, and
+the actual installed guardian with cache and automatic GC off. No guardian
+fallback was accepted. Samples include command dispatch through the completed
+prompt. No-op medians were 24.5 ms plain versus 118.6 ms supervised, adding
+94.1 ms; edit medians were 123.6 ms versus 216.6 ms, adding 93.0 ms. This run
+meets the proposed 100 ms median allowance for this small crate, compared with
+the earlier registered-shell run's 110.1/119.6 ms added medians. These are
+separate paired runs, not a claim that each individual change caused a specific
+improvement. No-op supervised p95 was 185.4 ms versus the earlier 154.7 ms,
+so tail variability remains visible. Representative workloads, concurrency,
+wrapper percentiles, and the wider performance release gate remain open.
 
 ## Abandoned terminal-host retirement
 

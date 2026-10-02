@@ -166,6 +166,9 @@ edit, an old schema, later file edits, real daemon restart, and an already-unloa
 retry. Final platform evidence and the remaining loaded-definition/startup and
 latency gates are tracked in the
 [macOS checklist](docs/macos-cargo-supervision.md#cargo-job-retirement-and-scope-binding).
+The optimized registered-zsh probe at `779397e` adds 94.1 ms for no-op builds
+and 93.0 ms for edit builds, within this tiny crate's proposed median allowance;
+the no-op tail and representative-workload performance gate remain open.
 
 The [19-job run](https://github.com/Augani/rgo/actions/runs/36998573830) passed
 at `5557f94`, including Intel macOS 15.7.9 and all existing platform suites.

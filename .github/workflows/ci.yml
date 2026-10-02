@@ -3,16 +3,28 @@ name: CI
 on:
   push:
   pull_request:
+  workflow_dispatch:
+    inputs:
+      guardian_only:
+        description: Run only the existing macOS guardian cases
+        type: boolean
+        default: true
+      guardian_runner:
+        description: macOS runtime for the focused audit
+        type: choice
+        options: [macos-14, macos-15-intel]
+        default: macos-14
 
 permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
+  group: ci-${{ github.workflow }}-${{ github.ref }}-${{ github.event_name == 'workflow_dispatch' && inputs.guardian_only && inputs.guardian_runner || 'full' }}
   cancel-in-progress: true
 
 jobs:
   validate:
+    if: github.event_name != 'workflow_dispatch' || !inputs.guardian_only
     name: ${{ matrix.os }} / ${{ matrix.toolchain }}
     runs-on: ${{ matrix.os }}
     strategy:
@@ -105,6 +117,7 @@ jobs:
         run: git diff --check
 
   source-msrv:
+    if: github.event_name != 'workflow_dispatch' || !inputs.guardian_only
     name: Source build / Rust 1.85 / ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     strategy:
@@ -120,6 +133,7 @@ jobs:
         run: cargo build --workspace --locked
 
   cargo-boundary:
+    if: github.event_name != 'workflow_dispatch' || !inputs.guardian_only
     name: Cargo 1.90/1.91 activation / ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     strategy:
@@ -140,6 +154,7 @@ jobs:
         run: python scripts/verify-cargo-boundary.py
 
   pinned-nightly-layout:
+    if: github.event_name != 'workflow_dispatch' || !inputs.guardian_only
     name: Pinned nightly layout / ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     strategy:
@@ -160,8 +175,8 @@ jobs:
         run: python scripts/verify-nightly-layout.py --toolchain nightly-2026-01-28 --without-profile-lock
 
   macos-intel-supervisor:
-    name: macOS Intel Cargo guardian
-    runs-on: macos-15-intel
+    name: ${{ github.event_name == 'workflow_dispatch' && inputs.guardian_only && format('macOS Cargo guardian / {0}', inputs.guardian_runner) || 'macOS Intel Cargo guardian' }}
+    runs-on: ${{ github.event_name == 'workflow_dispatch' && inputs.guardian_only && inputs.guardian_runner || 'macos-15-intel' }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -177,6 +192,7 @@ jobs:
         run: cargo test -p rgo-storage --test macos_coalition --test supervised_interrupt -- --nocapture
 
   btrfs-smoke:
+    if: github.event_name != 'workflow_dispatch' || !inputs.guardian_only
     name: Linux btrfs smoke
     runs-on: ubuntu-latest
     continue-on-error: true

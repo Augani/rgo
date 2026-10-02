@@ -734,3 +734,23 @@ API alone therefore cannot establish the remaining loaded-definition ownership
 gate across supported runtimes. Its actual domain/error behavior and a bounded,
 runtime-gated alternative still need investigation. The journal changes do not
 close that gate or claim a launch-latency improvement.
+
+The optimized [registered-shell paired probe](benchmarks/2026-10-02-macos-arm64-cargo-guardian-job-recovery.json)
+at clean `779397e` completed 24 no-op and 12 edit-build pairs with actual
+guardian admission, cache off, and automatic GC off. Added median wall time was
+94.1 ms for no-op builds and 93.0 ms for edit builds, within the proposed 100 ms
+allowance for this tiny crate. No-op supervised p95 was 185.4 ms, higher than
+the earlier registered-shell sample; the raw results retain that variability.
+The paired fixture and compiler match the earlier run, but these separate runs
+do not isolate the causal contribution of each implementation change. Larger
+and concurrent workloads remain a release gate.
+
+The first [19-job platform attempt](https://github.com/Augani/rgo/actions/runs/37031117420/attempts/1)
+at `779397e` passed 18 jobs, including the Intel guardian cases and complete
+macOS beta/nightly suites. macOS stable's coalition case passed, but its
+interrupt fixture could not signal the launcher group immediately after
+resume. The original assertion lacked errno, child status and stderr, so the
+failure is not classified as a harness race or a runtime defect. Eight focused
+local repeats passed. Failure diagnostics were added to the same fixture with
+all assertions retained; the single failed platform job is being rerun. This
+does not establish a resolved interrupt gate.

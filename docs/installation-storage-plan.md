@@ -184,6 +184,10 @@ existing fixture covers scope edits, interrupted removal, daemon restart, and
 an already-unloaded journal retry. Full cancellation, currently loaded-definition
 ownership, final platform validation, and latency remain open in the
 [macOS checklist](macos-cargo-supervision.md#cargo-job-retirement-and-scope-binding).
+The optimized registered-zsh probe at `779397e` adds 94.1/93.0 ms to no-op/edit
+medians with no accepted fallback and cache/automatic GC off. This small crate
+passes the proposed median allowance; tail variability and the representative
+performance gate remain open.
 
 **macOS priority (2026-10-02):** a private real-Cargo audit reproduced deletion
 while a detached child with closed inherited descriptors was still writing.
