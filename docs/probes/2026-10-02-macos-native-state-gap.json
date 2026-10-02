@@ -49,5 +49,12 @@
     "created_file_modes_differ": true,
     "descriptor_and_cleanup_assertions_passed": true
   },
-  "limits": "Only this mask and NOFILE comparison is observed. Normal activation and automatic GC remain disabled. Restoration/admission implementation and cross-platform verification remain open."
+  "limits": "Only this mask and NOFILE comparison is observed. Normal activation and automatic GC remain disabled. Restoration/admission implementation and cross-platform verification remain open.",
+  "private_probe_cleanup": {
+    "no_jobs_receipts_sockets_or_matching_processes": true,
+    "archive": "/tmp/rgo-native-state-private-probe.zip",
+    "removed_owned_case": "/private/tmp/rgostate-vmi4z49o/c",
+    "retained_previous_pair": "/private/tmp/rgostate-vmi4z49o/previous",
+    "reason": "Verified 4adb00f pair retained for the next native-state live-version probe; exact hashes are recorded."
+  }
 }

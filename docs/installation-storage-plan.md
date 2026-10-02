@@ -342,6 +342,10 @@ precedes the request, without retrying the operation. The same private Cargo
 comparison reproduced lost umask/NOFILE settings. The
 [follow-up checklist](macos-cargo-supervision.md#ipc-response-ordering-and-remaining-native-state--october-2-2026)
 keeps all six unexplained failures and native-state restoration/admission open.
+The corrected source passed all 19 individual jobs on attempt 1 in the
+[platform run](https://github.com/Augani/rgo/actions/runs/37072444439), including
+the actual arm64 stable/beta/nightly and Intel nested cases. This validates the
+combined batch; the six unexplained failures and native-state gap stay open.
 
 **macOS priority (2026-10-02):** a private real-Cargo audit reproduced deletion
 while a detached child with closed inherited descriptors was still writing.

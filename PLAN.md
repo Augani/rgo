@@ -162,6 +162,10 @@ remains unexplained alongside the five earlier failures. A private Cargo
 comparison also reproduced lost umask 077 and NOFILE limit 128 (managed used
 022/256). Their restoration/admission gate remains open in the
 [checklist](docs/macos-cargo-supervision.md#ipc-response-ordering-and-remaining-native-state--october-2-2026).
+The corrected source `0c02969` passed all 19 individual jobs on attempt 1 in
+the [platform run](https://github.com/Augani/rgo/actions/runs/37072444439), including
+actual arm64 stable/beta/nightly and Intel I/O/nested checks. This verifies the
+batch without explaining the six failures or fixing the native-state gap.
 
 ## 0. What changed vs. `doc.md`, and why
 

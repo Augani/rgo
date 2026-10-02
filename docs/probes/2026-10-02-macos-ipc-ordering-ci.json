@@ -1,0 +1,260 @@
+{
+  "url": "https://github.com/Augani/rgo/actions/runs/37072444439",
+  "head_sha": "0c02969c34fad0b0c888aca0249eb6ba395126bb",
+  "status": "completed",
+  "conclusion": "success",
+  "run_attempt": 1,
+  "individual_jobs": [
+    {
+      "databaseId": 111054778997,
+      "name": "Linux btrfs smoke",
+      "status": "completed",
+      "conclusion": "success",
+      "startedAt": "2026-10-02T22:25:53Z",
+      "completedAt": "2026-10-02T22:26:54Z",
+      "url": "https://github.com/Augani/rgo/actions/runs/37072444439/job/111054778997"
+    },
+    {
+      "databaseId": 111054779181,
+      "name": "Cargo 1.90/1.91 activation / macos-14",
+      "status": "completed",
+      "conclusion": "success",
+      "startedAt": "2026-10-02T22:25:59Z",
+      "completedAt": "2026-10-02T22:27:07Z",
+      "url": "https://github.com/Augani/rgo/actions/runs/37072444439/job/111054779181"
+    },
+    {
+      "databaseId": 111054779258,
+      "name": "Pinned nightly layout / ubuntu-latest",
+      "status": "completed",
+      "conclusion": "success",
+      "startedAt": "2026-10-02T22:25:54Z",
+      "completedAt": "2026-10-02T22:26:35Z",
+      "url": "https://github.com/Augani/rgo/actions/runs/37072444439/job/111054779258"
+    },
+    {
+      "databaseId": 111054779261,
+      "name": "Cargo 1.90/1.91 activation / ubuntu-latest",
+      "status": "completed",
+      "conclusion": "success",
+      "startedAt": "2026-10-02T22:25:54Z",
+      "completedAt": "2026-10-02T22:26:55Z",
+      "url": "https://github.com/Augani/rgo/actions/runs/37072444439/job/111054779261"
+    },
+    {
+      "databaseId": 111054779269,
+      "name": "windows-latest / stable",
+      "status": "completed",
+      "conclusion": "success",
+      "startedAt": "2026-10-02T22:25:53Z",
+      "completedAt": "2026-10-02T22:37:13Z",
+      "url": "https://github.com/Augani/rgo/actions/runs/37072444439/job/111054779269"
+    },
+    {
+      "databaseId": 111054779280,
+      "name": "macOS Intel Cargo guardian",
+      "status": "completed",
+      "conclusion": "success",
+      "startedAt": "2026-10-02T22:25:58Z",
+      "completedAt": "2026-10-02T22:29:31Z",
+      "url": "https://github.com/Augani/rgo/actions/runs/37072444439/job/111054779280"
+    },
+    {
+      "databaseId": 111054779294,
+      "name": "Cargo 1.90/1.91 activation / windows-latest",
+      "status": "completed",
+      "conclusion": "success",
+      "startedAt": "2026-10-02T22:25:53Z",
+      "completedAt": "2026-10-02T22:28:33Z",
+      "url": "https://github.com/Augani/rgo/actions/runs/37072444439/job/111054779294"
+    },
+    {
+      "databaseId": 111054779317,
+      "name": "Source build / Rust 1.85 / ubuntu-latest",
+      "status": "completed",
+      "conclusion": "success",
+      "startedAt": "2026-10-02T22:25:53Z",
+      "completedAt": "2026-10-02T22:26:40Z",
+      "url": "https://github.com/Augani/rgo/actions/runs/37072444439/job/111054779317"
+    },
+    {
+      "databaseId": 111054779371,
+      "name": "Source build / Rust 1.85 / windows-latest",
+      "status": "completed",
+      "conclusion": "success",
+      "startedAt": "2026-10-02T22:25:54Z",
+      "completedAt": "2026-10-02T22:27:27Z",
+      "url": "https://github.com/Augani/rgo/actions/runs/37072444439/job/111054779371"
+    },
+    {
+      "databaseId": 111054779413,
+      "name": "Pinned nightly layout / windows-latest",
+      "status": "completed",
+      "conclusion": "success",
+      "startedAt": "2026-10-02T22:25:53Z",
+      "completedAt": "2026-10-02T22:27:50Z",
+      "url": "https://github.com/Augani/rgo/actions/runs/37072444439/job/111054779413"
+    },
+    {
+      "databaseId": 111054779425,
+      "name": "Source build / Rust 1.85 / macos-14",
+      "status": "completed",
+      "conclusion": "success",
+      "startedAt": "2026-10-02T22:25:59Z",
+      "completedAt": "2026-10-02T22:26:48Z",
+      "url": "https://github.com/Augani/rgo/actions/runs/37072444439/job/111054779425"
+    },
+    {
+      "databaseId": 111054779432,
+      "name": "Pinned nightly layout / macos-14",
+      "status": "completed",
+      "conclusion": "success",
+      "startedAt": "2026-10-02T22:26:55Z",
+      "completedAt": "2026-10-02T22:27:55Z",
+      "url": "https://github.com/Augani/rgo/actions/runs/37072444439/job/111054779432"
+    },
+    {
+      "databaseId": 111054779435,
+      "name": "windows-latest / beta",
+      "status": "completed",
+      "conclusion": "success",
+      "startedAt": "2026-10-02T22:26:23Z",
+      "completedAt": "2026-10-02T22:31:41Z",
+      "url": "https://github.com/Augani/rgo/actions/runs/37072444439/job/111054779435"
+    },
+    {
+      "databaseId": 111054779491,
+      "name": "macos-14 / beta",
+      "status": "completed",
+      "conclusion": "success",
+      "startedAt": "2026-10-02T22:25:59Z",
+      "completedAt": "2026-10-02T22:30:30Z",
+      "url": "https://github.com/Augani/rgo/actions/runs/37072444439/job/111054779491"
+    },
+    {
+      "databaseId": 111054779494,
+      "name": "macos-14 / stable",
+      "status": "completed",
+      "conclusion": "success",
+      "startedAt": "2026-10-02T22:26:00Z",
+      "completedAt": "2026-10-02T22:33:52Z",
+      "url": "https://github.com/Augani/rgo/actions/runs/37072444439/job/111054779494"
+    },
+    {
+      "databaseId": 111054779590,
+      "name": "ubuntu-latest / nightly",
+      "status": "completed",
+      "conclusion": "success",
+      "startedAt": "2026-10-02T22:25:55Z",
+      "completedAt": "2026-10-02T22:30:04Z",
+      "url": "https://github.com/Augani/rgo/actions/runs/37072444439/job/111054779590"
+    },
+    {
+      "databaseId": 111054779635,
+      "name": "ubuntu-latest / beta",
+      "status": "completed",
+      "conclusion": "success",
+      "startedAt": "2026-10-02T22:25:54Z",
+      "completedAt": "2026-10-02T22:29:52Z",
+      "url": "https://github.com/Augani/rgo/actions/runs/37072444439/job/111054779635"
+    },
+    {
+      "databaseId": 111054779706,
+      "name": "macos-14 / nightly",
+      "status": "completed",
+      "conclusion": "success",
+      "startedAt": "2026-10-02T22:27:13Z",
+      "completedAt": "2026-10-02T22:32:07Z",
+      "url": "https://github.com/Augani/rgo/actions/runs/37072444439/job/111054779706"
+    },
+    {
+      "databaseId": 111054779923,
+      "name": "ubuntu-latest / stable",
+      "status": "completed",
+      "conclusion": "success",
+      "startedAt": "2026-10-02T22:25:54Z",
+      "completedAt": "2026-10-02T22:34:20Z",
+      "url": "https://github.com/Augani/rgo/actions/runs/37072444439/job/111054779923"
+    }
+  ],
+  "macos_observations": [
+    {
+      "job_id": 111054779494,
+      "job": "macos-14 / stable",
+      "cargo": "1.99.0 (5f94df478 2026-08-27)",
+      "explicit_clean_passed": true,
+      "os": "macOS 14.8.9",
+      "os_build": "23J631",
+      "arch": "arm64",
+      "rustc": "1.99.0 (b940084d7 2026-09-28)",
+      "core_cases": 116,
+      "core_seconds": 2.17,
+      "strict_cas_pressure_passed": true,
+      "nested_cargo_passed": true,
+      "nested_suite_cases": 10,
+      "nested_suite_seconds": 33.5,
+      "coalition_seconds": 15.96,
+      "interrupt_seconds": 1.67
+    },
+    {
+      "job_id": 111054779491,
+      "job": "macos-14 / beta",
+      "cargo": "1.100.0-beta.2 (3d7cf6e93 2026-09-25)",
+      "explicit_clean_passed": true,
+      "os": "macOS 14.8.9",
+      "os_build": "23J631",
+      "arch": "arm64",
+      "rustc": "1.100.0-beta.2 (2311729bc 2026-10-01)",
+      "core_cases": 116,
+      "core_seconds": 2.21,
+      "strict_cas_pressure_passed": true,
+      "nested_cargo_passed": true,
+      "nested_suite_cases": 10,
+      "nested_suite_seconds": 33.1,
+      "coalition_seconds": 12.25,
+      "interrupt_seconds": 1.49
+    },
+    {
+      "job_id": 111054779706,
+      "job": "macos-14 / nightly",
+      "cargo": "1.101.0-nightly (f3865b2a4 2026-09-29)",
+      "explicit_clean_passed": true,
+      "os": "macOS 14.8.9",
+      "os_build": "23J631",
+      "arch": "arm64",
+      "rustc": "1.101.0-nightly (c36f14571 2026-10-01)",
+      "core_cases": 116,
+      "core_seconds": 1.9,
+      "strict_cas_pressure_passed": true,
+      "advisory": true,
+      "nested_cargo_passed": true,
+      "nested_suite_cases": 10,
+      "nested_suite_seconds": 33.27,
+      "coalition_seconds": 16.63,
+      "interrupt_seconds": 1.52
+    },
+    {
+      "job_id": 111054779280,
+      "job": "macOS Intel Cargo guardian",
+      "cargo": "1.99.0 (5f94df478 2026-08-27)",
+      "os": "macOS 15.7.9",
+      "os_build": "24G830",
+      "arch": "x86_64",
+      "pending_alarm_observed": true,
+      "unsupported_mask_checkout_exit": 74,
+      "startup_subcases": 10,
+      "pending_usr2_observed": true,
+      "managed_usr2_signal_exit": 31,
+      "preparation_usr2_signal_exit": 31,
+      "nested_cargo_passed": true,
+      "nested_suite_cases": 1,
+      "nested_suite_seconds": 2.13,
+      "inherited_file_pipe_assertions_passed": true,
+      "managed_exit_code": 17,
+      "actual_completed_nested_gc_passed": true,
+      "coalition_seconds": 24.82,
+      "interrupt_seconds": 1.96
+    }
+  ],
+  "limits": "Verifies this source batch on the existing 19 jobs, including advisory lanes. Does not explain the three earlier interrupt/terminal/CAS failures or the two local background terminal-stop failures or the initial descriptor-matrix stable prepared-marker failure or establish full native-state/descriptor coverage, build-script nested admission, activation, installer/terminal version-skew, IDE or performance acceptance."
+}

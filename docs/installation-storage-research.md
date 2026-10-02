@@ -981,3 +981,12 @@ peer closed while its exact reply remained buffered. Apple's
 [socket implementation](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/kern/uipc_socket.c)
 rejects options on a fully shut-down socket. The client now sets its response
 timeout before sending the operation, retaining the single-request contract.
+
+The corrected source `0c02969` passed all 19 individual jobs on attempt 1 in
+the [platform matrix](https://github.com/Augani/rgo/actions/runs/37072444439).
+All three arm64 lanes now pass clean, coalition, interrupt and nested Cargo;
+Intel also verifies inherited-FD I/O, ten startup outcomes and actual final
+nested GC. The [record](probes/2026-10-02-macos-ipc-ordering-ci.json) separates
+this verification from the initial failures. Six unexplained failures and the
+reproduced file-mask/resource-limit defect remain open, with normal activation
+and automatic GC disabled.

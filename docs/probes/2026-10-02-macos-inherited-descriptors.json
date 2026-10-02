@@ -195,7 +195,7 @@
     "all_bins_release": "passed (30.73s)",
     "format": "passed",
     "diff": "passed",
-    "full_workspace_suite": "First matrix failed on macOS stable startup and advisory nightly IPC response timeout; final source verification pending.",
+    "full_workspace_suite": "PASS in the existing remote platform matrix; no duplicate full local suite",
     "release_audit_hooks_present": false
   },
   "limits": "Both cases were extended, with no new Rust test case or CI lane. Five prior unexplained failures remain open. Build-script Cargo with an inherited RUSTC override uses existing unverified-compiler fallback. This does not close every inherited process-state or nested-build class. Native supervisor remains a private pilot and automatic GC remains disabled. Regular files, shared aliases and jobserver pipes are verified here; other descriptor/native process-state classes retain their existing acceptance gates.",
@@ -297,7 +297,8 @@
     "final_clippy_all_targets": {
       "result": "passed with -D warnings after last diagnostic edit",
       "sha256": "dd621e9ff7c9eac161c730aa8a79332dd68698435a7a84d044d9ad39dfa1f5d2"
-    }
+    },
+    "full_workspace_suite": "PASS on corrected source in the existing remote platform matrix; no duplicate full local suite"
   },
   "initial_platform_verification": {
     "record": "2026-10-02-macos-inherited-descriptors-initial-ci.json",
@@ -306,5 +307,14 @@
     "individual_jobs_passed": 17,
     "individual_jobs_total": 19,
     "run_attempt": 1
-  }
+  },
+  "platform_verification": {
+    "record": "2026-10-02-macos-ipc-ordering-ci.json",
+    "code_sha": "0c02969c34fad0b0c888aca0249eb6ba395126bb",
+    "run_url": "https://github.com/Augani/rgo/actions/runs/37072444439",
+    "individual_jobs_passed": 19,
+    "individual_jobs_total": 19,
+    "run_attempt": 1
+  },
+  "release_status": "The corrected source passed all 19 existing jobs on attempt 1. Six unexplained failures and the reproduced umask/resource-limit defect remain open; normal activation and automatic GC disabled."
 }

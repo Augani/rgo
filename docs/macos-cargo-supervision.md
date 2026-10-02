@@ -1147,7 +1147,7 @@ failures, and does not close the broader activation and release gates.
   The existing nested case now passes in 3.40 s with actual final GC.
 - [x] Build all bins in debug/release and pass zero-warning all-target Clippy,
   formatting and diff checks. Release binaries exclude private audit hooks.
-- [ ] Validate the final batch on the existing platform matrix, including
+- [x] Validate the final batch on the existing platform matrix, including
   the actual nested case on macOS arm64 stable/beta/nightly and Intel stable.
 - [ ] Complete other inherited native-state/descriptor classes and nested
   build-script/compiler-override shapes, terminal/IDE/workflow and upgrade
@@ -1180,7 +1180,7 @@ run cannot explain that failure. It joins the five earlier unexplained failures.
   verification and a single operation; do not retry destructive requests.
 - [x] Add failure-only caller status/stderr, owned launchctl state and private
   event diagnostics to the existing startup subcase at its unchanged deadline.
-- [ ] Verify the corrected source on the existing platform matrix. A passing
+- [x] Verify the corrected source on the existing platform matrix. A passing
   startup case alone does not diagnose the earlier stable failure.
 - [ ] Resolve the sixth unexplained failure: arm64 stable did not prepare the
   fourth, blocked-TERM startup subcase in the initial descriptor matrix.
@@ -1191,3 +1191,30 @@ run cannot explain that failure. It joins the five earlier unexplained failures.
 - [ ] Restore or decline unsupported file masks and resource limits before
   admission; verify the same ordinary/managed comparison and live version skew.
   Normal activation and automatic GC remain disabled.
+- [ ] Capture attributes before query threads/guards, without changing the
+  caller's mask during checkout fallback. Validate limits before admission;
+  decline limits that the guardian cannot restore rather than relaxing them.
+- [ ] Negotiate attribute support before transferring the invocation; reject
+  old requests without captured attributes before receipt/commit/spawn. Verify
+  both version directions retain native checkout settings and one execution.
+- [ ] Extend the existing I/O probe with the observed 077/128 comparison,
+  preserving its descriptor, jobserver, exact-exit and actual-GC assertions.
+  Validate the combined batch rather than adding duplicate cases per attribute.
+- [ ] Audit active timers, scheduling attributes and process-associated file
+  locks. Preserve proven classes or decline managed admission; file/pipe
+  descriptor transfer alone is not proof of their exec behavior.
+
+The corrected [platform run](https://github.com/Augani/rgo/actions/runs/37072444439)
+passed all 19 individual jobs on attempt 1 at `0c02969`, including advisory
+nightly/btrfs. On arm64 macOS 14.8.9 build 23J631, stable/beta/nightly all passed
+the clean case, 116 core cases including strict CAS pressure, and the ten-case
+supervised suite containing nested Cargo. Coalition/interrupt durations were
+15.96/1.67 s, 12.25/1.49 s and 16.63/1.52 s respectively. Intel macOS 15.7.9
+build 24G830 passed all ten startup outcomes, inherited-FD I/O and actual GC;
+coalition/interrupt took 24.82/1.96 s and the filtered nested case 2.13 s.
+The [individual record](probes/2026-10-02-macos-ipc-ordering-ci.json) preserves
+the exact source and runtimes. Local clean and instrumented startup cases also
+passed, with debug/release all-bin builds, zero-warning Clippy and format/diff
+checks. No Rust test case or CI job was added. The initial 17/19 run and its
+stable failure remain separately recorded; six unexplained failures and the
+reproduced umask/resource-limit gap still gate normal activation and auto-GC.
