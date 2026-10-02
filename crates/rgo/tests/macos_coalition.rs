@@ -125,12 +125,46 @@ fn cancellation_before_commit(sandbox: &Sandbox, project: &std::path::Path, rgo:
             .chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
     )
     .unwrap();
+    let source = project.join("src/main.rs");
+    let original_source = std::fs::read(&source).unwrap();
     let mut failures = Vec::new();
-    for (signal, action, ignored) in [
-        (libc::SIGINT, b"resume".as_slice(), false),
-        (libc::SIGTERM, b"fail".as_slice(), false),
-        (libc::SIGINT, b"resume".as_slice(), true),
+    for (signal, action, ignored, blocked) in [
+        (libc::SIGINT, b"resume".as_slice(), false, false),
+        (libc::SIGTERM, b"fail".as_slice(), false, false),
+        (libc::SIGINT, b"resume".as_slice(), true, false),
+        (libc::SIGTERM, b"resume".as_slice(), false, true),
+        (libc::SIGTERM, b"fail".as_slice(), false, true),
     ] {
+        if blocked {
+            // Check the inherited mask before changing the application action.
+            // A queued TERM must kill the managed app or invoke the fallback
+            // handler when unblocked; normal return is a lost notification.
+            std::fs::write(
+                &source,
+                format!(
+                    r#"unsafe extern "C" {{
+    fn sigprocmask(how: i32, set: *const u32, old: *mut u32) -> i32;
+    fn signal(sig: i32, action: usize) -> usize;
+    fn _exit(code: i32) -> !;
+}}
+extern "C" fn terminated(_: i32) {{ unsafe {{ _exit(74) }} }}
+fn main() {{ unsafe {{
+    let mut mask = 0_u32;
+    assert_eq!(sigprocmask({setmask}, std::ptr::null(), &mut mask), 0);
+    let term = 1_u32 << ({term} - 1);
+    assert_ne!(mask & term, 0, "Cargo lost its inherited signal mask");
+    if {handled} {{ signal({term}, terminated as *const () as usize); }}
+    assert_eq!(sigprocmask({unblock}, &term, std::ptr::null_mut()), 0);
+}} }}
+"#,
+                    setmask = libc::SIG_SETMASK,
+                    term = libc::SIGTERM,
+                    unblock = libc::SIG_UNBLOCK,
+                    handled = action == b"fail",
+                ),
+            )
+            .unwrap();
+        }
         std::fs::create_dir(&directory).unwrap();
         std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
         let log = directory.join("stderr");
@@ -140,13 +174,26 @@ fn cancellation_before_commit(sandbox: &Sandbox, project: &std::path::Path, rgo:
             .env("PATH", &path)
             .env("RGO_MACOS_SUPERVISOR_PILOT", "1")
             .env("RGO_MACOS_SUPERVISOR_AUDIT", "1")
-            .args(["build", "--offline"])
+            .args([if blocked { "run" } else { "build" }, "--offline"])
             .stdout(std::process::Stdio::null())
             .stderr(std::fs::File::create(&log).unwrap());
         if ignored {
             unsafe {
                 command.pre_exec(|| {
                     if libc::signal(libc::SIGINT, libc::SIG_IGN) == libc::SIG_ERR {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+        }
+        if blocked {
+            unsafe {
+                command.pre_exec(|| {
+                    let mut mask = std::mem::zeroed();
+                    libc::sigemptyset(&mut mask);
+                    libc::sigaddset(&mut mask, libc::SIGTERM);
+                    if libc::sigprocmask(libc::SIG_BLOCK, &mask, std::ptr::null_mut()) != 0 {
                         return Err(std::io::Error::last_os_error());
                     }
                     Ok(())
@@ -165,7 +212,11 @@ fn cancellation_before_commit(sandbox: &Sandbox, project: &std::path::Path, rgo:
         assert_eq!(unsafe { libc::kill(probe.child.id() as i32, signal) }, 0);
         if !ignored {
             wait_for_file(
-                &directory.join("cancel-observed"),
+                &directory.join(if blocked {
+                    "signal-observed"
+                } else {
+                    "cancel-observed"
+                }),
                 Instant::now() + Duration::from_secs(3),
             );
         }
@@ -180,13 +231,16 @@ fn cancellation_before_commit(sandbox: &Sandbox, project: &std::path::Path, rgo:
         };
         let committed = directory.join("committed").exists();
         println!(
-            "startup cancellation: signal={signal}, ignored={ignored}, committed={committed}, status={status:?}"
+            "startup cancellation: signal={signal}, ignored={ignored}, blocked={blocked}, committed={committed}, status={status:?}"
         );
-        if committed != ignored
+        let expected_commit = ignored || (blocked && action == b"resume");
+        if committed != expected_commit
             || (ignored && !status.success())
-            || (!ignored && status.signal() != Some(signal))
+            || (blocked && action == b"fail" && status.code() != Some(74))
+            || (blocked && action == b"resume" && status.signal() != Some(signal))
+            || (!ignored && !blocked && status.signal() != Some(signal))
         {
-            failures.push(format!("signal={signal}, ignored={ignored}, committed={committed}, status={status:?}; stderr={}", std::fs::read_to_string(&log).unwrap()));
+            failures.push(format!("signal={signal}, ignored={ignored}, blocked={blocked}, committed={committed}, status={status:?}; stderr={}", std::fs::read_to_string(&log).unwrap()));
         }
         // Wait for the owned one-use guardian to finish, then prove positive
         // reclamation before repeating in the same isolated workspace.
@@ -222,6 +276,7 @@ fn cancellation_before_commit(sandbox: &Sandbox, project: &std::path::Path, rgo:
         for name in [
             "prepared",
             "cancel-observed",
+            "signal-observed",
             "release",
             "committed",
             "stderr",
@@ -234,6 +289,7 @@ fn cancellation_before_commit(sandbox: &Sandbox, project: &std::path::Path, rgo:
         }
         std::fs::remove_dir(&directory).unwrap();
     }
+    std::fs::write(source, original_source).unwrap();
     assert!(
         failures.is_empty(),
         "startup cancellation failures: {failures:#?}"

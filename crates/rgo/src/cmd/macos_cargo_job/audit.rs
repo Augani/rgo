@@ -1,6 +1,6 @@
 //! Debug-only deterministic handshake audit. Never compiled into release bins.
 
-use super::SIGNALS;
+use super::{SIGNALS, cancelled_signal};
 use anyhow::{Result, ensure};
 use rgo_core::paths::RgoPaths;
 use std::io::Write;
@@ -41,14 +41,26 @@ pub(super) fn prepared(paths: &RgoPaths) -> Result<()> {
     };
     publish(&directory, "prepared")?;
     let deadline = Instant::now() + Duration::from_secs(10);
-    let terminating = [libc::SIGINT, libc::SIGTERM, libc::SIGHUP, libc::SIGQUIT]
-        .into_iter()
-        .fold(0_u32, |mask, signal| mask | (1 << signal));
     let mut observed = false;
+    let mut pending_observed = false;
     loop {
-        if !observed && SIGNALS.load(Ordering::Acquire) & terminating != 0 {
+        if !observed && cancelled_signal().is_some() {
             publish(&directory, "cancel-observed")?;
             observed = true;
+        }
+        // A blocked notification may still be in the kernel, or already
+        // captured by the relay. Observe either without consuming it.
+        let mut pending = unsafe { std::mem::zeroed() };
+        ensure!(
+            unsafe { libc::sigpending(&mut pending) } == 0,
+            "cannot observe audit pending signals"
+        );
+        if !pending_observed
+            && (unsafe { libc::sigismember(&pending, libc::SIGTERM) } == 1
+                || SIGNALS.load(Ordering::Acquire) & (1 << libc::SIGTERM) != 0)
+        {
+            publish(&directory, "signal-observed")?;
+            pending_observed = true;
         }
         match std::fs::read(directory.join("release")) {
             Ok(action) => {

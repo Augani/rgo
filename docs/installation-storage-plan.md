@@ -235,6 +235,16 @@ and all existing suites, installers and recovery checks. The broader
 signal/timing matrix remains open in the
 [macOS checklist](macos-cargo-supervision.md#runtime-signal-forwarding--october-2-2026).
 
+**macOS blocked pending signals:** the existing private preparation fixture
+reproduced queued SIGTERM disappearing during managed handoff, with fallback
+as a passing control. The launcher now captures forwarded blocked notifications
+without treating them as cancellation, restores unforwarded pending signals
+before fallback exec, and reports actual child signal death after unblocking
+the result signal. The combined local coalition/terminal/recovery case passed
+in 21.58 s with all five preparation subcases. Other mask/action classes and
+commit/exec timing remain open in the
+[macOS checklist](macos-cargo-supervision.md#blocked-pending-termination--october-2-2026).
+
 **macOS priority (2026-10-02):** a private real-Cargo audit reproduced deletion
 while a detached child with closed inherited descriptors was still writing.
 The [macOS supervisor checklist](macos-cargo-supervision.md) records the selected

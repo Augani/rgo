@@ -854,3 +854,46 @@ all three expected preparation outcomes. Every existing macOS
 stable/beta/nightly, Linux/Windows, source-build, Cargo-boundary, nightly-layout,
 installer/service, btrfs and budget-recovery lane passed. The broader timing,
 masked-signal, IDE/runtime and performance gates remain open.
+
+## Blocked pending termination — October 2, 2026
+
+- [x] Reproduce a blocked SIGTERM queued during preparation disappearing from
+  managed Cargo. The same private case proves that ordinary fallback retained
+  the notification and invoked the application's handler with exit code 74.
+- [x] Capture forwarded notifications in the launcher independently of the
+  child's inherited mask. Originally blocked termination is queued for Cargo,
+  rather than treated as a preparation cancellation.
+- [x] Restore captured, unforwarded blocked notifications to the launching
+  thread's kernel pending set before fallback exec. Block relay signals while
+  restoring actions/mask; use thread-directed `raise` for pending restoration.
+- [x] Preserve actual signal death when the child unblocks an originally
+  blocked signal. Restore the launcher state, then unblock the result signal
+  before terminating the launcher with that signal.
+- [x] Extend the existing preparation subcases with managed and injected-error
+  blocked-SIGTERM paths. Require the application's inherited mask, signal exit
+  15 for managed execution, exit code 74 for fallback, owned-job retirement,
+  and actual idle-context deletion. No new Rust test case was added.
+- [x] Pass the combined local coalition/terminal/recovery case in 21.58 s.
+  All five preparation subcases produced their required commit/status outcomes.
+  The existing custom-handler interrupt case passed in 3.68 s, retaining its
+  exact exit code 73, stop/resume, descendant protection and idle reclamation.
+  All-bin debug/release builds, zero-warning Clippy, format and diff checks
+  passed. Debug audit strings are absent from both release executables.
+- [ ] Verify the final batch across the existing platform lanes.
+- [ ] Complete other inherited masks/actions, unsupported signal classes, and
+  timing immediately around commit, child creation and exec. This queued-TERM
+  case does not close those races or the supported IDE/runtime/performance gate.
+
+The [captured observations](probes/2026-10-02-macos-blocked-signals.json) record
+the failed managed path and successful fallback control before the fix. The
+debug audit observes either the kernel pending set or a captured notification
+without consuming it, then releases preparation explicitly. The final managed
+variant requires native signal death instead of a numerically similar exit
+code. Protocol 9, admission revision 4 and ownership/receipt schemas are
+unchanged. Normal activation and automatic GC remain off, and the two earlier
+unexplained failures remain unresolved.
+
+Apple documents that exec preserves the signal mask and ignored actions in its
+[execve reference](https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man2/execve.2.html).
+The fixture checks that contract with real Cargo in private homes; it does not
+replace evidence for notifications at every handoff boundary.

@@ -1,0 +1,34 @@
+{
+  "purpose": "Existing private-home macOS coalition case: blocked pending SIGTERM across managed Cargo and preparation-error fallback",
+  "baseline": "92bb436303abeb4ec01dd7c50553e3b64a54f63b (native code c24958d), with debug-only pending observation and two existing-case subcases",
+  "platform": "macOS 27.2 build 26B5091g arm64; Cargo 1.98.0 stable",
+  "isolation": "rgo-testkit Sandbox private HOME/CARGO_HOME/RGO_HOME; real Cargo offline; cache and automatic GC off",
+  "before_fix": {
+    "command": "cargo test -p rgo-storage --test macos_coalition launchd_coalition_observes_closed_fd_writer_after_cargo_exits -- --exact --nocapture",
+    "duration_seconds": 4.79,
+    "managed": "TERM blocked before exec; queued to the launcher at the observed preparation pause; managed commit true, application returned 0 instead of its TERM handler's 74: FAILED",
+    "fallback": "Same blocked notification plus injected preparation error; no managed commit, exact application handler exit 74: PASS",
+    "original_controls": "Deliverable INT: no commit, signal 2; deliverable TERM plus preparation error: no commit, signal 15; ignored INT: commit true, exit 0; all PASS",
+    "cleanup": "Owned job retirement and actual idle-context deletion required before aggregate failure"
+  },
+  "after_fix": {
+    "command": "cargo test -p rgo-storage --test macos_coalition launchd_coalition_observes_closed_fd_writer_after_cargo_exits -- --exact --nocapture",
+    "duration_seconds": 21.58,
+    "managed": "Strengthened to default TERM action: inherited mask verified, commit true, actual signal exit 15 required and observed",
+    "fallback": "Inherited mask verified, no commit, exact application handler exit 74 required and observed",
+    "original_controls": "All three prior preparation subcases retained their expected outcomes",
+    "other_requirements": "Closed-FD detached writer and foreign replacement survive; real idle GC, journal/daemon recovery, native bytes/stdio, controlling terminal, registered zsh crash recovery and metadata retirement all passed"
+  },
+  "implementation": "Separate original cancellation eligibility from runtime forwarding; internally capture forwarded blocked notifications while preserving Cargo's native mask; restore unforwarded pending signals with thread-directed raise before fallback; unblock the result signal to report actual child signal death",
+  "verification": [
+    "cargo build: passed, all binaries",
+    "existing coalition/terminal case: passed, 21.58 s",
+    "existing supervised_interrupt case: passed, 3.68 s; exact handler exit 73, stop/resume, descendant protection and idle reclamation",
+    "cargo clippy --all-targets -- -D warnings: passed, zero warnings",
+    "cargo build --workspace --release: passed, all binaries",
+    "cargo fmt --all -- --check: passed",
+    "git diff --check: passed",
+    "All three debug audit strings present in debug rgo and absent from release rgo and rgo-rustc-wrapper"
+  ],
+  "limits": "This proves queued SIGTERM at the existing preparation pause. Other masks/actions, unsupported signal classes, commit/child creation/exec timing, IDE/runtime and representative performance remain open. Automatic GC and normal pilot activation remain off. Two earlier unexplained interrupt/terminal failures remain unresolved. No new Rust test case; debug audit excluded from release binaries. Protocol 9/admission revision 4 unchanged."
+}

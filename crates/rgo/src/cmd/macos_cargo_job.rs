@@ -46,11 +46,12 @@ const FORWARDED_SIGNALS: [i32; 7] = [
 ];
 static SIGNALS: AtomicU32 = AtomicU32::new(0);
 static RELAY_MASK: AtomicU32 = AtomicU32::new(0);
+static CANCEL_MASK: AtomicU32 = AtomicU32::new(0);
 static SIGNAL_WAKE: AtomicI32 = AtomicI32::new(-1);
 const TERMINATING_SIGNALS: [i32; 4] = [libc::SIGINT, libc::SIGTERM, libc::SIGHUP, libc::SIGQUIT];
 
 fn cancelled_signal() -> Option<i32> {
-    let pending = SIGNALS.load(Ordering::Acquire) & RELAY_MASK.load(Ordering::Acquire);
+    let pending = SIGNALS.load(Ordering::Acquire) & CANCEL_MASK.load(Ordering::Acquire);
     TERMINATING_SIGNALS
         .into_iter()
         .find(|signal| pending & (1 << signal) != 0)
@@ -59,6 +60,12 @@ fn cancelled_signal() -> Option<i32> {
 fn terminate(signal: i32) -> ! {
     unsafe {
         libc::signal(signal, libc::SIG_DFL);
+        // The primary may have unblocked a signal that the original caller
+        // blocked. Report its actual signal death after restoring that mask.
+        let mut mask = std::mem::zeroed();
+        libc::sigemptyset(&mut mask);
+        libc::sigaddset(&mut mask, signal);
+        libc::sigprocmask(libc::SIG_UNBLOCK, &mask, std::ptr::null_mut());
         libc::raise(signal);
     }
     std::process::exit(128 + signal);
@@ -623,12 +630,9 @@ impl PreparedJob {
                     drop(session);
                     drop(self.signals.take());
                     if let Some(signal) = signal {
-                        unsafe {
-                            libc::signal(signal, libc::SIG_DFL);
-                            libc::raise(signal);
-                        }
+                        terminate(signal);
                     }
-                    std::process::exit(code.unwrap_or(128 + signal.unwrap_or(1)));
+                    std::process::exit(code.unwrap_or(129));
                 }
                 Ok(Ok(Message::Failed { detail })) => {
                     bail!("Cargo guardian failed after commit: {detail}")
@@ -681,6 +685,17 @@ struct SignalRelay {
 }
 
 impl SignalRelay {
+    fn forwarded_set() -> libc::sigset_t {
+        let mut mask = unsafe { std::mem::zeroed() };
+        unsafe {
+            libc::sigemptyset(&mut mask);
+            for signal in FORWARDED_SIGNALS {
+                libc::sigaddset(&mut mask, signal);
+            }
+        }
+        mask
+    }
+
     fn action() -> libc::sigaction {
         let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
         action.sa_sigaction = capture_signal as *const () as usize;
@@ -692,6 +707,7 @@ impl SignalRelay {
     fn new() -> Result<Self> {
         SIGNALS.store(0, Ordering::Relaxed);
         RELAY_MASK.store(0, Ordering::Relaxed);
+        CANCEL_MASK.store(0, Ordering::Relaxed);
         SIGNAL_WAKE.store(wake::Wake::get()?.writer(), Ordering::Relaxed);
         let mut mask = unsafe { std::mem::zeroed() };
         ensure!(
@@ -723,20 +739,21 @@ impl SignalRelay {
             } else {
                 RELAY_MASK.fetch_or(1 << signal, Ordering::Release);
             }
+            if previous.sa_sigaction != libc::SIG_IGN
+                && unsafe { libc::sigismember(&mask, signal) } == 0
+            {
+                CANCEL_MASK.fetch_or(1 << signal, Ordering::Release);
+            }
         }
-        // SIGCONT resumes a stopped process even when ignored or blocked.
-        // Window sizes also change without delivery of SIGWINCH. Observe both
-        // notifications to reproduce the effects on the separate group/PTY;
-        // Cargo retains the mask/dispositions captured before this relay.
-        let mut effects = unsafe { std::mem::zeroed() };
-        unsafe {
-            libc::sigemptyset(&mut effects);
-            libc::sigaddset(&mut effects, libc::SIGCONT);
-            libc::sigaddset(&mut effects, libc::SIGWINCH);
-        }
+        // Fork does not inherit pending signals. Capture blocked notifications
+        // here and deliver them to the separate Cargo group, which retains the
+        // caller's original mask. Only originally deliverable termination is
+        // a preparation cancellation. CONT/window kernel effects are still
+        // observed even when ignored; Cargo keeps its own native actions.
+        let forwarded = Self::forwarded_set();
         ensure!(
-            unsafe { libc::sigprocmask(libc::SIG_UNBLOCK, &effects, std::ptr::null_mut()) } == 0,
-            "cannot observe terminal kernel effects"
+            unsafe { libc::sigprocmask(libc::SIG_UNBLOCK, &forwarded, std::ptr::null_mut()) } == 0,
+            "cannot observe Cargo group notifications"
         );
         Ok(relay)
     }
@@ -770,10 +787,23 @@ impl Drop for SignalRelay {
     fn drop(&mut self) {
         // Keep the captured bits/mask until preparation's fallback decision.
         // An error must still acknowledge a cancellation after handler restore.
+        let forwarded = Self::forwarded_set();
+        unsafe { libc::sigprocmask(libc::SIG_BLOCK, &forwarded, std::ptr::null_mut()) };
         SIGNAL_WAKE.store(-1, Ordering::Relaxed);
+        let pending = SIGNALS.load(Ordering::Acquire);
         for (signal, previous) in &self.dispositions {
             unsafe {
                 libc::sigaction(*signal, previous, std::ptr::null_mut());
+                if previous.sa_sigaction != libc::SIG_IGN
+                    && libc::sigismember(&self.mask, *signal) == 1
+                    && pending & (1 << signal) != 0
+                {
+                    // Restore captured-but-unforwarded blocked notifications
+                    // to this thread's kernel pending set. A preparation error
+                    // then execs fallback Cargo in this same PID. Thread-local
+                    // raise avoids delivery to a still-unblocked reader thread.
+                    libc::raise(*signal);
+                }
             }
         }
         unsafe {
