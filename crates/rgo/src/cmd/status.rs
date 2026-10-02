@@ -89,6 +89,15 @@ pub fn run() -> Result<()> {
                 }
             }
         }
+        if let Some(deficit) = status.free_space_deficit_bytes.filter(|value| *value > 0) {
+            println!("Reserve deficit      {:>10}", human(deficit));
+            if let Some(unmet) = status.unmet_free_space_bytes.filter(|value| *value > 0) {
+                println!("Reserve unmet est.   {:>10}", human(unmet));
+                if let Some(reason) = status.unmet_free_space_reason {
+                    println!("Reserve reason       {reason}");
+                }
+            }
+        }
         println!(
             "Active leases        {:>10}   pinned {}",
             status.active_leases, status.pinned_contexts
@@ -205,6 +214,13 @@ pub fn run() -> Result<()> {
         free.map(human).unwrap_or_else(|| "unknown".to_owned()),
         human(e.cfg.min_free_space)
     );
+    if let Some(deficit) = free
+        .map(|free| e.cfg.min_free_space.saturating_sub(free))
+        .filter(|value| *value > 0)
+    {
+        println!("Reserve deficit      {:>10}", human(deficit));
+        println!("Reserve unmet est.      unknown   (daemon unavailable)");
+    }
     println!("Potentially eligible    unknown   (daemon unavailable)");
     println!("Protected builds        unknown   (daemon unavailable)");
     let budget_excess = managed.saturating_sub(e.cfg.max_size);

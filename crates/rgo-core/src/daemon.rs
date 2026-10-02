@@ -929,7 +929,12 @@ fn status_report(state: &State) -> Result<StatusReport> {
         .saturating_sub(eligible_managed_bytes)
         .saturating_sub(budget_plan.protected_context_bytes)
         .saturating_sub(protected_cas_bytes);
-    let unmet_budget_reason = if unmet_budget_bytes > 0 {
+    let free_space_deficit_bytes = state
+        .cfg
+        .min_free_space
+        .saturating_sub(budget_plan.free_bytes);
+    let unmet_free_space_bytes = free_space_deficit_bytes.saturating_sub(eligible_managed_bytes);
+    let inability_reason = |reserve: bool| {
         let mut reasons = Vec::new();
         if budget_plan.protected_context_bytes > 0 {
             reasons.push("protected build contexts");
@@ -940,13 +945,15 @@ fn status_report(state: &State) -> Result<StatusReport> {
         if unclassified > 0 {
             reasons.push("operational state or other ineligible data");
         }
-        if reasons.is_empty() {
+        if reserve {
+            reasons.push("free-space reserve exceeds currently eligible managed storage");
+        } else if reasons.is_empty() {
             reasons.push("eligible-byte estimates do not cover the excess");
         }
-        Some(reasons.join("; "))
-    } else {
-        None
+        reasons.join("; ")
     };
+    let unmet_budget_reason = (unmet_budget_bytes > 0).then(|| inability_reason(false));
+    let unmet_free_space_reason = (unmet_free_space_bytes > 0).then(|| inability_reason(true));
     let object_bytes = state.cas.object_bytes()?;
     let observations_incomplete = cache_event_log_truncated(&state.paths);
     let cache = {
@@ -971,6 +978,9 @@ fn status_report(state: &State) -> Result<StatusReport> {
         eligible_managed_bytes: Some(eligible_managed_bytes),
         unmet_budget_bytes: Some(unmet_budget_bytes),
         unmet_budget_reason,
+        free_space_deficit_bytes: Some(free_space_deficit_bytes),
+        unmet_free_space_bytes: Some(unmet_free_space_bytes),
+        unmet_free_space_reason,
         soft_watermark_bytes: state.cfg.soft_watermark,
         hard_limit_bytes: state.cfg.max_size,
         volume_free_bytes: budget_plan.free_bytes,

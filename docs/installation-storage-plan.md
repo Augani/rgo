@@ -361,6 +361,17 @@ Workspace selection now also falls back to ordinary Cargo under the global guard
 - [ ] Handle one active project larger than the budget, low space before compile, ENOSPC during publication/staging, all-data-pinned cases, clock jumps, and read-only roots explicitly.
 - [x] Define the user promise as recovery toward the budget when safe eligible storage exists, with visible transient excess. README and the storage configuration contract describe a recovery target; status reports protected storage and an unmet target. A strict quota that interrupts builds is outside this release.
 
+**Free-space status update (2026-10-02):** status now reports the observed
+reserve deficit separately from managed-size budget excess. It estimates the
+part that current eligible managed storage cannot cover and explains protected
+build/CAS and other ineligible state. A below-budget root can therefore show an
+unmet reserve without claiming it is over its size budget. The CLI fallback
+reports an observed deficit but leaves eligibility unknown without a daemon.
+These are allocated-byte estimates, not a promise of returned volume space.
+The existing pinned-budget fixture covers reserve failure without filling the
+volume; it also retains its positive reclamation and unpin recovery controls.
+The wider P3 policy and accounting checklist remains open.
+
 **Suggested policy:** garbage/temp first; expired orphans next; stale documented incremental state when safely identifiable; then idle contexts and cold CAS entries by measured value/age. Keep the initial implementation explainable before attempting adaptive eviction.
 
 The private-daemon below-budget orphan fixture passed on Linux, macOS, and Windows in the [18-job matrix](https://github.com/Augani/rgo/actions/runs/36909576863). That run also passed the supervised-volume setup warning and Linux filesystem exclusions. The preceding Ubuntu beta run stopped a still-compiling Cargo fixture at its 30-second readiness deadline; the bounded readiness allowance now accommodates slow shared runners without delaying successful starts. The interrupted local full-suite command did not yield a final exit status, so this matrix provides the completed full-suite evidence.

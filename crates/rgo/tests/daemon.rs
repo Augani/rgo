@@ -1273,6 +1273,65 @@ fn opted_in_maintenance_reclaims_idle_bytes_and_reports_pinned_excess() {
         panic!("daemon did not return storage status: {response:?}");
     };
     assert_eq!(status.unmet_budget_bytes, Some(0));
+    assert_eq!(status.free_space_deficit_bytes, Some(0));
+    assert_eq!(status.unmet_free_space_bytes, Some(0));
+    assert_eq!(status.unmet_free_space_reason, None);
+
+    // A reserve can be unmet independently of the managed-size budget. Use a
+    // deliberately impossible reserve instead of filling the runner's volume.
+    drop(daemon);
+    std::fs::create_dir_all(&pinned).unwrap();
+    std::fs::write(pinned.join("intermediates"), vec![0u8; 2 * 1024 * 1024]).unwrap();
+    rgo_core::context::write_supervised_sidecar(
+        &pinned,
+        &pinned_project,
+        &pinned_project.join("Cargo.toml"),
+        true,
+    )
+    .unwrap();
+    rgo_core::context::write_durable_pin(&paths, &pinned).unwrap();
+    let reserve = rgo_core::config::volume_total_bytes_checked(&paths.root)
+        .unwrap()
+        .saturating_add(1024 * 1024 * 1024);
+    std::fs::write(paths.config_file(), format!(
+        "[storage]\nmax_size = '1000000000000B'\nmin_free_space = '{reserve}B'\n[gc]\nauto = false\n"
+    )).unwrap();
+    let _daemon = StopDaemon(start_daemon(&sb));
+    let response = ipc::request_with_timeout(
+        &paths.socket_path(),
+        Request::QueryStatus,
+        Duration::from_secs(5),
+    )
+    .unwrap();
+    let Response::Status(status) = response else {
+        panic!("daemon did not return reserve status: {response:?}");
+    };
+    assert!(status.managed_bytes < status.hard_limit_bytes);
+    assert_eq!(status.unmet_budget_bytes, Some(0));
+    let deficit = reserve.saturating_sub(status.volume_free_observed_bytes.unwrap());
+    assert!(deficit > 0);
+    assert_eq!(status.free_space_deficit_bytes, Some(deficit));
+    assert_eq!(
+        status.unmet_free_space_bytes,
+        Some(deficit.saturating_sub(status.eligible_managed_bytes.unwrap()))
+    );
+    assert!(status.unmet_free_space_bytes.unwrap() > 0);
+    let reason = status.unmet_free_space_reason.unwrap();
+    assert!(reason.contains("protected build contexts"), "{reason}");
+    assert!(reason.contains("free-space reserve"), "{reason}");
+    let visible = sb.cmd(cargo_bin("rgo")).arg("status").output().unwrap();
+    assert!(
+        visible.status.success(),
+        "{}",
+        String::from_utf8_lossy(&visible.stderr)
+    );
+    let visible = String::from_utf8_lossy(&visible.stdout);
+    assert!(visible.contains("Reserve deficit"), "{visible}");
+    assert!(visible.contains("Reserve unmet est."), "{visible}");
+    assert!(visible.contains("protected build contexts"), "{visible}");
+    assert!(!visible.contains("Over budget"), "{visible}");
+    assert!(!visible.contains("Budget unmet est."), "{visible}");
+    assert!(pinned.is_dir());
 }
 
 #[test]

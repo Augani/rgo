@@ -307,6 +307,16 @@ pub struct StatusReport {
     pub unmet_budget_bytes: Option<u64>,
     #[serde(default)]
     pub unmet_budget_reason: Option<String>,
+    /// Observed free-space reserve shortfall, independently of the size budget.
+    /// Absent when the volume reading is unavailable or the daemon is older.
+    #[serde(default)]
+    pub free_space_deficit_bytes: Option<u64>,
+    /// Portion of the reserve shortfall not covered by currently eligible
+    /// allocated-byte estimates. Deletion may return less actual free space.
+    #[serde(default)]
+    pub unmet_free_space_bytes: Option<u64>,
+    #[serde(default)]
+    pub unmet_free_space_reason: Option<String>,
     pub soft_watermark_bytes: u64,
     pub hard_limit_bytes: u64,
     /// Legacy numeric field; zero also represented a failed volume probe.
@@ -561,20 +571,39 @@ mod tests {
             .remove("eligible_managed_bytes");
         older.as_object_mut().unwrap().remove("unmet_budget_bytes");
         older.as_object_mut().unwrap().remove("unmet_budget_reason");
+        for field in [
+            "free_space_deficit_bytes",
+            "unmet_free_space_bytes",
+            "unmet_free_space_reason",
+        ] {
+            older.as_object_mut().unwrap().remove(field);
+        }
         let decoded: StatusReport = serde_json::from_value(older).unwrap();
         assert_eq!(decoded.volume_free_observed_bytes, None);
         assert_eq!(decoded.eligible_managed_bytes, None);
         assert_eq!(decoded.unmet_budget_bytes, None);
         assert_eq!(decoded.unmet_budget_reason, None);
+        assert_eq!(decoded.free_space_deficit_bytes, None);
+        assert_eq!(decoded.unmet_free_space_bytes, None);
+        assert_eq!(decoded.unmet_free_space_reason, None);
 
         let current = StatusReport {
             volume_free_bytes: 0,
             volume_free_observed_bytes: Some(0),
+            free_space_deficit_bytes: Some(4096),
+            unmet_free_space_bytes: Some(2048),
+            unmet_free_space_reason: Some("protected build contexts".into()),
             ..Default::default()
         };
         let decoded: StatusReport =
             serde_json::from_value(serde_json::to_value(current).unwrap()).unwrap();
         assert_eq!(decoded.volume_free_observed_bytes, Some(0));
+        assert_eq!(decoded.free_space_deficit_bytes, Some(4096));
+        assert_eq!(decoded.unmet_free_space_bytes, Some(2048));
+        assert_eq!(
+            decoded.unmet_free_space_reason.as_deref(),
+            Some("protected build contexts")
+        );
     }
 
     #[test]
