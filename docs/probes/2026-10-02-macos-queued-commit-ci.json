@@ -1,0 +1,180 @@
+{
+  "url": "https://github.com/Augani/rgo/actions/runs/37057092962",
+  "head_sha": "e4744613a4a3394a76ef9db5bc92997a926f29f8",
+  "status": "completed",
+  "conclusion": "success",
+  "run_attempt": 1,
+  "individual_jobs": [
+    {
+      "databaseId": 111004341471,
+      "name": "macOS Intel Cargo guardian",
+      "status": "completed",
+      "conclusion": "success",
+      "startedAt": "2026-10-02T19:54:01Z",
+      "completedAt": "2026-10-02T19:57:32Z",
+      "url": "https://github.com/Augani/rgo/actions/runs/37057092962/job/111004341471"
+    },
+    {
+      "databaseId": 111004341738,
+      "name": "Linux btrfs smoke",
+      "status": "completed",
+      "conclusion": "success",
+      "startedAt": "2026-10-02T19:53:58Z",
+      "completedAt": "2026-10-02T19:55:00Z",
+      "url": "https://github.com/Augani/rgo/actions/runs/37057092962/job/111004341738"
+    },
+    {
+      "databaseId": 111004341740,
+      "name": "ubuntu-latest / stable",
+      "status": "completed",
+      "conclusion": "success",
+      "startedAt": "2026-10-02T19:53:59Z",
+      "completedAt": "2026-10-02T20:01:20Z",
+      "url": "https://github.com/Augani/rgo/actions/runs/37057092962/job/111004341740"
+    },
+    {
+      "databaseId": 111004341742,
+      "name": "Source build / Rust 1.85 / macos-14",
+      "status": "completed",
+      "conclusion": "success",
+      "startedAt": "2026-10-02T19:55:34Z",
+      "completedAt": "2026-10-02T19:56:26Z",
+      "url": "https://github.com/Augani/rgo/actions/runs/37057092962/job/111004341742"
+    },
+    {
+      "databaseId": 111004341756,
+      "name": "Source build / Rust 1.85 / windows-latest",
+      "status": "completed",
+      "conclusion": "success",
+      "startedAt": "2026-10-02T19:54:00Z",
+      "completedAt": "2026-10-02T19:55:45Z",
+      "url": "https://github.com/Augani/rgo/actions/runs/37057092962/job/111004341756"
+    },
+    {
+      "databaseId": 111004341757,
+      "name": "Cargo 1.90/1.91 activation / macos-14",
+      "status": "completed",
+      "conclusion": "success",
+      "startedAt": "2026-10-02T19:54:07Z",
+      "completedAt": "2026-10-02T19:55:27Z",
+      "url": "https://github.com/Augani/rgo/actions/runs/37057092962/job/111004341757"
+    },
+    {
+      "databaseId": 111004341775,
+      "name": "macos-14 / nightly",
+      "status": "completed",
+      "conclusion": "success",
+      "startedAt": "2026-10-02T19:54:04Z",
+      "completedAt": "2026-10-02T19:58:30Z",
+      "url": "https://github.com/Augani/rgo/actions/runs/37057092962/job/111004341775"
+    },
+    {
+      "databaseId": 111004341812,
+      "name": "Pinned nightly layout / macos-14",
+      "status": "completed",
+      "conclusion": "success",
+      "startedAt": "2026-10-02T19:56:59Z",
+      "completedAt": "2026-10-02T19:57:56Z",
+      "url": "https://github.com/Augani/rgo/actions/runs/37057092962/job/111004341812"
+    },
+    {
+      "databaseId": 111004341816,
+      "name": "Source build / Rust 1.85 / ubuntu-latest",
+      "status": "completed",
+      "conclusion": "success",
+      "startedAt": "2026-10-02T19:53:59Z",
+      "completedAt": "2026-10-02T19:54:43Z",
+      "url": "https://github.com/Augani/rgo/actions/runs/37057092962/job/111004341816"
+    },
+    {
+      "databaseId": 111004341819,
+      "name": "Cargo 1.90/1.91 activation / windows-latest",
+      "status": "completed",
+      "conclusion": "success",
+      "startedAt": "2026-10-02T19:54:01Z",
+      "completedAt": "2026-10-02T19:56:17Z",
+      "url": "https://github.com/Augani/rgo/actions/runs/37057092962/job/111004341819"
+    },
+    {
+      "databaseId": 111004341828,
+      "name": "Pinned nightly layout / windows-latest",
+      "status": "completed",
+      "conclusion": "success",
+      "startedAt": "2026-10-02T19:54:00Z",
+      "completedAt": "2026-10-02T19:56:19Z",
+      "url": "https://github.com/Augani/rgo/actions/runs/37057092962/job/111004341828"
+    },
+    {
+      "databaseId": 111004341850,
+      "name": "windows-latest / beta",
+      "status": "completed",
+      "conclusion": "success",
+      "startedAt": "2026-10-02T19:54:00Z",
+      "completedAt": "2026-10-02T19:59:03Z",
+      "url": "https://github.com/Augani/rgo/actions/runs/37057092962/job/111004341850"
+    },
+    {
+      "databaseId": 111004341855,
+      "name": "Cargo 1.90/1.91 activation / ubuntu-latest",
+      "status": "completed",
+      "conclusion": "success",
+      "startedAt": "2026-10-02T19:53:59Z",
+      "completedAt": "2026-10-02T19:55:08Z",
+      "url": "https://github.com/Augani/rgo/actions/runs/37057092962/job/111004341855"
+    },
+    {
+      "databaseId": 111004341865,
+      "name": "ubuntu-latest / beta",
+      "status": "completed",
+      "conclusion": "success",
+      "startedAt": "2026-10-02T19:53:59Z",
+      "completedAt": "2026-10-02T19:58:09Z",
+      "url": "https://github.com/Augani/rgo/actions/runs/37057092962/job/111004341865"
+    },
+    {
+      "databaseId": 111004341879,
+      "name": "Pinned nightly layout / ubuntu-latest",
+      "status": "completed",
+      "conclusion": "success",
+      "startedAt": "2026-10-02T19:53:59Z",
+      "completedAt": "2026-10-02T19:54:39Z",
+      "url": "https://github.com/Augani/rgo/actions/runs/37057092962/job/111004341879"
+    },
+    {
+      "databaseId": 111004341887,
+      "name": "ubuntu-latest / nightly",
+      "status": "completed",
+      "conclusion": "success",
+      "startedAt": "2026-10-02T19:53:59Z",
+      "completedAt": "2026-10-02T19:58:03Z",
+      "url": "https://github.com/Augani/rgo/actions/runs/37057092962/job/111004341887"
+    },
+    {
+      "databaseId": 111004341910,
+      "name": "macos-14 / stable",
+      "status": "completed",
+      "conclusion": "success",
+      "startedAt": "2026-10-02T19:56:31Z",
+      "completedAt": "2026-10-02T20:02:36Z",
+      "url": "https://github.com/Augani/rgo/actions/runs/37057092962/job/111004341910"
+    },
+    {
+      "databaseId": 111004341945,
+      "name": "windows-latest / stable",
+      "status": "completed",
+      "conclusion": "success",
+      "startedAt": "2026-10-02T19:54:00Z",
+      "completedAt": "2026-10-02T20:08:19Z",
+      "url": "https://github.com/Augani/rgo/actions/runs/37057092962/job/111004341945"
+    },
+    {
+      "databaseId": 111004341973,
+      "name": "macos-14 / beta",
+      "status": "completed",
+      "conclusion": "success",
+      "startedAt": "2026-10-02T19:57:39Z",
+      "completedAt": "2026-10-02T20:02:31Z",
+      "url": "https://github.com/Augani/rgo/actions/runs/37057092962/job/111004341973"
+    }
+  ]
+}

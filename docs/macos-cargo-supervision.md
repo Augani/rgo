@@ -947,8 +947,18 @@ completed full-platform acceptance.
   requirements locally in 24.72 s. The existing interrupt case passed in 3.57 s
   with exact code 73, stop/resume, survivor protection and actual idle deletion.
   No new Rust test case was added; all pause/cut hooks are debug-only.
-- [ ] Verify the final batch in the existing platform lanes.
-- [ ] Exercise live mixed-version upgrades and the remaining mask/action,
+- [x] Verify the final batch in the existing platform lanes: all 19 individual
+  jobs passed on attempt 1 at `e474461`, including advisory nightly. Arm64
+  stable/beta/nightly passed the two actual cases; Intel passed all seven
+  startup subcases and both cases with captured output.
+- [x] Exercise both healthy same-protocol handoffs with actual old/current
+  binaries in private homes. Hold the existing session-lock barrier, start the
+  caller, atomically switch the installed pair and release it. Old `S` commits
+  to the current guardian; the current caller rejects the old greeting and
+  falls back before commit. Each application runs once, returns exactly 17,
+  preserves output, retires its job and permits actual idle-context deletion.
+- [ ] Exercise full live upgrade/recovery, terminal and signal-state skew,
+  already-running old guardians, and the remaining mask/action,
   unsupported-state and post-commit/child-creation timing matrix. Resolve the
   earlier interrupt/terminal failures and the recorded CAS-reclamation failure
   before full release acceptance. Normal activation and automatic GC stay off.
@@ -961,8 +971,21 @@ Each subcase retires its owned guardian and requires real idle-context deletion
 before continuing. The prefix cut exercises the actual socket error and strict
 record decoder; it does not accept an error code as equivalent to cancellation.
 Protocol 9, admission revision 4 and cleanup ownership/receipt schemas are
-unchanged. Legacy capability handling is implemented; the live upgrade gate
-remains open.
+unchanged. The [live binary observations](probes/2026-10-02-macos-guardian-version-skew.json)
+record both basic handoffs and two probe corrections: an absent initial barrier
+file and a lexical `/tmp` versus `/private/tmp` comparison. Neither required a
+production fix; only the second direction was repeated after correcting path
+comparison. The broader live upgrade gate remains open.
+
+The [full platform run](https://github.com/Augani/rgo/actions/runs/37057092962)
+passed on macOS 14.8.9 build 23J631 arm64: stable 1.99.0 took 11.72 s coalition /
+1.32 s interrupt; beta 1.100.0-beta.2 took 12.43 s / 1.69 s; advisory nightly
+1.101.0 took 11.31 s / 1.59 s. Intel macOS 15.7.9 build 24G830 with stable 1.99.0
+took 27.75 s / 2.19 s. The
+[individual job record](probes/2026-10-02-macos-queued-commit-ci.json) includes all
+19 conclusions rather than inferring nightly acceptance from the overall run.
+This verifies the batch; the broader release gates and three earlier
+unexplained failures remain open.
 
 ## Completed GC exclusion — October 2, 2026
 
@@ -978,9 +1001,11 @@ remains open.
 - [x] Pass all 116 core cases locally in 2.15 s, including the duplicated-lock
   assertion, existing shared/legacy session protections and strict CAS pressure
   reclamation. No Rust test case was added.
-- [ ] Verify the final code on the existing platform matrix. The earlier beta
-  CAS failure remains unexplained: the duplicated-lock reproduction proves a
-  separate defect, not its historical cause.
+- [x] Verify the final code on the existing platform matrix: all 19 jobs passed
+  on attempt 1 at `e474461`. Each macOS arm64 stable/beta/nightly lane passed
+  all 116 core cases, including the strict CAS and duplicated-lock assertions.
+  The earlier beta CAS failure remains unexplained: the duplicated-lock
+  reproduction proves a separate defect, not its historical cause.
 
 The [lock observations](probes/2026-10-02-gc-exclusive-descriptors.json) record
 the deterministic failure and correction. Duplication models a concurrent fork

@@ -42,5 +42,75 @@
     "all_bin_release_build": "PASS, 41.22 s",
     "format_and_diff": "PASS",
     "release_audit_exclusion": "PASS for rgo and rgo-rustc-wrapper; debug rgo positive control"
+  },
+  "platform_lanes": {
+    "code_sha": "e4744613a4a3394a76ef9db5bc92997a926f29f8",
+    "run_url": "https://github.com/Augani/rgo/actions/runs/37057092962",
+    "macos_jobs": "All four recorded jobs and all 19 individual matrix jobs completed successfully on attempt 1",
+    "lanes": [
+      {
+        "job_id": 111004341910,
+        "job": "macos-14 / stable",
+        "os": "macOS 14.8.9",
+        "os_build": "23J631",
+        "arch": "arm64",
+        "cargo": "1.99.0 (5f94df478 2026-08-27)",
+        "rustc": "1.99.0 (b940084d7 2026-09-28)",
+        "coalition_seconds": 11.72,
+        "interrupt_seconds": 1.32,
+        "core_cases": 116,
+        "core_seconds": 1.66
+      },
+      {
+        "job_id": 111004341973,
+        "job": "macos-14 / beta",
+        "os": "macOS 14.8.9",
+        "os_build": "23J631",
+        "arch": "arm64",
+        "cargo": "1.100.0-beta.2 (3d7cf6e93 2026-09-25)",
+        "rustc": "1.100.0-beta.2 (2311729bc 2026-10-01)",
+        "coalition_seconds": 12.43,
+        "interrupt_seconds": 1.69,
+        "core_cases": 116,
+        "core_seconds": 2.4
+      },
+      {
+        "job_id": 111004341775,
+        "job": "macos-14 / nightly",
+        "os": "macOS 14.8.9",
+        "os_build": "23J631",
+        "arch": "arm64",
+        "cargo": "1.101.0-nightly (f3865b2a4 2026-09-29)",
+        "rustc": "1.101.0-nightly (c36f14571 2026-10-01)",
+        "coalition_seconds": 11.31,
+        "interrupt_seconds": 1.59,
+        "core_cases": 116,
+        "core_seconds": 1.9,
+        "advisory": true
+      },
+      {
+        "job_id": 111004341471,
+        "job": "macOS Intel Cargo guardian",
+        "os": "macOS 15.7.9",
+        "os_build": "24G830",
+        "arch": "x86_64",
+        "cargo": "1.99.0 (5f94df478 2026-08-27)",
+        "rustc": "1.99.0 (b940084d7 2026-09-28)",
+        "coalition_seconds": 27.75,
+        "interrupt_seconds": 2.19,
+        "startup_subcases": 7,
+        "pending_TERM_observations": 3
+      }
+    ]
+  },
+  "full_platform_run": {
+    "url": "https://github.com/Augani/rgo/actions/runs/37057092962",
+    "head_sha": "e4744613a4a3394a76ef9db5bc92997a926f29f8",
+    "status": "completed",
+    "conclusion": "success",
+    "run_attempt": 1,
+    "individual_jobs_passed": 19,
+    "individual_jobs_total": 19,
+    "individual_job_record": "2026-10-02-macos-queued-commit-ci.json"
   }
 }

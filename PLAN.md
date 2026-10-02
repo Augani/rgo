@@ -119,8 +119,13 @@ surviving through duplicated descriptors; GC-only guards now explicitly unlock,
 with record descriptors closed before the same-process fence releases. Cargo's
 inherited shared descendant locks remain unchanged. All 116 core cases and both
 existing macOS integration cases pass locally, alongside an all-bin build and
-zero-warning Clippy. Platform acceptance, live upgrades, broader signal timing
-and the earlier unexplained failures remain open in the
+zero-warning Clippy. The
+[19-job platform run](https://github.com/Augani/rgo/actions/runs/37057092962)
+passed at `e474461` on attempt 1, including actual arm64 stable/beta/nightly and
+Intel cases. Basic live old/current handoffs also preserve one execution, exact
+exit 17, expected storage and idle cleanup in private homes. Full upgrade
+recovery, broader signal timing and the earlier unexplained failures remain
+open in the
 [macOS checklist](docs/macos-cargo-supervision.md#queued-commit-and-startup-recovery--october-2-2026).
 Normal pilot activation and automatic GC remain off.
 

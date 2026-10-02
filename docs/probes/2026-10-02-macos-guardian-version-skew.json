@@ -1,0 +1,48 @@
+{
+  "purpose": "Live same-protocol macOS caller/guardian skew during an atomic binary switch",
+  "previous_sha": "a78cef1de80b16ed543536106f9c94d520340fcf",
+  "current_sha": "e4744613a4a3394a76ef9db5bc92997a926f29f8",
+  "platform": "ProductName:\t\tmacOS\nProductVersion:\t\t27.2\nBuildVersion:\t\t26B5091g",
+  "cargo": "cargo 1.98.0 (797e8a9bc 2026-08-05)",
+  "binary_sha256": {
+    "previous": {
+      "rgo": "2117047b14f1f33c3365759267839215db72ee5414047bdeff5dbd9a85b8f09d",
+      "rgo-rustc-wrapper": "88800eb94dbe104b2d10046e996d5cc1ca1ca0729d4b4b5fa90906b5cc6f5194"
+    },
+    "current": {
+      "rgo": "6b353ea6f1ef967a9cd8bb463f4a8427a669c1b272ced8e106e6d05921c5c863",
+      "rgo-rustc-wrapper": "c81076af9159703d6110bd3dd369947ed9db677b83a6e3d80790c22d1c5046ab"
+    }
+  },
+  "method": "Build the actual previous source and use protected copies of the verified current debug pair. In each private HOME/CARGO_HOME/RGO_HOME, take the existing local session flock, start unchanged cargo run --offline, wait for RGO_TEST_SESSION_LOCK_MARKER, atomically switch the installed pair, then release the barrier. The loaded caller remains the initial binary; launchd starts the replacement guardian. Automatic GC and compiler caching remain off.",
+  "observations": [
+    {
+      "caller": "previous",
+      "guardian": "current",
+      "caller_at_barrier": true,
+      "guardian_committed": true,
+      "application_exit_code": 17,
+      "application_invocations": 1,
+      "out_dir": "/tmp/rgo-mixed-version-q4l4sk6c/previous-caller-current-guardian-barrier/home/.rgo/builds/5d/5fabd629035229bde8b0f32c0148ad561cfc4eeb41bab2950e97db87b92452/debug/build/mixed-version-probe-71f15912d806ce2b/out",
+      "idle_metadata_retired": true,
+      "actual_idle_gc": true
+    },
+    {
+      "caller": "current",
+      "guardian": "previous",
+      "caller_at_barrier": true,
+      "guardian_committed": false,
+      "application_exit_code": 17,
+      "application_invocations": 1,
+      "out_dir": "/private/tmp/rgo-mixed-version-q4l4sk6c/new-old-canonical/project/target/debug/build/mixed-version-probe-71f15912d806ce2b/out",
+      "idle_metadata_retired": true,
+      "actual_idle_gc": true
+    }
+  ],
+  "controls": "Exact application stdout/stderr, one recorded application invocation, exact exit 17, real build-script OUT_DIR under the expected managed/checkout root, owned job retirement, nonempty prepared context list followed by actual idle-context deletion via rgo gc --target 0, and explicit shutdown/wait of each owned private daemon.",
+  "probe_corrections": [
+    "Before any Cargo launch, the initial probe expected setup to have created the process guard file. The fixture now creates its own regular private lock file before holding it.",
+    "The first current-caller/old-guardian application returned 17 once with no commit, but its location assertion compared /private/tmp with /tmp lexically. The corrected comparison resolves both paths; only that direction was rerun to complete the remaining assertions. No rgo code was changed."
+  ],
+  "limits": "This proves two healthy same-protocol nonterminal handoffs on the recorded local runtime. It does not prove installer crash/rollback, older cleanup protocols or schemas, terminal/pending-signal skew, an already-running old guardian, every runtime, or full upgrade/activation readiness. No new Rust test case or CI lane."
+}

@@ -171,7 +171,10 @@ fence releases. Cargo's inherited shared descendant locks are unchanged. All
 116 core cases passed locally in 2.15 s, including the strict CAS pressure case.
 The [observations](probes/2026-10-02-gc-exclusive-descriptors.json) prove this
 defect and correction, not the cause of the earlier beta CAS failure. Final
-platform verification and the broader P2 safety gates remain open.
+code passed all 19 individual jobs in the
+[platform matrix](https://github.com/Augani/rgo/actions/runs/37057092962) at
+`e474461` on attempt 1, including macOS beta's strict CAS/lock assertions.
+The broader P2 safety gates and that earlier failure's explanation remain open.
 
 **macOS terminal metadata follow-up:** complete registered-shell records now
 have a separate daemon retirement path with a synced sibling journal, exact
@@ -278,6 +281,16 @@ startup subcases and the combined local recovery/terminal case passed in
 24.72 s; the existing interrupt case passed in 3.57 s. Remaining compatibility
 and timing work stays open in the
 [macOS checklist](macos-cargo-supervision.md#queued-commit-and-startup-recovery--october-2-2026).
+The [live binary handoff probe](probes/2026-10-02-macos-guardian-version-skew.json)
+also verifies old `S` with the current guardian and current-caller fallback with
+the old guardian after an atomic private binary switch. Both preserve one
+application invocation, exit 17, expected storage placement and real idle GC.
+Full installer/guardian recovery, terminal and signal-state skew remain open.
+The final code, including the GC lock correction, passed both existing cases
+locally in 22.87 s / 3.56 s and all 19 individual jobs in the
+[platform run](https://github.com/Augani/rgo/actions/runs/37057092962) at `e474461`
+on attempt 1. The recorded arm64 stable/beta/nightly and Intel outcomes close
+this batch's platform check, while normal activation remains disabled.
 
 **macOS priority (2026-10-02):** a private real-Cargo audit reproduced deletion
 while a detached child with closed inherited descriptors was still writing.
