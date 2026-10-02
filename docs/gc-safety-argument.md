@@ -59,8 +59,9 @@ establishes where intermediates go; it does not give rgo a context-wide
 ownership lock. The profile `.cargo-build-lock` probe is only an additional
 liveness heuristic. Fresh contexts created by supervised Cargo carry a
 `supervised_origin` sidecar field and current `supervision_version` (2). The
-supervised GC planner protects contexts without that current admission revision for orphan, age, incremental, and pressure cleanup; its
-executor checks the origin again after acquiring the lifecycle guard. For
+supervised GC planner protects contexts without that current admission revision
+for orphan, age, incremental, and pressure cleanup; its executor checks the
+revision again after acquiring the lifecycle guard. For
 eligible supervised contexts, GC can skip the ten-minute timestamp grace while
 still refusing a held or unreadable profile lock and holding rgo's guard
 through deletion. This does not detect direct Cargo writing into an already
@@ -155,6 +156,13 @@ process-level session guard.
   rename-pause run](https://github.com/Augani/rgo/actions/runs/36513462716)
   checked that a new session waits at GC's locked and staged points and can
   recreate a fresh context only after removal.
+- The revised producer fixtures pass locally: real Cargo preserves both
+  environment-selected and included-config wrappers while leaving managed
+  storage untouched. The GC fixture excludes old supervision revisions in
+  planning and execution while reclaiming a current idle neighbor. The
+  no-service lifecycle fixture verifies recorded protocol-6 shutdown followed
+  by protocol-7 activation. These checks cover the configured producer and
+  upgrade boundary; they do not prove arbitrary broker lifetimes.
 - A focused origin fixture requires a native-origin context to stay protected
   while a supervised neighbor is reclaimed under pressure. It also calls the
   deletion executor on the native context and requires refusal. The local
@@ -188,12 +196,13 @@ process-level session guard.
   Linux, macOS, and Windows CI matrix](https://github.com/Augani/rgo/actions/runs/36634010013).
   This covers one build-script shape without relying on an
   active rustc-wrapper lease.
-- A private-home `cargo doc` fixture holds rustdoc before it writes output,
-  refuses removal of the active context, and reclaims an unrelated idle one.
-  After release, the requested documentation appears in the checkout and the
-  context becomes reclaimable. It passed locally on macOS arm64 and in the
-  [Linux and macOS CI workspace suites](https://github.com/Augani/rgo/actions/runs/36785074208);
-  other rustdoc-command coverage remains open.
+- The earlier `cargo doc` fixture selected a custom rustdoc executable and
+  checked managed-context protection in the [former Unix suites](https://github.com/Augani/rgo/actions/runs/36785074208).
+  Revision 2 deliberately leaves that producer outside managed storage. The
+  updated fixture requires ordinary storage, preserves the global session
+  guard while custom rustdoc runs, and permits idle-context reclamation after
+  exit. Documentation must still appear under checkout `target/doc`. Stock
+  rustdoc lifecycle races and other command shapes remain open.
 - The supervised launcher refreshes its owned sidecar before each admitted
   Cargo invocation. A private-home unchanged second `cargo build` confirms a
   no-op invocation updates `last_seen` without rustc running. It passed locally

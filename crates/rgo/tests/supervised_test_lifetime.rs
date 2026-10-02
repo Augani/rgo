@@ -454,7 +454,7 @@ fn running_build_script_keeps_its_context_while_gc_reclaims_an_idle_one() {
 
 #[cfg(unix)]
 #[test]
-fn running_rustdoc_keeps_its_context_while_gc_reclaims_an_idle_one() {
+fn custom_rustdoc_uses_ordinary_storage_and_holds_the_global_guard() {
     use std::os::unix::fs::PermissionsExt;
 
     let sandbox = Sandbox::new().unwrap();
@@ -536,13 +536,16 @@ fn running_rustdoc_keeps_its_context_while_gc_reclaims_an_idle_one() {
     };
     wait_for_marker(&ready, running.child.as_mut().unwrap(), &output, "rustdoc");
 
-    let active = paths
-        .checked_managed_build_dirs()
-        .unwrap()
-        .into_iter()
-        .find(|candidate| candidate != &idle)
-        .expect("supervised cargo doc has a managed context");
-    let blocked = gc::remove_atomically(&paths, &active).unwrap_err();
+    assert_eq!(
+        paths.checked_managed_build_dirs().unwrap(),
+        vec![idle.clone()]
+    );
+    assert!(
+        std::fs::read_to_string(&output)
+            .unwrap()
+            .contains("custom compiler or wrapper")
+    );
+    let blocked = gc::remove_atomically(&paths, &idle).unwrap_err();
     assert!(
         blocked.to_string().contains("supervised Cargo"),
         "unexpected GC refusal: {blocked:#}"
@@ -557,8 +560,10 @@ fn running_rustdoc_keeps_its_context_while_gc_reclaims_an_idle_one() {
         "{}",
         String::from_utf8_lossy(&pass.stderr)
     );
-    assert!(active.is_dir(), "GC removed a context during rustdoc");
-    assert!(!idle.exists(), "GC did not reclaim the idle context");
+    assert!(
+        idle.is_dir(),
+        "GC ignored the ordinary-storage session's global guard"
+    );
 
     std::fs::write(&release, b"release").unwrap();
     let status = running.child.as_mut().unwrap().wait().unwrap();
@@ -573,7 +578,15 @@ fn running_rustdoc_keeps_its_context_while_gc_reclaims_an_idle_one() {
             .join("target/doc/rustdoc_lifetime/index.html")
             .is_file()
     );
-    gc::remove_atomically(&paths, &active).unwrap();
+    assert_eq!(
+        paths.checked_managed_build_dirs().unwrap(),
+        vec![idle.clone()]
+    );
+    gc::remove_atomically(&paths, &idle).unwrap();
+    assert!(
+        !idle.exists(),
+        "the released global guard prevented idle reclamation"
+    );
 }
 
 #[test]

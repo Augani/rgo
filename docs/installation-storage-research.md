@@ -369,3 +369,36 @@ sidecar there and rejected a build-directory environment override. Ordinary
 doctor inspection now has structured JSON output and does not run write-based
 filesystem probes. These results do not demonstrate GUI, Windows-service,
 external-config-writer, or cross-platform installer behavior yet.
+
+
+## Compiler-broker admission follow-up — 2026-10-02
+
+Sccache's [execution-mode documentation](https://github.com/mozilla/sccache/blob/main/docs/Architecture.md#execution-modes)
+places default compiler execution and output writes in its background server.
+Inference: guarding Cargo's process tree alone cannot prove that this writer
+has finished after its client exits. Client-side mode may be ignored for some
+options, so that environment setting is insufficient to establish protection.
+No sccache corruption was reproduced in this review.
+
+The implemented supervised policy preserves custom compiler/wrapper commands
+and uses ordinary Cargo storage for them. It checks inherited producer settings
+and Cargo's ancestor/home config filenames and include chains; unreadable
+settings also use ordinary storage. Only an adjacent matched rgo wrapper without
+an inner wrapper is allowed. The no-wrapper path needs no extra executable
+probe. Doctor reports the exception. The existing Unix real-Cargo fixture passed
+both environment-selected and included-config wrappers, confirmed the wrapper
+actually ran, checked correct program output, and required that the managed
+context was neither refreshed nor newly created.
+
+Admission revision 2 uses a fresh context namespace. Older contexts remain
+accounted and protected; refresh cannot promote them. The focused GC fixture
+preserved both native and old supervised contexts while reclaiming a current
+idle neighbor. Protocol 7 rejects an older daemon's admission policy; setup can
+request only the unchanged Shutdown operation using a recorded protocol 6.
+The existing no-service lifecycle fixture passed that wire-version upgrade and
+required release of the daemon singleton before activating the new record.
+
+External brokers launched by build scripts, linkers, runners, or custom toolchains
+and settings changed after inspection remain unproven. The default still leaves
+automatic GC and compiler caching off. This is progress on the configured
+producer boundary, not completion of P2 or the storage release gate.

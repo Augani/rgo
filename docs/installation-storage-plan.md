@@ -316,7 +316,13 @@ A separate private-home fixture now holds an unchanged supervised `cargo test --
 
 A private-home real-Cargo build-script fixture now pauses after the build script's compiler invocation. A direct context deletion refuses the active session, a manual GC pass still removes an unrelated idle context, and the script must write into its Cargo-provided `OUT_DIR` before the build completes. It passed locally on macOS arm64 and in the [full Linux, macOS, and Windows CI matrix](https://github.com/Augani/rgo/actions/runs/36634010013); other descendant/process shapes remain open.
 
-A focused supervised `cargo doc --offline --no-deps` fixture holds the Cargo-selected rustdoc executable before it writes documentation. While rustdoc is held, explicit cleanup refuses its managed context and a daemon GC pass removes another idle context. After release, documentation lands in the checkout's `target/doc` and the former context is reclaimable. It passed locally on macOS arm64 and in the [Linux and macOS CI workspace suites](https://github.com/Augani/rgo/actions/runs/36785074208); other rustdoc command shapes remain open. This checks a process that need not invoke rgo's compiler wrapper during the protected interval.
+The earlier `cargo doc --offline --no-deps` fixture selected a custom rustdoc
+executable and checked managed-context exclusion in the [former Unix suites](https://github.com/Augani/rgo/actions/runs/36785074208).
+Admission revision 2 routes that producer to ordinary storage. The revised
+fixture requires no new managed context, confirms the global guard protects
+existing contexts while the selected rustdoc runs, checks checkout `target/doc`,
+and requires idle reclamation after exit. It does not establish the remaining
+stock-rustdoc lifecycle race coverage.
 
 A private-home supervised no-op fixture builds once, ages the owned context sidecar, then runs unchanged `cargo build --offline` again. The second Cargo invocation reports no compilation and refreshes `last_seen` while preserving `first_seen`, so age-based selection does not treat active no-op use as inactivity. It passed locally on macOS arm64 and in the [full Linux, macOS, and Windows CI matrix](https://github.com/Augani/rgo/actions/runs/36635824970). This applies to admitted supervised commands, not direct native Cargo sessions, which remain ineligible for destructive cleanup.
 
