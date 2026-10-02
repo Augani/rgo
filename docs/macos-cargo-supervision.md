@@ -521,7 +521,7 @@ before its first unlink and keeps it through the unload acknowledgement.
   completed unload. No new Rust test case was added.
 - [ ] Complete every preparation/commit interruption and incomplete-record
   recovery path, including a full filesystem failure/cancellation matrix.
-- [ ] Eliminate Cargo-job unloading by label and verify that a foreign loaded
+- [x] Eliminate Cargo-job unloading by label and verify that a foreign loaded
   replacement survives original-job metadata cleanup on the platform matrix.
 - [x] Record optimized terminal-path timing for this batch.
 - [x] Record the full platform matrix and focused macOS 14 diagnostic run,
@@ -725,4 +725,25 @@ driver now includes bounded process, foreground,
 terminal-mode, and private guardian-log diagnostics on future timeouts; its
 assertions and deadlines are unchanged. This observation remains open alongside
 the earlier macOS stable interrupt failure. Normal activation and automatic GC
-remain off; platform results for this new policy are still pending.
+remain off; platform results for this policy are recorded below.
+
+The optimized [one-use-job terminal samples](benchmarks/2026-10-02-macos-arm64-cargo-guardian-once.json)
+at clean `b4f9e46` completed 24 no-op and 12 edit pairs, with matched binary
+SHA-256 checks and no accepted guardian fallback. Both cache and automatic GC
+were off. Plain/managed medians were 24.0/116.6 ms for no-op and 126.7/221.7 ms
+for edit builds, adding 92.6/95.0 ms. Managed p95 was 125.7/240.9 ms. This meets
+the proposed median allowance for the same tiny crate; larger/concurrent
+workloads and the release performance gate remain open.
+
+At `b4f9e46`, the [platform run](https://github.com/Augani/rgo/actions/runs/37037063311)
+passed the new coalition/replacement and interrupt cases on macOS 14.8.9
+build 23J631 arm64 (8.61 s / 1.43 s) and macOS 15.7.9 build 24G830 Intel
+(18.92 s / 2.04 s), both using Cargo/rustc 1.99.0. The complete macOS
+stable/beta/nightly suites and all three Rust 1.85 source-build lanes passed.
+All 19 jobs completed successfully without a retry, including the complete
+Linux/Windows suites, installer and service probes, exact Cargo boundary
+checks, source builds, nightly layout checks, btrfs smoke, and 100-project
+budget recovery.
+The replacement/unload race gate is closed by removing label-based unloading;
+the two unexplained terminal/interrupt failures and remaining startup,
+cancellation, runtime, and performance gates stay open.

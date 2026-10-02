@@ -199,8 +199,11 @@ other query failures; older receipts retain strict protection. Admission
 revision 4 and protocol 9 separate this policy from older contexts/daemons.
 The extended existing fixture checks a foreign replacement, a surviving writer,
 legacy protection, actual GC, restart, and journal replay. One local retry passed
-its terminal sequence after an unexplained startup timeout. Platform validation,
-that timeout, the earlier interrupt failure, and the wider P2 gates remain open
+its terminal sequence after an unexplained startup timeout. The [19-job platform
+run](https://github.com/Augani/rgo/actions/runs/37037063311) passed at `b4f9e46`
+without a retry, including arm64 and Intel guardian cases. The replacement/unload
+race is resolved; that timeout, the earlier interrupt failure, and the wider P2
+gates remain open
 in the [macOS checklist](macos-cargo-supervision.md#one-use-job-retirement--october-2-2026).
 
 **macOS priority (2026-10-02):** a private real-Cargo audit reproduced deletion

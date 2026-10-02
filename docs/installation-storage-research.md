@@ -760,3 +760,39 @@ all 19 jobs passing results. A separate
 at `c6df6b8` passed both existing cases with the new diagnostics; unrelated
 platform jobs were intentionally skipped. Neither success establishes the cause
 of the initial failure or a resolved interrupt gate.
+
+### One-use macOS Cargo jobs avoid replacement races
+
+The pilot now uses `LaunchOnlyOnce` and removes only its owned metadata; it no
+longer unloads Cargo jobs by name. This avoids needing a loaded-definition query
+that remains valid until a later unload. A separate private [launchd audit](probes/macos-launch-once.py)
+observed registration removal after normal exit and SIGKILL while a detached,
+closed-FD writer remained kernel-counted. The writer's late write succeeded;
+only afterward did the coalition become reaped. The [raw result](probes/2026-10-02-macos-launch-once.json)
+records both cases on macOS 27.2 arm64.
+
+Inference from Apple's pinned [reaping implementation](https://github.com/apple-oss-distributions/xnu/blob/f6217f891ac0bb64f3d375211650a4c1ff8ca1ea/osfmk/kern/coalition.c)
+and [absent-ID syscall result](https://github.com/apple-oss-distributions/xnu/blob/f6217f891ac0bb64f3d375211650a4c1ff8ca1ea/bsd/kern/sys_coalition.c):
+exact `-1`/`ESRCH` establishes retirement for a positively observed, same-boot
+coalition ID. The private API/runtime gate still applies. Receipt schema 2
+expresses that policy; schema 1 retains its previous strict protection. Owner
+schema 4 requires the one-use definition, while admission revision 4/protocol 9
+isolate the new policy. The existing fixture checks actual GC, a replacement job
+surviving metadata cleanup, old-receipt protection, and journal replay. A terminal
+startup timeout remains unexplained after one passing local retry; the broader
+safety gates stay open in the [macOS checklist](macos-cargo-supervision.md#one-use-job-retirement--october-2-2026).
+
+At clean `b4f9e46`, the optimized [registered-shell paired benchmark](benchmarks/2026-10-02-macos-arm64-cargo-guardian-once.json)
+completed 24 no-op and 12 edit pairs with no accepted supervisor fallback and
+cache/automatic GC off. Added median latency was 92.6 ms and 95.0 ms respectively;
+managed p95 was 125.7 ms and 240.9 ms. This small-crate result meets the proposed
+median allowance; it does not establish representative or concurrent performance
+or isolate a causal per-change improvement.
+
+The [19-job platform run](https://github.com/Augani/rgo/actions/runs/37037063311)
+completed successfully at `b4f9e46`, with no retry. It passed the replacement
+and interrupt cases on macOS 14.8.9 arm64 and macOS 15.7.9 Intel, the full
+existing workspace/platform suites, source builds, installer/service probes,
+Cargo boundaries, and budget recovery. This closes the Cargo-job replacement
+race by eliminating label-based unloading; the earlier unexplained failures
+and wider P2/P5 release gates remain open.

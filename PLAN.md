@@ -75,8 +75,11 @@ receipt schema 2 recognizes proven same-boot coalition reaping; legacy receipts
 remain strict. Owner schema 4, admission revision 4, and protocol 9 bind this
 policy. The existing fixture checks a foreign replacement surviving cleanup and
 journal replay. Local validation required one terminal-timeout retry; both that
-timeout and the prior platform interrupt failure remain unresolved. Platform
-validation and all remaining gates stay in the [macOS checklist](docs/macos-cargo-supervision.md#one-use-job-retirement--october-2-2026).
+timeout and the prior platform interrupt failure remain unresolved. The
+[19-job platform run](https://github.com/Augani/rgo/actions/runs/37037063311) passed
+at `b4f9e46` without a retry, including the actual replacement case on arm64 and
+Intel. The replacement/unload race is closed; remaining activation and safety
+gates stay in the [macOS checklist](docs/macos-cargo-supervision.md#one-use-job-retirement--october-2-2026).
 
 ## 0. What changed vs. `doc.md`, and why
 
