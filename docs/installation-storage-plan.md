@@ -184,9 +184,27 @@ SIGKILL with a surviving closed-FD writer, subsequent reclamation, stdin/EOF,
 separate output, native bytes, exit 17, and healthy job cleanup locally. Admission
 revision 3, a distinct coalition namespace, and protocol 8 protect it from older
 cleanup policies; setup retains recorded protocol-6/7 Shutdown recovery.
-Normal activation remains descriptor-only while terminal control, abandoned-job
+The [18-job run](https://github.com/Augani/rgo/actions/runs/36997090024) passed
+at `0caa7ba`, including the actual launcher fixture and all existing platform
+workspace, installer, and recovery jobs. This precedes the next recovery and
+signal-handling follow-up.
+Normal activation remains descriptor-only while terminal control, complete job
 recovery, supported runtimes, and the full P2 matrix remain open. See the
 [detailed checklist](macos-cargo-supervision.md).
+
+**macOS recovery and signals follow-up:** versioned owner records bind each
+job to its selected context before bootstrap. Daemon maintenance and actual GC
+recover recognized idle jobs only under exclusive scope guards, after synced
+receipt retirement. Bounded no-follow reads and exact definitions preserve
+edited jobs and extra files. The extended coalition fixture passed late-write
+safety, an edited idle definition, and automatic metadata recovery with
+destructive automatic GC off. The existing interrupt fixture now runs the
+installed macOS pilot, passes stop/resume and Ctrl-C, preserves its surviving
+child, and reclaims an idle neighbor. Both passed locally on macOS 27.2 arm64.
+A focused Intel lane runs these same cases. Terminal invocations fall back to
+checkout storage before pilot admission until controlling-terminal handoff is
+implemented. No additional Rust test case was added. Full startup/recovery
+interruption and runtime gates remain open.
 
 - [ ] Document the exact lock/lifecycle protocol Cargo uses for each supported version and platform. Determine whether it covers build scripts, rustdoc, no-op commands, package/install operations, test execution, and waiting Cargo processes.
 - [ ] Build deterministic race fixtures that pause between liveness check, lock acquisition, rename, and removal. Require that GC actually deletes other eligible data while the target build remains protected.

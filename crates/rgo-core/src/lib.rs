@@ -18,6 +18,8 @@ pub mod gc;
 pub mod ipc;
 #[cfg(target_os = "macos")]
 pub mod macos_coalition;
+#[cfg(target_os = "macos")]
+pub mod macos_jobs;
 pub mod paths;
 pub mod service;
 pub mod size;

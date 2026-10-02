@@ -590,6 +590,27 @@ setup recovery fixture also passed recorded protocol-7 Shutdown recovery.
 Admission revision 3 and protocol 8 fence the new policy from older daemons.
 The coalition path uses a distinct namespace so it cannot reuse descriptor-only
 histories. Normal activation is not changed yet: terminal signal/job-control
-proof, abandoned-job recovery, startup/cancellation boundaries, and the supported
+proof, complete abandoned-job recovery, startup/cancellation boundaries, and the supported
 runtime matrix remain in the [macOS checklist](macos-cargo-supervision.md).
 Automatic GC stays off by default. The fixture count is unchanged.
+
+The next follow-up persists a versioned job-owner record containing its context
+before bootstrap. Both daemon maintenance and real GC acquire exclusive scope
+guards before recovering idle jobs, and sync receipt pruning before reaping a
+coalition. Missing/reaped IDs and invalid records remain errors. Reads and
+metadata passes are bounded; edited definitions and added content survive.
+The existing coalition fixture now verifies restoration followed by maintenance
+recovery with destructive automatic GC off. The existing interrupt case runs
+the installed pilot and verifies SIGTSTP/SIGCONT followed by Ctrl-C, retained
+child protection, and unrelated idle reclamation. Both passed locally.
+
+Terminal descriptors need a separate handoff: Apple's `tcsetpgrp` requires the
+controlling terminal and process group to belong to the caller's session.
+Descriptor passing alone cannot establish this relationship for a launchd job.
+The private pilot therefore falls back to checkout storage for terminal
+invocations before admission while that transport is implemented.
+[Apple's terminal process-group contract](https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man3/tcsetpgrp.3.html).
+A focused `macos-15-intel` lane reuses the two existing cases to extend kernel
+interface and launcher evidence beyond arm64. All metadata interruption points,
+loaded-job replacement, terminal control, and the declared runtime range remain
+open; this follow-up adds no Rust test case.

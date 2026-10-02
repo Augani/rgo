@@ -176,6 +176,17 @@ process-level session guard.
   [Design and remaining checklist](macos-cargo-supervision.md),
   [repeatable counterexample](probes/README.md).
 
+- The installed macOS pilot's two existing fixtures now also pass local crash
+  recovery and stop/resume handling. Recognized job metadata is recovered by
+  daemon maintenance and actual GC under exclusive context guards after
+  durable receipt pruning, including with automatic destructive GC disabled.
+  An edited idle definition is retained, then recovered after exact restoration.
+  The interrupt fixture stops and resumes the actual launcher, sends Ctrl-C,
+  retains a surviving child, and reclaims an idle neighbor. Terminal commands
+  use checkout storage before pilot admission; controlling-terminal handoff,
+  loaded-job replacement and every metadata interruption remain open. This
+  does not close the normal launcher's descriptor gap.
+
 - Unit and private-home fixtures verify context/global lock exclusion,
   missing-sidecar refusal, pin changes after planning, and an unrelated idle
   context being reclaimed while one context is held. The [cross-platform

@@ -107,15 +107,49 @@ the fixture no longer supplies a separate test-only helper.
   discriminator prevents this pilot from reusing descriptor-only contexts.
   The existing setup recovery fixture now exercises recorded protocol 7;
   the unchanged Shutdown compatibility range still includes protocol 6.
-- [ ] Complete signal and terminal job-control evidence, abandoned-job recovery,
+- [x] Relay SIGINT, SIGTERM, SIGHUP, SIGQUIT, SIGTSTP, and SIGCONT. Observe
+  primary stop events and reflect them in the caller's shell job. The existing
+  interrupt fixture now uses the actual macOS pilot, requires a stop/resume
+  cycle before Ctrl-C, preserves the surviving child, and reclaims an idle
+  neighbor. This is process-group evidence with redirected descriptors;
+  controlling-terminal compatibility is still open.
+- [x] Persist the selected context in a versioned job-owner record before
+  bootstrap. Daemon maintenance and actual GC recover recognized idle jobs
+  under the context's exclusive GC guards. Receipt pruning is synced before
+  bootout can reap the identity. Neither a missing PID nor a query failure is
+  accepted as completion.
+- [x] Bound owner/plist reads, reject symlinks and unsupported schemas, compare
+  the exact generated definition, and preserve edited definitions or added
+  content. Cleanup unlinks only the four known job entries. Maintenance keeps
+  its directory iterator across passes, reads at most 16 entries per pass,
+  and bounds its bootout helper. The same coalition fixture verifies an edited
+  idle job survives, then maintenance recovers it after restoration with
+  automatic destructive GC disabled.
+- [x] Keep terminal invocations in checkout storage before pilot admission.
+  Passing terminal descriptors to a different launchd session does not make
+  that session own the shell's controlling terminal. The next transport batch
+  must establish and verify this handoff before enabling terminal admission.
+- [ ] Complete controlling-terminal evidence, every abandoned-job interruption,
   every startup/cancellation boundary, and the declared runtime/architecture
   matrix before making this the normal installed launcher path.
 
-The private regression passed locally on macOS 27.2 arm64 with the new launcher.
-This is still a pilot, and the previously recorded `325b2e5` CI run only validates
-the earlier observation/receipt implementation. Updated platform evidence is
-required for this batch. The routine suite still contains one coalition test;
-the existing case was extended instead of creating duplicate fixtures.
+The [18-job platform run](https://github.com/Augani/rgo/actions/runs/36997090024)
+passed at `0caa7ba`, including the actual installed-launcher coalition fixture,
+macOS stable/beta/nightly workspace suites, source builds, installer probes,
+and the existing 100-project recovery checks. That run validates the stream
+handoff pilot before this recovery/stop-resume follow-up.
+
+The two existing private regressions passed locally on macOS 27.2 arm64 with
+the recovery and stop/resume implementation; build, format, and diff checks
+also passed. This is still a pilot. Updated platform evidence is required for
+this batch; a focused `macos-15-intel` lane runs those same two cases because
+[GitHub identifies that runner as Intel](https://docs.github.com/en/actions/reference/runners/github-hosted-runners).
+No additional Rust test case was added in this follow-up.
+
+Power loss or cancellation between individual metadata removals and bootout,
+loaded-job replacement, every preparation/commit boundary, and the complete
+signal-disposition and terminal matrix still require work. Older pilot owner
+records are preserved when their schema cannot establish the recovery scope.
 
 ## Integrate with unchanged Cargo commands
 

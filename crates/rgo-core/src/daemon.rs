@@ -113,6 +113,8 @@ struct State {
     gc_lock: Arc<Mutex<()>>,
     operation_lock: Arc<Mutex<()>>,
     pin_pruner: Arc<Mutex<context::PinPruneScanner>>,
+    #[cfg(target_os = "macos")]
+    macos_job_scanner: Arc<Mutex<crate::macos_jobs::RecoveryScanner>>,
     pending_scanner: Arc<Mutex<crate::supervision::PendingMaintenanceScanner>>,
     trigger_scan: Arc<Mutex<crate::size::TriggerScan>>,
     auto_gc_retry_at: Arc<Mutex<Option<Instant>>>,
@@ -257,6 +259,8 @@ pub fn run(paths: RgoPaths, cfg: Resolved) -> Result<()> {
         gc_lock: Arc::new(Mutex::new(())),
         operation_lock: Arc::new(Mutex::new(())),
         pin_pruner: Arc::new(Mutex::new(context::PinPruneScanner::default())),
+        #[cfg(target_os = "macos")]
+        macos_job_scanner: Arc::new(Mutex::new(crate::macos_jobs::RecoveryScanner::default())),
         pending_scanner: Arc::new(Mutex::new(
             crate::supervision::PendingMaintenanceScanner::default(),
         )),
@@ -1275,6 +1279,10 @@ fn run_gc(
     // The initial inventory runs without the admission lock. The GC lock
     // excludes another daemon-owned deletion throughout the pass.
     let operation = state.operation_lock.lock().unwrap();
+    #[cfg(target_os = "macos")]
+    if !dry_run {
+        recover_macos_cargo_jobs(state);
+    }
     let managed_bytes = snapshot.total_bytes();
     let contexts = snapshot.contexts;
     let build_bytes = snapshot.build_bytes;
@@ -2420,6 +2428,20 @@ fn select_cas_manifests(
     Ok(selected)
 }
 
+#[cfg(target_os = "macos")]
+fn recover_macos_cargo_jobs(state: &State) {
+    match state
+        .macos_job_scanner
+        .lock()
+        .unwrap()
+        .scan(&state.paths, 16)
+    {
+        Ok(0) => {}
+        Ok(recovered) => tracing::debug!(recovered, "recovered idle macOS Cargo jobs"),
+        Err(error) => tracing::warn!(%error, "macOS Cargo job recovery deferred"),
+    }
+}
+
 fn maintenance(state: &State) -> Result<()> {
     drain_cache_events(
         &state.paths,
@@ -2428,6 +2450,8 @@ fn maintenance(state: &State) -> Result<()> {
     )?;
     let migrated = {
         let _operation = state.operation_lock.lock().unwrap();
+        #[cfg(target_os = "macos")]
+        recover_macos_cargo_jobs(state);
         let free_bytes = volume_free_bytes_checked(&state.paths.root)?;
         let db = state.db.lock().unwrap();
         db.expire_leases()?;
@@ -3334,6 +3358,8 @@ mod tests {
             gc_lock: Arc::new(Mutex::new(())),
             operation_lock: Arc::new(Mutex::new(())),
             pin_pruner: Arc::new(Mutex::new(context::PinPruneScanner::default())),
+            #[cfg(target_os = "macos")]
+            macos_job_scanner: Arc::new(Mutex::new(crate::macos_jobs::RecoveryScanner::default())),
             pending_scanner: Arc::new(Mutex::new(
                 crate::supervision::PendingMaintenanceScanner::default(),
             )),

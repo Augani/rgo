@@ -47,6 +47,7 @@ fn launchd_coalition_observes_closed_fd_writer_after_cargo_exits() {
         .unwrap();
     let setup = sandbox
         .cmd(rgo)
+        .env("RGO_DAEMON_POLL_SECS", "1")
         .args(["setup", "--supervised", "--no-service", "--real-cargo"])
         .arg(cargo)
         .output()
@@ -101,6 +102,7 @@ while not pathlib.Path(os.environ['RGO_COALITION_READY']).exists():
         .current_dir(&project)
         .env("PATH", &search_path)
         .env("RGO_MACOS_SUPERVISOR_PILOT", "1")
+        .env("RGO_DAEMON_POLL_SECS", "1")
         .env("RGO_COALITION_READY", &ready)
         .env("RGO_COALITION_RELEASE", &release)
         .env("RGO_COALITION_RESULT", &result)
@@ -195,6 +197,7 @@ while not pathlib.Path(os.environ['RGO_COALITION_READY']).exists():
     );
     let gc = sandbox
         .cmd(rgo)
+        .env("RGO_DAEMON_POLL_SECS", "1")
         .args(["gc", "--target", "0"])
         .output()
         .unwrap();
@@ -227,6 +230,13 @@ while not pathlib.Path(os.environ['RGO_COALITION_READY']).exists():
         "invalid durable protection was treated as an idle context"
     );
     std::fs::write(&receipt, saved_receipt).unwrap();
+    // An edited definition must survive housekeeping even after its context
+    // becomes idle. Restoring the exact owned definition permits recovery.
+    let definition_path = job.directory.join("job.plist");
+    let definition = std::fs::read(&definition_path).unwrap();
+    let mut edited = definition.clone();
+    edited.extend_from_slice(b"<!-- user edit -->");
+    std::fs::write(&definition_path, edited).unwrap();
     std::fs::write(&release, b"continue").unwrap();
     wait_for_file(&result, Instant::now() + Duration::from_secs(10));
     assert_eq!(std::fs::read_to_string(&result).unwrap(), "write succeeded");
@@ -251,6 +261,35 @@ while not pathlib.Path(os.environ['RGO_COALITION_READY']).exists():
         String::from_utf8_lossy(&gc.stderr)
     );
     assert!(!contexts[0].exists(), "idle context was not reclaimed");
+    assert!(job.directory.is_dir(), "recovery removed an edited job");
+    assert!(
+        sandbox
+            .cmd("launchctl")
+            .args(["print", &job.target])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    std::fs::write(&definition_path, definition).unwrap();
+    // Metadata recovery also runs with automatic destructive GC disabled.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while job.directory.exists() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(25));
+    }
+    assert!(
+        !job.directory.exists(),
+        "idle crashed guardian was not recovered"
+    );
+    assert!(
+        !sandbox
+            .cmd("launchctl")
+            .args(["print", &job.target])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
     println!(
         "installed Cargo pilot: real detached writer protected through Cargo exit and guardian SIGKILL; late write succeeded; idle context reclaimed"
     );

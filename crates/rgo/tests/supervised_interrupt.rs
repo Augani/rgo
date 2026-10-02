@@ -90,6 +90,8 @@ fn terminal_ctrl_c_keeps_a_surviving_cargo_descendant_protected() {
     )
     .unwrap();
     let mut command = sandbox.cmd("cargo");
+    #[cfg(target_os = "macos")]
+    command.env("RGO_MACOS_SUPERVISOR_PILOT", "1");
     let child = command
         .current_dir(&project)
         .env("PATH", &search_path)
@@ -121,7 +123,34 @@ fn terminal_ctrl_c_keeps_a_surviving_cargo_descendant_protected() {
     );
 
     let cargo_pid = running.child.id() as i32;
+    #[cfg(not(target_os = "macos"))]
     assert_eq!(unsafe { libc::getpgid(child_pid) }, cargo_pid);
+    #[cfg(target_os = "macos")]
+    assert_ne!(
+        unsafe { libc::getpgid(child_pid) },
+        cargo_pid,
+        "macOS did not isolate Cargo in its guardian's process group"
+    );
+    #[cfg(target_os = "macos")]
+    {
+        assert_eq!(unsafe { libc::kill(-cargo_pid, libc::SIGTSTP) }, 0);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let mut status = 0;
+            let changed =
+                unsafe { libc::waitpid(cargo_pid, &mut status, libc::WNOHANG | libc::WUNTRACED) };
+            if changed == cargo_pid {
+                assert!(libc::WIFSTOPPED(status), "Cargo exited instead of stopping");
+                break;
+            }
+            assert!(
+                changed >= 0 && Instant::now() < deadline,
+                "guardian did not reflect Cargo's stop to its launcher"
+            );
+            thread::sleep(Duration::from_millis(25));
+        }
+        assert_eq!(unsafe { libc::kill(-cargo_pid, libc::SIGCONT) }, 0);
+    }
     let interrupted = unsafe { libc::kill(-cargo_pid, libc::SIGINT) };
     assert_eq!(interrupted, 0);
     let deadline = Instant::now() + Duration::from_secs(10);

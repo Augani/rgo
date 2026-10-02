@@ -159,6 +159,23 @@ jobs:
       - name: Verify relocation and fail-closed native deletion in both layouts
         run: python scripts/verify-nightly-layout.py --toolchain nightly-2026-01-28 --without-profile-lock
 
+  macos-intel-supervisor:
+    name: macOS Intel Cargo guardian
+    runs-on: macos-15-intel
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Record macOS runtime and architecture
+        run: |
+          sw_vers
+          uname -m
+          cargo --version --verbose
+      - name: Build every binary before real-Cargo fixtures
+        run: cargo build --workspace --locked
+      - name: Verify descendant protection, job recovery, and signal handoff
+        timeout-minutes: 3
+        run: cargo test -p rgo-storage --test macos_coalition --test supervised_interrupt -- --nocapture
+
   btrfs-smoke:
     name: Linux btrfs smoke
     runs-on: ubuntu-latest

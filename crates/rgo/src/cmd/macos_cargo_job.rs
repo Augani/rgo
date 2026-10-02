@@ -5,6 +5,7 @@
 
 use anyhow::{Context, Result, bail, ensure};
 use rgo_core::macos_coalition::ResourceCoalition;
+use rgo_core::macos_jobs::{self, CargoJobOwner as Owner};
 use rgo_core::paths::RgoPaths;
 use rgo_core::supervision::{self, SessionGuard};
 use serde::{Deserialize, Serialize};
@@ -22,16 +23,15 @@ use std::time::{Duration, Instant};
 
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(20);
 const SOCKET_NAME: &str = "control.sock";
-const FORWARDED_SIGNALS: [i32; 4] = [libc::SIGINT, libc::SIGTERM, libc::SIGHUP, libc::SIGQUIT];
+const FORWARDED_SIGNALS: [i32; 6] = [
+    libc::SIGINT,
+    libc::SIGTERM,
+    libc::SIGHUP,
+    libc::SIGQUIT,
+    libc::SIGTSTP,
+    libc::SIGCONT,
+];
 static SIGNALS: AtomicU32 = AtomicU32::new(0);
-
-#[derive(Serialize, Deserialize)]
-struct Owner {
-    label: String,
-    domain: String,
-    token: String,
-    definition: String,
-}
 
 #[derive(Serialize, Deserialize)]
 struct Invocation {
@@ -54,6 +54,7 @@ enum Message {
     Started {
         pid: u32,
     },
+    Stopped,
     Exited {
         code: Option<i32>,
         signal: Option<i32>,
@@ -207,15 +208,6 @@ fn receive_stdio(stream: &UnixStream) -> Result<[OwnedFd; 3]> {
         .map_err(|_| anyhow::anyhow!("invalid standard descriptor count"))
 }
 
-fn xml(value: &str) -> String {
-    value
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&apos;")
-}
-
 // Relative Unix socket names avoid macOS's short sockaddr path limit even when
 // the owned storage root has a long path. Restore the actual directory handle,
 // which also works if the caller's working directory was renamed meanwhile.
@@ -230,71 +222,6 @@ fn in_directory<T>(directory: &Path, operation: impl FnOnce() -> Result<T>) -> R
     result
 }
 
-fn verify_owner(directory: &Path, owner: &Owner, bytes: &[u8]) -> Result<()> {
-    use std::os::unix::fs::MetadataExt;
-    let metadata = std::fs::symlink_metadata(directory)?;
-    ensure!(
-        metadata.is_dir()
-            && metadata.uid() == unsafe { libc::geteuid() }
-            && metadata.mode() & 0o077 == 0,
-        "Cargo job directory is not private and owned"
-    );
-    for name in ["owner.json", "job.plist"] {
-        let metadata = std::fs::symlink_metadata(directory.join(name))?;
-        ensure!(
-            metadata.is_file() && !metadata.file_type().is_symlink(),
-            "Cargo job definition is not a regular file"
-        );
-    }
-    ensure!(
-        std::fs::read(directory.join("owner.json"))? == bytes
-            && std::fs::read(directory.join("job.plist"))? == owner.definition.as_bytes(),
-        "Cargo job ownership changed"
-    );
-    Ok(())
-}
-
-fn read_owner(directory: &Path) -> Result<Vec<u8>> {
-    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-    let metadata = std::fs::symlink_metadata(directory)?;
-    ensure!(
-        metadata.is_dir()
-            && metadata.uid() == unsafe { libc::geteuid() }
-            && metadata.mode() & 0o077 == 0,
-        "Cargo job directory is not private and owned"
-    );
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(directory.join("owner.json"))?;
-    let metadata = file.metadata()?;
-    ensure!(
-        metadata.is_file()
-            && metadata.uid() == unsafe { libc::geteuid() }
-            && metadata.len() <= 16 * 1024,
-        "unsafe or oversized Cargo job owner record"
-    );
-    let mut bytes = Vec::new();
-    file.take(16 * 1024 + 1).read_to_end(&mut bytes)?;
-    ensure!(
-        bytes.len() <= 16 * 1024,
-        "Cargo job owner record grew beyond its limit"
-    );
-    Ok(bytes)
-}
-
-fn cleanup(directory: &Path, owner: &Owner, bytes: &[u8]) -> Result<()> {
-    verify_owner(directory, owner, bytes)?;
-    let target = format!("{}/{}", owner.domain, owner.label);
-    // Remove the one-use rendezvous before bootout: a restarted old definition
-    // cannot obtain another invocation or enter a managed context.
-    std::fs::remove_dir_all(directory)?;
-    let _ = Command::new("/bin/launchctl")
-        .args(["bootout", &target])
-        .output()?;
-    Ok(())
-}
-
 struct EarlyCleanup<'a> {
     directory: &'a Path,
     owner: &'a Owner,
@@ -305,7 +232,7 @@ struct EarlyCleanup<'a> {
 impl Drop for EarlyCleanup<'_> {
     fn drop(&mut self) {
         if self.safe_to_reap {
-            let _ = cleanup(self.directory, self.owner, self.bytes);
+            let _ = macos_jobs::cleanup(self.directory, self.owner, self.bytes);
         }
     }
 }
@@ -322,6 +249,10 @@ impl PreparedJob {
         paths: &RgoPaths,
         context: &Path,
     ) -> Result<Self> {
+        ensure!(
+            (0..=2).all(|fd| unsafe { libc::isatty(fd) } == 0),
+            "the private macOS pilot has not enabled controlling-terminal handoff"
+        );
         paths.ensure_layout()?;
         let invocation = Invocation {
             executable: executable.as_os_str().as_bytes().to_vec(),
@@ -351,26 +282,12 @@ impl PreparedJob {
         let mut entropy = [0_u8; 32];
         File::open("/dev/urandom")?.read_exact(&mut entropy)?;
         let token = blake3::hash(&entropy).to_hex().to_string();
-        let label = format!("com.rgo.cargo.{}", &token[..32]);
-        let domain = format!("gui/{}", unsafe { libc::geteuid() });
-        let rgo = std::env::current_exe()?;
-        let definition = format!(
-            "<?xml version=\"1.0\"?><plist version=\"1.0\"><dict><key>Label</key><string>{label}</string><key>ProgramArguments</key><array><string>{}</string><string>macos-cargo-job</string><string>--directory</string><string>{}</string><string>--token</string><string>{token}</string></array><key>RunAtLoad</key><true/><key>AbandonProcessGroup</key><true/><key>StandardOutPath</key><string>/dev/null</string><key>StandardErrorPath</key><string>{}</string></dict></plist>",
-            xml(rgo.to_str().context("guardian executable is not UTF-8")?),
-            xml(directory
-                .to_str()
-                .context("guardian directory is not UTF-8")?),
-            xml(directory
-                .join("guardian.stderr")
-                .to_str()
-                .context("guardian diagnostic path is not UTF-8")?)
-        );
-        let owner = Owner {
-            label,
-            domain,
+        let owner = Owner::new(
+            directory,
+            std::env::current_exe()?,
+            context.to_owned(),
             token,
-            definition,
-        };
+        )?;
         let bytes = serde_json::to_vec(&owner)?;
         for (name, data) in [
             ("owner.json", bytes.as_slice()),
@@ -411,7 +328,7 @@ impl PreparedJob {
                         .unwrap_or_default();
                     // No request or commit was sent, so this job cannot have
                     // started Cargo or registered a managed context.
-                    let _ = cleanup(&_directory, &owner, &bytes);
+                    let _ = macos_jobs::cleanup(&_directory, &owner, &bytes);
                     bail!("waiting for Cargo guardian: {error}; {diagnostic}");
                 }
             }
@@ -452,7 +369,7 @@ impl PreparedJob {
         std::thread::spawn(move || {
             loop {
                 let message = read_frame::<Message>(&mut reader);
-                let terminal = !matches!(message, Ok(Message::Started { .. }));
+                let terminal = !matches!(message, Ok(Message::Started { .. } | Message::Stopped));
                 if sender.send(message).is_err() || terminal {
                     break;
                 }
@@ -467,6 +384,11 @@ impl PreparedJob {
             }
             match receiver.recv_timeout(Duration::from_millis(20)) {
                 Ok(Ok(Message::Started { .. })) => {}
+                Ok(Ok(Message::Stopped)) => {
+                    // Reflect an observed primary stop in the shell's actual
+                    // job. SIGCONT after `fg`/`bg` is relayed on the next loop.
+                    unsafe { libc::raise(libc::SIGSTOP) };
+                }
                 Ok(Ok(Message::Exited { code, signal })) => {
                     drop(session);
                     drop(signals);
@@ -548,6 +470,37 @@ fn send_exit(stream: &mut UnixStream, status: ExitStatus) {
     );
 }
 
+enum ChildChange {
+    Exited(ExitStatus),
+    Stopped,
+    None,
+}
+
+fn poll_child(child: &std::process::Child) -> Result<ChildChange> {
+    let mut status = 0;
+    let changed = unsafe {
+        libc::waitpid(
+            child.id().try_into()?,
+            &mut status,
+            libc::WNOHANG | libc::WUNTRACED | libc::WCONTINUED,
+        )
+    };
+    if changed < 0 {
+        let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::Interrupted {
+            return Ok(ChildChange::None);
+        }
+        return Err(error).context("observing Cargo process state");
+    }
+    Ok(if changed == 0 || libc::WIFCONTINUED(status) {
+        ChildChange::None
+    } else if libc::WIFSTOPPED(status) {
+        ChildChange::Stopped
+    } else {
+        ChildChange::Exited(ExitStatus::from_raw(status))
+    })
+}
+
 /// Private launchd entry point. Only the authenticated one-use socket supplies
 /// an invocation; restarting its old definition cannot start another Cargo.
 pub fn guardian(directory: &Path, token: &str) -> Result<()> {
@@ -555,15 +508,14 @@ pub fn guardian(directory: &Path, token: &str) -> Result<()> {
         token.len() == 64 && token.bytes().all(|byte| byte.is_ascii_hexdigit()),
         "invalid Cargo job token"
     );
-    let bytes = read_owner(directory)?;
-    let owner: Owner = serde_json::from_slice(&bytes)?;
+    let (owner, bytes) = macos_jobs::read_owner(directory)?;
     ensure!(
         owner.token == token
             && owner.label == format!("com.rgo.cargo.{}", &token[..32])
             && owner.domain == format!("gui/{}", unsafe { libc::geteuid() }),
         "Cargo job owner does not match its invocation"
     );
-    verify_owner(directory, &owner, &bytes)?;
+    macos_jobs::verify_owner(directory, &owner, &bytes)?;
     let mut early_cleanup = EarlyCleanup {
         directory,
         owner: &owner,
@@ -584,7 +536,9 @@ pub fn guardian(directory: &Path, token: &str) -> Result<()> {
     let [stdin, stdout, stderr] = receive_stdio(&stream)?;
     let paths = RgoPaths { root: request.root };
     ensure!(
-        paths.root.is_absolute() && request.context.is_absolute(),
+        paths.root.is_absolute()
+            && directory.parent() == Some(paths.state_dir().as_path())
+            && request.context == owner.context,
         "Cargo job scope must be absolute"
     );
     let mut session = supervision::lock_cargo_session(&paths, Some(&request.context))?;
@@ -619,7 +573,7 @@ pub fn guardian(directory: &Path, token: &str) -> Result<()> {
         stream.set_read_timeout(None)?;
         stream.set_nonblocking(true)?;
         session.retain_across_exec()?;
-        let mut child = Command::new(OsString::from_vec(request.executable))
+        let child = Command::new(OsString::from_vec(request.executable))
             .args(request.args.into_iter().map(OsString::from_vec))
             .current_dir(PathBuf::from(OsString::from_vec(request.directory)))
             .env_clear()
@@ -640,9 +594,15 @@ pub fn guardian(directory: &Path, token: &str) -> Result<()> {
         let mut disconnected = false;
         loop {
             if !primary_exited {
-                if let Some(status) = child.try_wait()? {
-                    send_exit(&mut stream, status);
-                    primary_exited = true;
+                match poll_child(&child)? {
+                    ChildChange::Exited(status) => {
+                        send_exit(&mut stream, status);
+                        primary_exited = true;
+                    }
+                    ChildChange::Stopped => {
+                        let _ = write_frame(&mut stream, &Message::Stopped);
+                    }
+                    ChildChange::None => {}
                 }
             }
             if !disconnected {
@@ -691,7 +651,7 @@ pub fn guardian(directory: &Path, token: &str) -> Result<()> {
     }
     session.finish_macos_coalition()?;
     early_cleanup.safe_to_reap = true;
-    cleanup(directory, &owner, &bytes)?;
+    macos_jobs::cleanup(directory, &owner, &bytes)?;
     early_cleanup.safe_to_reap = false;
     result
 }

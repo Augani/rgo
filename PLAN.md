@@ -87,8 +87,19 @@ descriptors, and holds kernel-backed exclusion after Cargo or guardian exit.
 The extended existing fixture passed guardian SIGKILL, a surviving closed-FD
 writer, later reclamation, stdin/EOF, separate output, native bytes, exit 17,
 and healthy cleanup locally. Revision 3/protocol 8 isolate the new policy;
-normal activation awaits terminal-control, recovery, and platform evidence in
+normal activation awaits terminal-control, complete recovery, and platform evidence in
 the [macOS checklist](docs/macos-cargo-supervision.md).
+
+**macOS recovery and signals:** daemon maintenance now recovers recognized idle
+Cargo jobs under their exclusive scope guards, even with destructive automatic
+GC off. Versioned, bounded owner records, exact generated definitions, and
+nonrecursive cleanup preserve edits and user-added files. The existing
+coalition fixture passed that recovery locally, and the existing interrupt
+fixture passed a stop/resume cycle, Ctrl-C, surviving-child protection, and idle
+neighbor reclamation through the actual pilot. Terminal invocations use
+checkout storage until controlling-terminal handoff is implemented. A focused
+Intel CI lane covers these same two cases; full interruption and runtime gates
+remain open.
 
 `doc.md` treats the rustc-wrapper + CAS as the core and the managed build roots as a
 supporting piece. After checking what Cargo actually supports today (Cargo 1.98), the

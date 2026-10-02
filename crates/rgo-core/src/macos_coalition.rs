@@ -364,7 +364,9 @@ pub(crate) fn permits_gc(paths: &RgoPaths, context: Option<&Path>) -> Result<boo
         }
         // A validated record from an earlier boot cannot name a current task.
         // On this boot only successful zero-count observations permit pruning.
-        std::fs::remove_file(path)?;
+        std::fs::remove_file(&path)?;
+        std::fs::File::open(path.parent().context("coalition receipt has no parent")?)?
+            .sync_all()?;
     }
     Ok(true)
 }
