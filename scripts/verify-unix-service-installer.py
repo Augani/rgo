@@ -99,6 +99,7 @@ def main() -> None:
     environment = os.environ.copy()
     environment.update(
         HOME=str(home),
+        XDG_CONFIG_HOME=str(home / ".config"),
         CARGO_HOME=str(cargo_home),
         RGO_HOME=str(rgo_home),
         RUSTUP_HOME=os.environ.get("RUSTUP_HOME", str(Path.home() / ".rustup")),
@@ -261,6 +262,7 @@ def main() -> None:
         native_environment = environment.copy()
         native_environment.update(
             HOME=str(native_home), CARGO_HOME=str(native_cargo_home),
+            XDG_CONFIG_HOME=str(native_home / ".config"),
             RGO_HOME=str(native_rgo_home),
         )
         native_installer = [
