@@ -531,6 +531,20 @@ CAS manifest reads/listing now reject malformed object digests before constructi
 
 **Exit evidence:** from a clean supported machine, one command activates the product, a new shell/IDE can run unchanged Cargo, service maintenance occurs without rgo commands, upgrade preserves builds, and uninstall leaves plain Cargo usable with original settings restored.
 
+**Windows uninstall transaction (2026-10-02):** the installer now saves exact
+installer-state, pending-state, and activation-record snapshots before removal.
+A retained uninstall journal supports resuming after activation undo, command
+removal, PATH restoration, or installer-state removal. It blocks another install
+until removal finishes, checks command digests again before deletion, preserves
+intervening installer-metadata edits, and makes repeated completed uninstall a
+no-op. Versioned binaries, old-shell Cargo fallbacks, and managed data are retained.
+The existing private Windows installer probe now exercises those four boundaries,
+reinstall rejection, edited command/state preservation, and recovery alongside
+its running-Cargo and exact raw User PATH/type controls. Both scripts parse, and
+a local PowerShell helper probe with a mocked undo passed; actual Windows
+validation is pending. This does not close every core setup/undo write boundary,
+service-manager interruption, or the broader uninstall/purge release gates.
+
 The [build-only release run for `b4092e1`](https://github.com/Augani/rgo/actions/runs/36894054104) passed all four platform archive jobs and complete-bundle verification. Its public publish job was skipped; this proves that candidate assets can be assembled, not that a public installer endpoint or lifecycle gate is ready.
 
 **Current release-workflow preparation:** the macOS Intel build job now uses `macos-15-intel`, which [GitHub's current hosted-runner reference](https://docs.github.com/en/actions/reference/runners/github-hosted-runners) lists as a standard x86_64 runner; the old `macos-13` label was removed from the release matrix. Packaging checks that the CLI and wrapper versions match, and tag builds require `v<binary-version>`. Public tag builds now request a [GitHub artifact attestation](https://docs.github.com/en/actions/how-tos/secure-your-work/use-artifact-attestations/use-artifact-attestations) for each archive before the release job may publish it. [Augani/rgo](https://github.com/Augani/rgo) is an owned public repository with source on `master`; this checkout's `origin` and Cargo metadata point to it. Private-home CI installation pilots now run on Linux, macOS, and Windows, as recorded below, but no tagged release asset or public installer exists. Release publication remains gated on P1–P5 evidence.

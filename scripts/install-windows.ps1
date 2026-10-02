@@ -1249,6 +1249,115 @@ function Restore-OwnedPath($State) {
     }
 }
 
+function Stop-UninstallForProbe([string]$Stage) {
+    if ($script:DevelopmentBundle -and $env:RGO_TEST_WINDOWS_UNINSTALL_STOP_AFTER -eq $Stage) {
+        throw "development uninstall stopped after $Stage"
+    }
+}
+
+function Assert-UninstallSnapshot([string]$Path, [AllowNull()][object]$Before) {
+    $current = Encoded-File $Path
+    Assert-Condition ($null -eq $current -or (Test-ExactText $current $Before)) "installer metadata changed during uninstall: $Path"
+}
+
+function Invoke-OwnedUninstall {
+    if (-not (Test-Path -LiteralPath $script:uninstallJournalPath)) {
+        if (-not (Test-Path -LiteralPath $script:statePath) -and
+            -not (Test-Path -LiteralPath $script:pendingPath)) {
+            Assert-Condition (-not (Test-Path -LiteralPath (Join-Path $script:resolvedCargoHome '.rgo-install.json'))) 'Cargo activation has no installer ownership record; use rgo setup --undo'
+            Write-Host 'No installer-owned Windows activation remains'
+            return
+        }
+        $stateBefore = Encoded-File $script:statePath
+        $pendingBefore = Encoded-File $script:pendingPath
+        $journal = [ordered]@{
+            schemaVersion = 1
+            stateBefore = $stateBefore
+            pendingBefore = $pendingBefore
+            recordBefore = (Encoded-File (Join-Path $script:resolvedCargoHome '.rgo-install.json'))
+        }
+    } else {
+        Assert-PlainFile $script:uninstallJournalPath
+        Assert-Condition ((Get-Item -LiteralPath $script:uninstallJournalPath).Length -le 67108864) 'uninstall journal is too large'
+        $journal = Read-Json $script:uninstallJournalPath
+        Assert-Condition ($journal.schemaVersion -eq 1) 'unsupported uninstall journal'
+    }
+    $encodedState = if ($null -ne $journal.stateBefore) { $journal.stateBefore } else { $journal.pendingBefore }
+    Assert-Condition ($encodedState -is [string]) 'uninstall journal has no installer ownership snapshot'
+    $state = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($encodedState)) | ConvertFrom-Json
+    Assert-UpgradeState $state 'uninstall' $true
+    Select-OwnedShim $state
+    Assert-UninstallSnapshot $script:statePath $journal.stateBefore
+    Assert-UninstallSnapshot $script:pendingPath $journal.pendingBefore
+    $recordPath = Join-Path $script:resolvedCargoHome '.rgo-install.json'
+    Assert-UninstallSnapshot $recordPath $journal.recordBefore
+    Assert-OwnedUserPath $state
+    if (Test-Path -LiteralPath $script:versions) { Assert-PlainDirectory $script:versions }
+    if (Test-Path -LiteralPath $script:resolvedBinDir) { Assert-PlainDirectory $script:resolvedBinDir }
+    $versionDir = Join-Path $script:versions $state.versionDirectory
+    if (Test-Path -LiteralPath $versionDir) { Assert-PlainDirectory $versionDir }
+    $cli = Join-Path $versionDir 'rgo.exe'
+    $wrapper = Join-Path $versionDir 'rgo-rustc-wrapper.exe'
+    if (Test-Path -LiteralPath $recordPath) {
+        # Undo executes the CLI; a missing wrapper must not prevent removal.
+        Assert-PlainFile $cli
+        Assert-Condition ((File-Digest $cli) -eq $state.cliDigest) "retained uninstall CLI changed: $cli"
+    }
+    $commands = @(@((Join-Path $script:resolvedBinDir 'rgo.exe'), $state.cliDigest),
+        @((Join-Path $script:resolvedBinDir 'rgo-rustc-wrapper.exe'), $state.wrapperDigest))
+    foreach ($pair in $commands) {
+        if (Test-Path -LiteralPath $pair[0]) {
+            Assert-PlainFile $pair[0]
+            Assert-Condition ((File-Digest $pair[0]) -eq $pair[1]) "command entrypoint changed: $($pair[0])"
+        }
+    }
+    if (Test-Path -LiteralPath $recordPath) { Assert-Record $state $cli $wrapper }
+    if (-not (Test-Path -LiteralPath $script:uninstallJournalPath)) {
+        Write-JsonAtomic $script:uninstallJournalPath $journal
+    }
+    $journalDigest = File-Digest $script:uninstallJournalPath
+    if (Test-Path -LiteralPath $recordPath) {
+        Assert-Record $state $cli $wrapper
+        $undoArgs = @('setup', '--undo')
+        if ($state.noService) { $undoArgs += '--no-service' }
+        Invoke-Checked $cli $undoArgs | Out-Null
+    }
+    Assert-Condition (-not (Test-Path -LiteralPath $recordPath)) 'Cargo activation remains after undo'
+    if (Test-SupervisedState $state) {
+        if ($state.PSObject.Properties['shimPath'] -and $state.shimPath) {
+            if (Test-Path -LiteralPath $script:shimPath) {
+                Assert-PlainFile $script:shimPath
+                Assert-Condition ((File-Digest $script:shimPath) -eq $state.cliDigest) 'retained Cargo fallback changed during undo'
+                Assert-PlainFile (Join-Path $script:shimDir '.rgo-cargo-fallback.json')
+            }
+        } else {
+            Assert-Condition (-not (Test-Path -LiteralPath $script:shimPath)) 'legacy Cargo shim remains after undo'
+        }
+    }
+    Stop-UninstallForProbe 'undo'
+    foreach ($pair in $commands) {
+        if (Test-Path -LiteralPath $pair[0]) {
+            # Undo may run for several seconds. Preserve an entry edited since
+            # preflight instead of deleting it using the earlier observation.
+            Assert-PlainFile $pair[0]
+            Assert-Condition ((File-Digest $pair[0]) -eq $pair[1]) "command entrypoint changed during uninstall: $($pair[0])"
+            Remove-Item -LiteralPath $pair[0] -Force
+            Stop-UninstallForProbe 'command'
+        }
+    }
+    Restore-OwnedPath $state
+    Stop-UninstallForProbe 'path'
+    foreach ($entry in @(@($script:statePath, $journal.stateBefore), @($script:pendingPath, $journal.pendingBefore))) {
+        Assert-UninstallSnapshot $entry[0] $entry[1]
+        if (Test-Path -LiteralPath $entry[0]) { Remove-Item -LiteralPath $entry[0] -Force }
+    }
+    Stop-UninstallForProbe 'state'
+    Assert-PlainFile $script:uninstallJournalPath
+    Assert-Condition ((File-Digest $script:uninstallJournalPath) -eq $journalDigest) 'uninstall journal changed during removal'
+    Remove-Item -LiteralPath $script:uninstallJournalPath -Force
+    Write-Host "Removed owned Cargo activation and commands; retained versioned binaries and managed data at $script:resolvedRgoHome"
+}
+
 function Resolve-RealCargo([string]$Requested) {
     if ($Requested) {
         $path = Full-Path $Requested
@@ -1297,6 +1406,7 @@ $versions = Join-Path $resolvedInstallRoot 'versions'
 $statePath = Join-Path $resolvedInstallRoot 'installer-windows.json'
 $pendingPath = Join-Path $resolvedInstallRoot 'installer-windows-pending.json'
 $upgradeJournalPath = Join-Path $resolvedInstallRoot 'installer-windows-upgrade.json'
+$uninstallJournalPath = Join-Path $resolvedInstallRoot 'installer-windows-uninstall.json'
 $previousCargoHome = $env:CARGO_HOME
 $previousRgoHome = $env:RGO_HOME
 
@@ -1310,56 +1420,13 @@ if (-not $VerifyOnly) {
 $env:CARGO_HOME = $resolvedCargoHome
 $env:RGO_HOME = $resolvedRgoHome
 try {
+    if (-not $Uninstall -and -not $VerifyOnly -and (Test-Path -LiteralPath $uninstallJournalPath)) {
+        throw 'an uninstall is pending; finish it with -Uninstall before installing'
+    }
     if (-not $VerifyOnly) { Recover-Upgrade $upgradeJournalPath }
     if ($Uninstall) {
         Assert-Condition (-not ($VerifyOnly -or $Repair -or $ReleaseTag -or $Latest -or $Archive -or $Repository)) '-Uninstall cannot be combined with install inputs'
-        if (-not (Test-Path -LiteralPath $statePath) -and -not (Test-Path -LiteralPath $pendingPath)) {
-            throw 'no installer-owned Windows activation was found'
-        }
-        $state = if (Test-Path -LiteralPath $statePath) { Read-Json $statePath } else { Read-Json $pendingPath }
-        Select-OwnedShim $state
-        Assert-Condition ((Test-SamePath $state.cargoHome $resolvedCargoHome) -and
-            (Test-SamePath $state.installRoot $resolvedInstallRoot) -and
-            (Test-SamePath $state.binDir $resolvedBinDir) -and
-            (Test-SamePath $state.rgoHome $resolvedRgoHome)) 'installer state belongs to a different destination'
-        Assert-Condition ($state.schemaVersion -eq 1 -and $state.versionDirectory -match '^rgo-v[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?-x86_64-pc-windows-msvc$') 'installer state has an unsupported version or path'
-        Assert-OwnedUserPath $state
-        $versionDir = Join-Path $versions $state.versionDirectory
-        $cli = Join-Path $versionDir 'rgo.exe'
-        $wrapper = Join-Path $versionDir 'rgo-rustc-wrapper.exe'
-        $ownedCli = Join-Path $resolvedBinDir 'rgo.exe'
-        $ownedWrapper = Join-Path $resolvedBinDir 'rgo-rustc-wrapper.exe'
-        foreach ($pair in @(@($ownedCli, $state.cliDigest), @($ownedWrapper, $state.wrapperDigest))) {
-            if (Test-Path -LiteralPath $pair[0]) {
-                Assert-PlainFile $pair[0]
-                Assert-Condition ((File-Digest $pair[0]) -eq $pair[1]) "command entrypoint changed: $($pair[0])"
-            }
-        }
-        if (Test-Path -LiteralPath (Join-Path $resolvedCargoHome '.rgo-install.json')) {
-            Assert-Record $state $cli $wrapper
-            $undoArgs = @('setup', '--undo')
-            if ($state.noService) { $undoArgs += '--no-service' }
-            Invoke-Checked $cli $undoArgs | Out-Null
-        }
-        Assert-Condition (-not (Test-Path -LiteralPath (Join-Path $resolvedCargoHome '.rgo-install.json'))) 'Cargo activation remains after undo'
-        if (Test-SupervisedState $state) {
-            if ($state.PSObject.Properties['shimPath'] -and $state.shimPath) {
-                if (Test-Path -LiteralPath $shimPath) {
-                    Assert-PlainFile $shimPath
-                    Assert-Condition ((File-Digest $shimPath) -eq $state.cliDigest) 'retained Cargo fallback changed during undo'
-                    Assert-PlainFile (Join-Path $shimDir '.rgo-cargo-fallback.json')
-                }
-            } else {
-                Assert-Condition (-not (Test-Path -LiteralPath $shimPath)) 'legacy Cargo shim remains after undo'
-            }
-        }
-        foreach ($path in @($ownedCli, $ownedWrapper)) {
-            if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Force }
-        }
-        Restore-OwnedPath $state
-        if (Test-Path -LiteralPath $statePath) { Remove-Item -LiteralPath $statePath -Force }
-        if (Test-Path -LiteralPath $pendingPath) { Remove-Item -LiteralPath $pendingPath -Force }
-        Write-Host "Removed owned Cargo activation and commands; retained the versioned Cargo fallback for old shells and managed data at $resolvedRgoHome"
+        Invoke-OwnedUninstall
         return
     }
 

@@ -462,3 +462,23 @@ The [18-job matrix](https://github.com/Augani/rgo/actions/runs/36973401620) also
 passed, including full workspace suites and 100-project recovery on Linux,
 macOS, and Windows. No new test cases were added; the existing fixture gained
 the retry and recovery assertions.
+
+## Resumable Windows uninstall — 2026-10-02
+
+The Windows installer previously removed activation, commands, PATH entries,
+and ownership metadata in sequence without an uninstall snapshot. It also used
+command digests observed before undo when later removing those commands. The
+new uninstall journal binds retries to the original installer/pending state and
+activation record. Pending removal blocks install, file digests are rechecked
+before deletion, and changed installer metadata is preserved. The journal remains
+usable after the installer-state file has been removed; completed repeated
+uninstall is harmless. Existing versioned binaries, Cargo fallback copies, and
+managed storage remain outside removal.
+
+The existing private Windows installer probe adds controlled failures after
+undo, first command removal, PATH restoration, and state removal. It requires
+recovery, rejects an intervening install, preserves edited command/state files,
+and retains its running-Cargo and exact raw PATH/type controls. A local PowerShell
+helper probe passed with undo mocked; both installer/probe scripts parse. A live
+Windows run is still required. These boundaries do not prove every internal
+core undo or service-manager write, power-loss durability, or safe data purge.

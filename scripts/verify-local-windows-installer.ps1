@@ -77,6 +77,21 @@ function Get-ActivationBytes([string]$Cargo, [string]$Root) {
     }
     return $values
 }
+function Stop-UninstallAt([string]$Stage, [string]$Cargo, [string]$Root) {
+    $before = $env:RGO_TEST_WINDOWS_UNINSTALL_STOP_AFTER
+    try {
+        $env:RGO_TEST_WINDOWS_UNINSTALL_STOP_AFTER = $Stage
+        try {
+            & $installScript -Uninstall -DevelopmentBundle -CargoHome $Cargo -RgoHome $Root
+            throw "uninstall did not stop after $Stage"
+        } catch {
+            if ($_.Exception.Message -ne "development uninstall stopped after $Stage") { throw }
+        }
+    } finally { $env:RGO_TEST_WINDOWS_UNINSTALL_STOP_AFTER = $before }
+    if (-not (Test-Path (Join-Path $Cargo 'rgo/installer-windows-uninstall.json'))) {
+        throw "interrupted uninstall lost its ownership journal after $Stage"
+    }
+}
 New-Item -ItemType Directory -Force -Path @($stage, $cargoHome, $rgoHome, (Join-Path $project 'src')) | Out-Null
 Copy-Item -LiteralPath $cli, $wrapper -Destination $stage
 foreach ($file in @('README.md', 'doc.md', 'LICENSE-MIT', 'LICENSE-APACHE')) {
@@ -448,6 +463,28 @@ fn main() {
         }
         Start-Sleep -Milliseconds 100
     }
+    Stop-UninstallAt 'undo' $cargoHome $rgoHome
+    if (Test-Path -LiteralPath $recordPath) { throw 'interrupted uninstall did not undo Cargo activation' }
+    try {
+        & $installScript @supervisedUpgradeArgs
+        throw 'reinstall accepted a pending uninstall'
+    } catch {
+        if ($_.Exception.Message -notmatch 'an uninstall is pending') { throw }
+    }
+    $ownedCommand = Join-Path $cargoHome 'bin/rgo.exe'
+    [IO.File]::WriteAllText($ownedCommand, 'user replacement')
+    try {
+        & $installScript -Uninstall -CargoHome $cargoHome -RgoHome $rgoHome
+        throw 'uninstall deleted a user replacement command'
+    } catch {
+        if ($_.Exception.Message -notmatch 'command entrypoint changed') { throw }
+    }
+    if ([IO.File]::ReadAllText($ownedCommand) -cne 'user replacement') {
+        throw 'uninstall overwrote the replacement command'
+    }
+    Copy-Item -LiteralPath (Normalize-PlanPath $upgradedRecord.rgo_binary) -Destination $ownedCommand -Force
+    Stop-UninstallAt 'command' $cargoHome $rgoHome
+    & $installScript -Uninstall -CargoHome $cargoHome -RgoHome $rgoHome
     & $installScript -Uninstall -CargoHome $cargoHome -RgoHome $rgoHome
     $installed = $false
     $heldCargo.Refresh()
@@ -515,6 +552,23 @@ fn main() {
             throw 'a newly composed Windows PATH would not resolve cargo.exe to the upgraded shim'
         }
     } finally { $env:PATH = $installedProcessPath }
+    Stop-UninstallAt 'path' $cargoHome $rgoHome
+    $uninstallStatePath = Join-Path $cargoHome 'rgo/installer-windows.json'
+    $uninstallStateBefore = [IO.File]::ReadAllBytes($uninstallStatePath)
+    [IO.File]::AppendAllText($uninstallStatePath, "`n")
+    try {
+        & $installScript -Uninstall -CargoHome $cargoHome -RgoHome $rgoHome
+        throw 'uninstall accepted edited installer metadata'
+    } catch {
+        if ($_.Exception.Message -notmatch 'installer metadata changed during uninstall') { throw }
+    }
+    if ((Get-Item -LiteralPath $uninstallStatePath).Length -le $uninstallStateBefore.Length) {
+        throw 'uninstall erased an intervening metadata edit'
+    }
+    [IO.File]::WriteAllBytes($uninstallStatePath, $uninstallStateBefore)
+    Stop-UninstallAt 'state' $cargoHome $rgoHome
+    if (Test-Path -LiteralPath $uninstallStatePath) { throw 'uninstall did not remove its state before interruption' }
+    & $installScript -Uninstall -CargoHome $cargoHome -RgoHome $rgoHome
     & $installScript -Uninstall -CargoHome $cargoHome -RgoHome $rgoHome
     $installed = $false
     if ([string](Get-RawUserPath) -cne [string]$expectedUserPath -or
