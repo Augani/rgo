@@ -1,5 +1,6 @@
 #![cfg(target_os = "macos")]
 
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -73,6 +74,24 @@ fn wait_for_file(path: &std::path::Path, deadline: Instant) {
         thread::sleep(Duration::from_millis(20));
     }
     assert!(path.is_file(), "probe did not publish {}", path.display());
+}
+
+fn stop_private_daemon(paths: &RgoPaths) -> std::fs::File {
+    assert!(matches!(
+        rgo_core::ipc::request(&paths.socket_path(), Request::Shutdown).unwrap(),
+        Response::Ok
+    ));
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(paths.state_dir().join("daemon.lock"))
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !FileExt::try_lock_exclusive(&lock).unwrap() {
+        assert!(Instant::now() < deadline, "private daemon did not stop");
+        thread::sleep(Duration::from_millis(20));
+    }
+    lock
 }
 
 #[test]
@@ -271,6 +290,46 @@ while not pathlib.Path(os.environ['RGO_COALITION_READY']).exists():
         "invalid durable protection was treated as an idle context"
     );
     std::fs::write(&receipt, saved_receipt).unwrap();
+    // Editing only the cleanup scope must invalidate the generated definition,
+    // rather than redirect maintenance to a different, apparently idle context.
+    let owner_path = job.directory.join("owner.json");
+    let original_owner = std::fs::read(&owner_path).unwrap();
+    let mut redirected: serde_json::Value = serde_json::from_slice(&original_owner).unwrap();
+    redirected["context"] =
+        serde_json::to_value(paths.builds_dir().join("aa/other-context")).unwrap();
+    std::fs::write(&owner_path, serde_json::to_vec(&redirected).unwrap()).unwrap();
+    assert!(rgo_core::macos_jobs::read_owner(&job.directory).is_err());
+    let gc = sandbox
+        .cmd(rgo)
+        .args(["gc", "--target", "0"])
+        .output()
+        .unwrap();
+    assert!(
+        gc.status.success(),
+        "{}",
+        String::from_utf8_lossy(&gc.stderr)
+    );
+    assert!(contexts[0].is_dir() && job.directory.is_dir());
+    assert_eq!(coalition.active_tasks().unwrap(), 1);
+    std::fs::write(&owner_path, &original_owner).unwrap();
+    // Earlier pilot schemas cannot establish this definition/scope binding.
+    redirected = serde_json::from_slice(&original_owner).unwrap();
+    redirected["version"] = serde_json::json!(2);
+    let plist_path = job.directory.join("job.plist");
+    let original_plist = std::fs::read(&plist_path).unwrap();
+    let old_definition = redirected["definition"].as_str().unwrap().replace(
+        &format!(
+            "<string>--context</string><string>{}</string>",
+            contexts[0].display()
+        ),
+        "",
+    );
+    redirected["definition"] = serde_json::json!(old_definition);
+    std::fs::write(&plist_path, old_definition).unwrap();
+    std::fs::write(&owner_path, serde_json::to_vec(&redirected).unwrap()).unwrap();
+    assert!(rgo_core::macos_jobs::read_owner(&job.directory).is_err());
+    std::fs::write(&owner_path, original_owner).unwrap();
+    std::fs::write(&plist_path, original_plist).unwrap();
     // An edited definition must survive housekeeping even after its context
     // becomes idle. Restoring the exact owned definition permits recovery.
     let definition_path = job.directory.join("job.plist");
@@ -312,14 +371,60 @@ while not pathlib.Path(os.environ['RGO_COALITION_READY']).exists():
             .status
             .success()
     );
-    std::fs::write(&definition_path, definition).unwrap();
+    let daemon_lock = stop_private_daemon(&paths);
+    std::fs::write(&definition_path, &definition).unwrap();
+    let (retiring_owner, retiring_bytes) =
+        rgo_core::macos_jobs::read_owner(&job.directory).unwrap();
+    let journal = job.directory.parent().unwrap().join(format!(
+        ".retiring-{}.json",
+        job.directory.file_name().unwrap().to_str().unwrap()
+    ));
+    let guard = supervision::try_lock_gc(&paths, Some(&contexts[0]))
+        .unwrap()
+        .unwrap();
+    assert!(
+        !rgo_core::macos_jobs::cleanup_step(&job.directory, &retiring_owner, &retiring_bytes, 2)
+            .unwrap()
+    );
+    assert!(
+        !job.directory.join("control.sock").exists() && !job.directory.join("owner.json").exists()
+    );
+    assert!(journal.is_file());
+    let saved_journal = std::fs::read(&journal).unwrap();
+    assert!(
+        rgo_core::macos_jobs::read_owner(&job.directory)
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("retirement is pending")
+    );
+    let mut changed_definition = definition.clone();
+    changed_definition.extend_from_slice(b"<!-- later user edit -->");
+    std::fs::write(&definition_path, changed_definition).unwrap();
+    let edited = rgo_core::macos_jobs::cleanup(&job.directory, &retiring_owner, &retiring_bytes)
+        .unwrap_err();
+    assert!(edited.to_string().contains("content changed"), "{edited:#}");
+    assert!(definition_path.is_file() && journal.is_file());
+    std::fs::write(&definition_path, &definition).unwrap();
+    drop(guard);
+    drop(daemon_lock);
+    let _first_daemon = PrivateDaemon(
+        sandbox
+            .cmd(rgo)
+            .args(["daemon", "--foreground"])
+            .env("RGO_DAEMON_POLL_SECS", "1")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
     // Metadata recovery also runs with automatic destructive GC disabled.
     let deadline = Instant::now() + Duration::from_secs(10);
-    while job.directory.exists() && Instant::now() < deadline {
+    while (job.directory.exists() || journal.exists()) && Instant::now() < deadline {
         thread::sleep(Duration::from_millis(25));
     }
     assert!(
-        !job.directory.exists(),
+        !job.directory.exists() && !journal.exists(),
         "idle crashed guardian was not recovered"
     );
     // Recovery removes the rendezvous before bootout can reap the identity.
@@ -336,6 +441,24 @@ while not pathlib.Path(os.environ['RGO_COALITION_READY']).exists():
         assert!(Instant::now() < deadline, "recovered job was not unloaded");
         thread::sleep(Duration::from_millis(20));
     }
+    // The observed already-unloaded result is the underlying ESRCH error,
+    // rather than a generic failure that would authorize discarding a journal.
+    let unloaded = sandbox
+        .cmd("launchctl")
+        .args(["bootout", &job.target])
+        .output()
+        .unwrap();
+    assert_eq!(unloaded.status.code(), Some(libc::ESRCH));
+    // Model interruption after successful bootout but before the journal's
+    // unlink: the exact durable journal can be acknowledged by another pass.
+    let guard = supervision::try_lock_gc(&paths, Some(&contexts[0]))
+        .unwrap()
+        .unwrap();
+    std::fs::write(&journal, saved_journal).unwrap();
+    std::fs::set_permissions(&journal, std::fs::Permissions::from_mode(0o600)).unwrap();
+    rgo_core::macos_jobs::cleanup(&job.directory, &retiring_owner, &retiring_bytes).unwrap();
+    assert!(!journal.exists());
+    drop(guard);
     println!(
         "installed Cargo pilot: real detached writer protected through Cargo exit and guardian SIGKILL; late write succeeded; idle context reclaimed"
     );
@@ -528,20 +651,7 @@ fn main() {
 
     // Stop the actual daemon before interrupting retirement. Acquiring its
     // singleton lock proves exit; a stale socket is not evidence of liveness.
-    assert!(matches!(
-        rgo_core::ipc::request(&paths.socket_path(), Request::Shutdown).unwrap(),
-        Response::Ok
-    ));
-    let daemon_lock = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(paths.state_dir().join("daemon.lock"))
-        .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while !FileExt::try_lock_exclusive(&daemon_lock).unwrap() {
-        assert!(Instant::now() < deadline, "private daemon did not stop");
-        thread::sleep(Duration::from_millis(20));
-    }
+    let daemon_lock = stop_private_daemon(&paths);
     drop(worker_release);
     let deadline = Instant::now() + Duration::from_secs(10);
     while worker.state().unwrap() == ProcessState::Live {

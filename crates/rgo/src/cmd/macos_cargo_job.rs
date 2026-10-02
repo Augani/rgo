@@ -18,11 +18,12 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 mod events;
 mod terminal;
+mod wake;
 
 pub use terminal::recovery::Action as TerminalHostAction;
 
@@ -42,6 +43,7 @@ const FORWARDED_SIGNALS: [i32; 7] = [
     libc::SIGWINCH,
 ];
 static SIGNALS: AtomicU32 = AtomicU32::new(0);
+static SIGNAL_WAKE: AtomicI32 = AtomicI32::new(-1);
 
 #[derive(Serialize, Deserialize)]
 struct Invocation {
@@ -300,6 +302,21 @@ struct EarlyCleanup<'a> {
     safe_to_reap: bool,
 }
 
+fn sync_pair(first: File, second: File) -> Result<()> {
+    // Independent flushes can overlap, but both must succeed before proceeding
+    // to namespace durability or bootstrap. Never skip a required flush.
+    std::thread::scope(|scope| {
+        let pending = std::thread::Builder::new().spawn_scoped(scope, move || first.sync_all())?;
+        let last = second.sync_all();
+        let first = pending
+            .join()
+            .map_err(|_| anyhow::anyhow!("Cargo metadata sync worker panicked"))?;
+        first?;
+        last?;
+        Ok(())
+    })
+}
+
 impl Drop for EarlyCleanup<'_> {
     fn drop(&mut self) {
         if self.safe_to_reap {
@@ -351,19 +368,22 @@ impl PreparedJob {
         // ownership boundary on the new per-job directory before publishing it.
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(temporary.path(), std::fs::Permissions::from_mode(0o700))?;
-        let directory = temporary.path();
-        let listener = in_directory(directory, || Ok(UnixListener::bind(SOCKET_NAME)?))?;
+        // Preserve unknown or partial content on later preparation failure.
+        // TempDir's recursive destructor cannot establish that ownership.
+        let directory = temporary.keep();
+        let listener = in_directory(&directory, || Ok(UnixListener::bind(SOCKET_NAME)?))?;
         listener.set_nonblocking(true)?;
         let mut entropy = [0_u8; 32];
         File::open("/dev/urandom")?.read_exact(&mut entropy)?;
         let token = blake3::hash(&entropy).to_hex().to_string();
         let owner = Owner::new(
-            directory,
+            &directory,
             std::env::current_exe()?,
             context.to_owned(),
             token,
         )?;
         let bytes = serde_json::to_vec(&owner)?;
+        let mut records = Vec::new();
         for (name, data) in [
             ("owner.json", bytes.as_slice()),
             ("job.plist", owner.definition.as_bytes()),
@@ -373,19 +393,22 @@ impl PreparedJob {
                 .create_new(true)
                 .open(directory.join(name))?;
             file.write_all(data)?;
-            file.sync_all()?;
+            records.push(file);
         }
-        File::open(directory)?.sync_all()?;
+        let [owner_record, definition]: [File; 2] = records
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("Cargo job metadata records are missing"))?;
+        sync_pair(owner_record, definition)?;
+        sync_pair(File::open(&directory)?, File::open(paths.state_dir())?)?;
         let files_ready = started.elapsed();
         // The guardian owns this directory now, including after the caller exits.
-        let _directory = temporary.keep();
         let mut early_cleanup = EarlyCleanup {
-            directory: &_directory,
+            directory: &directory,
             owner: &owner,
             bytes: &bytes,
             safe_to_reap: true,
         };
-        macos_jobs::bootstrap(&_directory, &owner, &bytes, deadline)?;
+        macos_jobs::bootstrap(&directory, &owner, &bytes, deadline)?;
         let bootstrapped = started.elapsed();
         let mut stream = loop {
             match listener.accept() {
@@ -412,7 +435,7 @@ impl PreparedJob {
                     }
                 }
                 Err(error) => {
-                    let diagnostic = std::fs::read_to_string(_directory.join("guardian.stderr"))
+                    let diagnostic = std::fs::read_to_string(directory.join("guardian.stderr"))
                         .unwrap_or_default();
                     // No request or commit was sent, so this job cannot have
                     // started Cargo or registered a managed context.
@@ -488,17 +511,23 @@ impl PreparedJob {
         let committed = Instant::now();
         self.stream.write_all(b"S")?; // From here failure cannot retry Cargo.
         let mut reader = self.stream.try_clone()?;
+        let wake = wake::Wake::get()?;
         let (sender, receiver) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             loop {
                 let message = read_frame::<Message>(&mut reader);
                 let terminal = !matches!(message, Ok(Message::Started { .. } | Message::Stopped));
-                if sender.send(message).is_err() || terminal {
+                if sender.send(message).is_err() {
+                    break;
+                }
+                wake.notify();
+                if terminal {
                     break;
                 }
             }
         });
         loop {
+            wake.drain()?;
             if let Some(terminal) = &mut self.terminal {
                 if let Some(foreground) = terminal.changed_foreground()? {
                     if foreground {
@@ -513,7 +542,7 @@ impl PreparedJob {
                     }
                 }
             }
-            let pending = SIGNALS.swap(0, Ordering::Relaxed);
+            let pending = SIGNALS.swap(0, Ordering::AcqRel);
             for signal in FORWARDED_SIGNALS {
                 if pending & (1 << signal) != 0 {
                     match (signal, self.terminal.as_ref()) {
@@ -522,11 +551,7 @@ impl PreparedJob {
                     }
                 }
             }
-            match receiver.recv_timeout(if self.terminal.is_some() {
-                Duration::ZERO
-            } else {
-                Duration::from_millis(20)
-            }) {
+            match receiver.try_recv() {
                 Ok(Ok(Message::Started { .. })) => {
                     tracing::debug!(
                         elapsed_ms = committed.elapsed().as_secs_f64() * 1000.0,
@@ -567,9 +592,22 @@ impl PreparedJob {
                 Ok(Err(error)) => {
                     return Err(error).context("Cargo guardian disconnected after commit");
                 }
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
                     if let Some(terminal) = &mut self.terminal {
-                        terminal.pump(terminal.foreground(), 10)?;
+                        // Only relay after the handoff has been configured.
+                        // The live foreground group may change between the
+                        // top-of-loop check and this poll.
+                        let foreground = terminal.relaying_input();
+                        // zsh's `fg` does not send SIGCONT to an already
+                        // running job. Discover that terminal handoff while
+                        // backgrounded; foreground replies/signals wake us.
+                        terminal.pump(
+                            foreground,
+                            if foreground { -1 } else { 100 },
+                            Some(wake.reader()),
+                        )?;
+                    } else {
+                        wake.wait()?;
                     }
                 }
                 Err(error) => return Err(error.into()),
@@ -579,9 +617,17 @@ impl PreparedJob {
 }
 
 extern "C" fn capture_signal(signal: i32) {
+    let saved_errno = unsafe { *libc::__error() };
     if (0..32).contains(&signal) {
-        SIGNALS.fetch_or(1 << signal, Ordering::Relaxed);
+        SIGNALS.fetch_or(1 << signal, Ordering::Release);
+        let fd = SIGNAL_WAKE.load(Ordering::Relaxed);
+        if fd >= 0 {
+            // Only async-signal-safe operations; the nonblocking pipe remains
+            // open for this process's lifetime, including handler teardown.
+            unsafe { libc::write(fd, b"S".as_ptr().cast(), 1) };
+        }
     }
+    unsafe { *libc::__error() = saved_errno };
 }
 
 struct SignalRelay(Vec<(i32, libc::sigaction)>);
@@ -589,6 +635,7 @@ struct SignalRelay(Vec<(i32, libc::sigaction)>);
 impl SignalRelay {
     fn new() -> Result<Self> {
         SIGNALS.store(0, Ordering::Relaxed);
+        SIGNAL_WAKE.store(wake::Wake::get()?.writer(), Ordering::Relaxed);
         let mut relay = Self(Vec::new());
         for signal in FORWARDED_SIGNALS {
             let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
@@ -610,6 +657,7 @@ impl SignalRelay {
 
 impl Drop for SignalRelay {
     fn drop(&mut self) {
+        SIGNAL_WAKE.store(-1, Ordering::Relaxed);
         for (signal, previous) in &self.0 {
             unsafe {
                 libc::sigaction(*signal, previous, std::ptr::null_mut());
@@ -667,7 +715,7 @@ fn poll_child(child: &std::process::Child) -> Result<ChildChange> {
 
 /// Private launchd entry point. Only the authenticated one-use socket supplies
 /// an invocation; restarting its old definition cannot start another Cargo.
-pub fn guardian(directory: &Path, token: &str) -> Result<()> {
+pub fn guardian(directory: &Path, token: &str, context: Option<&Path>) -> Result<()> {
     ensure!(
         token.len() == 64 && token.bytes().all(|byte| byte.is_ascii_hexdigit()),
         "invalid Cargo job token"
@@ -675,6 +723,7 @@ pub fn guardian(directory: &Path, token: &str) -> Result<()> {
     let (owner, bytes) = macos_jobs::read_owner(directory)?;
     ensure!(
         owner.token == token
+            && context == Some(owner.context.as_path())
             && owner.label == format!("com.rgo.cargo.{}", &token[..32])
             && owner.domain == format!("gui/{}", unsafe { libc::geteuid() }),
         "Cargo job owner does not match its invocation"
@@ -720,6 +769,9 @@ pub fn guardian(directory: &Path, token: &str) -> Result<()> {
         "Cargo job scope must be absolute"
     );
     let mut session = supervision::lock_cargo_session(&paths, Some(&request.context))?;
+    // Recovery can fence a startup waiting for this scope. Revalidate after
+    // acquiring it, before publishing any receipt or accepting a commit.
+    macos_jobs::verify_owner(directory, &owner, &bytes)?;
     early_cleanup.safe_to_reap = false;
     let admission = session.record_macos_coalition();
     if let Err(error) = admission {

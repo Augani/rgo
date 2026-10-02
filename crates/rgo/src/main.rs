@@ -36,6 +36,8 @@ enum Cmd {
         directory: std::path::PathBuf,
         #[arg(long)]
         token: String,
+        #[arg(long)]
+        context: Option<std::path::PathBuf>,
     },
     /// Experimental supervised Cargo launcher used only in private probes.
     #[command(hide = true)]
@@ -181,9 +183,11 @@ fn main() -> Result<()> {
             cmd::macos_cargo_job::terminal_host(action, home.as_deref())
         }
         #[cfg(target_os = "macos")]
-        Some(Cmd::MacosCargoJob { directory, token }) => {
-            cmd::macos_cargo_job::guardian(&directory, &token)
-        }
+        Some(Cmd::MacosCargoJob {
+            directory,
+            token,
+            context,
+        }) => cmd::macos_cargo_job::guardian(&directory, &token, context.as_deref()),
         Some(Cmd::CargoShim {
             real_cargo,
             cargo_home,

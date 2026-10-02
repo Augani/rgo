@@ -478,6 +478,64 @@ Intel guardian lane and full macOS stable/beta/nightly suites, all three Rust
 it does not close the broader supported-shell, lifecycle, IDE, or performance
 release gates.
 
+## Cargo job retirement and scope binding
+
+The earlier cleanup removed `owner.json` and the job directory before calling
+`bootout`. A process interruption between those operations left no recovery
+record. Cleanup now syncs a sibling `.retiring-macos-cargo-job-*.json` journal
+before its first unlink and keeps it through the unload acknowledgement.
+
+- [x] Bind new owner schema 3's context to its generated `--context` program
+  argument. The guardian requires that exact argument and invocation scope.
+  An edit to only the owner context invalidates its definition instead of
+  redirecting maintenance to another apparently idle scope. Preserve schemas
+  1/2, which cannot establish this binding.
+- [x] Recheck owner bytes and the absence of a retirement journal after acquiring
+  the guardian's context guard and before publishing its kernel receipt.
+- [x] Sync the job directory's parent before bootstrap. Preserve partial or
+  unknown later preparation content instead of invoking a recursive temporary
+  directory destructor on failure.
+- [x] Overlap independent owner/plist flushes, then independent job/parent
+  directory flushes; require every flush to succeed before bootstrap.
+- [x] Wake the caller's relay with a process-lifetime, close-on-exec pipe for
+  guardian replies and signals. Avoid the recurring foreground polling delay.
+  Retain a 100 ms background-only check for `fg` of a silent running job;
+  zsh 5.9 only sends `SIGCONT` when the job was stopped. Extend the existing
+  terminal fixture to verify this handoff before application input/output or
+  exit. Read original-terminal input only after configuring relay mode, and
+  recheck foreground ownership after poll returns from a stop/resume.
+- [x] Retain the exact owner bytes, directory identity, and known file/socket
+  fingerprints in a bounded, private, no-follow journal outside the job folder.
+  Publish new job and terminal retirement journals without replacing an
+  existing destination. Preserve extra files or changed bytes/inodes.
+- [x] Fence the rendezvous first and reject pending retirement during startup.
+  Resume after the owner header or entire job folder is gone. Existing exclusive
+  GC guards still establish build-lifetime safety; the journal does not replace
+  receipt or kernel observations.
+- [x] Preserve the journal on unload timeout or failure. Accept successful
+  `bootout` or the observed `ESRCH` already-unloaded result, rather than treating
+  every nonzero status as completion. Other results preserve recovery state.
+- [x] Extend the existing fixture for an edited context while its closed-FD
+  writer remains alive, an actual old schema/definition, interrupted removal,
+  a later edited definition, real daemon restart, and journal replay after a
+  completed unload. No new Rust test case was added.
+- [ ] Complete every preparation/commit interruption and incomplete-record
+  recovery path, including a full filesystem failure/cancellation matrix.
+- [ ] Prove ownership of the currently loaded definition before unloading a
+  job whose registration may have been replaced externally.
+- [ ] Validate the final batch in the platform matrix and record optimized
+  terminal-path timing before considering normal activation.
+
+The journal holds at most four known entries, regular reads remain bounded to
+16 KiB, and the journal is limited to 64 KiB. Removal steps are bounded; the
+same two-second helper deadline and exclusive scope guards remain in force.
+The two existing local cases passed schema 3, journal replay, the reply/signal
+wakeup, the silent running background handoff, and terminal recovery on macOS
+27.2 arm64 (16.25 s and 2.83 s). All-bin build, zero-warning all-target Clippy,
+format and diff checks passed. Platform CI is pending. Launch-overhead gates
+remain open; optimized paired measurements will assess the effect of overlapping
+flushes and waking replies without skipping startup durability.
+
 ## Abandoned terminal-host retirement
 
 The registered terminal's guardian can retire before its shell record is

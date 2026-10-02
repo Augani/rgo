@@ -73,7 +73,8 @@ def wait_for(operation, description):
     deadline = time.monotonic() + 10
     while not operation():
         if time.monotonic() >= deadline:
-            raise RuntimeError(description)
+            raise RuntimeError(f"{description}; foreground={os.tcgetpgrp(master)}, shell={pid}, "
+                f"modes={termios.tcgetattr(master)}; transcript={bytes(transcript[-6000:])!r}")
         time.sleep(0.02)
 
 def jobs():
@@ -186,6 +187,32 @@ try:
         status(17)
     command("stty -tostop")
     expect(prompt)
+
+    # `fg` of an already-running zsh job sends no SIGCONT. A silent job
+    # must still acquire relay mode before any input, output, or exit wakes it.
+    command("RGO_PROBE_IDLE_BACKGROUND=1 cargo run --offline")
+    expect(b"RGO_TERMINAL_READY")
+    wait_for(lambda: pathlib.Path("idle-background-ready").exists(), "idle process did not start")
+    send(b"\x1a")
+    expect(prompt)
+    shell_command("bg")
+    shell_command("jobs -r > background-state")
+    assert b"running" in pathlib.Path("background-state").read_bytes(), "idle background job was not running"
+    command("fg")
+    def foreground_ready():
+        # An actual terminal keeps consuming shell output during a handoff.
+        # Preserve it for the subsequent expectations and failure diagnostics.
+        if select.select([master], [], [], 0)[0]:
+            chunk = os.read(master, 8192)
+            pending.extend(chunk)
+            transcript.extend(chunk)
+        return os.tcgetpgrp(master) != pid and termios.tcgetattr(master)[3] & (termios.ICANON | termios.ECHO) == 0
+    wait_for(foreground_ready,
+        "silent running background job did not enter foreground relay mode")
+    pathlib.Path("idle-background-release").write_text("continue")
+    send(b"quit\n")
+    expect(prompt)
+    status(17)
 
     # The shell has already regained its prompt before this detached process
     # writes. Closing the caller's master must not hang up that surviving PTY.

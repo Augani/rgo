@@ -6,9 +6,9 @@
 
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
-use std::fs::{File, ReadDir};
+use std::fs::ReadDir;
 use std::io::Read;
-use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -20,6 +20,7 @@ const BOOTOUT_TIMEOUT: Duration = Duration::from_secs(2);
 pub const JOB_PREFIX: &str = "macos-cargo-job-";
 
 mod command;
+mod retirement;
 
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -49,7 +50,7 @@ fn definition(directory: &Path, owner: &CargoJobOwner) -> Result<String> {
         ""
     };
     Ok(format!(
-        "<?xml version=\"1.0\"?><plist version=\"1.0\"><dict><key>Label</key><string>{}</string><key>ProgramArguments</key><array><string>{}</string><string>macos-cargo-job</string><string>--directory</string><string>{}</string><string>--token</string><string>{}</string></array><key>RunAtLoad</key><true/><key>AbandonProcessGroup</key><true/>{scheduling}<key>StandardOutPath</key><string>/dev/null</string><key>StandardErrorPath</key><string>{}</string></dict></plist>",
+        "<?xml version=\"1.0\"?><plist version=\"1.0\"><dict><key>Label</key><string>{}</string><key>ProgramArguments</key><array><string>{}</string><string>macos-cargo-job</string><string>--directory</string><string>{}</string><string>--token</string><string>{}</string><string>--context</string><string>{}</string></array><key>RunAtLoad</key><true/><key>AbandonProcessGroup</key><true/>{scheduling}<key>StandardOutPath</key><string>/dev/null</string><key>StandardErrorPath</key><string>{}</string></dict></plist>",
         owner.label,
         xml(owner
             .executable
@@ -59,6 +60,10 @@ fn definition(directory: &Path, owner: &CargoJobOwner) -> Result<String> {
             .to_str()
             .context("guardian directory is not UTF-8")?),
         owner.token,
+        xml(owner
+            .context
+            .to_str()
+            .context("guardian context is not UTF-8")?),
         xml(directory
             .join("guardian.stderr")
             .to_str()
@@ -78,7 +83,7 @@ impl CargoJobOwner {
             "invalid Cargo job token"
         );
         let mut owner = Self {
-            version: 2,
+            version: 3,
             label: format!("com.rgo.cargo.{}", &token[..32]),
             domain: format!("gui/{}", unsafe { libc::geteuid() }),
             token,
@@ -100,7 +105,7 @@ impl CargoJobOwner {
 
     fn validate(&self, directory: &Path) -> Result<()> {
         ensure!(
-            matches!(self.version, 1 | 2)
+            self.version == 3
                 && self.token.len() == 64
                 && self.token.bytes().all(|byte| byte.is_ascii_hexdigit())
                 && self.label == format!("com.rgo.cargo.{}", &self.token[..32])
@@ -169,6 +174,10 @@ fn read_record(path: &Path) -> Result<Vec<u8>> {
 }
 
 pub fn read_owner(directory: &Path) -> Result<(CargoJobOwner, Vec<u8>)> {
+    ensure!(
+        !retirement::pending(directory)?,
+        "Cargo job retirement is pending"
+    );
     verify_directory(directory)?;
     let bytes = read_record(&directory.join("owner.json"))?;
     let owner: CargoJobOwner = serde_json::from_slice(&bytes)?;
@@ -178,6 +187,10 @@ pub fn read_owner(directory: &Path) -> Result<(CargoJobOwner, Vec<u8>)> {
 }
 
 pub fn verify_owner(directory: &Path, owner: &CargoJobOwner, bytes: &[u8]) -> Result<()> {
+    ensure!(
+        !retirement::pending(directory)?,
+        "Cargo job retirement is pending"
+    );
     verify_directory(directory)?;
     owner.validate(directory)?;
     ensure!(
@@ -186,6 +199,12 @@ pub fn verify_owner(directory: &Path, owner: &CargoJobOwner, bytes: &[u8]) -> Re
         "Cargo job ownership changed"
     );
     Ok(())
+}
+
+/// Maintenance may resume a validated retirement after its original header is
+/// gone. Startup always uses `read_owner`, which refuses a pending retirement.
+pub fn recovery_owner(directory: &Path) -> Result<(CargoJobOwner, Vec<u8>)> {
+    retirement::owner(directory)
 }
 
 /// The caller has not supplied any invocation yet. Registration failure can
@@ -215,48 +234,22 @@ pub fn bootstrap(
 /// Only call after durable retirement under a session guard, or while holding
 /// exclusive GC guards. Removing the one-use rendezvous fences job restarts.
 pub fn cleanup(directory: &Path, owner: &CargoJobOwner, bytes: &[u8]) -> Result<()> {
-    verify_owner(directory, owner, bytes)?;
-    // Preserve user-added content. A guardian writes only these four entries;
-    // unknown entries must not turn this into recursive user-file deletion.
-    let entries = std::fs::read_dir(directory)?
-        .take(5)
-        .collect::<std::io::Result<Vec<_>>>()?;
     ensure!(
-        entries.len() <= 4,
-        "Cargo job directory has unexpected entries"
+        cleanup_step(directory, owner, bytes, 4)?,
+        "Cargo job retirement remains incomplete"
     );
-    for entry in &entries {
-        ensure!(
-            ["owner.json", "job.plist", "control.sock", "guardian.stderr"]
-                .iter()
-                .any(|name| entry.file_name() == *name),
-            "Cargo job directory has unexpected content"
-        );
-        let metadata = std::fs::symlink_metadata(entry.path())?;
-        let expected_type = if entry.file_name() == "control.sock" {
-            metadata.file_type().is_socket()
-        } else {
-            metadata.is_file()
-        };
-        ensure!(
-            expected_type && metadata.uid() == unsafe { libc::geteuid() },
-            "Cargo job directory contains a replaced entry"
-        );
-    }
-    for entry in entries {
-        std::fs::remove_file(entry.path())?;
-    }
-    std::fs::remove_dir(directory)?;
-    File::open(directory.parent().context("Cargo job has no parent")?)?.sync_all()?;
-    let _status = command::run(
-        Command::new("/bin/launchctl")
-            .args(["bootout", &owner.target()])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null()),
-        Instant::now() + BOOTOUT_TIMEOUT,
-    )?;
-    Ok(()) // An already unloaded job is also safe.
+    Ok(())
+}
+
+/// Same guard precondition as `cleanup`. Bound removals while retaining a
+/// synced sibling journal; a later maintenance process can finish the step.
+pub fn cleanup_step(
+    directory: &Path,
+    owner: &CargoJobOwner,
+    bytes: &[u8],
+    max_files: usize,
+) -> Result<bool> {
+    retirement::advance(directory, owner, bytes, max_files)
 }
 
 /// Retain the directory iterator across maintenance passes, so busy or edited
@@ -279,12 +272,18 @@ impl RecoveryScanner {
                 break;
             };
             let entry = entry?;
-            if !entry.file_name().to_string_lossy().starts_with(JOB_PREFIX) {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            let directory_name = name
+                .strip_prefix(".retiring-")
+                .and_then(|name| name.strip_suffix(".json"))
+                .unwrap_or(name);
+            if !directory_name.starts_with(JOB_PREFIX) {
                 continue;
             }
-            let directory = entry.path();
+            let directory = paths.state_dir().join(directory_name);
             let recover = (|| -> Result<bool> {
-                let (owner, bytes) = read_owner(&directory)?;
+                let (owner, bytes) = recovery_owner(&directory)?;
                 ensure!(
                     directory.parent() == Some(paths.state_dir().as_path()),
                     "Cargo job root changed"

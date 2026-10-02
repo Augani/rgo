@@ -157,6 +157,16 @@ The [19-job platform run](https://github.com/Augani/rgo/actions/runs/37020240840
 passed at `95d7358`, including the extended Intel/macOS fixture and full
 existing platform suites, installers, source builds, and recovery probes.
 
+**macOS Cargo job retirement:** new schema 3 binds the cleanup context into its
+generated job arguments; old unbound schemas remain preserved. A synced sibling
+journal now survives removal of the ownership header and job directory until
+unload is acknowledged. Startup rechecks ownership under its scope guard and
+preserves incomplete preparation content. The existing fixture covers a scope
+edit, an old schema, later file edits, real daemon restart, and an already-unloaded
+retry. Final platform evidence and the remaining loaded-definition/startup and
+latency gates are tracked in the
+[macOS checklist](docs/macos-cargo-supervision.md#cargo-job-retirement-and-scope-binding).
+
 The [19-job run](https://github.com/Augani/rgo/actions/runs/36998573830) passed
 at `5557f94`, including Intel macOS 15.7.9 and all existing platform suites.
 The [guardian latency samples](docs/benchmarks/2026-10-02-macos-arm64-cargo-guardian.json)

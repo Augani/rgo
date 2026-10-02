@@ -352,10 +352,16 @@ pub fn write(directory: &Path, name: &str, value: &impl Serialize, durable: bool
         matches!(name, "host.json" | "lease.json" | "generation"),
         "unknown terminal record name"
     );
-    atomic_write(directory, name, value, durable)
+    atomic_write(directory, name, value, durable, true)
 }
 
-fn atomic_write(directory: &Path, name: &str, value: &impl Serialize, durable: bool) -> Result<()> {
+fn atomic_write(
+    directory: &Path,
+    name: &str,
+    value: &impl Serialize,
+    durable: bool,
+    replace: bool,
+) -> Result<()> {
     private_directory(directory)?;
     let bytes = serde_json::to_vec(value)?;
     ensure!(
@@ -369,7 +375,11 @@ fn atomic_write(directory: &Path, name: &str, value: &impl Serialize, durable: b
     if durable {
         temporary.as_file().sync_all()?;
     }
-    temporary.persist(directory.join(name))?;
+    if replace {
+        temporary.persist(directory.join(name))?;
+    } else {
+        temporary.persist_noclobber(directory.join(name))?;
+    }
     if durable {
         File::open(directory)?.sync_all()?;
     }
@@ -668,7 +678,7 @@ pub fn retire_step(
             };
             // This journal survives individual removals and remains outside the
             // directory until its disappearance has been durably acknowledged.
-            atomic_write(&parent, &retirement_name(token), &retirement, true)?;
+            atomic_write(&parent, &retirement_name(token), &retirement, true, false)?;
             retirement
         }
         Err(error) => return Err(error.into()),

@@ -179,6 +179,10 @@ impl Caller {
         unsafe { libc::tcgetpgrp(self.fd()) == self.configuration.owner_group }
     }
 
+    pub(super) fn relaying_input(&self) -> bool {
+        self.raw_active && self.foreground()
+    }
+
     pub(super) fn activate(&mut self) -> Result<()> {
         ensure!(
             Settings::read(self.fd())? == self.configuration.settings,
@@ -241,7 +245,7 @@ impl Caller {
         Ok(Some(foreground))
     }
 
-    pub(super) fn pump(&mut self, read_input: bool, timeout: i32) -> Result<()> {
+    pub(super) fn pump(&mut self, read_input: bool, timeout: i32, wake: Option<i32>) -> Result<()> {
         let master = self.master.as_mut().context("PTY master is missing")?;
         let mut descriptors = [
             libc::pollfd {
@@ -270,12 +274,38 @@ impl Caller {
                 },
                 revents: 0,
             },
+            libc::pollfd {
+                fd: wake.unwrap_or(-1),
+                events: libc::POLLIN,
+                revents: 0,
+            },
         ];
-        let result = unsafe { libc::poll(descriptors.as_mut_ptr(), 2, timeout) };
+        let result = unsafe {
+            libc::poll(
+                descriptors.as_mut_ptr(),
+                descriptors.len() as libc::nfds_t,
+                timeout,
+            )
+        };
         if result < 0 && std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
             return Err(std::io::Error::last_os_error().into());
         }
-        if descriptors[0].revents & libc::POLLIN != 0 {
+        ensure!(
+            descriptors[0].revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) == 0,
+            "original Cargo terminal disconnected"
+        );
+        ensure!(
+            descriptors[1].revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) == 0,
+            "guardian Cargo terminal disconnected"
+        );
+        // A stop/resume can return from poll after the shell has taken the
+        // terminal. Never consume shell input using the pre-poll ownership.
+        if read_input
+            && descriptors[0].revents & libc::POLLIN != 0
+            && unsafe {
+                libc::tcgetpgrp(self.original.as_raw_fd()) == self.configuration.owner_group
+            }
+        {
             read_once(&mut self.original, &mut self.input)?;
         }
         if descriptors[1].revents & libc::POLLIN != 0 {
@@ -302,7 +332,7 @@ impl Caller {
             if std::time::Instant::now() >= deadline && self.output.is_empty() {
                 return Ok(());
             }
-            self.pump(false, 10)?;
+            self.pump(false, 10, None)?;
         }
     }
 }

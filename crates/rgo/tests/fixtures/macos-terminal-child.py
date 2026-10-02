@@ -1,8 +1,10 @@
 """Application used by the installed-launcher terminal compatibility fixture."""
 import os
+import pathlib
 import signal
 import subprocess
 import sys
+import time
 
 expected = os.environ.get("RGO_PROBE_STDIO", "111")
 actual = "".join("1" if os.isatty(fd) else "0" for fd in range(3))
@@ -19,6 +21,13 @@ if os.environ.get("RGO_PROBE_BACKGROUND"):
     signal.signal(signal.SIGCONT, lambda *_: os.write(1, b"RGO_CONTINUED\n"))
 print(f"\x1b[32mRGO_TTY:{actual}\x1b[0m", flush=True)
 print("RGO_TERMINAL_READY", file=sys.stderr, flush=True)
+if os.environ.get("RGO_PROBE_IDLE_BACKGROUND"):
+    pathlib.Path("idle-background-ready").write_text("ready")
+    deadline = time.monotonic() + 20
+    while not pathlib.Path("idle-background-release").exists():
+        if time.monotonic() >= deadline:
+            raise RuntimeError("idle background process was not released")
+        time.sleep(0.02)
 if os.environ.get("RGO_PROBE_LATE"):
     subprocess.Popen([sys.executable, "-c", """
 import os, pathlib, time
