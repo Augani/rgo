@@ -921,3 +921,69 @@ at `9452c3d` passed all 116 existing tests in 1.97 s on macOS 14.8.9 build
 non-reproduction with stronger diagnostics, not an explanation or a GC fix.
 The original failure stays open; no retry or weaker assertion converts it into
 completed full-platform acceptance.
+
+## Queued commit and startup recovery — October 2, 2026
+
+- [x] Reproduce a prepared blocked SIGTERM arriving too late: pause the caller
+  after commit and require the application to inspect its own kernel pending
+  set before unblocking. The baseline application observes `missing` and exits
+  0; fallback observes `pending` and exits through its handler with code 74.
+- [x] Advertise the guardian's pending-before-exec capability. Refuse an absent
+  capability before terminal activation or commit. Accept legacy `S`; send a
+  complete `Q` plus four-byte pending mask for new callers.
+- [x] Validate queued bits against forwarded signals and the captured blocked,
+  non-ignored state. Restore native actions/mask, then recreate those pending
+  notifications in the single-threaded child before exec. Retain unsent bits
+  in the caller's restoration guard until the complete packet is written.
+- [x] Separate prepared and running jobs. Every error from the commit phase
+  leaves the record incomplete and may use checkout fallback after restoring
+  terminal/signals and acknowledging cancellation. A completed record yields
+  only a running job; its errors never start another Cargo invocation.
+- [x] Reproduce and fix two incomplete-record outcomes in the existing case:
+  actual write-half shutdown after three bytes originally returns code 1 for
+  both queued TERM and captured INT. The final paths require no guardian commit,
+  fallback handler code 74 for TERM, and signal exit 2 without fallback for INT.
+- [x] Pass all seven startup subcases plus the existing writer/terminal/recovery
+  requirements locally in 24.72 s. The existing interrupt case passed in 3.57 s
+  with exact code 73, stop/resume, survivor protection and actual idle deletion.
+  No new Rust test case was added; all pause/cut hooks are debug-only.
+- [ ] Verify the final batch in the existing platform lanes.
+- [ ] Exercise live mixed-version upgrades and the remaining mask/action,
+  unsupported-state and post-commit/child-creation timing matrix. Resolve the
+  earlier interrupt/terminal failures and the recorded CAS-reclamation failure
+  before full release acceptance. Normal activation and automatic GC stay off.
+
+The [captured observations](probes/2026-10-02-macos-queued-commit.json) distinguish
+the old one-byte commit's lost notification from the intermediate queued
+transport's missing fallback/cancellation handling. The final application
+observes `pending` while the caller is paused, before any runtime signal relay.
+Each subcase retires its owned guardian and requires real idle-context deletion
+before continuing. The prefix cut exercises the actual socket error and strict
+record decoder; it does not accept an error code as equivalent to cancellation.
+Protocol 9, admission revision 4 and cleanup ownership/receipt schemas are
+unchanged. Legacy capability handling is implemented; the live upgrade gate
+remains open.
+
+## Completed GC exclusion — October 2, 2026
+
+- [x] Reproduce exclusive locks surviving a completed GC operation through
+  duplicated open file descriptions in the existing context/global lock case.
+  The pre-fix assertion fails while all passive copies remain open.
+- [x] Explicitly unlock only GC's exclusive Unix flock guards. Wrap each
+  successful acquisition immediately so early errors release partial ownership.
+  Leave Cargo's inherited shared descendant locks unchanged.
+- [x] Close GC's process-associated record descriptors before its legacy flock
+  guards and release the same-process guard last. This prevents a completed
+  operation's descriptor closure from clearing a newly admitted record lock.
+- [x] Pass all 116 core cases locally in 2.15 s, including the duplicated-lock
+  assertion, existing shared/legacy session protections and strict CAS pressure
+  reclamation. No Rust test case was added.
+- [ ] Verify the final code on the existing platform matrix. The earlier beta
+  CAS failure remains unexplained: the duplicated-lock reproduction proves a
+  separate defect, not its historical cause.
+
+The [lock observations](probes/2026-10-02-gc-exclusive-descriptors.json) record
+the deterministic failure and correction. Duplication models a concurrent fork
+retaining a descriptor before exec closes it, without forking a multithreaded
+test runner. Explicit unlock ends an actual completed operation; it never
+weakens the shared locks protecting Cargo or authorizes cleanup of a live job.

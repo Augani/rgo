@@ -46,6 +46,22 @@ rebuild-over-migrate when the filesystem is the source of truth.
   Receipt schema 1 retains its strict zero-count policy, including protection
   when its ID cannot be queried. Neither schema enables normal pilot activation
   or automatic GC.
+  The per-job greeting now advertises `pending_before_exec`; a current caller
+  falls back before terminal activation/commit when it is absent or false.
+  The guardian accepts legacy `S`, and current callers send `Q` plus a four-byte
+  big-endian pending mask. Only forwarded, originally blocked, non-ignored
+  signals are accepted. The complete five-byte record is required before spawn;
+  queued signals are recreated while blocked in the child before exec. Incomplete
+  commit errors restore state and permit checkout fallback after acknowledging
+  cancellation. A completed record yields a running job whose errors never
+  retry Cargo. This capability negotiation does not change protocol 9,
+  admission revision 4, or receipt/owner schemas: cleanup authority is unchanged.
+- **Unix GC lock lifetime**: completed exclusive GC operations explicitly
+  release their flock guards, including on partial acquisition errors. Passive
+  descriptor copies cannot retain that exclusion after the operation ends.
+  Process-associated record descriptors close before the same-process guard
+  admits another operation. Cargo's inherited shared descendant locks retain
+  their close-only lifetime so running descendants remain protected.
 - **Pin downgrade**: the supervised launcher restores the legacy in-context
   marker when a durable pin survives `cargo clean`, so older readers see it on
   the next supervised build. Native-only Cargo can bypass that restoration;

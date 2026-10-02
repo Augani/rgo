@@ -163,6 +163,16 @@ The layout initializer now rejects a filesystem-root `RGO_HOME` and a pre-existi
 **Purpose:** deletion must be coordinated with the entire build, including paths that never invoke rgo's compiler wrapper.
 **Primary areas:** `context.rs`, `gc.rs`, `daemon.rs`, `db.rs`, `ipc.rs`, wrapper, real-Cargo concurrency tests.
 
+**Completed Unix GC exclusion:** the existing context/global lock case now
+reproduces a completed operation retaining exclusive flock locks through passive
+duplicated descriptors. GC-only guards explicitly unlock on completion and
+partial-acquisition errors; record descriptors close before the same-process
+fence releases. Cargo's inherited shared descendant locks are unchanged. All
+116 core cases passed locally in 2.15 s, including the strict CAS pressure case.
+The [observations](probes/2026-10-02-gc-exclusive-descriptors.json) prove this
+defect and correction, not the cause of the earlier beta CAS failure. Final
+platform verification and the broader P2 safety gates remain open.
+
 **macOS terminal metadata follow-up:** complete registered-shell records now
 have a separate daemon retirement path with a synced sibling journal, exact
 byte/file identity checks, and live-process exclusion. It never changes terminal
@@ -256,6 +266,18 @@ That run completed with 18 of 19 jobs passing. The
 passed all 116 existing tests on the matching macOS build and beta compiler;
 it did not reproduce or explain the first failure. No production GC change
 or weaker deletion assertion was made, and the original failure remains open.
+
+**macOS queued commit:** the existing fixture now pauses the caller after commit
+and requires the application's own pending-set observation before unblocking
+TERM. A complete, negotiated five-byte commit recreates queued blocked signals
+in the child before exec. Prepared and running jobs have separate types, so an
+incomplete record can restore state and fall back while completed-commit errors
+never retry Cargo. Two real socket-prefix cuts additionally require preserved
+TERM through fallback and signal-2 cancellation without fallback. All seven
+startup subcases and the combined local recovery/terminal case passed in
+24.72 s; the existing interrupt case passed in 3.57 s. Remaining compatibility
+and timing work stays open in the
+[macOS checklist](macos-cargo-supervision.md#queued-commit-and-startup-recovery--october-2-2026).
 
 **macOS priority (2026-10-02):** a private real-Cargo audit reproduced deletion
 while a detached child with closed inherited descriptors was still writing.

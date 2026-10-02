@@ -1,0 +1,22 @@
+{
+  "purpose": "Completed GC exclusion must end even while passive copies of its Unix flock descriptors remain open",
+  "baseline": "a78cef1de80b16ed543536106f9c94d520340fcf, with an assertion added to the existing context/global lock test",
+  "platform": "macOS 27.2 build 26B5091g arm64; Cargo 1.98.0 stable",
+  "before": {
+    "command": "cargo test -p rgo-core --lib supervision::tests::context_and_global_sessions_prevent_gc_without_replacing_lock_files -- --exact --nocapture",
+    "duration_seconds": 0.01,
+    "result": "FAILED: completed GC exclusion survived through duplicated descriptors",
+    "observation": "Duplicate the local, legacy-global and legacy-context exclusive flock descriptors, drop the GC owner, then require a new GC guard while all passive copies remain open"
+  },
+  "fix": "Owned exclusive Unix flock guards explicitly unlock on drop, including partial acquisition errors. GC record descriptors close before the flock guards; the same-process guard releases last. Cargo's inherited shared session descriptors retain their previous close-only lifetime.",
+  "after": {
+    "command": "cargo test -p rgo-core --lib",
+    "duration_seconds": 2.15,
+    "passed": 116,
+    "failed": 0,
+    "filtered": 0,
+    "requirements": "Duplicated exclusion release, existing shared/global/legacy session protections and strict CAS-only pressure reclamation all pass"
+  },
+  "isolation": "Each existing core case uses its own private temporary RGO_HOME; no developer activation changes. Descriptor duplication avoids forking a multithreaded test runner.",
+  "limits": "This deterministic defect does not establish the cause of the earlier macOS beta CAS-reclamation failure. Final platform verification remains pending. No Rust test case was added."
+}

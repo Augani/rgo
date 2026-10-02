@@ -1,0 +1,46 @@
+{
+  "purpose": "Existing macOS coalition case: blocked notifications before Cargo/app exec, incomplete commit fallback, and cancellation at a partial commit",
+  "baseline": "a78cef1de80b16ed543536106f9c94d520340fcf (native blocked-signal code 43dfe6a), with debug-only post-commit caller pause and pending-set observation",
+  "platform": "macOS 27.2 build 26B5091g arm64; Cargo 1.98.0 stable",
+  "isolation": "Sandbox private HOME/CARGO_HOME/RGO_HOME; real Cargo offline; cache and automatic GC off",
+  "command": "cargo test -p rgo-storage --test macos_coalition launchd_coalition_observes_closed_fd_writer_after_cargo_exits -- --exact --nocapture",
+  "before_queued_commit": {
+    "duration_seconds": 4.74,
+    "managed": "Caller paused after S commit, before runtime relay. App observed TERM missing from its kernel pending set and returned 0 instead of signal 15: FAILED",
+    "fallback": "Prep failure retained pending TERM in the same PID; app observed pending and returned handler code 74: PASS",
+    "cleanup": "Owned job retirement and actual idle-context deletion required before aggregate failure"
+  },
+  "intermediate_transport": {
+    "implementation": "Q plus four-byte queued mask; child pending-state restoration; prior run error path still propagated errors without fallback/cancellation acknowledgement",
+    "duration_seconds": 4.9,
+    "managed": "App observed pending before unblocking even with caller paused; actual signal exit 15: PASS",
+    "blocked_term_cut": "Socket write half shut down after three of five commit bytes. No managed commit, missing app marker, caller code 1 instead of fallback handler code 74: FAILED",
+    "deliverable_int_cut": "Captured INT at the same prefix cut. No managed commit, caller code 1 instead of signal 2: FAILED"
+  },
+  "after_phase_split": {
+    "duration_seconds": 24.72,
+    "managed": "Own mask and kernel pending set observed in the app before runtime relay; pending TERM, managed commit true, actual signal exit 15: PASS",
+    "prep_fallback": "Pending TERM, no managed commit, exact handler code 74: PASS",
+    "prefix_fallback": "Pending TERM restored after actual incomplete-record socket error; no managed commit, exact handler code 74: PASS",
+    "prefix_cancellation": "Captured deliverable INT acknowledged after restoration; no managed commit or fallback, actual signal exit 2: PASS",
+    "other_startup_controls": "All three prior deliverable/ignored termination controls retained their expected outcomes",
+    "retained_requirements": "Closed-FD detached writer, foreign replacement, real idle GC, durable job/terminal recovery, native arguments/environment and real controlling-terminal cases all passed"
+  },
+  "interrupt": "Existing custom-handler case passed in 3.57 s; exact code 73, stop/resume, surviving descendant and actual idle-context reclamation",
+  "compatibility": "Prepared greeting advertises pending_before_exec. Missing/false capability falls back before activation/commit. Guardian accepts legacy S and validates Q bits against forwarded, originally blocked and non-ignored signals. No cleanup authority, IPC protocol 9, admission revision 4 or receipt/owner schema change.",
+  "limits": "Live mixed-version upgrade, remaining mask/action and unsupported caller-state classes, post-commit/child-creation timing, declared runtime range, IDE and representative performance remain open. Three earlier unexplained interrupt/terminal/CAS failures remain unresolved. No new Rust test case; debug hooks excluded from release binaries.",
+  "final_with_gc_lock_fix": {
+    "command": "cargo test -p rgo-storage --test macos_coalition --test supervised_interrupt -- --nocapture",
+    "coalition_duration_seconds": 22.87,
+    "interrupt_duration_seconds": 3.56,
+    "result": "Both existing cases passed, including all seven startup subcases, actual writer protection and idle cleanup, terminal recovery and interrupt handler code 73"
+  },
+  "required_local_checks": {
+    "all_bin_debug_build": "PASS, 15.76 s",
+    "clippy_all_targets_deny_warnings": "PASS, 46.71 s",
+    "core_suite": "PASS, 116 cases in 2.15 s",
+    "all_bin_release_build": "PASS, 41.22 s",
+    "format_and_diff": "PASS",
+    "release_audit_exclusion": "PASS for rgo and rgo-rustc-wrapper; debug rgo positive control"
+  }
+}

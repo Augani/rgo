@@ -5,6 +5,7 @@ use anyhow::{Result, ensure};
 use rgo_core::paths::RgoPaths;
 use std::io::Write;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::os::unix::net::UnixStream;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
@@ -86,4 +87,65 @@ pub(super) fn committed(paths: &RgoPaths, enabled: bool) -> Result<()> {
         publish(&directory, "committed")?;
     }
     Ok(())
+}
+
+pub(super) fn caller_committed(paths: &RgoPaths) -> Result<()> {
+    let enabled = std::env::var_os("RGO_MACOS_SUPERVISOR_COMMIT_AUDIT").as_deref()
+        == Some(std::ffi::OsStr::new("1"));
+    let Some(directory) = directory(paths, enabled)? else {
+        return Ok(());
+    };
+    publish(&directory, "caller-committed")?;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match std::fs::read(directory.join("delivery-release")) {
+            Ok(action) => {
+                ensure!(action == b"resume", "invalid commit audit release");
+                return Ok(());
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        ensure!(
+            Instant::now() < deadline,
+            "supervisor commit audit was not released"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+pub(super) fn commit_prefix(
+    paths: &RgoPaths,
+    stream: &mut UnixStream,
+    commit: &[u8; 5],
+) -> Result<usize> {
+    let enabled = std::env::var_os("RGO_MACOS_SUPERVISOR_COMMIT_CUT_AUDIT").as_deref()
+        == Some(std::ffi::OsStr::new("1"));
+    let Some(directory) = directory(paths, enabled)? else {
+        return Ok(0);
+    };
+    stream.write_all(&commit[..3])?;
+    publish(&directory, "commit-cut")?;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut observed = false;
+    loop {
+        if !observed && cancelled_signal().is_some() {
+            publish(&directory, "commit-cancel-observed")?;
+            observed = true;
+        }
+        match std::fs::read(directory.join("cut-release")) {
+            Ok(action) => {
+                ensure!(action == b"resume", "invalid commit cut release");
+                stream.shutdown(std::net::Shutdown::Write)?;
+                return Ok(3);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        ensure!(
+            Instant::now() < deadline,
+            "supervisor commit cut was not released"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
 }

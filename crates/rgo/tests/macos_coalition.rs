@@ -108,6 +108,8 @@ fn publish_audit_release(path: &std::path::Path, action: &[u8]) -> std::io::Resu
 impl Drop for CancelProbe {
     fn drop(&mut self) {
         let _ = publish_audit_release(&self.release, b"resume");
+        let _ = publish_audit_release(&self.release.with_file_name("delivery-release"), b"resume");
+        let _ = publish_audit_release(&self.release.with_file_name("cut-release"), b"resume");
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
@@ -128,12 +130,14 @@ fn cancellation_before_commit(sandbox: &Sandbox, project: &std::path::Path, rgo:
     let source = project.join("src/main.rs");
     let original_source = std::fs::read(&source).unwrap();
     let mut failures = Vec::new();
-    for (signal, action, ignored, blocked) in [
-        (libc::SIGINT, b"resume".as_slice(), false, false),
-        (libc::SIGTERM, b"fail".as_slice(), false, false),
-        (libc::SIGINT, b"resume".as_slice(), true, false),
-        (libc::SIGTERM, b"resume".as_slice(), false, true),
-        (libc::SIGTERM, b"fail".as_slice(), false, true),
+    for (signal, action, ignored, blocked, cut) in [
+        (libc::SIGINT, b"resume".as_slice(), false, false, false),
+        (libc::SIGTERM, b"fail".as_slice(), false, false, false),
+        (libc::SIGINT, b"resume".as_slice(), true, false, false),
+        (libc::SIGTERM, b"resume".as_slice(), false, true, false),
+        (libc::SIGTERM, b"fail".as_slice(), false, true, false),
+        (libc::SIGTERM, b"resume".as_slice(), false, true, true),
+        (libc::SIGINT, b"resume".as_slice(), false, false, true),
     ] {
         if blocked {
             // Check the inherited mask before changing the application action.
@@ -144,6 +148,7 @@ fn cancellation_before_commit(sandbox: &Sandbox, project: &std::path::Path, rgo:
                 format!(
                     r#"unsafe extern "C" {{
     fn sigprocmask(how: i32, set: *const u32, old: *mut u32) -> i32;
+    fn sigpending(set: *mut u32) -> i32;
     fn signal(sig: i32, action: usize) -> usize;
     fn _exit(code: i32) -> !;
 }}
@@ -153,6 +158,12 @@ fn main() {{ unsafe {{
     assert_eq!(sigprocmask({setmask}, std::ptr::null(), &mut mask), 0);
     let term = 1_u32 << ({term} - 1);
     assert_ne!(mask & term, 0, "Cargo lost its inherited signal mask");
+    let mut pending = 0_u32;
+    assert_eq!(sigpending(&mut pending), 0);
+    let marker = std::path::PathBuf::from(std::env::var_os("RGO_PENDING_MARKER").unwrap());
+    let temporary = marker.with_extension("pending");
+    std::fs::write(&temporary, if pending & term != 0 {{ b"pending".as_slice() }} else {{ b"missing".as_slice() }}).unwrap();
+    std::fs::rename(temporary, marker).unwrap();
     if {handled} {{ signal({term}, terminated as *const () as usize); }}
     assert_eq!(sigprocmask({unblock}, &term, std::ptr::null_mut()), 0);
 }} }}
@@ -160,7 +171,7 @@ fn main() {{ unsafe {{
                     setmask = libc::SIG_SETMASK,
                     term = libc::SIGTERM,
                     unblock = libc::SIG_UNBLOCK,
-                    handled = action == b"fail",
+                    handled = action == b"fail" || cut,
                 ),
             )
             .unwrap();
@@ -188,6 +199,10 @@ fn main() {{ unsafe {{
             }
         }
         if blocked {
+            command.env("RGO_PENDING_MARKER", directory.join("pending-observed"));
+            if action == b"resume" && !cut {
+                command.env("RGO_MACOS_SUPERVISOR_COMMIT_AUDIT", "1");
+            }
             unsafe {
                 command.pre_exec(|| {
                     let mut mask = std::mem::zeroed();
@@ -200,6 +215,9 @@ fn main() {{ unsafe {{
                 });
             }
         }
+        if cut {
+            command.env("RGO_MACOS_SUPERVISOR_COMMIT_CUT_AUDIT", "1");
+        }
         let mut probe = CancelProbe {
             child: command.spawn().unwrap(),
             release: directory.join("release"),
@@ -209,8 +227,10 @@ fn main() {{ unsafe {{
             Instant::now() + Duration::from_secs(10),
         );
         assert!(probe.child.try_wait().unwrap().is_none());
-        assert_eq!(unsafe { libc::kill(probe.child.id() as i32, signal) }, 0);
-        if !ignored {
+        if !cut || blocked {
+            assert_eq!(unsafe { libc::kill(probe.child.id() as i32, signal) }, 0);
+        }
+        if !ignored && (!cut || blocked) {
             wait_for_file(
                 &directory.join(if blocked {
                     "signal-observed"
@@ -221,6 +241,46 @@ fn main() {{ unsafe {{
             );
         }
         publish_audit_release(&probe.release, action).unwrap();
+        if cut {
+            wait_for_file(
+                &directory.join("commit-cut"),
+                Instant::now() + Duration::from_secs(3),
+            );
+            if !blocked {
+                assert_eq!(unsafe { libc::kill(probe.child.id() as i32, signal) }, 0);
+                wait_for_file(
+                    &directory.join("commit-cancel-observed"),
+                    Instant::now() + Duration::from_secs(3),
+                );
+            }
+            publish_audit_release(&directory.join("cut-release"), b"resume").unwrap();
+        }
+        if blocked {
+            if action == b"resume" && !cut {
+                wait_for_file(
+                    &directory.join("caller-committed"),
+                    Instant::now() + Duration::from_secs(3),
+                );
+            }
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while !directory.join("pending-observed").is_file()
+                && probe.child.try_wait().unwrap().is_none()
+                && Instant::now() < deadline
+            {
+                thread::sleep(Duration::from_millis(10));
+            }
+            let observed = std::fs::read(directory.join("pending-observed")).unwrap_or_default();
+            println!(
+                "pending TERM before app unblocks: {:?}",
+                String::from_utf8_lossy(&observed)
+            );
+            if observed != b"pending" {
+                failures.push(format!("TERM was not pending before app code; release={action:?}, observed={observed:?}"));
+            }
+            if action == b"resume" && !cut {
+                publish_audit_release(&directory.join("delivery-release"), b"resume").unwrap();
+            }
+        }
         let deadline = Instant::now() + Duration::from_secs(10);
         let status = loop {
             if let Some(status) = probe.child.try_wait().unwrap() {
@@ -231,16 +291,17 @@ fn main() {{ unsafe {{
         };
         let committed = directory.join("committed").exists();
         println!(
-            "startup cancellation: signal={signal}, ignored={ignored}, blocked={blocked}, committed={committed}, status={status:?}"
+            "startup cancellation: signal={signal}, ignored={ignored}, blocked={blocked}, cut={cut}, committed={committed}, status={status:?}"
         );
-        let expected_commit = ignored || (blocked && action == b"resume");
+        let fallback = blocked && (action == b"fail" || cut);
+        let expected_commit = ignored || (blocked && action == b"resume" && !cut);
         if committed != expected_commit
             || (ignored && !status.success())
-            || (blocked && action == b"fail" && status.code() != Some(74))
-            || (blocked && action == b"resume" && status.signal() != Some(signal))
+            || (fallback && status.code() != Some(74))
+            || (blocked && !fallback && status.signal() != Some(signal))
             || (!ignored && !blocked && status.signal() != Some(signal))
         {
-            failures.push(format!("signal={signal}, ignored={ignored}, blocked={blocked}, committed={committed}, status={status:?}; stderr={}", std::fs::read_to_string(&log).unwrap()));
+            failures.push(format!("signal={signal}, ignored={ignored}, blocked={blocked}, cut={cut}, committed={committed}, status={status:?}; stderr={}", std::fs::read_to_string(&log).unwrap()));
         }
         // Wait for the owned one-use guardian to finish, then prove positive
         // reclamation before repeating in the same isolated workspace.
@@ -279,6 +340,12 @@ fn main() {{ unsafe {{
             "signal-observed",
             "release",
             "committed",
+            "caller-committed",
+            "delivery-release",
+            "pending-observed",
+            "commit-cut",
+            "commit-cancel-observed",
+            "cut-release",
             "stderr",
         ] {
             match std::fs::remove_file(directory.join(name)) {

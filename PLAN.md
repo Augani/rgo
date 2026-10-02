@@ -109,6 +109,21 @@ and release gates remain open.
 
 ## 0. What changed vs. `doc.md`, and why
 
+**2026-10-02 queued macOS commit and completed GC locks:** the existing pilot
+case reproduced blocked TERM missing from the application's pending set and
+incorrect code-1 outcomes after an incomplete commit. Capability negotiation,
+a complete queued-signal record and distinct prepared/running job types now
+preserve pending notifications before exec and permit fallback only before a
+completed commit. A separate existing core case reproduced exclusive GC locks
+surviving through duplicated descriptors; GC-only guards now explicitly unlock,
+with record descriptors closed before the same-process fence releases. Cargo's
+inherited shared descendant locks remain unchanged. All 116 core cases and both
+existing macOS integration cases pass locally, alongside an all-bin build and
+zero-warning Clippy. Platform acceptance, live upgrades, broader signal timing
+and the earlier unexplained failures remain open in the
+[macOS checklist](docs/macos-cargo-supervision.md#queued-commit-and-startup-recovery--october-2-2026).
+Normal pilot activation and automatic GC remain off.
+
 **2026-10-02 macOS supervisor:** Unix cleanup with a detached closed-FD writer
 is a reproduced corruption case. A local isolated launchd fixture verifies
 durable kernel-coalition protection through real GC and idle reclamation;

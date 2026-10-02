@@ -195,7 +195,9 @@ pub fn run(
                 &command_args,
                 &paths,
                 context,
-            ) {
+            )
+            .and_then(|job| job.commit(&mut session))
+            {
                 Ok(job) => return job.run(session),
                 Err(error) => {
                     super::macos_cargo_job::abort_cancelled();

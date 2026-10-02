@@ -102,6 +102,8 @@ enum Message {
     },
     Prepared {
         coalition: u64,
+        #[serde(default)]
+        pending_before_exec: bool,
     },
     Configured,
     Started {
@@ -363,10 +365,23 @@ pub(super) struct PreparedJob {
     stream: UnixStream,
     terminal: Option<terminal::Caller>,
     signals: Option<SignalRelay>,
+    #[cfg(debug_assertions)]
+    audit_paths: RgoPaths,
+}
+
+/// Obtained only after the complete commit packet was sent. Errors from this
+/// phase must never launch another Cargo invocation.
+pub(super) struct RunningJob {
+    stream: UnixStream,
+    terminal: Option<terminal::Caller>,
+    signals: Option<SignalRelay>,
+    #[cfg(debug_assertions)]
+    audit_paths: RgoPaths,
+    committed: Instant,
 }
 
 impl PreparedJob {
-    /// Prepare only. Cargo cannot start until `run` sends its one-byte commit.
+    /// Prepare only. Cargo cannot start until `commit` sends the full record.
     pub(super) fn prepare(
         executable: &Path,
         args: &[OsString],
@@ -500,7 +515,18 @@ impl PreparedJob {
         }
         send_descriptors(&stream, &descriptors)?;
         let coalition = match read_frame::<Message>(&mut stream)? {
-            Message::Prepared { coalition } => coalition,
+            Message::Prepared {
+                coalition,
+                pending_before_exec,
+            } => {
+                // A guardian launched during an upgrade may be older. Refuse
+                // this handoff before activating the terminal or committing.
+                ensure!(
+                    pending_before_exec,
+                    "Cargo guardian cannot queue signals before exec"
+                );
+                coalition
+            }
             Message::Failed { detail } => {
                 bail!("Cargo guardian cannot admit the invocation: {detail}")
             }
@@ -516,6 +542,8 @@ impl PreparedJob {
             stream,
             terminal,
             signals: Some(SignalRelay::new()?),
+            #[cfg(debug_assertions)]
+            audit_paths: paths.clone(),
         };
         if let Some(terminal) = &mut job.terminal {
             terminal.attach(
@@ -543,25 +571,56 @@ impl PreparedJob {
         Ok(job)
     }
 
-    pub(super) fn run(mut self, mut session: SessionGuard) -> Result<()> {
-        if let Some(signal) = cancelled_signal() {
-            if let Some(terminal) = &mut self.terminal {
-                terminal.restore();
-            }
-            drop(self.signals.take());
-            drop(session);
-            // No commit byte was sent. OS descriptor closure lets the guardian
-            // retire its empty receipt/job; cancellation never retries Cargo.
-            terminate(signal);
-        }
+    /// Every error leaves the commit incomplete, so the caller may restore
+    /// state and use checkout Cargo after acknowledging any cancellation.
+    pub(super) fn commit(mut self, session: &mut SessionGuard) -> Result<RunningJob> {
+        ensure!(
+            cancelled_signal().is_none(),
+            "Cargo preparation was cancelled"
+        );
         self.stream.set_read_timeout(None)?;
-        self.signals
-            .as_ref()
-            .context("Cargo signal relay is missing")?
-            .committing()?;
+        let pending = {
+            let relay = self
+                .signals
+                .as_mut()
+                .context("Cargo signal relay is missing")?;
+            relay.committing()?;
+            relay.queued_commit()
+        };
+        ensure!(cancelled_signal().is_none(), "Cargo commit was cancelled");
         session.release_local_for_macos_guardian();
         let committed = Instant::now();
-        self.stream.write_all(b"S")?; // From here failure cannot retry Cargo.
+        let mut commit = [0_u8; 5];
+        commit[0] = b'Q';
+        commit[1..].copy_from_slice(&pending.to_be_bytes());
+        // A failed write cannot have completed this fixed-length packet. The
+        // guardian waits for all bytes before spawning; teardown closes the
+        // stream, restores terminal state, and requeues unsent notifications.
+        #[cfg(debug_assertions)]
+        let offset = audit::commit_prefix(&self.audit_paths, &mut self.stream, &commit)?;
+        #[cfg(not(debug_assertions))]
+        let offset = 0;
+        self.stream.write_all(&commit[offset..])?;
+        // No fallible operation follows the completed packet in this phase.
+        if let Some(relay) = &mut self.signals {
+            relay.pending_commit = 0;
+        }
+        Ok(RunningJob {
+            stream: self.stream,
+            terminal: self.terminal,
+            signals: self.signals,
+            #[cfg(debug_assertions)]
+            audit_paths: self.audit_paths,
+            committed,
+        })
+    }
+}
+
+impl RunningJob {
+    pub(super) fn run(mut self, session: SessionGuard) -> Result<()> {
+        let committed = self.committed;
+        #[cfg(debug_assertions)]
+        audit::caller_committed(&self.audit_paths)?;
         let mut reader = self.stream.try_clone()?;
         let wake = wake::Wake::get()?;
         let (sender, receiver) = std::sync::mpsc::channel();
@@ -682,6 +741,7 @@ extern "C" fn capture_signal(signal: i32) {
 struct SignalRelay {
     dispositions: Vec<(i32, libc::sigaction)>,
     mask: libc::sigset_t,
+    pending_commit: u32,
 }
 
 impl SignalRelay {
@@ -717,6 +777,7 @@ impl SignalRelay {
         let mut relay = Self {
             dispositions: Vec::new(),
             mask,
+            pending_commit: 0,
         };
         for signal in FORWARDED_SIGNALS {
             let action = Self::action();
@@ -781,6 +842,25 @@ impl SignalRelay {
         }
         Ok(())
     }
+
+    fn queued_commit(&mut self) -> u32 {
+        let blocked = self
+            .dispositions
+            .iter()
+            .fold(0_u32, |mask, (signal, previous)| {
+                if previous.sa_sigaction != libc::SIG_IGN
+                    && unsafe { libc::sigismember(&self.mask, *signal) } == 1
+                {
+                    mask | (1 << signal)
+                } else {
+                    mask
+                }
+            });
+        // These bits remain owned by the relay until the complete commit is
+        // written. A failed write must still restore them on teardown.
+        self.pending_commit = SIGNALS.fetch_and(!blocked, Ordering::AcqRel) & blocked;
+        self.pending_commit
+    }
 }
 
 impl Drop for SignalRelay {
@@ -790,7 +870,7 @@ impl Drop for SignalRelay {
         let forwarded = Self::forwarded_set();
         unsafe { libc::sigprocmask(libc::SIG_BLOCK, &forwarded, std::ptr::null_mut()) };
         SIGNAL_WAKE.store(-1, Ordering::Relaxed);
-        let pending = SIGNALS.load(Ordering::Acquire);
+        let pending = SIGNALS.load(Ordering::Acquire) | self.pending_commit;
         for (signal, previous) in &self.dispositions {
             unsafe {
                 libc::sigaction(*signal, previous, std::ptr::null_mut());
@@ -941,6 +1021,7 @@ pub fn guardian(directory: &Path, token: &str, context: Option<&Path>) -> Result
             &mut stream,
             &Message::Prepared {
                 coalition: coalition.id(),
+                pending_before_exec: true,
             },
         )?;
         let mut initially_foreground = false;
@@ -959,7 +1040,23 @@ pub fn guardian(directory: &Path, token: &str, context: Option<&Path>) -> Result
         }
         let mut commit = [0_u8];
         stream.read_exact(&mut commit)?;
-        ensure!(commit == *b"S", "Cargo job was not committed");
+        let pending = match commit[0] {
+            b'S' => 0, // Older callers have no queued-signal packet.
+            b'Q' => {
+                let mut bytes = [0_u8; 4];
+                stream.read_exact(&mut bytes)?;
+                let pending = u32::from_be_bytes(bytes);
+                let forwarded = FORWARDED_SIGNALS
+                    .into_iter()
+                    .fold(0_u32, |mask, signal| mask | (1 << signal));
+                ensure!(
+                    pending & !forwarded == 0 && request.signals.accepts_pending(pending),
+                    "Cargo commit contains unsupported pending signals"
+                );
+                pending
+            }
+            _ => bail!("Cargo job was not committed"),
+        };
         #[cfg(debug_assertions)]
         audit::committed(
             &paths,
@@ -990,7 +1087,7 @@ pub fn guardian(directory: &Path, token: &str, context: Option<&Path>) -> Result
         // A pre_exec callback forces Command off Darwin's posix_spawn path.
         // Exec already resets caught handlers. Pipes need no callback when
         // the remaining inherited mask/ignored dispositions match the caller.
-        if slave.is_some() || request.signals != events::NativeSignals::capture()? {
+        if pending != 0 || slave.is_some() || request.signals != events::NativeSignals::capture()? {
             unsafe {
                 command.pre_exec(move || {
                     if let Some(slave) = slave.filter(|_| initially_foreground) {
@@ -1005,7 +1102,7 @@ pub fn guardian(directory: &Path, token: &str, context: Option<&Path>) -> Result
                             return Err(std::io::Error::last_os_error());
                         }
                     }
-                    request.signals.restore_in_child()
+                    request.signals.restore_in_child(pending)
                 });
             }
         }

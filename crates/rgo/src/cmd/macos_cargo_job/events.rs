@@ -46,8 +46,12 @@ impl NativeSignals {
         Ok(value)
     }
 
+    pub(super) fn accepts_pending(self, pending: u32) -> bool {
+        pending & !(self.blocked & !self.ignored) == 0
+    }
+
     // Only async-signal-safe syscalls: this runs between fork and exec.
-    pub(super) unsafe fn restore_in_child(self) -> std::io::Result<()> {
+    pub(super) unsafe fn restore_in_child(self, pending: u32) -> std::io::Result<()> {
         unsafe {
             let mut mask = std::mem::zeroed();
             libc::sigemptyset(&mut mask);
@@ -71,6 +75,14 @@ impl NativeSignals {
             }
             if libc::sigprocmask(libc::SIG_SETMASK, &mask, std::ptr::null_mut()) != 0 {
                 return Err(std::io::Error::last_os_error());
+            }
+            // Fork starts with no pending signals. Recreate only validated
+            // blocked notifications before exec can run Cargo/application code.
+            // The child is single-threaded here; kill/getpid are signal-safe.
+            for signal in super::FORWARDED_SIGNALS {
+                if pending & (1 << signal) != 0 && libc::kill(libc::getpid(), signal) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
             }
             Ok(())
         }

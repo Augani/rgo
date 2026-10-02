@@ -297,14 +297,31 @@ impl SessionGuard {
 }
 
 pub struct GcGuards {
-    #[cfg(unix)]
-    _local: File,
-    #[cfg(unix)]
-    _legacy_global: File,
+    // Drop process-associated record locks before admitting another operation
+    // in this process: closing an old descriptor also clears its record lock.
     _global: File,
-    #[cfg(unix)]
-    _legacy_context: Option<File>,
     _context: Option<File>,
+    #[cfg(unix)]
+    _legacy_context: Option<ExclusiveFlock>,
+    #[cfg(unix)]
+    _legacy_global: ExclusiveFlock,
+    #[cfg(unix)]
+    _local: ExclusiveFlock,
+}
+
+/// A completed GC operation must release its exclusive flock even if a
+/// concurrent fork briefly retains the same open file description. Cargo's
+/// shared descendant locks deliberately keep their existing close-only life.
+#[cfg(unix)]
+struct ExclusiveFlock(File);
+
+#[cfg(unix)]
+impl Drop for ExclusiveFlock {
+    fn drop(&mut self) {
+        if let Err(error) = FileExt::unlock(&self.0) {
+            tracing::warn!(%error, "releasing completed GC exclusion");
+        }
+    }
 }
 
 // POSIX record locks are process-associated. A separate flock file supplies
@@ -550,7 +567,12 @@ pub fn try_lock_gc(paths: &RgoPaths, context: Option<&Path>) -> Result<Option<Gc
         return Ok(None);
     }
     #[cfg(unix)]
-    verify_lock_identity(&paths.state_dir().join("locks/process-guard.lock"), &local)?;
+    let local = ExclusiveFlock(local);
+    #[cfg(unix)]
+    verify_lock_identity(
+        &paths.state_dir().join("locks/process-guard.lock"),
+        &local.0,
+    )?;
     #[cfg(unix)]
     let legacy_global = {
         let file = open_lock(paths, None, true)?;
@@ -558,7 +580,8 @@ pub fn try_lock_gc(paths: &RgoPaths, context: Option<&Path>) -> Result<Option<Gc
             tracing::debug!(guard = "legacy-global", "GC lifecycle guard is busy");
             return Ok(None);
         }
-        verify_lock_identity(&lock_path(paths, None, true)?, &file)?;
+        let file = ExclusiveFlock(file);
+        verify_lock_identity(&lock_path(paths, None, true)?, &file.0)?;
         file
     };
     let global = open_lock(paths, None, cfg!(not(unix)))?;
@@ -574,7 +597,8 @@ pub fn try_lock_gc(paths: &RgoPaths, context: Option<&Path>) -> Result<Option<Gc
             tracing::debug!(guard = "legacy-context", "GC lifecycle guard is busy");
             return Ok(None);
         }
-        verify_lock_identity(&lock_path(paths, Some(context), true)?, &file)?;
+        let file = ExclusiveFlock(file);
+        verify_lock_identity(&lock_path(paths, Some(context), true)?, &file.0)?;
         Some(file)
     } else {
         None
@@ -596,14 +620,14 @@ pub fn try_lock_gc(paths: &RgoPaths, context: Option<&Path>) -> Result<Option<Gc
         return Ok(None);
     }
     Ok(Some(GcGuards {
-        #[cfg(unix)]
-        _local: local,
-        #[cfg(unix)]
-        _legacy_global: legacy_global,
         _global: global,
+        _context: context_guard,
         #[cfg(unix)]
         _legacy_context: legacy_context_guard,
-        _context: context_guard,
+        #[cfg(unix)]
+        _legacy_global: legacy_global,
+        #[cfg(unix)]
+        _local: local,
     }))
 }
 
@@ -772,6 +796,24 @@ mod tests {
         assert!(try_lock_gc(&paths, Some(&context)).unwrap().is_none());
         drop(global_session);
         assert!(try_lock_gc(&paths, Some(&context)).unwrap().is_some());
+        #[cfg(unix)]
+        {
+            // Fork can duplicate these open file descriptions before exec
+            // closes them. Their passive copies must not retain a completed
+            // GC operation's exclusive locks.
+            let gc = try_lock_gc(&paths, Some(&context)).unwrap().unwrap();
+            let retained = [
+                gc._local.0.try_clone().unwrap(),
+                gc._legacy_global.0.try_clone().unwrap(),
+                gc._legacy_context.as_ref().unwrap().0.try_clone().unwrap(),
+            ];
+            drop(gc);
+            assert!(
+                try_lock_gc(&paths, Some(&context)).unwrap().is_some(),
+                "completed GC exclusion survived through duplicated descriptors"
+            );
+            drop(retained);
+        }
     }
 
     #[cfg(windows)]
