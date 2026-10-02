@@ -1,12 +1,14 @@
 """Drive an actual interactive zsh in a private PTY; no third-party packages."""
 import errno
 import fcntl
+import json
 import os
 import pathlib
 import pty
 import select
 import signal
 import struct
+import subprocess
 import termios
 import time
 
@@ -20,6 +22,8 @@ pending = bytearray()
 transcript = bytearray()
 prompt = b"rgo-probe> "
 shell_sequence = 0
+caller_groups = set()
+shell_reaped = False
 
 def expect(value, timeout=20):
     deadline = time.monotonic() + timeout
@@ -40,6 +44,10 @@ def expect(value, timeout=20):
             transcript.extend(chunk)
     end = pending.index(value) + len(value)
     del pending[:end]
+    if value == b"RGO_TERMINAL_READY":
+        group = os.tcgetpgrp(master)
+        if group != pid:
+            caller_groups.add(group)
 
 def send(value):
     os.write(master, value)
@@ -71,9 +79,48 @@ def wait_for(operation, description):
 def jobs():
     return list((pathlib.Path(os.environ["RGO_HOME"]) / "state").glob("macos-cargo-job-*"))
 
+def retire_private_jobs():
+    for directory in jobs():
+        try:
+            owner = json.loads((directory / "owner.json").read_text())
+            target = owner["domain"] + "/" + owner["label"]
+            assert owner["domain"] == f"gui/{os.getuid()}"
+            assert owner["label"] == "com.rgo.cargo." + owner["token"][:32]
+            state = subprocess.run(["launchctl", "print", target], capture_output=True,
+                text=True, timeout=3, check=False)
+            if state.returncode == 0 and str(directory) in state.stdout:
+                guardian = next(int(line.split("=", 1)[1]) for line in state.stdout.splitlines()
+                    if line.strip().startswith("pid = "))
+                rows = subprocess.check_output(["ps", "-axo", "pid=,ppid=,pgid="],
+                    text=True, timeout=3)
+                processes = [tuple(map(int, row.split())) for row in rows.splitlines()]
+                descendants = {guardian}
+                while True:
+                    expanded = descendants | {child for child, parent, _ in processes if parent in descendants}
+                    if expanded == descendants:
+                        break
+                    descendants = expanded
+                for child, _, group in processes:
+                    if child in descendants and child != guardian and group > 0 and group != pid:
+                        try:
+                            # Recheck live session membership before signaling.
+                            if os.getsid(child) == guardian:
+                                os.killpg(group, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+            subprocess.run(["launchctl", "bootout", target], stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL, timeout=3, check=False)
+        except (OSError, subprocess.TimeoutExpired):
+            # The guardian can retire between enumeration and this cleanup.
+            pass
+
 try:
     fcntl.ioctl(master, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 80, 0, 0))
     expect(prompt)
+    shell_command("precmd() { : 'existing prompt function'; }; rgo_existing_preexec() { print -r -- \"$1\" > existing-hook-command; }; preexec_functions=(rgo_existing_preexec)")
+    shell_command('eval "$("$RGO_TERMINAL_HELPER" macos-terminal-host init-zsh)"')
+    shell_command('eval "$("$RGO_TERMINAL_HELPER" macos-terminal-host init-zsh)"')
+    shell_command('[[ ${functions[precmd]} == *"existing prompt function"* && ${preexec_functions[(Ie)rgo_existing_preexec]} -gt 0 && -n $RGO_TERMINAL_HOST ]] || exit 91')
     command("stty -g > before-terminal-mode")
     expect(prompt)
     command("cargo run --offline")
@@ -159,6 +206,10 @@ try:
     expect(b"RGO_TERMINAL_READY")
     caller_group = os.tcgetpgrp(master)
     assert caller_group > 0 and caller_group != pid
+    hosts = list((pathlib.Path(os.environ["RGO_HOME"]) / "state/terminal-hosts").iterdir())
+    assert len(hosts) == 1
+    host = hosts[0]
+    crash_lease = json.loads((host / "lease.json").read_text())
     os.kill(caller_group, signal.SIGKILL)
     expect(prompt)
     status(137)
@@ -167,13 +218,85 @@ try:
     expect(prompt)
     before = pathlib.Path("before-crash-terminal-mode").read_bytes()
     after = pathlib.Path("crash-terminal-mode").read_bytes()
-    if before != after:
-        # Keep the observed limitation visible. Exact restoration after this
-        # shell/guardian race is an activation gate, not a passing claim.
-        print(f"macOS terminal activation gap: caller SIGKILL changed terminal mode: before={before!r}, after={after!r}")
+    assert before == after, f"registered shell did not recover after caller SIGKILL: before={before!r}, after={after!r}"
+
+    # Replay the actual saved lease after the original caller has gone. Even a
+    # matching raw-mode shape cannot authorize a later command or a reused PID.
+    pathlib.Path("saved-terminal-lease.json").write_text(json.dumps(crash_lease))
+    pathlib.Path("stale-terminal-lease.py").write_text('''import json, pathlib, sys, tty
+host = pathlib.Path(sys.argv[1])
+lease = json.loads(pathlib.Path('saved-terminal-lease.json').read_text())
+if sys.argv[2] == 'reused':
+    lease['generation'] = int((host / 'generation').read_text())
+    lease['caller'] = json.loads((host / 'host.json').read_text())['shell']
+    lease['caller']['started_microseconds'] = (lease['caller']['started_microseconds'] + 1) % 1000000
+path = host / 'lease.json'
+path.write_text(json.dumps(lease))
+path.chmod(0o600)
+with open('/dev/tty', 'rb', buffering=0) as terminal:
+    tty.setraw(terminal.fileno())
+''')
+    for reason in ("generation", "reused"):
+        shell_command(f"python3 stale-terminal-lease.py '{host}' {reason}")
+        assert not (host / "lease.json").exists(), f"{reason} lease was not retired"
+        shell_command("stty -g > refused-terminal-mode")
+        assert pathlib.Path("refused-terminal-mode").read_bytes() != before, f"{reason} lease overwrote a later raw mode"
+        shell_command('stty "$(cat before-crash-terminal-mode)"')
+    shell_command("stty -g > recovered-terminal-mode")
+    assert pathlib.Path("recovered-terminal-mode").read_bytes() == before
+    shell_command("stty -ixon; stty -g > intentional-terminal-edit")
+    shell_command("stty -g > subsequent-terminal-mode")
+    assert pathlib.Path("intentional-terminal-edit").read_bytes() == pathlib.Path("subsequent-terminal-mode").read_bytes(), "recovery overwrote a later terminal edit"
     assert b"guardian unavailable" not in transcript, bytes(transcript)
-    print("installed Cargo pilot: controlling /dev/tty, isatty/color, input/EOF, resize, Ctrl-Z/fg/bg, TOSTOP, Ctrl-C, exit status, normal terminal restoration, mixed pipes/redirection, late output, and caller-crash job cleanup passed")
-finally:
-    os.killpg(pid, signal.SIGKILL)
+    shell_command('precmd_functions=(${precmd_functions:#__rgo_terminal_precmd})')
+    command("cargo run --offline")
+    expect(b"RGO_TERMINAL_READY")
+    send(b"quit\n")
+    expect(prompt)
+    status(17)
+    shell_command('[[ $RGO_TERMINAL_HOST == disabled ]] || exit 93')
+    assert b"guardian unavailable" in transcript, "removed finalizer did not refuse admission"
+    assert not jobs(), "removed finalizer admitted an owned guardian"
+    shell_command('__rgo_terminal_undo; [[ -z $RGO_TERMINAL_HOST && ${functions[precmd]} == *"existing prompt function"* && ${preexec_functions[(Ie)rgo_existing_preexec]} -gt 0 ]] || exit 92')
+    assert not host.exists(), "undo retained the owned terminal host"
+    shell_command('eval "$("$RGO_TERMINAL_HELPER" macos-terminal-host init-zsh)"')
+    assert int(next((pathlib.Path(os.environ["RGO_HOME"]) / "state/terminal-hosts").iterdir()).joinpath("generation").read_text()) == 0
+    command("cargo run --offline")
+    expect(b"RGO_TERMINAL_READY")
+    # Disconnect an active physical terminal, then await actual shell exit and
+    # guardian retirement. There is no terminal left whose modes may be reset.
     os.close(master)
-    os.waitpid(pid, 0)
+    master = None
+    wait_for(lambda: not jobs(), "terminal disconnect retained an active guardian")
+    deadline = time.monotonic() + 10
+    while True:
+        exited, exit_status = os.waitpid(pid, os.WNOHANG)
+        if exited == pid:
+            shell_reaped = True
+            # zsh 5.9 handles SIGHUP via zexit(SIGHUP, ZEXIT_SIGNAL):
+            # its normal exit code is the signal number, not 128 + SIGHUP.
+            assert os.waitstatus_to_exitcode(exit_status) == signal.SIGHUP, exit_status
+            break
+        assert time.monotonic() < deadline, "disconnected shell did not exit"
+        time.sleep(0.02)
+    print("installed Cargo pilot: controlling /dev/tty, isatty/color, input/EOF, resize, Ctrl-Z/fg/bg, TOSTOP, Ctrl-C, exit status, normal terminal restoration, mixed pipes/redirection, late output, caller-crash job cleanup, registered zsh recovery, stale generations/PID identities, preserved hooks, undo, and active-terminal disconnect passed")
+finally:
+    # A failed assertion must also retire this private shell's stopped jobs.
+    # Their process groups differ from the shell group used by pty.fork().
+    for group in caller_groups:
+        try:
+            if os.getsid(group) == pid:
+                os.killpg(group, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    try:
+        retire_private_jobs()
+    finally:
+        try:
+            os.killpg(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        if master is not None:
+            os.close(master)
+        if not shell_reaped:
+            os.waitpid(pid, 0)

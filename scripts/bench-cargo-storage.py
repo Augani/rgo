@@ -15,6 +15,8 @@ import pathlib
 import platform
 import re
 import shutil
+import shlex
+import signal
 import statistics
 import subprocess
 import tempfile
@@ -24,7 +26,104 @@ import time
 REPO = pathlib.Path(__file__).resolve().parent.parent
 
 
-def command(argv, cwd, env, capture=None):
+class TerminalShell:
+    """One private interactive zsh; samples include hooks and prompt recovery."""
+
+    def __init__(self, project, env, rgo=None):
+        import pty
+        self.pid, self.master = pty.fork()
+        if self.pid == 0:
+            try:
+                os.chdir(project)
+                shell_env = {**env, "PS1": "rgo-bench> ", "TERM": "xterm-256color"}
+                os.execve("/bin/zsh", ["zsh", "-f"], shell_env)
+            except BaseException:
+                os._exit(127)
+        self.pending = bytearray()
+        self.sequence = 0
+        os.set_inheritable(self.master, False)
+        try:
+            self._expect(b"rgo-bench> ")
+            if rgo is not None:
+                self._run(f'eval "$( {shlex.quote(rgo)} macos-terminal-host init-zsh )"')
+                self._run('[[ -n $RGO_TERMINAL_HOST && $__rgo_terminal_owner == v1 ]]')
+        except BaseException:
+            self.close()
+            raise
+
+    def _expect(self, marker):
+        import select
+        deadline = time.monotonic() + 60
+        while marker not in self.pending:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise RuntimeError(f"terminal benchmark timed out: {bytes(self.pending[-4000:])!r}")
+            ready, _, _ = select.select([self.master], [], [], min(remaining, 0.2))
+            if ready:
+                chunk = os.read(self.master, 8192)
+                if not chunk:
+                    raise RuntimeError("terminal benchmark shell exited")
+                self.pending.extend(chunk)
+                if len(self.pending) > 256 * 1024:
+                    raise RuntimeError("terminal benchmark output exceeded its limit")
+        end = self.pending.index(marker) + len(marker)
+        result = bytes(self.pending[:end])
+        del self.pending[:end]
+        return result
+
+    def _run(self, text):
+        self.sequence += 1
+        marker = f"RGO_BENCH_DONE:{self.sequence}:".encode()
+        # Expansion keeps the completed marker out of the echoed command line.
+        line = f"{text}; __rgo_bench_status=$?; print -r -- RGO_BENCH_DONE:$(({self.sequence})):$__rgo_bench_status"
+        started = time.perf_counter_ns()
+        os.write(self.master, line.encode() + b"\n")
+        output = self._expect(marker)
+        ending = self._expect(b"rgo-bench> ")
+        elapsed = (time.perf_counter_ns() - started) / 1_000_000
+        status = int(ending.splitlines()[0])
+        if status:
+            raise RuntimeError(f"terminal command failed ({status}): {(output + ending)[-4000:]!r}")
+        return elapsed, output + ending
+
+    def run(self, argv, env, capture):
+        elapsed, output = self._run(shlex.join(map(str, argv)))
+        inspect_output(elapsed, output, env, capture)
+        return elapsed, output.decode(errors="replace")
+
+    def close(self):
+        # Close the PTY before reaping. Waiting with its master open can stall
+        # a macOS shell's terminal teardown. All samples finish at a prompt.
+        os.close(self.master)
+        for terminate in (False, True):
+            if terminate:
+                try:
+                    os.killpg(self.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                if os.waitpid(self.pid, os.WNOHANG)[0] == self.pid:
+                    return
+                time.sleep(0.02)
+        raise RuntimeError("terminal benchmark shell did not exit after PTY closure")
+
+
+def inspect_output(elapsed_ms, output, env, capture):
+    if env.get("RGO_MACOS_SUPERVISOR_PILOT") == "1" and b"guardian unavailable" in output:
+        raise RuntimeError("latency sample fell back outside the macOS guardian")
+    if capture is not None:
+        lines = re.sub(r"\x1b\[[0-9;]*m", "", output.decode(errors="replace")).splitlines()
+        capture.append({
+            "elapsed_ms": round(elapsed_ms, 1),
+            "stages": [line for line in lines if "macOS Cargo guardian " in line
+                       or "supervised Cargo " in line],
+        })
+
+
+def command(argv, cwd, env, capture=None, shell=None):
+    if shell is not None:
+        return shell.run(argv, env, capture)
     started = time.perf_counter_ns()
     result = subprocess.run(argv, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     elapsed_ms = (time.perf_counter_ns() - started) / 1_000_000
@@ -33,15 +132,7 @@ def command(argv, cwd, env, capture=None):
             f"{' '.join(map(str, argv))} failed ({result.returncode}):\n"
             + result.stderr.decode(errors="replace")[-4000:]
         )
-    if env.get("RGO_MACOS_SUPERVISOR_PILOT") == "1" and b"guardian unavailable" in result.stderr:
-        raise RuntimeError("latency sample fell back outside the macOS guardian")
-    if capture is not None:
-        lines = re.sub(r"\x1b\[[0-9;]*m", "", result.stderr.decode(errors="replace")).splitlines()
-        capture.append({
-            "elapsed_ms": round(elapsed_ms, 1),
-            "stages": [line for line in lines if "macOS Cargo guardian " in line
-                       or "supervised Cargo " in line],
-        })
+    inspect_output(elapsed_ms, result.stderr, env, capture)
     return elapsed_ms, result.stdout.decode(errors="replace").strip()
 
 
@@ -62,7 +153,7 @@ def sha256(path):
     return digest.hexdigest()
 
 
-def paired_samples(plain, managed, project, env, count, edit, capture=None):
+def paired_samples(plain, managed, project, env, count, edit, capture=None, shells=None):
     samples = {"plain": [], "supervised": []}
     for index in range(count):
         if edit:
@@ -73,7 +164,8 @@ def paired_samples(plain, managed, project, env, count, edit, capture=None):
         if index % 2:
             order.reverse()
         for mode, argv in order:
-            elapsed, _ = command(argv, project, env, capture if mode == "supervised" else None)
+            elapsed, _ = command(argv, project, env, capture if mode == "supervised" else None,
+                                 shells[mode] if shells else None)
             samples[mode].append(elapsed)
     return {mode: summary(values) for mode, values in samples.items()}
 
@@ -87,6 +179,7 @@ def main():
     parser.add_argument("--output", type=pathlib.Path)
     parser.add_argument("--macos-guardian", action="store_true", help="Measure the private macOS launchd guardian instead of descriptor-only supervision")
     parser.add_argument("--profile-guardian", action="store_true", help="Record debug timing stages separately; requires --macos-guardian")
+    parser.add_argument("--zsh-terminal", action="store_true", help="Compare private interactive zsh sessions, registering recovery only for the guardian; requires --macos-guardian")
     args = parser.parse_args()
     if not args.real_cargo or not args.real_cargo.is_absolute():
         parser.error("--real-cargo must name an absolute Cargo executable")
@@ -96,6 +189,8 @@ def main():
         parser.error("--macos-guardian requires macOS")
     if args.profile_guardian and not args.macos_guardian:
         parser.error("--profile-guardian requires --macos-guardian")
+    if args.zsh_terminal and not args.macos_guardian:
+        parser.error("--zsh-terminal requires --macos-guardian")
 
     real_rustup_home = os.environ.get("RUSTUP_HOME", str(pathlib.Path.home() / ".rustup"))
     with tempfile.TemporaryDirectory(prefix="rgo-bench-") as temporary:
@@ -134,16 +229,22 @@ def main():
         env.pop("RGO_HOME")  # Include fresh-process Cargo-home pointer discovery.
         plain = [cargo, "build", "--offline"]
         managed = [str(shim), "build", "--offline"]
-        command(plain, project, env)
-        command(managed, project, env)
-        for _ in range(4):
-            command(plain, project, env)
-            command(managed, project, env)
-        timings = {"warm_noop": [], "edit_build": []} if args.profile_guardian else None
-        warm = paired_samples(plain, managed, project, env, args.warm_samples, False,
-                              timings["warm_noop"] if timings else None)
-        edit = paired_samples(plain, managed, project, env, args.edit_samples, True,
-                              timings["edit_build"] if timings else None)
+        shells = {}
+        try:
+            if args.zsh_terminal:
+                shells["plain"] = TerminalShell(project, env)
+                shells["supervised"] = TerminalShell(project, env, rgo)
+            for _ in range(5):
+                command(plain, project, env, shell=shells.get("plain"))
+                command(managed, project, env, shell=shells.get("supervised"))
+            timings = {"warm_noop": [], "edit_build": []} if args.profile_guardian else None
+            warm = paired_samples(plain, managed, project, env, args.warm_samples, False,
+                                  timings["warm_noop"] if timings else None, shells)
+            edit = paired_samples(plain, managed, project, env, args.edit_samples, True,
+                                  timings["edit_build"] if timings else None, shells)
+        finally:
+            for shell in shells.values():
+                shell.close()
         result = {
             "platform": platform.platform(),
             "cargo": cargo_version,
@@ -157,6 +258,8 @@ def main():
             "cache_enabled": False,
             "automatic_gc_enabled": False,
             "macos_supervisor_pilot": args.macos_guardian,
+            "terminal_shell": "zsh 5.9" if args.zsh_terminal else None,
+            "sample_boundary": "command dispatch through completed prompt" if args.zsh_terminal else "subprocess completion",
             "warm_noop": warm,
             "edit_build": edit,
         }

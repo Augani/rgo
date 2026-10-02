@@ -133,7 +133,8 @@ struct Receipt {
     coalitions: Vec<u64>,
 }
 
-fn boot_session() -> Result<String> {
+/// Kernel boot identity used to reject observations and receipts from a prior boot.
+pub fn boot_session() -> Result<String> {
     let mut buffer = [0_u8; 128];
     let mut length = buffer.len();
     let result = unsafe {

@@ -405,6 +405,7 @@ fn main() {
         .env("PATH", &search_path)
         .env("RGO_MACOS_SUPERVISOR_PILOT", "1")
         .env("RGO_TERMINAL_PROBE", "1")
+        .env("RGO_TERMINAL_HELPER", rgo)
         .env("RGO_COALITION_READY", &ready)
         .env("RGO_COALITION_RELEASE", &release)
         .env("RGO_COALITION_RESULT", &result)

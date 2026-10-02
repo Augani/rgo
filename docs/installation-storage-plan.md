@@ -228,6 +228,18 @@ scheduling and event readiness reduced the first combined median overhead to
 126.5 ms for no-ops and 127.9 ms for edits, still above the proposed allowance.
 The final spawn-path follow-up and platform results are tracked in the
 [macOS checklist](macos-cargo-supervision.md#terminal-handoff-and-measured-launch-overhead).
+
+**macOS registered-shell follow-up:** an explicitly registered zsh 5.9 pilot
+now preserves the terminal lease outside Cargo job data and acknowledges it in
+the owning shell. The existing real-Cargo driver passes exact restoration after
+caller SIGKILL, later intentional edits, rejected old generations/reused PID
+identities, preserved hooks, owned undo, finalizer-removal fallback to ordinary
+storage, and active-terminal disconnect locally. Nonblocking lease locks and
+builtin generation updates avoid freezing the shell or launching an extra
+process from every command hook. The full runtime/shell, abandoned-host
+recovery, nested Cargo, IDE, and performance gates remain open; this does not
+enable normal activation or unattended GC. Details and the remaining checklist
+are in [shell cooperation](macos-cargo-supervision.md#shell-cooperation-feasibility).
 Normal activation, automatic GC, and the broader P2 gates remain unchanged.
 
 The following startup batch bounds the bootstrap helper, uses kernel exit

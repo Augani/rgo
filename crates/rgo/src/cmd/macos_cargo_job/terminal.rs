@@ -12,7 +12,10 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 
 const BUFFER_LIMIT: usize = 64 * 1024;
 
+pub(super) mod recovery;
+
 #[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub(super) struct Settings {
     input: u64,
     output: u64,
@@ -74,9 +77,26 @@ impl Settings {
         );
         Ok(())
     }
+
+    fn same_effective_mode(&self, other: &Self) -> bool {
+        let mut left = self.clone();
+        let mut right = other.clone();
+        // PENDIN is a kernel input-queue state, not a persistent mode setting.
+        left.local &= !libc::PENDIN;
+        right.local &= !libc::PENDIN;
+        left == right
+    }
+
+    fn zsh_resumed(&self) -> Self {
+        let mut settings = self.clone();
+        settings.local |= libc::ICANON | libc::ECHO;
+        settings.local &= !libc::FLUSHO;
+        settings
+    }
 }
 
 #[derive(Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct Configuration {
     settings: Settings,
     owner_group: i32,
@@ -149,6 +169,47 @@ fn write_once(file: &mut File, buffer: &mut Vec<u8>) -> Result<()> {
     }
 }
 
+fn open_original() -> Result<Option<File>> {
+    let Some(first) = (0..=2).find(|fd| unsafe { libc::isatty(*fd) } != 0) else {
+        return Ok(None);
+    };
+    let mut name = [0_i8; 1024];
+    ensure!(
+        unsafe { libc::ttyname_r(first, name.as_mut_ptr(), name.len()) } == 0,
+        "identifying original terminal failed"
+    );
+    let name = unsafe { std::ffi::CStr::from_ptr(name.as_ptr()) }
+        .to_bytes()
+        .to_vec();
+    let original = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NOCTTY | libc::O_NONBLOCK | libc::O_NOFOLLOW)
+        .open(std::ffi::OsString::from_vec(name))?;
+    let control = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NOCTTY)
+        .open("/dev/tty")?;
+    let foreground = unsafe { libc::tcgetpgrp(original.as_raw_fd()) };
+    ensure!(
+        foreground > 0 && foreground == unsafe { libc::tcgetpgrp(control.as_raw_fd()) },
+        "standard terminal is not the controlling terminal"
+    );
+    let identity = original.metadata()?.rdev();
+    for fd in 0..=2 {
+        if unsafe { libc::isatty(fd) } != 0 {
+            let mut metadata = unsafe { std::mem::zeroed() };
+            ensure!(
+                unsafe { libc::fstat(fd, &mut metadata) } == 0
+                    && metadata.st_rdev as u64 == identity,
+                "standard streams use different terminals"
+            );
+        }
+    }
+    Ok(Some(original))
+}
+
 pub(super) struct Caller {
     original: File,
     master: Option<File>,
@@ -158,49 +219,17 @@ pub(super) struct Caller {
     last_foreground: Option<bool>,
     input: Vec<u8>,
     output: Vec<u8>,
+    recovery: Option<recovery::Lease>,
 }
 
 impl Caller {
-    pub(super) fn open() -> Result<Option<Self>> {
-        let Some(first) = (0..=2).find(|fd| unsafe { libc::isatty(*fd) } != 0) else {
+    pub(super) fn open(paths: &rgo_core::paths::RgoPaths) -> Result<Option<Self>> {
+        let Some(original) = open_original()? else {
             return Ok(None);
         };
-        let mut name = [0_i8; 1024];
-        ensure!(
-            unsafe { libc::ttyname_r(first, name.as_mut_ptr(), name.len()) } == 0,
-            "identifying original terminal failed"
-        );
-        let name = unsafe { std::ffi::CStr::from_ptr(name.as_ptr()) }
-            .to_bytes()
-            .to_vec();
-        let original = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .custom_flags(libc::O_NOCTTY | libc::O_NONBLOCK | libc::O_NOFOLLOW)
-            .open(std::ffi::OsString::from_vec(name))?;
-        let control = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .custom_flags(libc::O_NOCTTY)
-            .open("/dev/tty")?;
-        let foreground = unsafe { libc::tcgetpgrp(original.as_raw_fd()) };
-        ensure!(
-            foreground > 0 && foreground == unsafe { libc::tcgetpgrp(control.as_raw_fd()) },
-            "standard terminal is not the controlling terminal"
-        );
-        let identity = original.metadata()?.rdev();
-        for fd in 0..=2 {
-            if unsafe { libc::isatty(fd) } != 0 {
-                let mut metadata = unsafe { std::mem::zeroed() };
-                ensure!(
-                    unsafe { libc::fstat(fd, &mut metadata) } == 0
-                        && metadata.st_rdev as u64 == identity,
-                    "standard streams use different terminals"
-                );
-            }
-        }
         let settings = Settings::read(original.as_raw_fd())?;
         let raw = settings.raw()?;
+        let recovery = recovery::Lease::for_caller(paths, &original)?;
         Ok(Some(Self {
             original,
             master: None,
@@ -215,6 +244,7 @@ impl Caller {
             last_foreground: None,
             input: Vec::new(),
             output: Vec::new(),
+            recovery,
         }))
     }
 
@@ -244,6 +274,9 @@ impl Caller {
             "terminal changed during preparation"
         );
         if self.foreground() {
+            if let Some(recovery) = &mut self.recovery {
+                recovery.arm(&self.original, &self.configuration)?;
+            }
             self.raw.apply(self.fd())?;
             self.raw_active = true;
         }
@@ -252,13 +285,17 @@ impl Caller {
     }
 
     pub(super) fn restore(&mut self) {
-        if self.raw_active && Settings::read(self.fd()).is_ok_and(|current| current == self.raw) {
-            let _ = self.configuration.settings.apply(self.fd());
+        if self.raw_active
+            && Settings::read(self.fd()).is_ok_and(|current| current == self.raw)
+            && self.configuration.settings.apply(self.fd()).is_ok()
+        {
+            if let Some(recovery) = &mut self.recovery {
+                let _ = recovery.disarm();
+            }
         }
         self.raw_active = false;
         self.last_foreground = None;
     }
-
     pub(super) fn resize(&self) -> Result<()> {
         let size = window(self.fd())?;
         ensure!(

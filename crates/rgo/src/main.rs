@@ -23,6 +23,14 @@ struct Cli {
 enum Cmd {
     #[cfg(target_os = "macos")]
     #[command(hide = true)]
+    MacosTerminalHost {
+        #[arg(long)]
+        home: Option<std::path::PathBuf>,
+        #[command(subcommand)]
+        action: cmd::macos_cargo_job::TerminalHostAction,
+    },
+    #[cfg(target_os = "macos")]
+    #[command(hide = true)]
     MacosCargoJob {
         #[arg(long)]
         directory: std::path::PathBuf,
@@ -168,6 +176,10 @@ fn main() -> Result<()> {
     }
 
     let result = match cli.cmd {
+        #[cfg(target_os = "macos")]
+        Some(Cmd::MacosTerminalHost { home, action }) => {
+            cmd::macos_cargo_job::terminal_host(action, home.as_deref())
+        }
         #[cfg(target_os = "macos")]
         Some(Cmd::MacosCargoJob { directory, token }) => {
             cmd::macos_cargo_job::guardian(&directory, &token)

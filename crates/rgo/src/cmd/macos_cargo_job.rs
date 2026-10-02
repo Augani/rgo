@@ -24,6 +24,12 @@ use std::time::{Duration, Instant};
 mod events;
 mod terminal;
 
+pub use terminal::recovery::Action as TerminalHostAction;
+
+pub fn terminal_host(action: TerminalHostAction, home: Option<&Path>) -> Result<()> {
+    terminal::recovery::run(action, home)
+}
+
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(20);
 const SOCKET_NAME: &str = "control.sock";
 const FORWARDED_SIGNALS: [i32; 7] = [
@@ -318,7 +324,7 @@ impl PreparedJob {
     ) -> Result<Self> {
         let started = Instant::now();
         let deadline = started + STARTUP_TIMEOUT;
-        let mut terminal = terminal::Caller::open()?;
+        let mut terminal = terminal::Caller::open(paths)?;
         paths.ensure_layout()?;
         let invocation = Invocation {
             executable: executable.as_os_str().as_bytes().to_vec(),

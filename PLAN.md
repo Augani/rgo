@@ -124,9 +124,20 @@ uses kernel readiness, and Cargo version/workspace queries run together while
 checking fresh results. At `c788254`, optimized paired samples add 98.6 ms for
 no-op builds and 111.7 ms for edits. The edit gate remains open, alongside the
 terminal SIGKILL defect and broader recovery/runtime/IDE requirements. Local
-focused checks and Clippy pass; the [platform run](https://github.com/Augani/rgo/actions/runs/37007749125)
-is pending. Evidence and the next checklist remain in the
+focused checks and Clippy pass; the [19-job platform run](https://github.com/Augani/rgo/actions/runs/37007749125)
+passed, including Intel macOS and the full existing suites. Evidence and the next checklist remain in the
 [macOS checklist](docs/macos-cargo-supervision.md#bounded-helpers-and-cargo-query-overlap).
+
+**macOS registered-shell recovery:** an explicit zsh 5.9 pilot now records a
+terminal lease outside Cargo job data and restores the shell-owned mode after
+caller SIGKILL. Boot/process/terminal identities, command generations, exact
+mode comparison, and nonblocking host locks restrict recovery. Builtin command
+hooks preserve existing functions and support owned undo. The existing local
+real-Cargo fixture passes crash restoration and rejects old generations/reused
+PID identities; no Rust test case was added. Normal activation remains disabled
+while runtime, nested Cargo, IDE, metadata recovery, and performance
+gates remain open. Details are in the
+[macOS checklist](docs/macos-cargo-supervision.md#shell-cooperation-feasibility).
 
 The [19-job run](https://github.com/Augani/rgo/actions/runs/36998573830) passed
 at `5557f94`, including Intel macOS 15.7.9 and all existing platform suites.

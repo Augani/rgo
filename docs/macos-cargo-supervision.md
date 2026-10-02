@@ -241,16 +241,15 @@ The existing coalition crash and interrupted-Cargo cases also passed. No new
 Rust test case was added; all-bin build and warning-free all-target Clippy passed.
 The combined batch's platform results are recorded below.
 
-**Remaining terminal crash defect:** the same observation reproduces incomplete
+**Unregistered terminal crash defect:** the original observation reproduces incomplete
 terminal restoration after the caller is killed with SIGKILL. Zsh partly
 changes the original termios state before the guardian's exact-mode restoration
 check. The guardian preserves that changed state rather than overwriting it;
 some relay input/output and local-mode flags remain. Job retirement still
-completes. The fixture prints this limitation explicitly; it does not assert
-that crash restoration passed. Resolve mode ownership and verify prompt editing
-after this race before normal activation. Intentional later terminal edits,
-other shells, nested terminal consumers, and terminal-disconnect behavior remain
-separate compatibility work.
+completes. The later explicitly registered zsh prototype described below repairs
+that observed race locally and now asserts restoration. Unregistered shells
+retain the original defect. Broader shell configurations, nested terminal
+consumers, and supported-runtime evidence remain separate compatibility work.
 
 New version-2 job definitions explicitly request Interactive scheduling; exact
 version-1 definitions remain recognizable. SIGCHLD and control-socket readiness
@@ -361,8 +360,9 @@ be weakened to meet a timing target.
 The helper timeout/reaping check, existing coalition/terminal and interrupt
 cases, unsupported-Cargo passthrough case, all-bin debug/release builds, and
 warning-free all-target Clippy passed locally. The
-[combined platform run](https://github.com/Augani/rgo/actions/runs/37007749125)
-is pending; it supplies the full suite without another full local run.
+[combined 19-job platform run](https://github.com/Augani/rgo/actions/runs/37007749125)
+passed, including Intel macOS and the full existing suites, without another
+full local run.
 
 ### Shell cooperation feasibility
 
@@ -383,19 +383,85 @@ The installed Cargo PATH entrypoint remains unchanged.
 
 - [x] Check whether shell-owned finalization can repair the reproduced saved-mode
   problem, without freezing the shell or weakening the guardian's exact check.
-- [ ] Design a bounded terminal lease identifying the terminal, boot/session,
+- [x] Design a bounded terminal lease identifying the terminal, boot/session,
   original caller and shell, saved mode, and command generation. Preserve it
   until acknowledged recovery; a vanished Cargo job directory is insufficient.
-- [ ] Verify recovery eligibility before changing any mode. Reject stale/reused
+- [x] Implement recovery eligibility before changing any mode. Reject stale/reused
   identities, unknown shell state, a different foreground owner, and later edits.
-- [ ] Prototype explicitly registered zsh cooperation with reversible hook
+- [x] Prototype explicitly registered zsh cooperation with reversible hook
   ownership, preserving existing hooks/functions. Keep Cargo arguments and PATH
   interception intact; unsupported terminal shapes remain outside managed GC.
-- [ ] Extend the existing real-Cargo shell driver for caller SIGKILL and subsequent
+- [x] Extend the existing real-Cargo shell driver for caller SIGKILL and subsequent
   prompt editing, intentional edits, background jobs, terminal disconnect, hook
   removal, and stale receipts. Reuse the driver rather than add an equivalent case.
 - [ ] Measure the cooperating terminal path and validate the supported shell/
   runtime range before considering normal activation.
+
+The registered pilot uses a hidden `macos-terminal-host init-zsh` command; it
+does not change installer profiles or normal activation. For a private zsh 5.9
+evaluation, with the existing Cargo pilot configured, initialize that shell with:
+
+```zsh
+eval "$(/absolute/path/to/rgo macos-terminal-host init-zsh)"
+```
+
+Cargo commands still resolve through the installed PATH launcher. Registration
+adds owned hook functions to zsh's existing hook arrays and preserves an existing
+`precmd` function. Duplicate initialization recognizes its exact function bodies;
+`__rgo_terminal_undo` removes only those unchanged functions and owned records.
+Unknown conflicting functions are refused. This is a private prototype entrypoint,
+not the shipped one-command installer.
+
+Each host has a random token and private directory outside evictable Cargo job
+data. Bounded no-follow records bind the kernel boot ID, PID/start-time/session
+identities, terminal device identity, command generation, and original termios.
+The caller writes its lease before entering raw relay mode. A normal exact-mode
+restoration disarms it; job retirement cannot discard an unacknowledged lease.
+A different caller cannot overwrite that pending lease, even after its original
+process disappears. The owning shell must acknowledge it first.
+Recovery requires the owning shell and foreground terminal, a confirmed vanished
+original caller, matching command generation, and the exact relay mode or zsh
+5.9's documented local-flag normalization. Only the kernel's `PENDIN` queue-state
+bit is excluded from mode comparison. Reused PIDs and later generations retire
+the identified stale lease without applying its saved mode. Uncertain identities
+or unknown data disable recovery and preserve the record.
+
+The command counter uses zsh's [system and files builtins](https://zsh.sourceforge.io/Doc/Release/Zsh-Modules.html),
+with exclusive no-follow temporary creation and an atomic same-directory rename.
+An external helper in every `preexec` hook reproduced a background job-control
+failure and was removed. The counter is cleared at each prompt, so a missing
+`preexec` hook cannot reuse that completed generation. A missing or changed owned
+finalizer marks recovery disabled, making later terminal Cargo use ordinary
+checkout storage instead of silently reverting to the unregistered pilot.
+Host locks are nonblocking: a stopped
+caller cannot freeze its shell waiting for a lock. Atomic lease/counter visibility
+survives process crashes; drive flushes are unnecessary because reboot invalidates
+their boot/process identities. The initial host record is synced.
+
+The existing real-Cargo shell driver passes normal terminal behavior with these
+hooks present, exact restoration after caller SIGKILL and on the subsequent
+command, intentional later mode changes, replayed old generations, a mismatched
+start time for a reused PID, preserved hooks, owned undo, and disconnecting an
+active physical terminal locally on macOS 27.2 arm64. Removing the owned finalizer
+also passed a real unchanged Cargo invocation in ordinary checkout storage with
+no guardian admission. Disconnect retired its
+guardian; zsh's [SIGHUP handling](https://github.com/zsh-users/zsh/blob/zsh-5.9/Src/signals.c)
+uses its [signal-exit path](https://github.com/zsh-users/zsh/blob/zsh-5.9/Src/builtin.c),
+which returns exit code 1 rather than dying from an uncaught signal. The fixture
+asserts that behavior and leaves no live probe jobs after failure.
+It adds no Rust test case. The supported runtime/shell range, other hook ordering,
+abandoned-host metadata recovery, nested Cargo, and representative terminal-path
+performance remain explicit follow-up gates. All-bin build, the two existing
+focused macOS cases, and warning-free all-target Clippy passed locally.
+
+The existing latency probe now accepts `--macos-guardian --zsh-terminal` to
+compare separate private interactive zsh sessions. Only the managed session
+registers recovery. Alternating paired commands use the same disposable crate
+and Cargo home; their timer includes command dispatch, hooks, Cargo, and the
+completed prompt. Any guardian fallback invalidates the measurement. A short
+debug run verified this measurement path and bounded PTY teardown; optimized
+24-no-op/12-edit samples are the next performance observation. This does not
+replace the representative-workload gate.
 
 ## Integrate with unchanged Cargo commands
 
