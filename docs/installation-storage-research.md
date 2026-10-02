@@ -647,6 +647,14 @@ allowance; it does not justify changing the target or enabling normal activation
 The same source passed the [19-job matrix](https://github.com/Augani/rgo/actions/runs/37005085858),
 including Intel macOS, full platform suites, and the Rust 1.85 source builds.
 
+The following batch bounded the bootstrap helper and overlapped fresh Cargo
+version/workspace queries. Its [optimized paired probe](benchmarks/2026-10-02-macos-arm64-cargo-guardian-parallel.json)
+at `c788254` measured 98.6 ms added no-op time and 111.7 ms added edit time.
+The edit result still exceeds the allowance. A separate
+[diagnostic probe](benchmarks/2026-10-02-macos-arm64-cargo-guardian-stages.json)
+records the stage costs, so further optimization can target observed delays
+without removing durable ownership or coalition admission.
+
 Caller SIGKILL exposed another activation defect: zsh can partly alter the
 original terminal before the guardian's exact-mode restore. Job retirement
 completes, but remaining relay flags affect the terminal. The observation prints

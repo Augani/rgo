@@ -230,6 +230,15 @@ The final spawn-path follow-up and platform results are tracked in the
 [macOS checklist](macos-cargo-supervision.md#terminal-handoff-and-measured-launch-overhead).
 Normal activation, automatic GC, and the broader P2 gates remain unchanged.
 
+The following startup batch bounds the bootstrap helper, uses kernel exit
+readiness for helpers, and overlaps fresh Cargo version/workspace queries.
+Optimized [paired samples](benchmarks/2026-10-02-macos-arm64-cargo-guardian-parallel.json)
+at `c788254` add 98.6 ms for no-ops and 111.7 ms for edits; the edit result still
+misses the proposed allowance. The
+[timing and recovery checklist](macos-cargo-supervision.md#bounded-helpers-and-cargo-query-overlap)
+records stage measurements and keeps the terminal crash, runtime, recovery,
+and normal-activation gates open.
+
 - [ ] Document the exact lock/lifecycle protocol Cargo uses for each supported version and platform. Determine whether it covers build scripts, rustdoc, no-op commands, package/install operations, test execution, and waiting Cargo processes.
 - [ ] Build deterministic race fixtures that pause between liveness check, lock acquisition, rename, and removal. Require that GC actually deletes other eligible data while the target build remains protected.
 - [ ] Exercise long-running builds beyond the ten-minute recency window and wrapper lease TTL; use injected time only where it preserves the actual synchronization behavior being tested.

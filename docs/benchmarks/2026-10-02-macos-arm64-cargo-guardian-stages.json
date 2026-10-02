@@ -1,0 +1,144 @@
+{
+  "platform": "macOS-27.2-arm64-arm-64bit-Mach-O",
+  "cargo": "cargo 1.98.0 (797e8a9bc 2026-08-05)",
+  "rustc": "rustc 1.98.0 (88d9e12ae 2026-08-18)",
+  "rgo": "rgo 0.1.0",
+  "source_commit": "c78825485f8d9b9e26aba8ef82d8f53004eb4dfd",
+  "source_dirty": false,
+  "percentile_method": "nearest_rank",
+  "rgo_binary_sha256": "184896705f6df54c5864a0458b181d5168a614ca8458263467de5052238b32e2",
+  "wrapper_binary_sha256": "abaa307441b3062aa2fec65258983c81a23ba82064850210d2228a63be69847a",
+  "cache_enabled": false,
+  "automatic_gc_enabled": false,
+  "macos_supervisor_pilot": true,
+  "warm_noop": {
+    "plain": {
+      "median_ms": 26.0,
+      "p95_ms": 27.4,
+      "samples_ms": [
+        24.8,
+        27.4,
+        25.2,
+        26.8,
+        23.4,
+        27.1
+      ]
+    },
+    "supervised": {
+      "median_ms": 140.1,
+      "p95_ms": 169.9,
+      "samples_ms": [
+        133.9,
+        143.3,
+        169.9,
+        147.6,
+        137.0,
+        133.0
+      ]
+    }
+  },
+  "edit_build": {
+    "plain": {
+      "median_ms": 141.7,
+      "p95_ms": 150.4,
+      "samples_ms": [
+        150.4,
+        132.9
+      ]
+    },
+    "supervised": {
+      "median_ms": 256.5,
+      "p95_ms": 275.6,
+      "samples_ms": [
+        275.6,
+        237.5
+      ]
+    }
+  },
+  "guardian_timings": {
+    "warm_noop": [
+      {
+        "elapsed_ms": 133.9,
+        "stages": [
+          "DEBUG supervised Cargo context selection validation_ms=0.114042 queries_ms=23.438417 identity_ms=0.061166000000000005",
+          "DEBUG supervised Cargo launch preparation selection_ms=23.9845 activation_ms=1.545792",
+          "DEBUG macOS Cargo guardian preparation files_ms=21.55325 bootstrap_ms=5.353125 connection_ms=18.263499999999997 admission_ms=13.516416",
+          "DEBUG macOS Cargo guardian started primary elapsed_ms=0.918042",
+          "DEBUG macOS Cargo guardian primary result elapsed_ms=39.885333"
+        ]
+      },
+      {
+        "elapsed_ms": 143.3,
+        "stages": [
+          "DEBUG supervised Cargo context selection validation_ms=0.094083 queries_ms=22.00975 identity_ms=0.056958",
+          "DEBUG supervised Cargo launch preparation selection_ms=22.343417000000002 activation_ms=1.4315",
+          "DEBUG macOS Cargo guardian preparation files_ms=22.153 bootstrap_ms=5.212375 connection_ms=21.165542 admission_ms=23.773791999999997",
+          "DEBUG macOS Cargo guardian started primary elapsed_ms=0.8825000000000001",
+          "DEBUG macOS Cargo guardian primary result elapsed_ms=37.257458"
+        ]
+      },
+      {
+        "elapsed_ms": 169.9,
+        "stages": [
+          "DEBUG supervised Cargo context selection validation_ms=0.088625 queries_ms=22.268957999999998 identity_ms=0.045375",
+          "DEBUG supervised Cargo launch preparation selection_ms=22.594791999999998 activation_ms=1.437875",
+          "DEBUG macOS Cargo guardian preparation files_ms=25.721833 bootstrap_ms=4.924833 connection_ms=19.720458999999998 admission_ms=33.506665999999996",
+          "DEBUG macOS Cargo guardian started primary elapsed_ms=0.9832919999999999",
+          "DEBUG macOS Cargo guardian primary result elapsed_ms=52.760417"
+        ]
+      },
+      {
+        "elapsed_ms": 147.6,
+        "stages": [
+          "DEBUG supervised Cargo context selection validation_ms=0.112708 queries_ms=24.064292000000002 identity_ms=0.054917",
+          "DEBUG supervised Cargo launch preparation selection_ms=24.440291 activation_ms=1.324792",
+          "DEBUG macOS Cargo guardian preparation files_ms=20.742542 bootstrap_ms=4.600207999999999 connection_ms=20.841084 admission_ms=24.680583",
+          "DEBUG macOS Cargo guardian started primary elapsed_ms=0.944292",
+          "DEBUG macOS Cargo guardian primary result elapsed_ms=39.437167"
+        ]
+      },
+      {
+        "elapsed_ms": 137.0,
+        "stages": [
+          "DEBUG supervised Cargo context selection validation_ms=0.087541 queries_ms=21.210209 identity_ms=0.063416",
+          "DEBUG supervised Cargo launch preparation selection_ms=21.553417 activation_ms=1.546",
+          "DEBUG macOS Cargo guardian preparation files_ms=19.376292 bootstrap_ms=6.944167 connection_ms=15.418541 admission_ms=22.929167",
+          "DEBUG macOS Cargo guardian started primary elapsed_ms=1.535542",
+          "DEBUG macOS Cargo guardian primary result elapsed_ms=38.534167000000004"
+        ]
+      },
+      {
+        "elapsed_ms": 133.0,
+        "stages": [
+          "DEBUG supervised Cargo context selection validation_ms=0.075584 queries_ms=22.156166000000002 identity_ms=0.056334",
+          "DEBUG supervised Cargo launch preparation selection_ms=22.445583000000003 activation_ms=1.694667",
+          "DEBUG macOS Cargo guardian preparation files_ms=20.60325 bootstrap_ms=5.009708 connection_ms=16.44375 admission_ms=18.543917",
+          "DEBUG macOS Cargo guardian started primary elapsed_ms=1.4033749999999998",
+          "DEBUG macOS Cargo guardian primary result elapsed_ms=38.036709"
+        ]
+      }
+    ],
+    "edit_build": [
+      {
+        "elapsed_ms": 275.6,
+        "stages": [
+          "DEBUG supervised Cargo context selection validation_ms=0.079458 queries_ms=21.862875 identity_ms=0.056292",
+          "DEBUG supervised Cargo launch preparation selection_ms=22.175875 activation_ms=1.519334",
+          "DEBUG macOS Cargo guardian preparation files_ms=42.808 bootstrap_ms=5.5694159999999995 connection_ms=16.428542 admission_ms=27.699417",
+          "DEBUG macOS Cargo guardian started primary elapsed_ms=0.990583",
+          "DEBUG macOS Cargo guardian primary result elapsed_ms=149.14233299999998"
+        ]
+      },
+      {
+        "elapsed_ms": 237.5,
+        "stages": [
+          "DEBUG supervised Cargo context selection validation_ms=0.081375 queries_ms=23.732083 identity_ms=0.061",
+          "DEBUG supervised Cargo launch preparation selection_ms=24.064792 activation_ms=1.454792",
+          "DEBUG macOS Cargo guardian preparation files_ms=18.27175 bootstrap_ms=4.7732909999999995 connection_ms=15.645249999999999 admission_ms=19.682542",
+          "DEBUG macOS Cargo guardian started primary elapsed_ms=0.908875",
+          "DEBUG macOS Cargo guardian primary result elapsed_ms=143.513"
+        ]
+      }
+    ]
+  }
+}

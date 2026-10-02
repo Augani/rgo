@@ -190,7 +190,8 @@ contracts explain these preconditions. This primitive observation does not
 implement or verify Cargo terminal behavior.
 
 - [ ] Measure bootstrap, startup, Cargo runtime, and exit-notification costs;
-  evaluate an explicit Interactive job classification and readiness-driven
+  distinguish runtime from notification latency and extend beyond one crate.
+- [x] Use an explicit Interactive job classification and readiness-driven
   SIGCHLD/control-socket waiting instead of periodic primary-exit sleeps.
   Preserve recognition of the exact historical owned job definition.
 - [x] Preflight the caller's controlling terminal and descriptor identities
@@ -312,6 +313,89 @@ requires a privileged source coalition or the coalition-spawn entitlement for
 an explicitly selected coalition. Ordinary parent-session spawning must not
 assume that privilege. The PTY design therefore remains an opt-in prototype
 pending a reviewed terminal-mode ownership solution.
+
+### Bounded helpers and Cargo query overlap
+
+- [x] Bound `launchctl bootstrap` as well as guardian connection waiting.
+  Keep the owned record through registration and attempt safe cleanup when
+  failure occurs before any invocation is supplied. After request transmission
+  starts, the guardian owns receipt retirement.
+- [x] Wait for bootstrap/bootout helpers with a kernel exit notification rather
+  than a fixed polling pause. Kill and reap a timed-out direct helper; a timeout
+  does not authorize retiring any live coalition receipt.
+- [x] Add opt-in debug timing for selection, activation, owned-file preparation,
+  bootstrap, connection, admission, primary start, and primary result. Keep
+  diagnostics on stderr, including when Cargo emits JSON on stdout.
+- [x] Overlap fresh Cargo version and workspace queries. Preserve the selected
+  proxy, `+toolchain`, manifest arguments, and unmanaged fallback when either
+  query fails. Do not infer the active toolchain from rustup proxy bytes.
+- [ ] Close the complete performance gate with representative workloads;
+  neither a passing no-op median nor the short diagnostic probe is sufficient.
+
+At `c788254`, bootstrap and listener waiting share the original 20-second
+startup deadline; socket operations use the remaining interval. The bounded
+helper uses Apple's [kqueue exit notification contract](https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man2/kevent.2.html),
+but obtains the actual result with `waitpid` through `Child::try_wait`. Bootout
+retains its existing two-second deadline. Subsequent handshake operations and
+filesystem stalls still need the broader interruption audit; this change does
+not establish a strict wall-clock limit for every startup phase.
+
+The [24 no-op/12 edit-pair run](benchmarks/2026-10-02-macos-arm64-cargo-guardian-parallel.json)
+used optimized binaries from that clean source, with cache and automatic GC
+off and no accepted fallback. Median no-op time was 22.3 ms plain versus
+120.9 ms guardian, adding 98.6 ms. Edits were 124.0 ms versus 235.7 ms, adding
+111.7 ms. The no-op result meets the proposed absolute allowance in this run;
+the edit result does not. Do not enable normal activation on these results.
+New reports label nearest-rank percentiles explicitly; older reports retain
+the historical percentile calculation and raw samples.
+
+The separate [six-no-op/two-edit diagnostic probe](benchmarks/2026-10-02-macos-arm64-cargo-guardian-stages.json)
+records the debug stages and exact executable hashes. Median no-op stages were
+22.2 ms for the overlapping queries, 21.1 ms for owned-file preparation,
+5.1 ms for bootstrap, 19.0 ms for connection, and 23.4 ms for admission.
+These are stage observations from another run with diagnostic output; summing
+their medians is not an end-to-end sample, and its short sample count does not
+replace the paired performance gate. Durable metadata and admission must not
+be weakened to meet a timing target.
+
+The helper timeout/reaping check, existing coalition/terminal and interrupt
+cases, unsupported-Cargo passthrough case, all-bin debug/release builds, and
+warning-free all-target Clippy passed locally. The
+[combined platform run](https://github.com/Augani/rgo/actions/runs/37007749125)
+is pending; it supplies the full suite without another full local run.
+
+### Shell cooperation feasibility
+
+A [private zsh primitive probe](probes/2026-10-02-macos-shell-owned-terminal-recovery.json)
+compared a synthetic raw foreground child killed with SIGKILL, first without
+cooperation and then with a one-shot shell-owned `precmd` finalizer. A private
+foreground function saved `stty -g` before starting that child and armed the
+finalizer; the finalizer ran `stty` with those saved settings and disarmed itself.
+The baseline retained changed flags. The cooperating shell recovered its exact
+saved mode, including on the subsequent `stty -g` command, and preserved a later
+intentional `-ixon` edit through another prompt. An initial `-echo` comparison
+was unsuitable because zsh normally repairs echo itself.
+
+This demonstrates one recovery primitive on local zsh 5.9; it is not rgo
+integration, a lease-ownership proof, installer activation, or other-shell
+coverage. The private foreground function is only the experiment harness.
+The installed Cargo PATH entrypoint remains unchanged.
+
+- [x] Check whether shell-owned finalization can repair the reproduced saved-mode
+  problem, without freezing the shell or weakening the guardian's exact check.
+- [ ] Design a bounded terminal lease identifying the terminal, boot/session,
+  original caller and shell, saved mode, and command generation. Preserve it
+  until acknowledged recovery; a vanished Cargo job directory is insufficient.
+- [ ] Verify recovery eligibility before changing any mode. Reject stale/reused
+  identities, unknown shell state, a different foreground owner, and later edits.
+- [ ] Prototype explicitly registered zsh cooperation with reversible hook
+  ownership, preserving existing hooks/functions. Keep Cargo arguments and PATH
+  interception intact; unsupported terminal shapes remain outside managed GC.
+- [ ] Extend the existing real-Cargo shell driver for caller SIGKILL and subsequent
+  prompt editing, intentional edits, background jobs, terminal disconnect, hook
+  removal, and stale receipts. Reuse the driver rather than add an equivalent case.
+- [ ] Measure the cooperating terminal path and validate the supported shell/
+  runtime range before considering normal activation.
 
 ## Integrate with unchanged Cargo commands
 

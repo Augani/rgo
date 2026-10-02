@@ -1,0 +1,20 @@
+{
+  "platform": "macOS-27.2-arm64-arm-64bit-Mach-O",
+  "scope": "Private zsh -f PTY, synthetic raw foreground child killed with SIGKILL. Shell-cooperation primitive probe, not rgo integration or a terminal ownership proof.",
+  "results": [
+    {
+      "shell_owned_one_shot_hook": false,
+      "restored_saved_shell_mode": false,
+      "before": "gfmt1:cflag=4b00:iflag=2b02:lflag=200005cb:oflag=3:discard=f:dsusp=19:eof=4:eol=ff:eol2=ff:erase=7f:intr=3:kill=15:lnext=16:min=1:quit=1c:reprint=12:start=11:status=14:stop=13:susp=1a:time=0:werase=17:ispeed=9600:ospeed=9600",
+      "after": "gfmt1:cflag=4b00:iflag=2000:lflag=20000149:oflag=2:discard=f:dsusp=19:eof=4:eol=ff:eol2=ff:erase=7f:intr=3:kill=15:lnext=16:min=1:quit=1c:reprint=12:start=11:status=14:stop=13:susp=1a:time=0:werase=17:ispeed=9600:ospeed=9600",
+      "later_ixon_edit_preserved": null
+    },
+    {
+      "shell_owned_one_shot_hook": true,
+      "restored_saved_shell_mode": true,
+      "before": "gfmt1:cflag=4b00:iflag=2b02:lflag=200005cb:oflag=3:discard=f:dsusp=19:eof=4:eol=ff:eol2=ff:erase=7f:intr=3:kill=15:lnext=16:min=1:quit=1c:reprint=12:start=11:status=14:stop=13:susp=1a:time=0:werase=17:ispeed=9600:ospeed=9600",
+      "after": "gfmt1:cflag=4b00:iflag=2b02:lflag=200005cb:oflag=3:discard=f:dsusp=19:eof=4:eol=ff:eol2=ff:erase=7f:intr=3:kill=15:lnext=16:min=1:quit=1c:reprint=12:start=11:status=14:stop=13:susp=1a:time=0:werase=17:ispeed=9600:ospeed=9600",
+      "later_ixon_edit_preserved": true
+    }
+  ]
+}

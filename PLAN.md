@@ -119,6 +119,15 @@ Its [optimized-pair samples](docs/benchmarks/2026-10-02-macos-arm64-cargo-guardi
 record 109.4 ms median no-op overhead and 109.7 ms edit-build overhead. These
 results close the batch's validation step, while the activation gates stay open.
 
+**macOS startup follow-up:** bootstrap now has a deadline, helper completion
+uses kernel readiness, and Cargo version/workspace queries run together while
+checking fresh results. At `c788254`, optimized paired samples add 98.6 ms for
+no-op builds and 111.7 ms for edits. The edit gate remains open, alongside the
+terminal SIGKILL defect and broader recovery/runtime/IDE requirements. Local
+focused checks and Clippy pass; the [platform run](https://github.com/Augani/rgo/actions/runs/37007749125)
+is pending. Evidence and the next checklist remain in the
+[macOS checklist](docs/macos-cargo-supervision.md#bounded-helpers-and-cargo-query-overlap).
+
 The [19-job run](https://github.com/Augani/rgo/actions/runs/36998573830) passed
 at `5557f94`, including Intel macOS 15.7.9 and all existing platform suites.
 The [guardian latency samples](docs/benchmarks/2026-10-02-macos-arm64-cargo-guardian.json)
