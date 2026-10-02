@@ -408,3 +408,23 @@ External brokers launched by build scripts, linkers, runners, or custom toolchai
 and settings changed after inspection remain unproven. The default still leaves
 automatic GC and compiler caching off. This is progress on the configured
 producer boundary, not completion of P2 or the storage release gate.
+
+
+## Free-space reserve reporting follow-up — 2026-10-02
+
+Status previously explained only managed-size budget excess. A root could be
+below that limit while its volume lacked the configured free-space reserve;
+protected storage then left no explicit reserve-shortfall explanation. Status
+now reports the observed deficit and the portion not covered by current eligible
+allocated-byte estimates, with protection/ineligibility reasons. The fallback
+without a daemon can show an observed deficit but leaves eligibility unknown.
+
+The existing pinned-budget fixture retains its reclamation/unpin controls and
+now also exercises a below-budget root with pinned data and an impossible
+configured reserve, without filling the volume. Its IPC and CLI checks passed
+locally and in the [18-job matrix](https://github.com/Augani/rgo/actions/runs/36969296634), along with
+backward-compatible status decoding. Source accounting notes, README, and the
+historical benchmark table distinguish allocation estimates from returned
+volume space; snapshots, CoW sharing, outside links, and concurrent outside
+writes prevent an exact physical-savings claim. This is reporting progress;
+it does not close the broader P2/P3 release gates.

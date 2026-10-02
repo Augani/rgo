@@ -356,7 +356,7 @@ Workspace selection now also falls back to ordinary Cargo under the global guard
 - [ ] Bound cache-event logs, daemon logs, key-debug logs, quarantine, temp files, upload queues, and failed-job metadata; rotate/prune them without losing necessary recovery records.
 - [ ] Bound retained unpin decision records after proving no in-flight launcher or old marker can resurrect a pin; keep the race-safe ordering while pruning.
 - [ ] Audit hardlink-aware totals and incremental subtotals for consistent scanner scopes. Separate logical bytes, allocated-byte estimates, bytes unlinked, and measured volume space returned.
-- [ ] Treat CoW shared extents, sparse files, compression, external hardlinks, and filesystem snapshots as accounting limitations; avoid claiming exact unique physical savings from inode totals.
+- [x] Treat CoW shared extents, sparse files, compression, external hardlinks, and filesystem snapshots as accounting limitations; avoid claiming exact unique physical savings from inode totals. README, the size-accounting API notes, and historical benchmark labels distinguish allocated-file estimates from separately observed volume free space; outside writes can affect that observed delta. Filesystem-specific accounting audits and clone/copy benchmarks remain separate open items.
 - [ ] Add hysteresis and bounded scan work so repeated maintenance does not cause cache churn or frequent full-tree walks under the daemon operation lock.
 - [ ] Handle one active project larger than the budget, low space before compile, ENOSPC during publication/staging, all-data-pinned cases, clock jumps, and read-only roots explicitly.
 - [x] Define the user promise as recovery toward the budget when safe eligible storage exists, with visible transient excess. README and the storage configuration contract describe a recovery target; status reports protected storage and an unmet target. A strict quota that interrupts builds is outside this release.
@@ -370,7 +370,9 @@ reports an observed deficit but leaves eligibility unknown without a daemon.
 These are allocated-byte estimates, not a promise of returned volume space.
 The existing pinned-budget fixture covers reserve failure without filling the
 volume; it also retains its positive reclamation and unpin recovery controls.
-The wider P3 policy and accounting checklist remains open.
+The [18-job matrix](https://github.com/Augani/rgo/actions/runs/36969296634) passed all workspace suites,
+zero-warning Clippy, version boundaries, installer/lifecycle pilots, btrfs, and
+100-project recovery. The wider P3 policy and accounting checklist remains open.
 
 **Suggested policy:** garbage/temp first; expired orphans next; stale documented incremental state when safely identifiable; then idle contexts and cold CAS entries by measured value/age. Keep the initial implementation explainable before attempting adaptive eviction.
 

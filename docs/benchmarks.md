@@ -9,7 +9,7 @@ tokio(full), rand, anyhow — ~60 crates. Full data: `docs/dogfood-2026-09-18.md
 |---|---|---|---|
 | Checkout `target/` after `cargo build` | 194.3 MiB | 8.7 MiB | −95.5% on the checkout volume |
 | + no-op + incremental + `--release` | — | 11.1 MiB | intermediates stay out of the checkout |
-| Storage reclaimed by orphan GC | — | 181.2 MiB of 482.1 | contexts orphaned by checkout deletion are collected |
+| Allocated-byte estimate removed by orphan GC | — | 181.2 MiB of 482.1 | contexts orphaned by checkout deletion are collected |
 | Cross-volume (APFS image) `target/` | — | 11.1 MiB | uplifted outputs are copied, not hardlinked |
 
 These are historical, single-fixture measurements. Relocation reduced the
@@ -19,7 +19,12 @@ context, but unattended cleanup remains disabled by default until the
 [lifecycle and budget gates](installation-storage-plan.md) pass. Same-volume
 hardlinks can make uplifted outputs cheap on the checkout volume; cross-volume
 copies add another copy of each final binary. These runs did not establish a
-compiler RAM reduction.
+compiler RAM reduction. The storage figures are allocated-file estimates, not
+unique physical extent ownership. The recorded GC estimate does not establish
+181.2 MiB of volume space returned: CoW sharing, snapshots, external hardlinks,
+sparse/compressed allocation, and filesystem metadata can change that result.
+Measure volume free space before and after a pass separately; concurrent
+outside writes can also affect that observed delta.
 
 ## How to reproduce
 

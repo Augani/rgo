@@ -252,7 +252,8 @@ constraints can keep usage above it; `rgo status` reports protected storage and
 the unmet target. Status reports a free-space reserve deficit separately,
 even when managed storage is below its size budget, and estimates the portion
 that current eligible storage cannot cover. Allocated-byte estimates are not a
-promise of returned volume space. Cleanup works toward the budget when safe
+promise of returned volume space: shared CoW extents, snapshots, external
+hardlinks, sparse/compressed files, and filesystem metadata affect the result. Cleanup works toward the budget when safe
 eligible data exists.
 
 ## License

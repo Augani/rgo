@@ -1,6 +1,8 @@
-//! Physical size accounting. Reports *allocated* bytes (what the disk actually loses),
-//! counting each hard-linked inode once. Cargo hardlinks uplifted binaries between the
-//! build-dir and target-dir, so logical sums overstate reality.
+//! Allocated-file size estimates, counting each hard-linked inode once per scan.
+//! Cargo hardlinks uplifted binaries between build-dir and target-dir, so logical
+//! sums overstate allocation. Shared CoW extents, snapshots, external links, and
+//! filesystem metadata mean these estimates are not unique disk usage or a promise
+//! of free space returned by deletion; observe volume free space separately.
 
 use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};

@@ -27,6 +27,13 @@ protocol-6 shutdown recovery. The [18-job matrix](https://github.com/Augani/rgo/
 passed. Wrapper preservation is checked off in P1; actual IDE workflow validation
 and the broader P2/release gates remain open.
 
+**2026-10-02 reserve diagnostics:** status reports a free-space reserve deficit
+and unmet-reserve estimate independently of the managed-size budget, including
+below-budget pinned storage. The existing pinned-recovery and status-wire fixtures
+passed in the [18-job matrix](https://github.com/Augani/rgo/actions/runs/36969296634). Allocation estimates
+are explicitly separate from returned volume space; broader policy/safety work
+remains on the accepted checklist.
+
 ## 0. What changed vs. `doc.md`, and why
 
 `doc.md` treats the rustc-wrapper + CAS as the core and the managed build roots as a
