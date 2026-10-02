@@ -57,6 +57,17 @@ The existing Windows installer probe and [18-job matrix](https://github.com/Auga
 passed, including its running-Cargo and raw PATH/type controls. Every internal
 undo/service write, safe data purge, and the wider P4 release gates remain open.
 
+
+**2026-10-02 Linux service lifecycle:** setup enables the exact owned unit path,
+new scoped units avoid the default-target ordering cycle, and explicit repair
+resets the owned unit's failed/start-limit counter before activation. Exact
+historical definitions remain recognizable. The existing private installer probe
+passed real systemd crash recovery, a fresh user-manager start, older-definition
+replacement, native/supervised repair and upgrade recovery, unchanged Cargo, and
+uninstall. The [18-job matrix](https://github.com/Augani/rgo/actions/runs/36987224017)
+passed. GUI login/reboot, all service-manager interruption boundaries, and the
+broader P2/P4 release gates remain open.
+
 ## 0. What changed vs. `doc.md`, and why
 
 `doc.md` treats the rustc-wrapper + CAS as the core and the managed build roots as a

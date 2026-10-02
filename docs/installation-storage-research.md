@@ -505,10 +505,12 @@ user manager and private Cargo/storage homes. It exercises crash recovery, a
 fresh manager start observed through read-only doctor queries, replacement of
 the historical definition, and the existing native/supervised repair, interrupted
 upgrade, and uninstall sequence. Restarting the user manager requires explicit
-disposable CI opt-in and refuses a worker running inside that manager. Local
-all-bin build and zero-warning Clippy passed. The first Linux run observed crash
-recovery and a fresh manager start, then exposed an inherited XDG-config fixture
-path. After making that path private, historical-definition replacement passed,
-but rapid upgrade recovery encountered a refused service start. The explicit
-start-limit reset and failure-journal diagnostics await CI evidence. This does not establish GUI login,
+disposable CI opt-in and refuses a worker running inside that manager. The probe
+sets private XDG configuration roots for both installation modes and reports the
+unit status/journal on failure. Local all-bin build and zero-warning Clippy
+passed. The [18-job matrix](https://github.com/Augani/rgo/actions/runs/36987224017)
+passed after the explicit start-limit recovery change, including the complete
+Linux lifecycle sequence, full workspace suites, zero-warning Clippy, and the
+100-project recovery probes. No new Rust test cases were added.
+This does not establish GUI login,
 reboot, WSL/container behavior, or every service-manager interruption boundary.
