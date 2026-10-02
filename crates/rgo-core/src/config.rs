@@ -24,7 +24,7 @@ pub struct Storage {
     pub max_size: Size,
     /// Fraction of `max_size` at which background GC starts.
     pub soft_watermark: f64,
-    /// GC runs immediately if the volume's free space drops below this.
+    /// Request automatic GC below this reserve; a no-progress pass backs off.
     pub min_free_space: Size,
 }
 

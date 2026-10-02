@@ -41,6 +41,14 @@ The [18-job matrix](https://github.com/Augani/rgo/actions/runs/36972164863) pass
 including the actual 2 GiB btrfs pressure fixture. Available-space guarantees
 and publication/staging failures remain separate P3 gates.
 
+**2026-10-02 no-progress retries:** automatic GC waits two minutes after a
+pass reclaims nothing while pressure remains. Queued unpins and newly idle
+supervised launches can request earlier recovery; explicit GC is unchanged.
+The existing pinned-budget fixture checks quiet maintenance ticks followed by
+prompt unpin recovery. The [18-job matrix](https://github.com/Augani/rgo/actions/runs/36973401620)
+passed, including the 100-project recovery probes. The total work of a single
+pass and the broader P2/P3 release gates remain open.
+
 ## 0. What changed vs. `doc.md`, and why
 
 `doc.md` treats the rustc-wrapper + CAS as the core and the managed build roots as a
@@ -205,9 +213,9 @@ and deleting a project never leaves a stray multi-GB directory behind.
 
 ```toml
 # ~/.rgo/config.toml — everything optional; defaults are machine-aware
+# Choose a different root with RGO_HOME before setup or installer --rgo-home.
 # auto floor = min(20GiB, 25% of storage volume)
 [storage]
-root = "~/.rgo"
 max_size = "auto"           # auto = clamp(15% of volume, floor, 150GiB)
 soft_watermark = 0.80       # start background GC here
 min_free_space = "auto"     # auto = max(10% of volume, floor)
@@ -223,7 +231,8 @@ enabled = false
 ```
 
 Sizes parse as `"60GB"`, `"1.5TiB"`, `"auto"`. Machine-aware defaults are computed from
-the volume that holds `storage.root`.
+the volume that holds the selected storage root. `storage.root` is not a supported
+TOML setting; setup records the root selected through `RGO_HOME` or the installer.
 
 ### 3.2 Context discovery — mapping `builds/<hash>` back to a workspace
 

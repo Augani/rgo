@@ -2510,7 +2510,8 @@ fn maintenance(state: &State) -> Result<()> {
             let urgent = free_bytes < state.cfg.min_free_space || age_due;
             // This advisory scan runs outside the operation lock. It visits a
             // bounded number of entries per tick; the GC pass takes a fresh
-            // authoritative snapshot under the lock before selecting anything.
+            // authoritative snapshot and rechecks protections under admission
+            // before staging any deletion.
             let pressure = if urgent || idle_launch {
                 false
             } else {

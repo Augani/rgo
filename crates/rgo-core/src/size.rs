@@ -189,7 +189,7 @@ impl Scanner {
 /// A bounded, advisory trigger scan for automatic maintenance. A completed
 /// result can request an authoritative GC pass, but it is never used to plan a
 /// deletion: Cargo may change files between chunks, and explicit GC takes its
-/// own checked snapshot under the operation lock.
+/// own checked snapshot, then rechecks protections under the operation lock.
 #[derive(Default)]
 pub(crate) struct TriggerScan {
     walk: Option<walkdir::IntoIter>,

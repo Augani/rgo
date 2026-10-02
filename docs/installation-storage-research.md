@@ -442,3 +442,23 @@ mounted btrfs root while retaining positive reclamation controls. The
 [18-job matrix](https://github.com/Augani/rgo/actions/runs/36972164863) passed all
 jobs. This corrects capacity feasibility, not current free-space availability or
 safe behavior after every ENOSPC/publication failure.
+
+## Automatic no-progress retry limit — 2026-10-02
+
+Low free space could previously request a full automatic GC pass on every
+30-second maintenance tick, even when pins or data outside rgo made the reserve
+unattainable. A pass that reclaims nothing while pressure remains now establishes
+a two-minute monotonic retry delay. Bounded metadata maintenance continues;
+queued unpins and newly idle supervised Cargo sessions can request earlier
+recovery, and explicit GC bypasses the automatic scheduler. Restarting the
+daemon establishes a fresh scheduling baseline.
+
+The existing pinned-budget fixture observes completed maintenance ticks without
+another full-GC record, then requires unpin recovery within 15 seconds while
+the two-minute delay remains active. It passed locally with the all-bin build,
+zero-warning all-target Clippy, formatting, and diff checks. The wider single-pass
+work bound, launch-storm behavior, and P2 lifecycle proof remain open.
+The [18-job matrix](https://github.com/Augani/rgo/actions/runs/36973401620) also
+passed, including full workspace suites and 100-project recovery on Linux,
+macOS, and Windows. No new test cases were added; the existing fixture gained
+the retry and recovery assertions.
