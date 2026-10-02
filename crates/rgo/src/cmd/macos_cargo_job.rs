@@ -1246,7 +1246,10 @@ pub fn guardian(directory: &Path, token: &str, context: Option<&Path>) -> Result
         )?;
         stream.set_read_timeout(None)?;
         stream.set_nonblocking(true)?;
-        session.retain_across_exec()?;
+        // The guardian keeps these guards and its durable coalition receipt.
+        // Cargo needs only the caller's descriptors. Inheriting guardian lock
+        // files would expose foreign record/flock locks to nested launchers;
+        // the receipt already protects descendants after every FD is closed.
         let mut events = events::ChildEvents::new()?;
         let slave = terminal.as_ref().map(terminal::Guardian::slave_fd);
         let mut command = Command::new(OsString::from_vec(request.executable));
