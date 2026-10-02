@@ -55,6 +55,15 @@ rebuild-over-migrate when the filesystem is the source of truth.
   guardian repeats this admission check for older callers before publishing
   a receipt or accepting a commit. Even a currently ignored blocked signal is
   refused because the application may change its action later.
+  The greeting also advertises `inherited_fds`. A current caller requires this
+  capability before sending an invocation. It captures exec-visible descriptors
+  before opening its guards, transfers up to 32 extra descriptors and restores
+  their original numbers and shared open descriptions. Close-on-exec descriptors
+  stay excluded. Failed inventory/staging and older guardians use checkout
+  fallback; a current guardian refuses a legacy request without captured FD
+  state before receipt/commit/spawn. This preserves jobserver pipes without
+  rewriting Cargo/Make flags. Broader native process-state equivalence is still
+  an open pilot gate.
   The guardian accepts legacy `S` and earlier seven-signal `Q` records; current
   callers send `Q` plus a four-byte
   big-endian pending mask. Only forwarded, originally blocked, non-ignored

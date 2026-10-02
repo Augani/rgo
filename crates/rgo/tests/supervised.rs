@@ -863,6 +863,10 @@ fn nested_cargo_build_keeps_both_contexts_safe_while_gc_reclaims_an_idle_one() {
         .env("RGO_NESTED_MANIFEST", nested.join("Cargo.toml"))
         .env("RGO_NESTED_READY", &ready)
         .env("RGO_NESTED_RELEASE", &release)
+        .env(
+            "RGO_MACOS_SUPERVISOR_PILOT",
+            if cfg!(target_os = "macos") { "1" } else { "0" },
+        )
         .args(["run", "--offline"])
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -876,6 +880,27 @@ fn nested_cargo_build_keeps_both_contexts_safe_while_gc_reclaims_an_idle_one() {
         thread::sleep(Duration::from_millis(25));
     }
     let nested_started = ready.is_file();
+    // Observe the actual owned sidecars: the macOS pilot has a separate
+    // admission namespace from the test process's ordinary Unix backend.
+    #[cfg(target_os = "macos")]
+    let (parent_context, nested_context) = {
+        let directories = paths.checked_managed_build_dirs().unwrap();
+        let observed = |workspace: &Path, fallback: PathBuf| {
+            let workspace = workspace.canonicalize().unwrap().display().to_string();
+            directories
+                .iter()
+                .find(|directory| {
+                    context::read_sidecar(directory)
+                        .is_some_and(|sidecar| sidecar.workspace_root == workspace)
+                })
+                .cloned()
+                .unwrap_or(fallback)
+        };
+        (
+            observed(&parent, parent_context),
+            observed(&nested, nested_context),
+        )
+    };
     let both_guarded = nested_started
         && parent_context.is_dir()
         && nested_context.is_dir()
@@ -903,7 +928,10 @@ fn nested_cargo_build_keeps_both_contexts_safe_while_gc_reclaims_an_idle_one() {
     );
     assert!(
         both_guarded,
-        "nested Cargo did not retain both lifecycle guards"
+        "nested Cargo did not retain both lifecycle guards: parent={}, nested={}; {}",
+        parent_context.display(),
+        nested_context.display(),
+        String::from_utf8_lossy(&finished.stderr)
     );
     assert!(
         gc.as_ref().is_some_and(|output| output.status.success()),
@@ -914,6 +942,113 @@ fn nested_cargo_build_keeps_both_contexts_safe_while_gc_reclaims_an_idle_one() {
     );
     assert!(protected, "GC removed a running nested Cargo context");
     assert!(unrelated_reclaimed, "GC did not reclaim an idle context");
+    #[cfg(target_os = "macos")]
+    {
+        let stderr = String::from_utf8_lossy(&finished.stderr);
+        assert!(!stderr.contains("guardian unavailable"), "{stderr}");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while std::fs::read_dir(paths.state_dir()).unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with("macos-cargo-job-")
+        }) {
+            if Instant::now() >= deadline {
+                let state = sandbox
+                    .cmd("ps")
+                    .args(["-axo", "pid=,ppid=,pgid=,stat=,command="])
+                    .output()
+                    .unwrap();
+                let text = String::from_utf8_lossy(&state.stdout);
+                let rows: Vec<_> = text.lines().collect();
+                let mut owned: std::collections::HashSet<_> = rows
+                    .iter()
+                    .filter(|row| {
+                        row.contains(&sandbox.home.display().to_string())
+                            || row.contains(&sandbox.projects.display().to_string())
+                    })
+                    .map(|row| row.split_whitespace().next().unwrap().to_owned())
+                    .collect();
+                loop {
+                    let children: Vec<_> = rows
+                        .iter()
+                        .filter(|row| owned.contains(row.split_whitespace().nth(1).unwrap()))
+                        .map(|row| row.split_whitespace().next().unwrap().to_owned())
+                        .collect();
+                    let before = owned.len();
+                    owned.extend(children);
+                    if owned.len() == before {
+                        break;
+                    }
+                }
+                let processes: Vec<_> = rows
+                    .iter()
+                    .filter(|row| owned.contains(row.split_whitespace().next().unwrap()))
+                    .take(32)
+                    .collect();
+                let mut jobs = Vec::new();
+                for directory in paths
+                    .state_dir()
+                    .read_dir()
+                    .unwrap()
+                    .filter_map(Result::ok)
+                    .map(|entry| entry.path())
+                    .filter(|path| {
+                        path.file_name()
+                            .unwrap()
+                            .to_string_lossy()
+                            .starts_with("macos-cargo-job-")
+                    })
+                {
+                    let (owner, _) = rgo_core::macos_jobs::read_owner(&directory).unwrap();
+                    let job = sandbox
+                        .cmd("launchctl")
+                        .args(["print", &format!("{}/{}", owner.domain, owner.label)])
+                        .output()
+                        .unwrap();
+                    let job = String::from_utf8_lossy(&job.stdout);
+                    let pid = job
+                        .lines()
+                        .find_map(|line| line.trim().strip_prefix("pid = "))
+                        .and_then(|pid| pid.parse::<i32>().ok());
+                    let coalition = pid.and_then(|pid| {
+                        rgo_core::macos_coalition::ResourceCoalition::for_pid(pid).ok()
+                    });
+                    jobs.push((
+                        owner.context,
+                        pid,
+                        coalition
+                            .as_ref()
+                            .map(|c| (c.id(), c.active_tasks().map_err(|e| format!("{e:#}")))),
+                        std::fs::read_to_string(directory.join("guardian.stderr"))
+                            .unwrap_or_default(),
+                    ));
+                }
+                panic!(
+                    "nested guardians did not retire; jobs={jobs:?}; processes={processes:?}; stderr={stderr}"
+                );
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        let reclaimed = sandbox
+            .cmd(rgo)
+            .args(["gc", "--target", "0"])
+            .output()
+            .unwrap();
+        assert!(
+            reclaimed.status.success(),
+            "{}",
+            String::from_utf8_lossy(&reclaimed.stderr)
+        );
+        assert!(
+            !parent_context.exists() && !nested_context.exists(),
+            "idle nested contexts were not reclaimed"
+        );
+        println!(
+            "macOS nested Cargo: both managed contexts protected, idle neighbor reclaimed, both guardians retired and actual final GC passed"
+        );
+    }
 }
 
 #[test]

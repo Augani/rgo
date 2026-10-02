@@ -21,6 +21,7 @@ pub const JOB_PREFIX: &str = "macos-cargo-job-";
 
 mod command;
 mod retirement;
+pub use retirement::RetirementBusy;
 
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]

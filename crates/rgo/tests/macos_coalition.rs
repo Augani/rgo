@@ -825,6 +825,19 @@ fn main() {
     let mut out = std::io::stdout(); out.write_all(&input).unwrap();
     out.write_all(std::env::args_os().nth(1).unwrap().as_bytes()).unwrap();
     out.write_all(std::env::var_os("RGO_NATIVE_BYTES").unwrap().as_bytes()).unwrap();
+    if std::env::var_os("RGO_INHERITED_FDS").is_some() { unsafe {
+        assert!(std::path::Path::new(env!("OUT_DIR")).starts_with(std::path::Path::new(&std::env::var_os("RGO_HOME").unwrap()).join("builds")),"descriptor check used checkout fallback");
+        extern "C" { fn read(fd:i32,buf:*mut u8,len:usize)->isize; fn write(fd:i32,buf:*const u8,len:usize)->isize; fn fcntl(fd:i32,cmd:i32,...)->i32; }
+        let mut value = [0u8;6];
+        assert_eq!(read(40,value.as_mut_ptr(),3),3,"inherited file descriptor lost");
+        assert_eq!(read(41,value.as_mut_ptr().add(3),3),3,"inherited alias lost");
+        assert_eq!(&value,b"shared");
+        assert_eq!(fcntl(44,1),-1,"close-on-exec descriptor leaked");
+        let mut token=0u8;
+        assert_eq!(read(42,&mut token,1),1,"jobserver reader lost");
+        assert_eq!(token,b'+');
+        assert_eq!(write(43,&token,1),1,"jobserver writer lost");
+    } }
     eprintln!("application stderr preserved");
     std::process::exit(17);
 }
@@ -832,13 +845,35 @@ fn main() {
     )
     .unwrap();
     use std::io::Write;
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     use std::os::unix::ffi::OsStringExt;
+    use std::os::unix::process::CommandExt;
     use std::process::Stdio;
-    let mut child = sandbox
-        .cmd("cargo")
+    let inherited_file = project.join("inherited-file");
+    std::fs::write(&inherited_file, b"shared descriptor").unwrap();
+    let mut inherited_file = std::fs::File::open(inherited_file).unwrap();
+    #[allow(unsafe_code)]
+    let (jobserver_reader, jobserver_writer) = unsafe {
+        let mut descriptors = [-1; 2];
+        assert_eq!(libc::pipe(descriptors.as_mut_ptr()), 0);
+        let reader = OwnedFd::from_raw_fd(descriptors[0]);
+        let writer = OwnedFd::from_raw_fd(descriptors[1]);
+        for fd in [&reader, &writer] {
+            assert_eq!(
+                libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC),
+                0
+            );
+        }
+        assert_eq!(libc::write(writer.as_raw_fd(), b"+".as_ptr().cast(), 1), 1);
+        (reader, writer)
+    };
+    let mut command = sandbox.cmd("cargo");
+    command
         .current_dir(&project)
         .env("PATH", &search_path)
         .env("RGO_MACOS_SUPERVISOR_PILOT", "1")
+        .env("RGO_INHERITED_FDS", "1")
+        .env("MAKEFLAGS", "-j --jobserver-auth=42,43")
         .env("RGO_COALITION_READY", &ready)
         .env("RGO_COALITION_RELEASE", &release)
         .env("RGO_COALITION_RESULT", &result)
@@ -850,9 +885,31 @@ fn main() {
         .arg(std::ffi::OsString::from_vec(vec![b'a', 0xff]))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
+        .stderr(Stdio::piped());
+    #[allow(unsafe_code)]
+    unsafe {
+        let file = inherited_file.as_raw_fd();
+        let reader = jobserver_reader.as_raw_fd();
+        let writer = jobserver_writer.as_raw_fd();
+        command.pre_exec(move || {
+            for (source, destination) in [
+                (file, 40),
+                (file, 41),
+                (reader, 42),
+                (writer, 43),
+                (file, 44),
+            ] {
+                if libc::dup2(source, destination) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
+            if libc::fcntl(44, libc::F_SETFD, libc::FD_CLOEXEC) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut child = command.spawn().unwrap();
     child
         .stdin
         .take()
@@ -860,14 +917,8 @@ fn main() {
         .write_all(b"stdin through launchd\n")
         .unwrap();
     let output = child.wait_with_output().unwrap();
-    assert_eq!(
-        output.status.code(),
-        Some(17),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert_eq!(output.stdout, b"stdin through launchd\na\xffe\xfe");
-    assert!(String::from_utf8_lossy(&output.stderr).contains("application stderr preserved"));
+    let transport_status = output.status.code();
+    let transport_stderr = String::from_utf8_lossy(&output.stderr).into_owned();
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         let remaining = std::fs::read_dir(paths.state_dir())
@@ -896,8 +947,31 @@ fn main() {
             .is_some(),
         "healthy guardian did not retire its kernel receipt"
     );
+    let reclaimed = sandbox
+        .cmd(rgo)
+        .args(["gc", "--target", "0"])
+        .output()
+        .unwrap();
+    assert!(
+        reclaimed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&reclaimed.stderr)
+    );
+    assert!(
+        !contexts[0].exists(),
+        "idle descriptor context was not reclaimed"
+    );
+    assert_eq!(transport_status, Some(17), "{transport_stderr}");
+    assert_eq!(output.stdout, b"stdin through launchd\na\xffe\xfe");
+    assert!(transport_stderr.contains("application stderr preserved"));
+    use std::io::Seek;
+    assert_eq!(inherited_file.stream_position().unwrap(), 6);
+    assert!(
+        !transport_stderr.contains("failed to connect to jobserver"),
+        "{transport_stderr}"
+    );
     println!(
-        "installed Cargo pilot: stdin/EOF, stdout/stderr, non-UTF-8 args/environment, exit 17, and healthy job retirement passed"
+        "installed Cargo pilot: stdin/EOF, streams/native bytes, inherited file aliases/shared offset, jobserver pipe/token, close-on-exec exclusion, managed exit 17 and actual idle GC passed"
     );
 
     // Extend the same real-Cargo fixture with an interactive zsh job, rather

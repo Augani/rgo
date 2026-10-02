@@ -1117,3 +1117,46 @@ alarm, no managed commit and exact handler exit 74. The
 the exact source, runtimes and conclusions. This validates the mask fallback
 batch; it does not explain the two local terminal failures or the three earlier
 failures, and does not close the broader activation and release gates.
+
+## Inherited descriptors and nested completion — October 2, 2026
+
+- [x] Reproduce lost exec-visible file FD 40 and a disconnected Make jobserver
+  (FDs 42/43, `EBADF`) in the existing I/O case. No Rust test case was added.
+- [x] Capture the caller's non-CLOEXEC descriptors before opening rgo guards or
+  starting queries. Transfer up to 32 extra FDs, preserving original numbers,
+  aliases/shared offsets and pipe state; keep close-on-exec descriptors excluded.
+  Stage sources above all destinations and reserve empty destinations before
+  spawn allocates its exec-error pipe. Inventory/staging failures use checkout.
+- [x] Negotiate `inherited_fds` in the authenticated greeting before request
+  transfer. Refuse legacy requests without captured FD state before receipts,
+  commit or Cargo spawn. Protocol 9/admission 4/owner 4/receipt 2 are unchanged.
+- [x] Pass the extended existing coalition case locally (27.60 s): managed
+  storage, shared file offset 6, original jobserver token, CLOEXEC exclusion,
+  streams/native bytes, exact exit 17, owned retirement and actual idle GC.
+- [x] Verify both live version directions preserve FDs and one checkout app
+  execution with the original caller PID, exit 17 and actual idle GC. Verify
+  the current pair also commits in managed storage and preserves low FD 4's
+  shared offset, with one app invocation in its separate guardian process.
+- [x] Run the existing nested-Cargo case through the macOS pilot. Observe its
+  actual owned sidecars, protect both contexts, reclaim the idle neighbor and
+  require both guardians and completed contexts to retire.
+- [x] Diagnose remaining nested job metadata from the actual guardian error:
+  concurrent healthy completions contend for the shared retirement lock. Retry
+  only the typed busy error for up to five seconds after receipt retirement;
+  metadata edits and other errors remain errors. Maintenance stays nonblocking.
+  The existing nested case now passes in 3.40 s with actual final GC.
+- [x] Build all bins in debug/release and pass zero-warning all-target Clippy,
+  formatting and diff checks. Release binaries exclude private audit hooks.
+- [ ] Validate the final batch on the existing platform matrix, including
+  the actual nested case on macOS arm64 stable/beta/nightly and Intel stable.
+- [ ] Complete other inherited native-state/descriptor classes and nested
+  build-script/compiler-override shapes, terminal/IDE/workflow and upgrade
+  acceptance. The five prior unexplained failures remain open. Normal
+  activation and automatic GC remain disabled.
+
+The [record](probes/2026-10-02-macos-inherited-descriptors.json) distinguishes
+production failures from two probe corrections: an ordinary-Unix context ID
+expectation and a checkout-PID assertion applied to a managed guardian. It also
+records the build-script shape that uses the existing unverified-compiler
+fallback when Cargo exports `RUSTC`. Neither that fallback nor the verified
+regular-file/pipe classes prove every nested or native-state shape.

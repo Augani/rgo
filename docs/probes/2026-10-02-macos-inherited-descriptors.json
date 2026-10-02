@@ -1,0 +1,202 @@
+{
+  "date": "2026-10-02",
+  "baseline_code": "20bea89cc461161b416dad312e422e7b6757a8d2",
+  "platform": "ProductName:\t\tmacOS\nProductVersion:\t\t27.2\nBuildVersion:\t\t26B5091g",
+  "changes": [
+    "Capture exec-visible descriptors before rgo opens lifecycle guards; pass up to 32 extra descriptors by SCM_RIGHTS and restore exact numbers without overwriting sources or the exec-error pipe.",
+    "Negotiate inherited-FD capability in the greeting; decline legacy requests without captured FD state before receipt/commit/spawn. Both version directions preserve native checkout exec.",
+    "Retry only typed retirement-lock contention for up to five seconds after Cargo returned and the kernel receipt retired. Maintenance remains nonblocking."
+  ],
+  "local_evidence": {
+    "descriptor_failure": {
+      "sha256": "2b72b9665054c8c444e6cbf92a7ef58e4ad6e9568f22d79aa61ebe6854a030d9",
+      "results": [
+        "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 12.25s"
+      ],
+      "key_lines": [
+        "assertion `left == right` failed: warning: failed to connect to jobserver from environment variable `MAKEFLAGS=\"-j --jobserver-auth=42,43\"`: cannot open file descriptor 42 from the jobserver environment variable value: Bad file descriptor (os error 9)",
+        "assertion `left == right` failed: inherited file descriptor lost"
+      ]
+    },
+    "descriptor_fixed": {
+      "sha256": "065b39834101d042ce88c0ddf3271c497fd416b332eb4f7c90744847e0c34161",
+      "results": [
+        "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 27.60s"
+      ],
+      "key_lines": [
+        "installed Cargo pilot: stdin/EOF, streams/native bytes, inherited file aliases/shared offset, jobserver pipe/token, close-on-exec exclusion, managed exit 17 and actual idle GC passed"
+      ]
+    },
+    "nested_wrong_namespace": {
+      "sha256": "e1ec9edf079e14f478c1ac1c8d2686a6bd3e5f826ec23cebe4351105a762edaf",
+      "results": [
+        "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 9 filtered out; finished in 3.59s"
+      ],
+      "key_lines": []
+    },
+    "nested_retirement_failure": {
+      "sha256": "dc3b5691105181d1b7aa99d75b032686aa01414e825d9450688744634efef588",
+      "results": [
+        "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 9 filtered out; finished in 15.02s"
+      ],
+      "key_lines": []
+    },
+    "nested_retirement_process_state": {
+      "sha256": "eff652da76a88df8dea656e927d0113e7efe3b775a6a168470aa68c4898080a6",
+      "results": [
+        "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 9 filtered out; finished in 14.91s"
+      ],
+      "key_lines": [
+        "nested guardians did not retire; jobs=[(\"/var/folders/8f/l7zyp8_15jl68g9stnzw7lvw0000gn/T/.tmp9PBIUS/home/.rgo/builds/4a/31541931e0c878ab0c8607a4b6289a7f8e5bfd21f66a63e7e6ab78ba6465db\", None, None)]; processes=[\"97321     1 96836 S    /Users/augustusotu/Projects/rgo/target/debug/rgo daemon --foreground --home /var/folders/8f/l7zyp8_15jl68g9stnzw7lvw0000gn/T/.tmp9PBIUS/home/.rgo\"]; stderr=   Compiling nested-parent v0.1.0 (/private/var/folders/8f/l7zyp8_15jl68g9stnzw7lvw0000gn/T/.tmp9PBIUS/projects/nested-parent)"
+      ]
+    },
+    "nested_retirement_error": {
+      "sha256": "8f61cd452691cc86f3b69d50ca80cb4af6414c90f1896079d76f55ca4e3ab16d",
+      "results": [
+        "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 9 filtered out; finished in 13.80s"
+      ],
+      "key_lines": [
+        "nested guardians did not retire; jobs=[(\"/var/folders/8f/l7zyp8_15jl68g9stnzw7lvw0000gn/T/.tmpwQHWXU/home/.rgo/builds/55/95856f3eb8160a5ab9b53262d67308d2d7b4f23ec22776e71ad64f12c8f491\", None, None, \"Error: Cargo job retirement lock is busy\\n\")]; processes=[\"98876     1 98551 S    /Users/augustusotu/Projects/rgo/target/debug/rgo daemon --foreground --home /var/folders/8f/l7zyp8_15jl68g9stnzw7lvw0000gn/T/.tmpwQHWXU/home/.rgo\"]; stderr=   Compiling nested-parent v0.1.0 (/private/var/folders/8f/l7zyp8_15jl68g9stnzw7lvw0000gn/T/.tmpwQHWXU/projects/nested-parent)"
+      ]
+    },
+    "nested_fixed": {
+      "sha256": "0d8e91b4d0b79f67def5fb68f8fea231bf9d0fa08a7e392d174604b13cc0a707",
+      "results": [
+        "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 9 filtered out; finished in 3.40s"
+      ],
+      "key_lines": [
+        "macOS nested Cargo: both managed contexts protected, idle neighbor reclaimed, both guardians retired and actual final GC passed"
+      ]
+    }
+  },
+  "live_version_handoffs": {
+    "root": "/private/tmp/rgofdver-3vuumpj6",
+    "previous": "/private/tmp/rgofdver-3vuumpj6/previous",
+    "current": "/Users/augustusotu/Projects/rgo/target/debug",
+    "previous_sha": "20bea89cc461161b416dad312e422e7b6757a8d2",
+    "observations": [
+      {
+        "caller": "previous",
+        "guardian": "current",
+        "caller_at_barrier": true,
+        "guardian_committed": false,
+        "application_exit_code": 17,
+        "application_invocations": 1,
+        "same_pid": 98926,
+        "file_aliases_shared_offset": 6,
+        "jobserver_token_round_trip": true,
+        "close_on_exec_excluded": true,
+        "out_dir": "/private/tmp/rgofdver-3vuumpj6/o/project/target/debug/build/mixed-version-probe-71f15912d806ce2b/out",
+        "idle_metadata_retired": true,
+        "actual_idle_gc": true,
+        "captured_logs": {
+          "stdout.log": "native stdout\n",
+          "stderr.log": "rgo: macOS Cargo guardian unavailable (Cargo guardian cannot admit the invocation: Cargo caller did not capture inherited descriptors); using checkout storage\n   Compiling mixed-version-probe v0.1.0 (/private/tmp/rgofdver-3vuumpj6/o/project)\n    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.92s\n     Running `target/debug/mixed-version-probe`\nnative stderr\n",
+          "gc.log": "target 0 B; planned estimate 4.0 KiB; unlinked approximately 4.0 KiB\nManaged after GC      560.0 KiB\n  build contexts            0 B\n  compiler cache            0 B\n  other rgo state     560.0 KiB\nTarget still unmet    560.0 KiB\nSome remaining data was protected, ineligible, or could not be removed.\nVolume free observed 120.1 GiB before, 120.1 GiB after (other disk activity can affect this)\n"
+        }
+      },
+      {
+        "caller": "current",
+        "guardian": "previous",
+        "caller_at_barrier": true,
+        "guardian_committed": false,
+        "application_exit_code": 17,
+        "application_invocations": 1,
+        "same_pid": 99009,
+        "file_aliases_shared_offset": 6,
+        "jobserver_token_round_trip": true,
+        "close_on_exec_excluded": true,
+        "out_dir": "/private/tmp/rgofdver-3vuumpj6/n/project/target/debug/build/mixed-version-probe-71f15912d806ce2b/out",
+        "idle_metadata_retired": true,
+        "actual_idle_gc": true,
+        "captured_logs": {
+          "stdout.log": "native stdout\n",
+          "stderr.log": "rgo: macOS Cargo guardian unavailable (Cargo guardian cannot preserve inherited descriptors); using checkout storage\n   Compiling mixed-version-probe v0.1.0 (/private/tmp/rgofdver-3vuumpj6/n/project)\n    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.71s\n     Running `target/debug/mixed-version-probe`\nnative stderr\n",
+          "gc.log": "target 0 B; planned estimate 4.0 KiB; unlinked approximately 4.0 KiB\nManaged after GC      560.0 KiB\n  build contexts            0 B\n  compiler cache            0 B\n  other rgo state     560.0 KiB\nTarget still unmet    560.0 KiB\nSome remaining data was protected, ineligible, or could not be removed.\nVolume free observed 120.0 GiB before, 120.0 GiB after (other disk activity can affect this)\n"
+        }
+      }
+    ],
+    "platform": "ProductName:\t\tmacOS\nProductVersion:\t\t27.2\nBuildVersion:\t\t26B5091g",
+    "toolchain": "cargo 1.98.0 (797e8a9bc 2026-08-05)",
+    "binaries": {
+      "previous": {
+        "rgo": "5924d7482f82525c4beb05db76fb9250f1486901e9fbfd695c8b40deb4302a73",
+        "rgo-rustc-wrapper": "88800eb94dbe104b2d10046e996d5cc1ca1ca0729d4b4b5fa90906b5cc6f5194"
+      },
+      "current": {
+        "rgo": "c2ec4dfb60e2aed1439e0f8f16142aea1e215d8ffe2f9acfc7b9bdf5bab65678",
+        "rgo-rustc-wrapper": "88800eb94dbe104b2d10046e996d5cc1ca1ca0729d4b4b5fa90906b5cc6f5194"
+      }
+    },
+    "current_binary_scope": "Descriptor-transfer implementation before the independent final retirement-lock retry; exact binary hashes recorded. The managed low-FD proof uses the final debug build including that retry."
+  },
+  "managed_low_descriptor": {
+    "root": "/private/tmp/rgofdver-3vuumpj6",
+    "previous": "/private/tmp/rgofdver-3vuumpj6/previous",
+    "current": "/Users/augustusotu/Projects/rgo/target/debug",
+    "previous_sha": "20bea89cc461161b416dad312e422e7b6757a8d2",
+    "observations": [
+      {
+        "caller": "current",
+        "guardian": "current",
+        "caller_at_barrier": true,
+        "guardian_committed": true,
+        "application_exit_code": 17,
+        "application_invocations": 1,
+        "caller_pid": 344,
+        "application_pid": 383,
+        "same_pid": false,
+        "file_aliases_shared_offset": 6,
+        "original_low_source_fd": 4,
+        "jobserver_token_round_trip": true,
+        "close_on_exec_excluded": true,
+        "out_dir": "/private/tmp/rgofdver-3vuumpj6/managed-low/c/home/.rgo/builds/ae/e75e2bd382d277ce5f1541586e173805d9317dc92ece4f043de99cc2d86cf7/debug/build/mixed-version-probe-71f15912d806ce2b/out",
+        "idle_metadata_retired": true,
+        "actual_idle_gc": true,
+        "captured_logs": {
+          "stdout.log": "native stdout\n",
+          "stderr.log": "   Compiling mixed-version-probe v0.1.0 (/private/tmp/rgofdver-3vuumpj6/managed-low/c/project)\n    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.12s\n     Running `target/debug/mixed-version-probe`\nnative stderr\n",
+          "gc.log": "target 0 B; planned estimate 3.4 MiB; unlinked approximately 3.4 MiB\nManaged after GC      568.0 KiB\n  build contexts            0 B\n  compiler cache            0 B\n  other rgo state     568.0 KiB\nTarget still unmet    568.0 KiB\nSome remaining data was protected, ineligible, or could not be removed.\nVolume free observed 119.8 GiB before, 119.8 GiB after (other disk activity can affect this)\n"
+        }
+      }
+    ],
+    "platform": "ProductName:\t\tmacOS\nProductVersion:\t\t27.2\nBuildVersion:\t\t26B5091g",
+    "toolchain": "cargo 1.98.0 (797e8a9bc 2026-08-05)",
+    "binaries": {
+      "previous": {
+        "rgo": "5924d7482f82525c4beb05db76fb9250f1486901e9fbfd695c8b40deb4302a73",
+        "rgo-rustc-wrapper": "88800eb94dbe104b2d10046e996d5cc1ca1ca0729d4b4b5fa90906b5cc6f5194"
+      },
+      "current": {
+        "rgo": "e168d6e82c8537e0553c1c65d220930868313095e3855f43b4c9b47bc1f45113",
+        "rgo-rustc-wrapper": "88800eb94dbe104b2d10046e996d5cc1ca1ca0729d4b4b5fa90906b5cc6f5194"
+      }
+    }
+  },
+  "probe_corrections": [
+    "Nested fixture initially computed ordinary Unix IDs; it now identifies actual macOS context sidecars. The guards/reclamation assertions and deadlines are unchanged.",
+    "A managed-current/current manual run used the checkout assertion that app PID equals caller PID. It had one execution in a separate guardian process; the corrected probe checks one invocation and records both PIDs, plus exact low-FD shared offset. Both old/current fallback PID assertions had passed."
+  ],
+  "build_script_scope": {
+    "root": "/private/tmp/rgofds-pw5a54bn",
+    "source_sha": "5c0fdbcd9b0903c400ba4d07b8a0dcc72d66f6a0",
+    "parent_flags": "-j --jobserver-fds=3,5 --jobserver-auth=3,5",
+    "child_flags": "-j --jobserver-fds=3,5 --jobserver-auth=3,5",
+    "stderr": "   Compiling outer-jobserver v0.1.0 (/private/tmp/rgofds-pw5a54bn/parent)\n    Finished `dev` profile [unoptimized + debuginfo] target(s) in 2.93s\n",
+    "nested_stderr": "rgo: custom compiler or wrapper has no verified full-session writer protection; using ordinary Cargo storage\n   Compiling inner-jobserver v0.1.0 (/private/tmp/rgofds-pw5a54bn/nested)\n    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.69s\n",
+    "exit_code": 0,
+    "contexts": [
+      "/private/tmp/rgofds-pw5a54bn/home/.rgo/builds/06/328e1e1a106144120cb22fd4f3feec9339b41a352333f4f62b283ff0db9214"
+    ]
+  },
+  "checks": {
+    "all_bins_debug": "passed (18.37s)",
+    "clippy_all_targets": "passed with -D warnings (40.77s)",
+    "all_bins_release": "passed (30.73s)",
+    "format": "passed",
+    "diff": "passed",
+    "full_workspace_suite": "pending existing remote matrix; no duplicate full local suite",
+    "release_audit_hooks_present": false
+  },
+  "limits": "Both cases were extended, with no new Rust test case or CI lane. Five prior unexplained failures remain open. Build-script Cargo with an inherited RUSTC override uses existing unverified-compiler fallback. This does not close every inherited process-state or nested-build class. Native supervisor remains a private pilot and automatic GC remains disabled. Regular files, shared aliases and jobserver pipes are verified here; other descriptor/native process-state classes retain their existing acceptance gates."
+}

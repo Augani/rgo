@@ -228,6 +228,17 @@ pub(super) fn owner(directory: &Path) -> Result<(CargoJobOwner, Vec<u8>)> {
     }
 }
 
+#[derive(Debug)]
+pub struct RetirementBusy;
+
+impl std::fmt::Display for RetirementBusy {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("Cargo job retirement lock is busy")
+    }
+}
+
+impl std::error::Error for RetirementBusy {}
+
 pub(super) fn advance(
     directory: &Path,
     owner: &CargoJobOwner,
@@ -253,10 +264,9 @@ pub(super) fn advance(
     };
     let lock_path = paths.state_dir().join("locks/macos-job-retirement.lock");
     let lock = crate::supervision::open_lock_file(&lock_path)?;
-    ensure!(
-        FileExt::try_lock_exclusive(&lock)?,
-        "Cargo job retirement lock is busy"
-    );
+    if !FileExt::try_lock_exclusive(&lock)? {
+        return Err(RetirementBusy.into());
+    }
     crate::supervision::verify_lock_identity(&lock_path, &lock)?;
     let journal = if pending(directory)? {
         read_journal(&marker)?

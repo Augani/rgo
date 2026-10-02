@@ -141,6 +141,20 @@ automatic GC remain disabled.
 
 ## 0. What changed vs. `doc.md`, and why
 
+**2026-10-02 macOS descriptors and nested completion:** the existing I/O case
+reproduced a lost inherited file descriptor and a disconnected Make jobserver.
+The pilot now captures and transfers exec-visible descriptors, restores their
+numbers/shared descriptions and negotiates this capability before admission.
+Both live version directions use checkout fallback with one execution and
+preserved FDs; the current pair also verifies low-numbered FDs in managed
+storage. The existing nested-Cargo case now uses the macOS pilot and identified
+transient retirement-lock contention. A bounded typed retry after receipt
+retirement restores healthy completion, both active-context protections,
+idle-neighbor reclamation and final actual GC. See the
+[evidence and checklist](docs/macos-cargo-supervision.md#inherited-descriptors-and-nested-completion--october-2-2026).
+The five earlier unexplained failures and broader release gates remain open;
+normal activation and automatic GC stay disabled.
+
 **2026-10-02 queued macOS commit and completed GC locks:** the existing pilot
 case reproduced blocked TERM missing from the application's pending set and
 incorrect code-1 outcomes after an incomplete commit. Capability negotiation,

@@ -322,6 +322,19 @@ All 19 existing jobs passed on attempt 1 at `20bea89` in the
 both advisory nightly lanes and actual arm64/Intel guardian cases. The five
 unexplained failures and broader release gates remain open.
 
+**macOS inherited descriptors and nested completion:** the pilot now captures
+exec-visible FDs before its own guards, transfers their open descriptions and
+restores original numbers. The existing I/O fixture reproduces the former file
+loss/Make jobserver failure and verifies shared offsets, pipe tokens, native
+bytes, managed exit 17 and actual GC. Both live version directions use checkout
+fallback before commit and run once with FDs intact. The existing nested case
+now uses the macOS pilot, retains both active contexts while reclaiming an idle
+neighbor, and completes actual final cleanup. It exposed concurrent guardian
+retirement-lock contention; a bounded typed retry resolves that failure without
+blocking maintenance. [Evidence and remaining gates](macos-cargo-supervision.md#inherited-descriptors-and-nested-completion--october-2-2026)
+keep the broader process-state, workflow and five unexplained failures open.
+Normal activation and automatic GC stay disabled.
+
 **macOS priority (2026-10-02):** a private real-Cargo audit reproduced deletion
 while a detached child with closed inherited descriptors was still writing.
 The [macOS supervisor checklist](macos-cargo-supervision.md) records the selected

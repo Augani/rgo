@@ -930,3 +930,31 @@ arm64 stable/beta/nightly and Intel coalition/interrupt cases; Intel retains
 all ten startup outcomes, including kernel-pending SIGALRM and exact checkout
 handler exit 74. This verifies the change across those runtimes without
 explaining the terminal failures or closing broader compatibility gates.
+
+## macOS inherited descriptors and nested completion — October 2, 2026
+
+Cargo documents [build-script jobserver coordination](https://doc.rust-lang.org/cargo/reference/build-scripts.html#jobserver)
+and [`CARGO_MAKEFLAGS`](https://doc.rust-lang.org/cargo/reference/environment-variables.html#environment-variables-cargo-sets-for-build-scripts).
+The [rustc jobserver contract](https://doc.rust-lang.org/rustc/jobserver.html)
+also accepts Make's jobserver environment. Copying those flags without the
+referenced descriptors loses the connection. The existing macOS I/O fixture
+reproduced both lost file FD 40 and `MAKEFLAGS` pipe FD 42 failing with `EBADF`.
+
+The pilot now inventories its own incoming descriptor set with Darwin's
+`PROC_PIDLISTFDS`, before creating rgo guards. Apple's
+[implementation](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/kern/proc_info.c)
+provides sizing headroom and returns the actual entries under the descriptor
+lock. The caller checks CLOEXEC flags; incomplete/oversized inventory refuses
+admission. SCM_RIGHTS transfers open descriptions, and child restoration keeps
+numbers and aliases without overwriting later sources or spawn's error pipe.
+A greeting capability and explicit request state prevent silent legacy handoff.
+
+The [observations](probes/2026-10-02-macos-inherited-descriptors.json) verify
+managed files/aliases/shared offset, jobserver pipes/tokens, CLOEXEC exclusion,
+streams/bytes, exit 17 and actual cleanup. Both live version directions retain
+one checkout execution and native FDs; the current pair also verifies low FD 4
+in managed storage. Extending the existing nested case exposed a separate
+retirement-lock contention error during simultaneous healthy completion. A
+bounded retry of only that typed error resolves it after receipt retirement;
+maintenance stays nonblocking. Other native-state/nested classes and the five
+prior unexplained failures remain open, with normal activation and auto-GC off.

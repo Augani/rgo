@@ -187,9 +187,11 @@ jobs:
           cargo --version --verbose
       - name: Build every binary before real-Cargo fixtures
         run: cargo build --workspace --locked
-      - name: Verify descendant protection, job recovery, and signal handoff
+      - name: Verify descendant protection, nested completion, and signal handoff
         timeout-minutes: 3
-        run: cargo test -p rgo-storage --test macos_coalition --test supervised_interrupt -- --nocapture
+        run: |
+          cargo test -p rgo-storage --test macos_coalition --test supervised_interrupt -- --nocapture
+          cargo test -p rgo-storage --test supervised nested_cargo_build_keeps_both_contexts_safe_while_gc_reclaims_an_idle_one -- --exact --nocapture
 
   btrfs-smoke:
     if: github.event_name != 'workflow_dispatch' || !inputs.guardian_only

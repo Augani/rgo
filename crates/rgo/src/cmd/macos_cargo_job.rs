@@ -23,10 +23,12 @@ use std::time::{Duration, Instant};
 
 #[cfg(debug_assertions)]
 mod audit;
+mod descriptors;
 mod events;
 mod terminal;
 mod wake;
 
+pub(crate) use descriptors::Inherited as InheritedDescriptors;
 pub use terminal::recovery::Action as TerminalHostAction;
 
 pub fn terminal_host(action: TerminalHostAction, home: Option<&Path>) -> Result<()> {
@@ -108,12 +110,16 @@ struct Invocation {
     framed_control: bool,
     #[serde(default)]
     signals: events::NativeSignals,
+    #[serde(default)]
+    inherited_fds: Option<Vec<i32>>,
 }
 
 #[derive(Serialize, Deserialize)]
 enum Message {
     Greeting {
         token: String,
+        #[serde(default)]
+        inherited_fds: bool,
     },
     Prepared {
         coalition: u64,
@@ -223,7 +229,7 @@ fn check_peer(stream: &UnixStream) -> Result<()> {
 
 fn send_descriptors(stream: &UnixStream, descriptors: &[i32]) -> Result<()> {
     ensure!(
-        (1..=4).contains(&descriptors.len()),
+        (1..=descriptors::MAX_TRANSFER).contains(&descriptors.len()),
         "invalid descriptor transfer count"
     );
     for &descriptor in descriptors {
@@ -237,7 +243,7 @@ fn send_descriptors(stream: &UnixStream, descriptors: &[i32]) -> Result<()> {
         iov_base: marker.as_mut_ptr().cast(),
         iov_len: 1,
     };
-    let mut control = [0_u64; 16];
+    let mut control = [0_u64; 32];
     let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
     message.msg_iov = &mut io;
     message.msg_iovlen = 1;
@@ -269,7 +275,7 @@ fn send_descriptors(stream: &UnixStream, descriptors: &[i32]) -> Result<()> {
 
 fn receive_descriptors(stream: &UnixStream, expected: usize) -> Result<Vec<OwnedFd>> {
     ensure!(
-        (1..=4).contains(&expected),
+        (1..=descriptors::MAX_TRANSFER).contains(&expected),
         "invalid descriptor receive count"
     );
     let mut marker = [0_u8; 1];
@@ -277,7 +283,7 @@ fn receive_descriptors(stream: &UnixStream, expected: usize) -> Result<Vec<Owned
         iov_base: marker.as_mut_ptr().cast(),
         iov_len: 1,
     };
-    let mut control = [0_u64; 16];
+    let mut control = [0_u64; 32];
     let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
     message.msg_iov = &mut io;
     message.msg_iovlen = 1;
@@ -404,6 +410,7 @@ impl PreparedJob {
         args: &[OsString],
         paths: &RgoPaths,
         context: &Path,
+        inherited: &InheritedDescriptors,
     ) -> Result<Self> {
         let started = Instant::now();
         let deadline = started + STARTUP_TIMEOUT;
@@ -429,6 +436,7 @@ impl PreparedJob {
             terminal: terminal.is_some(),
             framed_control: true,
             signals,
+            inherited_fds: Some(inherited.targets.clone()),
         };
         // Serialize before registering any job, including the frame size check.
         ensure!(
@@ -525,9 +533,17 @@ impl PreparedJob {
         stream.set_read_timeout(Some(remaining))?;
         stream.set_write_timeout(Some(remaining))?;
         check_peer(&stream)?;
+        let Message::Greeting {
+            token,
+            inherited_fds,
+        } = read_frame::<Message>(&mut stream)?
+        else {
+            bail!("Cargo guardian authentication failed");
+        };
+        ensure!(token == owner.token, "Cargo guardian authentication failed");
         ensure!(
-            matches!(read_frame::<Message>(&mut stream)?, Message::Greeting { token } if token == owner.token),
-            "Cargo guardian authentication failed"
+            inherited_fds,
+            "Cargo guardian cannot preserve inherited descriptors"
         );
         let connected = started.elapsed();
         // From the first request byte the guardian may publish a receipt. It
@@ -538,6 +554,7 @@ impl PreparedJob {
         if let Some(terminal) = &terminal {
             descriptors.push(terminal.fd());
         }
+        descriptors.extend_from_slice(&inherited.targets);
         send_descriptors(&stream, &descriptors)?;
         let coalition = match read_frame::<Message>(&mut stream)? {
             Message::Prepared {
@@ -1026,13 +1043,24 @@ pub fn guardian(directory: &Path, token: &str, context: Option<&Path>) -> Result
         &mut stream,
         &Message::Greeting {
             token: token.to_owned(),
+            inherited_fds: true,
         },
     )?;
     let request = read_frame::<Invocation>(&mut stream)?;
-    let mut descriptors = receive_descriptors(&stream, if request.terminal { 4 } else { 3 })?;
+    let targets = request.inherited_fds.as_deref().unwrap_or_default();
+    descriptors::validate(targets)?;
+    let standard_count = if request.terminal { 4 } else { 3 };
+    let mut descriptors = receive_descriptors(&stream, standard_count + targets.len())?;
     // An older caller can still send a mask outside the current relay policy.
     // Refuse it before preparing a PTY, publishing a receipt or accepting Q/S.
-    if let Err(error) = request.signals.validate_for_managed() {
+    let validation = request.signals.validate_for_managed().and_then(|()| {
+        ensure!(
+            request.inherited_fds.is_some(),
+            "Cargo caller did not capture inherited descriptors"
+        );
+        Ok(())
+    });
+    if let Err(error) = validation {
         let _ = write_frame(
             &mut stream,
             &Message::Failed {
@@ -1041,6 +1069,7 @@ pub fn guardian(directory: &Path, token: &str, context: Option<&Path>) -> Result
         );
         return Err(error);
     }
+    let inherited = descriptors::Restored::prepare(targets, descriptors.split_off(standard_count))?;
     let mut terminal = if request.terminal {
         Some(terminal::Guardian::new(
             descriptors.pop().context("original terminal is missing")?,
@@ -1163,9 +1192,14 @@ pub fn guardian(directory: &Path, token: &str, context: Option<&Path>) -> Result
         // A pre_exec callback forces Command off Darwin's posix_spawn path.
         // Exec already resets caught handlers. Pipes need no callback when
         // the remaining inherited mask/ignored dispositions match the caller.
-        if pending != 0 || slave.is_some() || request.signals != events::NativeSignals::capture()? {
+        if pending != 0
+            || slave.is_some()
+            || !inherited.is_empty()
+            || request.signals != events::NativeSignals::capture()?
+        {
             unsafe {
                 command.pre_exec(move || {
+                    inherited.restore_in_child()?;
                     if let Some(slave) = slave.filter(|_| initially_foreground) {
                         // Command has established the child's process group. Make
                         // it foreground before exec can read its controlling PTY.
@@ -1302,7 +1336,20 @@ pub fn guardian(directory: &Path, token: &str, context: Option<&Path>) -> Result
     }
     session.finish_macos_coalition()?;
     early_cleanup.safe_to_reap = true;
-    macos_jobs::cleanup(directory, &owner, &bytes)?;
+    // Concurrent guardians can complete together. Only a busy retirement lock
+    // is transient; edited metadata and every other failure remain errors.
+    // Cargo already returned and the receipt retired, so this cannot delay or
+    // repeat managed work. Daemon maintenance keeps its nonblocking policy.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match macos_jobs::cleanup(directory, &owner, &bytes) {
+            Ok(()) => break,
+            Err(error) if error.is::<macos_jobs::RetirementBusy>() && Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => return Err(error),
+        }
+    }
     early_cleanup.safe_to_reap = false;
     result
 }
