@@ -884,7 +884,17 @@ fn main() {
     out.write_all(std::env::var_os("RGO_NATIVE_BYTES").unwrap().as_bytes()).unwrap();
     if std::env::var_os("RGO_INHERITED_FDS").is_some() { unsafe {
         assert!(std::path::Path::new(env!("OUT_DIR")).starts_with(std::path::Path::new(&std::env::var_os("RGO_HOME").unwrap()).join("builds")),"descriptor check used checkout fallback");
-        extern "C" { fn read(fd:i32,buf:*mut u8,len:usize)->isize; fn write(fd:i32,buf:*const u8,len:usize)->isize; fn fcntl(fd:i32,cmd:i32,...)->i32; }
+        extern "C" { fn read(fd:i32,buf:*mut u8,len:usize)->isize; fn write(fd:i32,buf:*const u8,len:usize)->isize; fn fcntl(fd:i32,cmd:i32,...)->i32; fn umask(mask:u16)->u16; fn getrlimit(resource:i32,value:*mut Limit)->i32; fn getpriority(which:i32,who:u32)->i32; }
+        #[repr(C)] struct Limit { soft:u64, hard:u64 }
+        let mask=umask(0); umask(mask); assert_eq!(mask,0o077,"caller file mask changed");
+        let mut limit=Limit{soft:0,hard:0}; assert_eq!(getrlimit(8,&mut limit),0);
+        assert_eq!(limit.soft,128,"caller NOFILE limit changed");
+        assert_eq!(limit.hard,std::env::var("RGO_NATIVE_NOFILE_HARD").unwrap().parse::<u64>().unwrap());
+        assert_eq!(getpriority(0,0),10,"caller nice value changed");
+        use std::os::unix::fs::PermissionsExt;
+        let created=std::path::Path::new(&std::env::var_os("RGO_HOME").unwrap()).join("native-created");
+        std::fs::write(&created,b"native permissions").unwrap();
+        assert_eq!(std::fs::metadata(created).unwrap().permissions().mode()&0o777,0o600);
         let mut value = [0u8;6];
         assert_eq!(read(40,value.as_mut_ptr(),3),3,"inherited file descriptor lost");
         assert_eq!(read(41,value.as_mut_ptr().add(3),3),3,"inherited alias lost");
@@ -924,11 +934,24 @@ fn main() {
         assert_eq!(libc::write(writer.as_raw_fd(), b"+".as_ptr().cast(), 1), 1);
         (reader, writer)
     };
+    #[allow(unsafe_code)]
+    let nofile = unsafe {
+        let mut limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        assert_eq!(libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit), 0);
+        libc::rlimit {
+            rlim_cur: 128,
+            rlim_max: limit.rlim_max,
+        }
+    };
     let mut command = sandbox.cmd("cargo");
     command
         .current_dir(&project)
         .env("PATH", &search_path)
         .env("RGO_MACOS_SUPERVISOR_PILOT", "1")
+        .env("RGO_NATIVE_NOFILE_HARD", nofile.rlim_max.to_string())
         .env("RGO_INHERITED_FDS", "1")
         .env("MAKEFLAGS", "-j --jobserver-auth=42,43")
         .env("RGO_COALITION_READY", &ready)
@@ -960,9 +983,13 @@ fn main() {
                     return Err(std::io::Error::last_os_error());
                 }
             }
-            if libc::fcntl(44, libc::F_SETFD, libc::FD_CLOEXEC) < 0 {
+            if libc::fcntl(44, libc::F_SETFD, libc::FD_CLOEXEC) < 0
+                || libc::setrlimit(libc::RLIMIT_NOFILE, &nofile) != 0
+                || libc::setpriority(libc::PRIO_PROCESS, 0, 10) != 0
+            {
                 return Err(std::io::Error::last_os_error());
             }
+            libc::umask(0o077);
             Ok(())
         });
     }
@@ -1028,7 +1055,7 @@ fn main() {
         "{transport_stderr}"
     );
     println!(
-        "installed Cargo pilot: stdin/EOF, streams/native bytes, inherited file aliases/shared offset, jobserver pipe/token, close-on-exec exclusion, managed exit 17 and actual idle GC passed"
+        "installed Cargo pilot: stdin/EOF, streams/native bytes, inherited file aliases/shared offset, jobserver pipe/token, close-on-exec exclusion, umask 077/mode 0600, NOFILE 128/hard limit, nice 10, managed exit 17 and actual idle GC passed"
     );
 
     // Extend the same real-Cargo fixture with an interactive zsh job, rather
@@ -1057,6 +1084,26 @@ fn main() {
         .env("RGO_COALITION_RESULT", &result)
         .output()
         .unwrap();
+    if !terminal.status.success() {
+        for entry in paths.state_dir().read_dir().unwrap().filter_map(Result::ok) {
+            if entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("macos-cargo-job-")
+            {
+                eprintln!(
+                    "terminal failure guardian {:?}: {}",
+                    entry.path(),
+                    std::fs::read_to_string(entry.path().join("guardian.stderr"))
+                        .unwrap_or_default()
+                );
+            }
+        }
+        eprintln!(
+            "terminal failure events: {}",
+            std::fs::read_to_string(event_audit.join("events")).unwrap_or_default()
+        );
+    }
     assert!(
         terminal.status.success(),
         "{}\n{}",

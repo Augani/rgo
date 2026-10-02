@@ -25,10 +25,12 @@ use std::time::{Duration, Instant};
 mod audit;
 mod descriptors;
 mod events;
+mod native;
 mod terminal;
 mod wake;
 
 pub(crate) use descriptors::Inherited as InheritedDescriptors;
+pub(crate) use native::Attributes as NativeAttributes;
 pub use terminal::recovery::Action as TerminalHostAction;
 
 pub fn terminal_host(action: TerminalHostAction, home: Option<&Path>) -> Result<()> {
@@ -112,6 +114,8 @@ struct Invocation {
     signals: events::NativeSignals,
     #[serde(default)]
     inherited_fds: Option<Vec<i32>>,
+    #[serde(default)]
+    native_attributes: Option<NativeAttributes>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -120,6 +124,8 @@ enum Message {
         token: String,
         #[serde(default)]
         inherited_fds: bool,
+        #[serde(default)]
+        native_attributes: bool,
     },
     Prepared {
         coalition: u64,
@@ -411,6 +417,7 @@ impl PreparedJob {
         paths: &RgoPaths,
         context: &Path,
         inherited: &InheritedDescriptors,
+        attributes: NativeAttributes,
     ) -> Result<Self> {
         let started = Instant::now();
         let deadline = started + STARTUP_TIMEOUT;
@@ -437,6 +444,7 @@ impl PreparedJob {
             framed_control: true,
             signals,
             inherited_fds: Some(inherited.targets.clone()),
+            native_attributes: Some(attributes),
         };
         // Serialize before registering any job, including the frame size check.
         ensure!(
@@ -536,7 +544,8 @@ impl PreparedJob {
         let Message::Greeting {
             token,
             inherited_fds,
-        } = read_frame::<Message>(&mut stream)?
+            native_attributes,
+        } = read_frame::<Message>(&mut stream).context("reading Cargo guardian greeting")?
         else {
             bail!("Cargo guardian authentication failed");
         };
@@ -544,6 +553,10 @@ impl PreparedJob {
         ensure!(
             inherited_fds,
             "Cargo guardian cannot preserve inherited descriptors"
+        );
+        ensure!(
+            native_attributes,
+            "Cargo guardian cannot preserve native attributes"
         );
         let connected = started.elapsed();
         // From the first request byte the guardian may publish a receipt. It
@@ -556,7 +569,9 @@ impl PreparedJob {
         }
         descriptors.extend_from_slice(&inherited.targets);
         send_descriptors(&stream, &descriptors)?;
-        let coalition = match read_frame::<Message>(&mut stream)? {
+        let coalition = match read_frame::<Message>(&mut stream)
+            .context("reading Cargo guardian prepared reply")?
+        {
             Message::Prepared {
                 coalition,
                 pending_before_exec,
@@ -594,14 +609,19 @@ impl PreparedJob {
         };
         if let Some(terminal) = &mut job.terminal {
             terminal.attach(
-                receive_descriptors(&job.stream, 1)?
+                receive_descriptors(&job.stream, 1)
+                    .context("receiving Cargo guardian terminal")?
                     .pop()
                     .context("PTY descriptor is missing")?,
             );
             job.stream.write_all(b"T")?;
             write_frame(&mut job.stream, &terminal.configuration()?)?;
             ensure!(
-                matches!(read_frame::<Message>(&mut job.stream)?, Message::Configured),
+                matches!(
+                    read_frame::<Message>(&mut job.stream)
+                        .context("reading Cargo guardian terminal configuration reply")?,
+                    Message::Configured
+                ),
                 "Cargo terminal was not configured"
             );
             terminal.activate()?;
@@ -1044,6 +1064,7 @@ pub fn guardian(directory: &Path, token: &str, context: Option<&Path>) -> Result
         &Message::Greeting {
             token: token.to_owned(),
             inherited_fds: true,
+            native_attributes: true,
         },
     )?;
     let request = read_frame::<Invocation>(&mut stream)?;
@@ -1058,7 +1079,10 @@ pub fn guardian(directory: &Path, token: &str, context: Option<&Path>) -> Result
             request.inherited_fds.is_some(),
             "Cargo caller did not capture inherited descriptors"
         );
-        Ok(())
+        request
+            .native_attributes
+            .context("Cargo caller did not capture native attributes")?
+            .validate_for_guardian()
     });
     if let Err(error) = validation {
         let _ = write_frame(
@@ -1069,6 +1093,9 @@ pub fn guardian(directory: &Path, token: &str, context: Option<&Path>) -> Result
         );
         return Err(error);
     }
+    let attributes = request
+        .native_attributes
+        .context("Cargo native attributes are missing")?;
     let inherited = descriptors::Restored::prepare(targets, descriptors.split_off(standard_count))?;
     let mut terminal = if request.terminal {
         Some(terminal::Guardian::new(
@@ -1189,32 +1216,26 @@ pub fn guardian(directory: &Path, token: &str, context: Option<&Path>) -> Result
             .stdout(Stdio::from(stdout))
             .stderr(Stdio::from(stderr))
             .process_group(0);
-        // A pre_exec callback forces Command off Darwin's posix_spawn path.
-        // Exec already resets caught handlers. Pipes need no callback when
-        // the remaining inherited mask/ignored dispositions match the caller.
-        if pending != 0
-            || slave.is_some()
-            || !inherited.is_empty()
-            || request.signals != events::NativeSignals::capture()?
-        {
-            unsafe {
-                command.pre_exec(move || {
-                    inherited.restore_in_child()?;
-                    if let Some(slave) = slave.filter(|_| initially_foreground) {
-                        // Command has established the child's process group. Make
-                        // it foreground before exec can read its controlling PTY.
-                        let mut blocked = std::mem::zeroed();
-                        libc::sigemptyset(&mut blocked);
-                        libc::sigaddset(&mut blocked, libc::SIGTTOU);
-                        if libc::sigprocmask(libc::SIG_BLOCK, &blocked, std::ptr::null_mut()) != 0
-                            || libc::tcsetpgrp(slave, libc::getpgrp()) != 0
-                        {
-                            return Err(std::io::Error::last_os_error());
-                        }
+        // Restore only in the actual child, after descriptor staging. The
+        // guardian retains its launchd limits and mask for lifecycle cleanup.
+        unsafe {
+            command.pre_exec(move || {
+                inherited.restore_in_child()?;
+                attributes.restore_in_child()?;
+                if let Some(slave) = slave.filter(|_| initially_foreground) {
+                    // Command has established the child's process group. Make
+                    // it foreground before exec can read its controlling PTY.
+                    let mut blocked = std::mem::zeroed();
+                    libc::sigemptyset(&mut blocked);
+                    libc::sigaddset(&mut blocked, libc::SIGTTOU);
+                    if libc::sigprocmask(libc::SIG_BLOCK, &blocked, std::ptr::null_mut()) != 0
+                        || libc::tcsetpgrp(slave, libc::getpgrp()) != 0
+                    {
+                        return Err(std::io::Error::last_os_error());
                     }
-                    request.signals.restore_in_child(pending)
-                });
-            }
+                }
+                request.signals.restore_in_child(pending)
+            });
         }
         let child = command
             .spawn()

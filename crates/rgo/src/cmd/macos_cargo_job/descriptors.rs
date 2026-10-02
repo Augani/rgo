@@ -9,7 +9,7 @@ pub(super) const MAX_INHERITED: usize = 32;
 pub(super) const MAX_TRANSFER: usize = MAX_INHERITED + 4;
 
 pub(crate) struct Inherited {
-    pub(super) targets: Vec<i32>,
+    pub(crate) targets: Vec<i32>,
 }
 
 impl Inherited {
@@ -138,10 +138,6 @@ impl Restored {
             mappings,
             _reservations: reservations,
         })
-    }
-
-    pub(super) fn is_empty(&self) -> bool {
-        self.mappings.is_empty()
     }
 
     /// Only async-signal-safe calls between fork and exec. dup2 clears CLOEXEC

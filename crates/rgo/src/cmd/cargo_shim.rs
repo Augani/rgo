@@ -41,9 +41,13 @@ pub fn run(
 ) -> Result<()> {
     let started = std::time::Instant::now();
     #[cfg(target_os = "macos")]
-    let inherited_fds = (std::env::var_os("RGO_MACOS_SUPERVISOR_PILOT").as_deref()
+    let native = (std::env::var_os("RGO_MACOS_SUPERVISOR_PILOT").as_deref()
         == Some(OsStr::new("1")))
-    .then(super::macos_cargo_job::InheritedDescriptors::capture);
+    .then(|| {
+        let inherited = super::macos_cargo_job::InheritedDescriptors::capture()?;
+        let attributes = super::macos_cargo_job::NativeAttributes::capture(&inherited.targets)?;
+        Ok::<_, anyhow::Error>((inherited, attributes))
+    });
     if !real_cargo.is_absolute() {
         bail!("--real-cargo must be an absolute path to the existing Cargo executable");
     }
@@ -194,16 +198,17 @@ pub fn run(
     #[cfg(target_os = "macos")]
     if std::env::var_os("RGO_MACOS_SUPERVISOR_PILOT").as_deref() == Some(OsStr::new("1")) {
         if let Some((context, root)) = &selection {
-            match inherited_fds
-                .context("Cargo descriptor capture is missing")
+            match native
+                .context("Cargo native attribute capture is missing")
                 .and_then(|capture| capture)
-                .and_then(|inherited| {
+                .and_then(|(inherited, attributes)| {
                     super::macos_cargo_job::PreparedJob::prepare(
                         real_cargo,
                         &command_args,
                         &paths,
                         context,
                         &inherited,
+                        attributes,
                     )
                 })
                 .and_then(|job| job.commit(&mut session))
