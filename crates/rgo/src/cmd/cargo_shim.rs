@@ -198,6 +198,7 @@ pub fn run(
             ) {
                 Ok(job) => return job.run(session),
                 Err(error) => {
+                    super::macos_cargo_job::abort_cancelled();
                     eprintln!(
                         "rgo: macOS Cargo guardian unavailable ({error:#}); using checkout storage"
                     );

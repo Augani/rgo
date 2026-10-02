@@ -81,6 +81,17 @@ at `b4f9e46` without a retry, including the actual replacement case on arm64 and
 Intel. The replacement/unload race is closed; remaining activation and safety
 gates stay in the [macOS checklist](docs/macos-cargo-supervision.md#one-use-job-retirement--october-2-2026).
 
+**2026-10-02 macOS preparation cancellation:** the pilot now checks captured
+termination before committing Cargo and before preparation-error fallback.
+Terminal restoration precedes signal restoration on preparation errors;
+originally ignored signals remain ignored, while continuation/window effects
+reach the separate Cargo group and PTY. The two existing macOS cases passed
+locally, including deterministic SIGINT/SIGTERM cancellation, ignored-SIGINT
+admission, and stop/resume with ignored and blocked SIGCONT. All-bin build and
+zero-warning Clippy passed. Platform verification is pending. This closes the
+two reproduced late-preparation paths, not every startup interruption boundary
+or the two earlier unexplained failures.
+
 ## 0. What changed vs. `doc.md`, and why
 
 **2026-10-02 macOS supervisor:** Unix cleanup with a detached closed-FD writer

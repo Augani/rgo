@@ -1,0 +1,40 @@
+{
+  "purpose": "Captured observations from the existing private-home macOS coalition fixture, with deterministic late-preparation auditing",
+  "native_baseline": "b4f9e46c71e949c4b5e14152b0f7a5a860e223ed",
+  "baseline_instrumentation": "Debug-only preparation pause and guardian commit marker; no cancellation fix",
+  "platform": "macOS 27.2 build 26B5091g arm64",
+  "toolchain": "Cargo/rustc 1.98.0 stable",
+  "isolation": "rgo-testkit Sandbox private HOME, CARGO_HOME, RGO_HOME; real Cargo offline; automatic GC and compiler cache off",
+  "before_fix": {
+    "result": "FAILED",
+    "duration_seconds": 5.71,
+    "observed_stdout": [
+      "startup cancellation: signal=2, ignored=false, committed=true, status=ExitStatus(unix_wait_status(2))",
+      "startup cancellation: signal=15, ignored=false, committed=false, status=ExitStatus(unix_wait_status(0))",
+      "startup cancellation: signal=2, ignored=true, committed=true, status=ExitStatus(unix_wait_status(0))"
+    ],
+    "sigterm_stderr_excerpt": "rgo: macOS Cargo guardian unavailable (injected preparation completion failure); using checkout storage"
+  },
+  "after_fix": {
+    "command": "cargo test -p rgo-storage --test macos_coalition --test supervised_interrupt -- --nocapture",
+    "result": "2 passed; 0 failed",
+    "coalition_case_duration_seconds": 31.09,
+    "interrupt_case_duration_seconds": 3.41,
+    "observed_stdout": [
+      "startup cancellation: signal=2, ignored=false, committed=false, status=ExitStatus(unix_wait_status(2))",
+      "startup cancellation: signal=15, ignored=false, committed=false, status=ExitStatus(unix_wait_status(15))",
+      "startup cancellation: signal=2, ignored=true, committed=true, status=ExitStatus(unix_wait_status(0))"
+    ],
+    "positive_reclamation": "Each subcase requires owned guardian metadata retirement and actual GC deletion of its idle managed contexts",
+    "interrupt_condition": "Caller inherits SIGCONT both ignored and blocked; existing stop/resume, Ctrl-C, surviving descendant and idle-neighbor reclamation assertions retained"
+  },
+  "verification": [
+    "cargo build: passed, all bins",
+    "cargo clippy --all-targets -- -D warnings: passed",
+    "cargo build --workspace --release: passed",
+    "Audit strings absent from release rgo/rgo-rustc-wrapper, present in debug rgo positive control",
+    "cargo fmt --all -- --check: passed",
+    "git diff --check: passed"
+  ],
+  "limits": "Observed late-preparation point only. Signal timing after the cancellation check, other startup cuts, supported runtime matrix, the earlier unexplained interrupt failure and separate terminal startup timeout remain open. Historical b4f9e46 performance measurements do not measure this change."
+}

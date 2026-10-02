@@ -206,6 +206,19 @@ race is resolved; that timeout, the earlier interrupt failure, and the wider P2
 gates remain open
 in the [macOS checklist](macos-cargo-supervision.md#one-use-job-retirement--october-2-2026).
 
+**macOS preparation cancellation:** captured SIGINT no longer proceeds to the
+Cargo commit after preparation, and captured SIGTERM plus a preparation error
+no longer launches fallback Cargo. Terminal restoration now precedes restored
+signal actions on these error paths. Original ignored actions are preserved;
+continuation and window notifications still reproduce the effects on the
+separate Cargo group/PTY. The two existing local macOS cases passed, including
+an ignored-SIGINT positive control and ignored/blocked SIGCONT stop/resume.
+No additional Rust test case was added; deterministic handshake auditing is
+excluded from release binaries. Platform verification is pending. The broader
+cancellation and runtime gates, plus the two earlier unexplained failures,
+remain open in the
+[macOS checklist](macos-cargo-supervision.md#preparation-cancellation--october-2-2026).
+
 **macOS priority (2026-10-02):** a private real-Cargo audit reproduced deletion
 while a detached child with closed inherited descriptors was still writing.
 The [macOS supervisor checklist](macos-cargo-supervision.md) records the selected

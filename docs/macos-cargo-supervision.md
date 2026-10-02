@@ -747,3 +747,48 @@ budget recovery.
 The replacement/unload race gate is closed by removing label-based unloading;
 the two unexplained terminal/interrupt failures and remaining startup,
 cancellation, runtime, and performance gates stay open.
+
+## Preparation cancellation — October 2, 2026
+
+- [x] Reproduce SIGINT captured at the end of preparation still committing
+  Cargo, and SIGTERM plus a preparation error starting fallback Cargo.
+- [x] Refuse the commit and fallback after captured termination, returning the
+  requested signal. Restore terminal state before original signal actions on
+  every subsequent preparation error.
+- [x] Preserve originally ignored termination signals. The ignored-SIGINT
+  positive control must commit real Cargo and finish successfully.
+- [x] Observe continuation/window notifications in the caller even when its
+  original dispositions/mask would suppress delivery. Cargo retains its
+  captured mask/dispositions. The existing interrupt case starts with SIGCONT
+  ignored and blocked, then requires stop/resume, Ctrl-C, a protected surviving
+  descendant, and actual reclamation of an idle neighbor.
+- [x] Extend only the existing coalition and interrupt cases. The deterministic
+  handshake audit requires a private owned directory, is enabled explicitly,
+  and is excluded from release binaries. Each cancellation subcase requires
+  owned job retirement and actual idle-context deletion before continuing.
+- [ ] Verify this change across the existing platform lanes. Local all-bin
+  build and zero-warning all-target Clippy passed; the coalition/terminal case
+  passed in 31.09 s and the interrupt case in 3.41 s on macOS 27.2 arm64.
+- [ ] Cover the remaining startup cuts and signal timing after the cancellation
+  check, and complete the inherited signal/mask and terminal compatibility
+  matrix before normal activation.
+- [ ] Resolve the original macOS stable interrupt failure and the later local
+  terminal startup timeout. The original failed job's archived log reports
+  0.91 s for the interrupt case; its child's thirty-second expiry cannot explain
+  that failure. The new cancellation checks do not establish its cause.
+
+Before the fix, the audit recorded SIGINT with `committed=true` and signal exit
+2, SIGTERM with `committed=false` but successful exit 0 through fallback, and
+ignored SIGINT with `committed=true` and exit 0. After the fix, the first two
+recorded `committed=false` with signal exits 2 and 15; the positive control still
+committed and exited 0. The existing writer, replacement-job, journal recovery,
+and controlling-terminal checks also passed in the same local run. The result
+closes these two reproduced paths; the broader startup/cancellation gate stays
+open. Protocol 9 and admission revision 4 are unchanged.
+
+The [captured subcase observations](probes/2026-10-02-macos-preparation-cancellation.json)
+record the baseline instrumentation, before/after statuses, and exact local
+command. Optimized all-bin build, formatting and diff checks also passed.
+Audit strings are absent from release `rgo`/`rgo-rustc-wrapper`, with their presence in
+debug `rgo` as the positive control. The earlier `b4f9e46` benchmark is historical
+performance evidence and does not measure this signal-handling change.

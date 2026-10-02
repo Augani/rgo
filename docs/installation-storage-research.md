@@ -796,3 +796,45 @@ existing workspace/platform suites, source builds, installer/service probes,
 Cargo boundaries, and budget recovery. This closes the Cargo-job replacement
 race by eliminating label-based unloading; the earlier unexplained failures
 and wider P2/P5 release gates remain open.
+
+### macOS preparation cancellation
+
+A deterministic pause in the existing private-home coalition fixture reproduced
+two late-preparation bugs. With SIGINT already captured, the old caller still
+committed managed Cargo. With SIGTERM captured and preparation completion forced
+to fail, it launched checkout-storage fallback Cargo and exited successfully.
+The ignored-SIGINT positive control committed and succeeded, proving that the
+guardian's commit observation was enabled. The fixture aggregates the subcases
+before failing so it also cleans up owned jobs and verifies actual idle GC.
+
+The caller now checks captured termination before commit and before fallback,
+and owns terminal/signal restoration in declaration order so preparation errors
+restore terminal state before restoring original signal actions. Original
+`SIG_IGN` actions are preserved rather than replaying an ignored notification
+after Cargo may have installed another disposition. SIGCONT and SIGWINCH remain
+observable for process continuation and PTY sizing. Cargo retains its captured
+original mask/dispositions. Apple's pinned
+[signal implementation](https://github.com/apple-oss-distributions/xnu/blob/f6217f891ac0bb64f3d375211650a4c1ff8ca1ea/bsd/kern/kern_sig.c#L1913)
+explicitly resumes stopped processes for SIGCONT even when blocked or ignored;
+the caller must reproduce that effect for Cargo's separate process group.
+
+After the fix, the same SIGINT/SIGTERM subcases both exited by the requested
+signal without a commit; ignored SIGINT still committed successfully. The
+existing interrupt fixture also passed after starting the caller with SIGCONT
+both ignored and blocked. Local macOS 27.2 arm64 passed the two existing cases
+in 31.09 s and 3.41 s, plus all-bin build and zero-warning all-target Clippy.
+The debug-only handshake hook is not compiled into release binaries. Platform
+verification is pending; this evidence covers the observed late-preparation
+point, not every startup cut or a signal arriving after the cancellation check.
+
+The original macOS stable interrupt failure completed in 0.91 s according to
+its archived job log, so its child's thirty-second expiry does not explain that
+failure. It still lacks the diagnostics required to establish a cause. Neither
+this cancellation fix nor later passing runs resolve that original failure or
+the separate terminal startup timeout.
+
+The [captured observations](probes/2026-10-02-macos-preparation-cancellation.json)
+retain the three before/after subcase statuses. Optimized all-bin build,
+formatting, and diff checks passed; audit markers are absent from release
+`rgo`/`rgo-rustc-wrapper` and present in debug `rgo` as a positive control. The previous
+`b4f9e46` performance sample does not measure this change.

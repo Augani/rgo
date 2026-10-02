@@ -94,6 +94,146 @@ fn stop_private_daemon(paths: &RgoPaths) -> std::fs::File {
     lock
 }
 
+struct CancelProbe {
+    child: std::process::Child,
+    release: PathBuf,
+}
+
+impl Drop for CancelProbe {
+    fn drop(&mut self) {
+        let _ = std::fs::write(&self.release, b"resume");
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+#[allow(unsafe_code)]
+fn cancellation_before_commit(sandbox: &Sandbox, project: &std::path::Path, rgo: &str) {
+    use std::os::unix::process::{CommandExt, ExitStatusExt};
+    let paths = RgoPaths {
+        root: sandbox.rgo_home.clone(),
+    };
+    let directory = paths.state_dir().join("macos-supervisor-audit");
+    let path = std::env::join_paths(
+        std::iter::once(sandbox.cargo_home.join("rgo/shims"))
+            .chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
+    )
+    .unwrap();
+    let mut failures = Vec::new();
+    for (signal, action, ignored) in [
+        (libc::SIGINT, b"resume".as_slice(), false),
+        (libc::SIGTERM, b"fail".as_slice(), false),
+        (libc::SIGINT, b"resume".as_slice(), true),
+    ] {
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let log = directory.join("stderr");
+        let mut command = sandbox.cmd("cargo");
+        command
+            .current_dir(project)
+            .env("PATH", &path)
+            .env("RGO_MACOS_SUPERVISOR_PILOT", "1")
+            .env("RGO_MACOS_SUPERVISOR_AUDIT", "1")
+            .args(["build", "--offline"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::fs::File::create(&log).unwrap());
+        if ignored {
+            unsafe {
+                command.pre_exec(|| {
+                    if libc::signal(libc::SIGINT, libc::SIG_IGN) == libc::SIG_ERR {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+        }
+        let mut probe = CancelProbe {
+            child: command.spawn().unwrap(),
+            release: directory.join("release"),
+        };
+        wait_for_file(
+            &directory.join("prepared"),
+            Instant::now() + Duration::from_secs(10),
+        );
+        assert!(probe.child.try_wait().unwrap().is_none());
+        assert_eq!(unsafe { libc::kill(probe.child.id() as i32, signal) }, 0);
+        if !ignored {
+            wait_for_file(
+                &directory.join("cancel-observed"),
+                Instant::now() + Duration::from_secs(3),
+            );
+        }
+        std::fs::write(&probe.release, action).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let status = loop {
+            if let Some(status) = probe.child.try_wait().unwrap() {
+                break status;
+            }
+            assert!(Instant::now() < deadline, "caller did not finish");
+            thread::sleep(Duration::from_millis(10));
+        };
+        let committed = directory.join("committed").exists();
+        println!(
+            "startup cancellation: signal={signal}, ignored={ignored}, committed={committed}, status={status:?}"
+        );
+        if committed != ignored
+            || (ignored && !status.success())
+            || (!ignored && status.signal() != Some(signal))
+        {
+            failures.push(format!("signal={signal}, ignored={ignored}, committed={committed}, status={status:?}; stderr={}", std::fs::read_to_string(&log).unwrap()));
+        }
+        // Wait for the owned one-use guardian to finish, then prove positive
+        // reclamation before repeating in the same isolated workspace.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while std::fs::read_dir(paths.state_dir()).unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with("macos-cargo-job-")
+        }) {
+            assert!(
+                Instant::now() < deadline,
+                "cancelled preparation was not retired"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+        let contexts = paths.managed_build_dirs();
+        let gc = sandbox
+            .cmd(rgo)
+            .args(["gc", "--target", "0"])
+            .output()
+            .unwrap();
+        assert!(
+            gc.status.success(),
+            "{}",
+            String::from_utf8_lossy(&gc.stderr)
+        );
+        assert!(
+            contexts.iter().all(|context| !context.exists()),
+            "idle preparation context was not reclaimed"
+        );
+        for name in [
+            "prepared",
+            "cancel-observed",
+            "release",
+            "committed",
+            "stderr",
+        ] {
+            match std::fs::remove_file(directory.join(name)) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => panic!("audit cleanup: {error}"),
+            }
+        }
+        std::fs::remove_dir(&directory).unwrap();
+    }
+    assert!(
+        failures.is_empty(),
+        "startup cancellation failures: {failures:#?}"
+    );
+}
+
 #[test]
 #[allow(unsafe_code)]
 fn launchd_coalition_observes_closed_fd_writer_after_cargo_exits() {
@@ -116,6 +256,13 @@ fn launchd_coalition_observes_closed_fd_writer_after_cargo_exits() {
         "{}",
         String::from_utf8_lossy(&setup.stderr)
     );
+    let paths = RgoPaths {
+        root: sandbox.rgo_home.clone(),
+    };
+    let _shutdown_daemon = ShutdownDaemon(paths.clone());
+    if cfg!(debug_assertions) {
+        cancellation_before_commit(&sandbox, &project, rgo);
+    }
     let ready = sandbox.home.join("writer.json");
     let release = sandbox.home.join("release-writer");
     let result = sandbox.home.join("writer-result");
@@ -182,10 +329,6 @@ while not pathlib.Path(os.environ['RGO_COALITION_READY']).exists():
         ready.is_file(),
         "successful Cargo did not publish the detached writer"
     );
-    let paths = RgoPaths {
-        root: sandbox.rgo_home.clone(),
-    };
-    let _shutdown_daemon = ShutdownDaemon(paths.clone());
     let directory = std::fs::read_dir(paths.state_dir())
         .unwrap()
         .map(|entry| entry.unwrap().path())

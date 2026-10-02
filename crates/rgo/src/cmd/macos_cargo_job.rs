@@ -21,6 +21,8 @@ use std::process::{Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
+#[cfg(debug_assertions)]
+mod audit;
 mod events;
 mod terminal;
 mod wake;
@@ -43,7 +45,32 @@ const FORWARDED_SIGNALS: [i32; 7] = [
     libc::SIGWINCH,
 ];
 static SIGNALS: AtomicU32 = AtomicU32::new(0);
+static RELAY_MASK: AtomicU32 = AtomicU32::new(0);
 static SIGNAL_WAKE: AtomicI32 = AtomicI32::new(-1);
+const TERMINATING_SIGNALS: [i32; 4] = [libc::SIGINT, libc::SIGTERM, libc::SIGHUP, libc::SIGQUIT];
+
+fn cancelled_signal() -> Option<i32> {
+    let pending = SIGNALS.load(Ordering::Acquire) & RELAY_MASK.load(Ordering::Acquire);
+    TERMINATING_SIGNALS
+        .into_iter()
+        .find(|signal| pending & (1 << signal) != 0)
+}
+
+fn terminate(signal: i32) -> ! {
+    unsafe {
+        libc::signal(signal, libc::SIG_DFL);
+        libc::raise(signal);
+    }
+    std::process::exit(128 + signal);
+}
+
+/// Preparation failure must not convert an observed cancellation into another
+/// Cargo launch. The failed preparation already dropped/restored its terminal.
+pub(super) fn abort_cancelled() {
+    if let Some(signal) = cancelled_signal() {
+        terminate(signal);
+    }
+}
 
 #[derive(Serialize, Deserialize)]
 struct Invocation {
@@ -341,7 +368,7 @@ impl PreparedJob {
     ) -> Result<Self> {
         let started = Instant::now();
         let deadline = started + STARTUP_TIMEOUT;
-        let mut terminal = terminal::Caller::open(paths)?;
+        let terminal = terminal::Caller::open(paths)?;
         paths.ensure_layout()?;
         let invocation = Invocation {
             executable: executable.as_os_str().as_bytes().to_vec(),
@@ -476,21 +503,29 @@ impl PreparedJob {
             coalition != ResourceCoalition::for_pid(std::process::id().try_into()?)?.id(),
             "Cargo guardian inherited its caller's coalition"
         );
-        let signals = SignalRelay::new()?;
-        if let Some(terminal) = &mut terminal {
+        // Owning terminal state and signal restoration in one object ensures
+        // every subsequent preparation error restores the terminal first.
+        let mut job = Self {
+            stream,
+            terminal,
+            signals: Some(SignalRelay::new()?),
+        };
+        if let Some(terminal) = &mut job.terminal {
             terminal.attach(
-                receive_descriptors(&stream, 1)?
+                receive_descriptors(&job.stream, 1)?
                     .pop()
                     .context("PTY descriptor is missing")?,
             );
-            stream.write_all(b"T")?;
-            write_frame(&mut stream, &terminal.configuration()?)?;
+            job.stream.write_all(b"T")?;
+            write_frame(&mut job.stream, &terminal.configuration()?)?;
             ensure!(
-                matches!(read_frame::<Message>(&mut stream)?, Message::Configured),
+                matches!(read_frame::<Message>(&mut job.stream)?, Message::Configured),
                 "Cargo terminal was not configured"
             );
             terminal.activate()?;
         }
+        #[cfg(debug_assertions)]
+        audit::prepared(paths)?;
         tracing::debug!(
             files_ms = files_ready.as_secs_f64() * 1000.0,
             bootstrap_ms = (bootstrapped - files_ready).as_secs_f64() * 1000.0,
@@ -498,14 +533,20 @@ impl PreparedJob {
             admission_ms = (started.elapsed() - connected).as_secs_f64() * 1000.0,
             "macOS Cargo guardian preparation"
         );
-        Ok(Self {
-            stream,
-            terminal,
-            signals: Some(signals),
-        })
+        Ok(job)
     }
 
     pub(super) fn run(mut self, mut session: SessionGuard) -> Result<()> {
+        if let Some(signal) = cancelled_signal() {
+            if let Some(terminal) = &mut self.terminal {
+                terminal.restore();
+            }
+            drop(self.signals.take());
+            drop(session);
+            // No commit byte was sent. OS descriptor closure lets the guardian
+            // retire its empty receipt/job; cancellation never retries Cargo.
+            terminate(signal);
+        }
         session.release_local_for_macos_guardian();
         self.stream.set_read_timeout(None)?;
         let committed = Instant::now();
@@ -542,7 +583,7 @@ impl PreparedJob {
                     }
                 }
             }
-            let pending = SIGNALS.swap(0, Ordering::AcqRel);
+            let pending = SIGNALS.swap(0, Ordering::AcqRel) & RELAY_MASK.load(Ordering::Acquire);
             for signal in FORWARDED_SIGNALS {
                 if pending & (1 << signal) != 0 {
                     match (signal, self.terminal.as_ref()) {
@@ -630,13 +671,25 @@ extern "C" fn capture_signal(signal: i32) {
     unsafe { *libc::__error() = saved_errno };
 }
 
-struct SignalRelay(Vec<(i32, libc::sigaction)>);
+struct SignalRelay {
+    dispositions: Vec<(i32, libc::sigaction)>,
+    mask: libc::sigset_t,
+}
 
 impl SignalRelay {
     fn new() -> Result<Self> {
         SIGNALS.store(0, Ordering::Relaxed);
+        RELAY_MASK.store(0, Ordering::Relaxed);
         SIGNAL_WAKE.store(wake::Wake::get()?.writer(), Ordering::Relaxed);
-        let mut relay = Self(Vec::new());
+        let mut mask = unsafe { std::mem::zeroed() };
+        ensure!(
+            unsafe { libc::sigprocmask(libc::SIG_SETMASK, std::ptr::null(), &mut mask) } == 0,
+            "cannot observe caller signal mask"
+        );
+        let mut relay = Self {
+            dispositions: Vec::new(),
+            mask,
+        };
         for signal in FORWARDED_SIGNALS {
             let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
             action.sa_sigaction = capture_signal as *const () as usize;
@@ -649,19 +702,51 @@ impl SignalRelay {
                 unsafe { libc::sigaction(signal, &action, &mut previous) } == 0,
                 "cannot relay Cargo signal"
             );
-            relay.0.push((signal, previous));
+            relay.dispositions.push((signal, previous));
+            if previous.sa_sigaction == libc::SIG_IGN
+                && signal != libc::SIGCONT
+                && signal != libc::SIGWINCH
+            {
+                // Ignore at delivery, rather than replaying the signal after
+                // exec when Cargo may have installed a different disposition.
+                ensure!(
+                    unsafe { libc::sigaction(signal, &previous, std::ptr::null_mut()) } == 0,
+                    "cannot preserve ignored Cargo signal"
+                );
+            } else {
+                RELAY_MASK.fetch_or(1 << signal, Ordering::Release);
+            }
         }
+        // SIGCONT resumes a stopped process even when ignored or blocked.
+        // Window sizes also change without delivery of SIGWINCH. Observe both
+        // notifications to reproduce the effects on the separate group/PTY;
+        // Cargo retains the mask/dispositions captured before this relay.
+        let mut effects = unsafe { std::mem::zeroed() };
+        unsafe {
+            libc::sigemptyset(&mut effects);
+            libc::sigaddset(&mut effects, libc::SIGCONT);
+            libc::sigaddset(&mut effects, libc::SIGWINCH);
+        }
+        ensure!(
+            unsafe { libc::sigprocmask(libc::SIG_UNBLOCK, &effects, std::ptr::null_mut()) } == 0,
+            "cannot observe terminal kernel effects"
+        );
         Ok(relay)
     }
 }
 
 impl Drop for SignalRelay {
     fn drop(&mut self) {
+        // Keep the captured bits/mask until preparation's fallback decision.
+        // An error must still acknowledge a cancellation after handler restore.
         SIGNAL_WAKE.store(-1, Ordering::Relaxed);
-        for (signal, previous) in &self.0 {
+        for (signal, previous) in &self.dispositions {
             unsafe {
                 libc::sigaction(*signal, previous, std::ptr::null_mut());
             }
+        }
+        unsafe {
+            libc::sigprocmask(libc::SIG_SETMASK, &self.mask, std::ptr::null_mut());
         }
     }
 }
@@ -814,6 +899,13 @@ pub fn guardian(directory: &Path, token: &str, context: Option<&Path>) -> Result
         let mut commit = [0_u8];
         stream.read_exact(&mut commit)?;
         ensure!(commit == *b"S", "Cargo job was not committed");
+        #[cfg(debug_assertions)]
+        audit::committed(
+            &paths,
+            request.environment.iter().any(|(key, value)| {
+                key.as_slice() == b"RGO_MACOS_SUPERVISOR_AUDIT" && value.as_slice() == b"1"
+            }),
+        )?;
         stream.set_read_timeout(None)?;
         stream.set_nonblocking(true)?;
         session.retain_across_exec()?;

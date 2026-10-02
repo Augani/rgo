@@ -91,7 +91,24 @@ fn terminal_ctrl_c_keeps_a_surviving_cargo_descendant_protected() {
     .unwrap();
     let mut command = sandbox.cmd("cargo");
     #[cfg(target_os = "macos")]
-    command.env("RGO_MACOS_SUPERVISOR_PILOT", "1");
+    {
+        command.env("RGO_MACOS_SUPERVISOR_PILOT", "1");
+        // SIGCONT resumes a native process even when ignored and blocked.
+        // The separate guardian group must receive that kernel effect too.
+        unsafe {
+            command.pre_exec(|| {
+                let mut mask = std::mem::zeroed();
+                libc::sigemptyset(&mut mask);
+                libc::sigaddset(&mut mask, libc::SIGCONT);
+                if libc::signal(libc::SIGCONT, libc::SIG_IGN) == libc::SIG_ERR
+                    || libc::sigprocmask(libc::SIG_BLOCK, &mask, std::ptr::null_mut()) != 0
+                {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
     let child = command
         .current_dir(&project)
         .env("PATH", &search_path)
