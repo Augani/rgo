@@ -94,6 +94,17 @@ Intel and all existing platform suites. This closes the two reproduced
 late-preparation paths, not every startup interruption boundary or the two
 earlier unexplained failures.
 
+**2026-10-02 runtime signal handoff:** originally ignored signals are discarded
+during macOS preparation, then forwarded to the Cargo group at the commit
+handoff so applications can change their actions after exec. The existing
+interrupt case reproduced lost SIGINT at `db8bbfe`; it now requires a custom
+handler's exit code 73, stop/resume, surviving-descendant protection, and idle
+reclamation. Local validation passed alongside the existing coalition/terminal
+case, all-bin debug/release builds and zero-warning Clippy. A partial result-file
+publication in that fixture was corrected with atomic completion markers;
+assertions and deadlines remain unchanged. Platform verification is pending.
+The wider inherited-signal/startup and release gates remain open.
+
 ## 0. What changed vs. `doc.md`, and why
 
 **2026-10-02 macOS supervisor:** Unix cleanup with a detached closed-FD writer

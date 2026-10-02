@@ -848,3 +848,44 @@ stable/beta/nightly and Linux/Windows suites, all source-build and compatibility
 lanes, installers/services, and existing budget recovery checks passed. This
 completes this batch's platform verification; broader inherited-signal, startup,
 IDE, runtime-range and performance gates remain open.
+
+### macOS runtime signal forwarding
+
+The preparation-cancellation change at `db8bbfe` preserved an initially ignored
+action for the entire launcher lifetime. Extending the existing interrupt case
+reproduced the resulting runtime bug: the application replaced ignored SIGINT
+with its default terminating action, but a direct job-group interrupt never
+reached it. The ten-second termination assertion failed; the whole case took
+13.09 s. This is a separate reproduced defect, not a classification of either
+earlier unexplained interrupt/terminal failure.
+
+The launcher now begins runtime forwarding at the commit handoff. It clears any
+transient preparation capture for an ignored action before enabling forwarding;
+the child's captured original actions and mask are unchanged. Once delivered
+to the child group, the kernel uses each process's current action. Apple's
+[signal-action documentation](https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man2/sigaction.2.html)
+describes action selection at delivery and ignored-action/mask inheritance
+through exec. This supports the phase distinction; it does not prove identical
+timing across every fork/exec/commit boundary of a separate-process launcher.
+
+The default-action variant passed in 5.15 s after the fix. The final existing
+case installs a custom async-signal-safe handler that exits 73 and requires that
+exact caller result. It passed in 4.93 s, with ignored/blocked SIGCONT, a
+stop/resume cycle, surviving-writer protection and actual idle reclamation.
+The coalition/terminal case passed in 24.21 s. All three preparation subcases
+retain their expected commit/status results, including ignored-SIGINT success.
+
+The first combined local run stopped on an empty writer-result file after its
+existence check. The producer's `write_text` creates the file before writing its
+completion bytes. Ready/result values and debug audit release actions now use
+complete temporary files followed by atomic rename; readers, success assertions
+and deadlines are unchanged. This fixes the partial-publication synchronization
+defect without treating an empty result as success.
+
+All-bin debug/release builds, zero-warning all-target Clippy, formatting and
+diff checks passed on macOS 27.2 arm64 with Cargo 1.98.0. Platform verification
+is pending. The [captured observations](probes/2026-10-02-macos-runtime-signals.json)
+separate the initial repro, final callback proof and publication failure.
+Protocol 9, admission revision 4, kernel receipts and job-retirement policy are
+unchanged. Pending masked signals, commit timing, other signal/action classes,
+IDE behavior and the broader release gates remain open.

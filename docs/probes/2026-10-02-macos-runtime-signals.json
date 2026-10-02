@@ -1,0 +1,37 @@
+{
+  "purpose": "Existing private-home macOS integration cases: runtime forwarding after inherited SIGINT ignore, plus complete publication of fixture markers",
+  "native_baseline": "db8bbfe86e8b69ced8bc39e63c7cb14c576daca1",
+  "platform": "macOS 27.2 build 26B5091g arm64; Cargo 1.98.0 stable",
+  "isolation": "rgo-testkit Sandbox private HOME/CARGO_HOME/RGO_HOME; real Cargo offline; cache and automatic GC off",
+  "runtime_before_fix": {
+    "caller": "SIGINT ignored; SIGCONT ignored and blocked",
+    "application": "Replace inherited SIGINT with SIG_DFL before publishing its surviving child",
+    "notification": "SIGINT to the caller's process group after stop/resume",
+    "result": "FAILED: Ctrl-C did not stop the Cargo launcher",
+    "duration_seconds": 13.09,
+    "termination_deadline_seconds": 10
+  },
+  "runtime_after_fix": {
+    "initial_default_action_variant": "PASS in 5.15 s",
+    "final_application": "Install a custom async-signal-safe SIGINT handler that calls _exit(73)",
+    "final_result": "PASS in 4.93 s; exact exit code 73 required",
+    "retained_requirements": "Stop/resume with ignored/blocked SIGCONT; surviving descendant protected; real idle-context reclamation"
+  },
+  "publication_followup": {
+    "first_combined_run": "Preparation subcases passed, then writer-result existed with empty contents; strict success assertion failed in 3.95 s",
+    "producer_defect": "write_text publishes file existence before complete value bytes",
+    "fix": "Publish complete ready/result and audit release values via temporary file and atomic rename",
+    "readers_and_deadlines": "Unchanged; empty contents are never accepted as success",
+    "coalition_after_fix": "PASS in 24.21 s, including writer/replacement/recovery and real terminal cases"
+  },
+  "verification": [
+    "cargo build: passed, all bins",
+    "cargo test -p rgo-storage --test macos_coalition -- --nocapture: passed after atomic publication fix",
+    "cargo test -p rgo-storage --test supervised_interrupt -- --nocapture: passed with final custom-handler proof",
+    "cargo clippy --all-targets -- -D warnings: passed",
+    "cargo build --workspace --release: passed",
+    "cargo fmt --all -- --check: passed",
+    "git diff --check: passed"
+  ],
+  "limits": "Pending blocked signals, commit/exec timing cuts, other action classes, IDE/runtime and representative performance gates remain open. No new Rust test case. The two earlier unexplained interrupt/terminal failures are not resolved or reclassified by this repro."
+}

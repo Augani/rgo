@@ -76,7 +76,20 @@ fn terminal_ctrl_c_keeps_a_surviving_cargo_descendant_protected() {
     let log = sandbox.home.join("interrupt-cargo.log");
     std::fs::write(
         project.join("src/main.rs"),
-        r#"fn main() {
+        r#"#[cfg(target_os = "macos")]
+unsafe extern "C" {
+    fn signal(number: i32, action: usize) -> usize;
+    fn _exit(code: i32) -> !;
+}
+#[cfg(target_os = "macos")]
+extern "C" fn interrupted(_: i32) { unsafe { _exit(73) } }
+fn main() {
+    // A running application may replace the SIGINT action it inherited from
+    // a background launch. Direct job-group signals must then reach it.
+    #[cfg(target_os = "macos")]
+    unsafe {
+        assert_ne!(signal(2, interrupted as *const () as usize), usize::MAX);
+    }
     let mut child = std::process::Command::new("sh")
         .arg("-c")
         .arg("trap '' INT; printf '%s' \"$$\" > \"$RGO_INTERRUPT_READY\"; i=0; while [ ! -f \"$RGO_INTERRUPT_RELEASE\" ] && [ \"$i\" -lt 30 ]; do sleep 1; i=$((i+1)); done")
@@ -93,14 +106,16 @@ fn terminal_ctrl_c_keeps_a_surviving_cargo_descendant_protected() {
     #[cfg(target_os = "macos")]
     {
         command.env("RGO_MACOS_SUPERVISOR_PILOT", "1");
-        // SIGCONT resumes a native process even when ignored and blocked.
-        // The separate guardian group must receive that kernel effect too.
+        // Preserve ignored SIGINT during startup, then let the running
+        // application change its action. SIGCONT is also ignored and blocked;
+        // the separate Cargo group must still receive its kernel effect.
         unsafe {
             command.pre_exec(|| {
                 let mut mask = std::mem::zeroed();
                 libc::sigemptyset(&mut mask);
                 libc::sigaddset(&mut mask, libc::SIGCONT);
-                if libc::signal(libc::SIGCONT, libc::SIG_IGN) == libc::SIG_ERR
+                if libc::signal(libc::SIGINT, libc::SIG_IGN) == libc::SIG_ERR
+                    || libc::signal(libc::SIGCONT, libc::SIG_IGN) == libc::SIG_ERR
                     || libc::sigprocmask(libc::SIG_BLOCK, &mask, std::ptr::null_mut()) != 0
                 {
                     return Err(std::io::Error::last_os_error());
@@ -181,9 +196,13 @@ fn terminal_ctrl_c_keeps_a_surviving_cargo_descendant_protected() {
     while running.child.try_wait().unwrap().is_none() && Instant::now() < deadline {
         thread::sleep(Duration::from_millis(25));
     }
-    assert!(
-        running.child.try_wait().unwrap().is_some(),
-        "Ctrl-C did not stop the Cargo launcher"
+    let status = running.child.try_wait().unwrap();
+    assert!(status.is_some(), "Ctrl-C did not stop the Cargo launcher");
+    #[cfg(target_os = "macos")]
+    assert_eq!(
+        status.unwrap().code(),
+        Some(73),
+        "the running application's replacement SIGINT handler did not determine the result"
     );
     assert_eq!(unsafe { libc::kill(child_pid, 0) }, 0);
     assert!(

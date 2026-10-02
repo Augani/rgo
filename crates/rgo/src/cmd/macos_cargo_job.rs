@@ -547,8 +547,12 @@ impl PreparedJob {
             // retire its empty receipt/job; cancellation never retries Cargo.
             terminate(signal);
         }
-        session.release_local_for_macos_guardian();
         self.stream.set_read_timeout(None)?;
+        self.signals
+            .as_ref()
+            .context("Cargo signal relay is missing")?
+            .committing()?;
+        session.release_local_for_macos_guardian();
         let committed = Instant::now();
         self.stream.write_all(b"S")?; // From here failure cannot retry Cargo.
         let mut reader = self.stream.try_clone()?;
@@ -677,6 +681,14 @@ struct SignalRelay {
 }
 
 impl SignalRelay {
+    fn action() -> libc::sigaction {
+        let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+        action.sa_sigaction = capture_signal as *const () as usize;
+        action.sa_flags = libc::SA_RESTART;
+        unsafe { libc::sigemptyset(&mut action.sa_mask) };
+        action
+    }
+
     fn new() -> Result<Self> {
         SIGNALS.store(0, Ordering::Relaxed);
         RELAY_MASK.store(0, Ordering::Relaxed);
@@ -691,12 +703,7 @@ impl SignalRelay {
             mask,
         };
         for signal in FORWARDED_SIGNALS {
-            let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
-            action.sa_sigaction = capture_signal as *const () as usize;
-            action.sa_flags = libc::SA_RESTART;
-            unsafe {
-                libc::sigemptyset(&mut action.sa_mask);
-            }
+            let action = Self::action();
             let mut previous = unsafe { std::mem::zeroed() };
             ensure!(
                 unsafe { libc::sigaction(signal, &action, &mut previous) } == 0,
@@ -707,8 +714,8 @@ impl SignalRelay {
                 && signal != libc::SIGCONT
                 && signal != libc::SIGWINCH
             {
-                // Ignore at delivery, rather than replaying the signal after
-                // exec when Cargo may have installed a different disposition.
+                // During preparation, discard ignored signals at delivery.
+                // Runtime group forwarding begins at the commit handoff.
                 ensure!(
                     unsafe { libc::sigaction(signal, &previous, std::ptr::null_mut()) } == 0,
                     "cannot preserve ignored Cargo signal"
@@ -732,6 +739,30 @@ impl SignalRelay {
             "cannot observe terminal kernel effects"
         );
         Ok(relay)
+    }
+
+    fn committing(&self) -> Result<()> {
+        for (signal, previous) in &self.dispositions {
+            if previous.sa_sigaction == libc::SIG_IGN
+                && *signal != libc::SIGCONT
+                && *signal != libc::SIGWINCH
+            {
+                // Do not replay anything captured in the transient install
+                // window during preparation. From this handoff, forward group
+                // notifications: Cargo/applications may change their own
+                // actions after exec. The child's native action decides what
+                // happens when the guardian delivers the notification.
+                let bit = 1 << signal;
+                SIGNALS.fetch_and(!bit, Ordering::AcqRel);
+                RELAY_MASK.fetch_or(bit, Ordering::Release);
+                let action = Self::action();
+                ensure!(
+                    unsafe { libc::sigaction(*signal, &action, std::ptr::null_mut()) } == 0,
+                    "cannot relay running Cargo group signal"
+                );
+            }
+        }
+        Ok(())
     }
 }
 

@@ -755,7 +755,7 @@ cancellation, runtime, and performance gates stay open.
 - [x] Refuse the commit and fallback after captured termination, returning the
   requested signal. Restore terminal state before original signal actions on
   every subsequent preparation error.
-- [x] Preserve originally ignored termination signals. The ignored-SIGINT
+- [x] Preserve originally ignored termination signals during preparation. The ignored-SIGINT
   positive control must commit real Cargo and finish successfully.
 - [x] Observe continuation/window notifications in the caller even when its
   original dispositions/mask would suppress delivery. Cargo retains its
@@ -809,3 +809,38 @@ stable/beta/nightly, Linux/Windows workspace suites, source builds, Cargo
 boundaries, nightly layouts, installers/services, btrfs and budget recovery
 checks all passed. Normal activation and automatic GC remain off while the
 remaining startup, inherited-signal, IDE/runtime and performance gates are open.
+
+## Runtime signal forwarding — October 2, 2026
+
+- [x] Reproduce lost runtime SIGINT when the caller starts with it ignored and
+  the running application replaces that action. The same interrupt case fails
+  its ten-second termination assertion at native baseline `db8bbfe`.
+- [x] Keep preparation-time ignored notifications discarded, clear transient
+  capture bits before the handoff, and enable group forwarding when committing
+  Cargo. The child retains its native actions/mask and applies its current
+  action when the guardian delivers a notification.
+- [x] Strengthen the existing interrupt case with a custom SIGINT handler and
+  require its exact exit code 73. Retain ignored/blocked SIGCONT, stop/resume,
+  surviving-descendant protection and actual idle-neighbor reclamation.
+- [x] Publish fixture ready/result values and audit release actions atomically.
+  The first combined run observed an existing but empty result file; the
+  producer previously exposed existence before complete bytes. Success
+  assertions, readers and deadlines are unchanged.
+- [x] Pass the two existing cases locally: final custom-handler interrupt
+  4.93 s, coalition/terminal/recovery 24.21 s. The intermediate default-action
+  variant passed in 5.15 s; the three preparation subcases retain their prior
+  expected commit/status outcomes. All-bin debug/release build, zero-warning
+  all-target Clippy, format and diff checks passed.
+- [ ] Verify this batch across the existing platform lanes.
+- [ ] Complete the remaining inherited-signal matrix and timing cuts, including
+  masked pending termination, failures during the commit handoff, other changed
+  actions, and notifications around child creation/exec. Keep normal activation
+  and automatic GC off until the broader safety/runtime gates are resolved.
+
+The [captured observations](probes/2026-10-02-macos-runtime-signals.json) record
+the native baseline, the initial default-action repro, the final custom-handler
+proof, and the result-publication failure. The old unexplained platform
+interrupt failure and local terminal timeout remain unresolved. This batch
+does not measure performance or close the complete inherited-signal contract;
+the earlier benchmark remains historical evidence. Protocol/admission and
+receipt/job ownership schemas are unchanged.

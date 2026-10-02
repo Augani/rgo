@@ -99,9 +99,15 @@ struct CancelProbe {
     release: PathBuf,
 }
 
+fn publish_audit_release(path: &std::path::Path, action: &[u8]) -> std::io::Result<()> {
+    let pending = path.with_extension("pending");
+    std::fs::write(&pending, action)?;
+    std::fs::rename(pending, path)
+}
+
 impl Drop for CancelProbe {
     fn drop(&mut self) {
-        let _ = std::fs::write(&self.release, b"resume");
+        let _ = publish_audit_release(&self.release, b"resume");
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
@@ -163,7 +169,7 @@ fn cancellation_before_commit(sandbox: &Sandbox, project: &std::path::Path, rgo:
                 Instant::now() + Duration::from_secs(3),
             );
         }
-        std::fs::write(&probe.release, action).unwrap();
+        publish_audit_release(&probe.release, action).unwrap();
         let deadline = Instant::now() + Duration::from_secs(10);
         let status = loop {
             if let Some(status) = probe.child.try_wait().unwrap() {
@@ -273,15 +279,21 @@ ready = pathlib.Path(os.environ['RGO_COALITION_READY'])
 release = pathlib.Path(os.environ['RGO_COALITION_RELEASE'])
 result = pathlib.Path(os.environ['RGO_COALITION_RESULT'])
 out = pathlib.Path(os.environ['OUT_DIR']) / 'late-build-output'
-ready.write_text(json.dumps({'pid': os.getpid(), 'output': str(out)}))
+ready_pending = ready.with_name(f'{ready.name}.{os.getpid()}.pending')
+ready_pending.write_text(json.dumps({'pid': os.getpid(), 'output': str(out)}))
+os.replace(ready_pending, ready)
 deadline = time.monotonic() + 90
 while not release.exists() and time.monotonic() < deadline:
     time.sleep(0.02)
 try:
     out.write_text('completed after Cargo exited')
-    result.write_text('write succeeded')
+    message = 'write succeeded'
 except OSError as error:
-    result.write_text(str(error))
+    message = str(error)
+# Existence is the reader's completion marker, so publish complete bytes.
+result_pending = result.with_name(f'{result.name}.{os.getpid()}.pending')
+result_pending.write_text(message)
+os.replace(result_pending, result)
 "#,
     )
     .unwrap();
