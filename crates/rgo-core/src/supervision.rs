@@ -240,6 +240,8 @@ fn finish_pending_maintenance(
 
 pub struct SessionGuard {
     _file: File,
+    #[cfg(target_os = "macos")]
+    scope: (RgoPaths, Option<PathBuf>),
     #[cfg(unix)]
     _local: File,
     #[cfg(unix)]
@@ -247,6 +249,14 @@ pub struct SessionGuard {
 }
 
 impl SessionGuard {
+    /// Experimental macOS guardian admission, not used by ordinary Cargo
+    /// launchers yet. Without an isolated launchd job this conservatively
+    /// protects the context for the launching application's entire lifetime.
+    #[cfg(target_os = "macos")]
+    pub fn record_macos_coalition(&self) -> Result<()> {
+        crate::macos_coalition::register_current(&self.scope.0, self.scope.1.as_deref())
+    }
+
     /// Keep both lifecycle descriptors open when a Unix launcher replaces
     /// itself with Cargo. The record lock tracks Cargo's process, and the
     /// inherited flock protects descendants that outlive it.
@@ -483,6 +493,8 @@ pub fn lock_cargo_session(paths: &RgoPaths, context: Option<&Path>) -> Result<Se
     verify_lock_identity(&lock_path(paths, context, cfg!(not(unix)))?, &file)?;
     Ok(SessionGuard {
         _file: file,
+        #[cfg(target_os = "macos")]
+        scope: (paths.clone(), context.map(Path::to_owned)),
         #[cfg(unix)]
         _local: local,
         #[cfg(unix)]
@@ -555,6 +567,11 @@ pub fn try_lock_gc(paths: &RgoPaths, context: Option<&Path>) -> Result<Option<Gc
     } else {
         None
     };
+    #[cfg(target_os = "macos")]
+    if !crate::macos_coalition::permits_gc(paths, context)? {
+        tracing::debug!(guard = "macos-coalition", "GC lifecycle guard is busy");
+        return Ok(None);
+    }
     Ok(Some(GcGuards {
         #[cfg(unix)]
         _local: local,

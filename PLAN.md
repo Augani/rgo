@@ -70,6 +70,14 @@ broader P2/P4 release gates remain open.
 
 ## 0. What changed vs. `doc.md`, and why
 
+**2026-10-02 macOS supervisor:** Unix cleanup with a detached closed-FD writer
+is a reproduced corruption case. A local isolated launchd fixture verifies
+durable kernel-coalition protection through real GC and idle reclamation;
+ordinary Cargo launchers are not integrated yet. The user selected macOS first.
+The [implementation checklist](docs/macos-cargo-supervision.md) records the
+remaining transport, lifecycle, compatibility, and platform gates. P2 remains
+open and automatic GC remains off by default.
+
 `doc.md` treats the rustc-wrapper + CAS as the core and the managed build roots as a
 supporting piece. After checking what Cargo actually supports today (Cargo 1.98), the
 priorities invert:

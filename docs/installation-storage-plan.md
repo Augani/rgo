@@ -163,6 +163,15 @@ The layout initializer now rejects a filesystem-root `RGO_HOME` and a pre-existi
 **Purpose:** deletion must be coordinated with the entire build, including paths that never invoke rgo's compiler wrapper.
 **Primary areas:** `context.rs`, `gc.rs`, `daemon.rs`, `db.rs`, `ipc.rs`, wrapper, real-Cargo concurrency tests.
 
+**macOS priority (2026-10-02):** a private real-Cargo audit reproduced deletion
+while a detached child with closed inherited descriptors was still writing.
+The [macOS supervisor checklist](macos-cargo-supervision.md) records the selected
+kernel-coalition design and remaining integration steps. Its experimental
+receipt/GC path passed a local real deletion-and-reclamation fixture, but the
+ordinary launcher does not register receipts yet. Manual cleanup and opted-in
+automatic cleanup retain the known Unix descriptor gap; doctor now reports it.
+Full P2 and unattended cleanup remain open.
+
 - [ ] Document the exact lock/lifecycle protocol Cargo uses for each supported version and platform. Determine whether it covers build scripts, rustdoc, no-op commands, package/install operations, test execution, and waiting Cargo processes.
 - [ ] Build deterministic race fixtures that pause between liveness check, lock acquisition, rename, and removal. Require that GC actually deletes other eligible data while the target build remains protected.
 - [ ] Exercise long-running builds beyond the ten-minute recency window and wrapper lease TTL; use injected time only where it preserves the actual synchronization behavior being tested.

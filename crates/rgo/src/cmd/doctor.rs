@@ -480,6 +480,13 @@ pub fn run(json: bool, verify: bool) -> Result<()> {
             )
         },
     );
+    #[cfg(unix)]
+    if supervised_deletion {
+        check(
+            false,
+            "Unix cleanup safety gap: a detached child that closes inherited descriptors can outlive Cargo without a GC guard; manual and opted-in automatic cleanup share this risk".into(),
+        );
+    }
     check_toolchains(
         supervised
             .as_ref()

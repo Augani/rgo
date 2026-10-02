@@ -150,6 +150,17 @@ process-level session guard.
 
 ## Evidence so far
 
+- A real macOS build-script audit reproduced the inherited-descriptor
+  counterexample: Cargo exited, manual GC deleted the still-running detached
+  writer's context, and its subsequent `OUT_DIR` write failed with `ENOENT`.
+  The experimental coalition fixture then registered an isolated launchd job
+  before Cargo, required real GC to preserve its closed-FD writer, rejected a
+  corrupted receipt, and reclaimed the context after the writer exited. Local
+  evidence is macOS 27.2 arm64. Ordinary launchers do not register this receipt
+  yet; this is a prototype proof for one process shape, not a production fix.
+  [Design and remaining checklist](macos-cargo-supervision.md),
+  [repeatable counterexample](probes/README.md).
+
 - Unit and private-home fixtures verify context/global lock exclusion,
   missing-sidecar refusal, pin changes after planning, and an unrelated idle
   context being reclaimed while one context is held. The [cross-platform
@@ -239,7 +250,7 @@ process-level session guard.
 | Condition | Current treatment | Release work |
 |---|---|---|
 | Native setup or an external Cargo/IDE launch with a managed build-dir override | The rgo lock does not cover it. Native `gc.auto` stays off; supervised cleanup excludes native-origin sidecars and refuses Cargo-home config drift. It cannot detect a direct process writing a context already marked supervised. | Prevent managed-namespace bypass in the supported activation contract or obtain an upstream Cargo lifecycle hook. |
-| A build-script or test descendant escapes the inherited Unix descriptor, or a Windows process starts through an external broker such as WMI | The parent can finish while an external writer remains. | Run real process-tree fixtures, define supported launch semantics, and refuse unattended deletion where exclusion cannot be guaranteed. |
+| A build-script or test descendant closes the inherited Unix descriptors, or a Windows process starts through an external broker such as WMI | Unix deletion after Cargo exit is reproduced with a detached writer. Doctor warns; the isolated macOS coalition/receipt prototype protects that shape, but ordinary launchers are not integrated. | Integrate the macOS supervisor first, then Linux; prove supported process shapes and refuse unattended deletion where exclusion cannot be guaranteed. |
 | Same-user replacement of the lock directory or, on Unix, a lock file after its final identity check | Existing holders could lock different file identities even though pre-acquisition checks passed. Windows now denies direct lock-file rename/delete while its handle is open; ancestor mutation remains unproven. | Define and enforce private lock-directory ownership/mutation rules; exercise replacement at every pause point. |
 | Unsupported filesystem locking, unreadable state, daemon outage, or failed Windows job creation | Error/guard contention skips GC; supervised launch should use ordinary Cargo storage if it cannot establish protection. | Prove fallback before any managed write on each platform and with service restart/interruption. |
 | Concurrent `cargo clean`, no-op/use without rustc, nested Cargo, long `cargo run`, Ctrl-C/crash, multiple GC clients | Only selected mechanism and live-command fixtures exist. | Deterministic real-Cargo race matrix with a positive deletion control in another context. |

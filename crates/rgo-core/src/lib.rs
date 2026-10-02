@@ -16,6 +16,8 @@ pub mod daemon;
 pub mod db;
 pub mod gc;
 pub mod ipc;
+#[cfg(target_os = "macos")]
+pub mod macos_coalition;
 pub mod paths;
 pub mod service;
 pub mod size;

@@ -514,3 +514,47 @@ Linux lifecycle sequence, full workspace suites, zero-warning Clippy, and the
 100-project recovery probes. No new Rust test cases were added.
 This does not establish GUI login,
 reboot, WSL/container behavior, or every service-manager interruption boundary.
+
+## macOS descendant supervision — 2026-10-02
+
+A private-home real Cargo audit reproduced deletion while a build-script child
+was still alive. Python's normal `subprocess.Popen` closes descriptors by
+default, and `start_new_session=True` detaches the child. After Cargo exited,
+rgo's inherited lock no longer protected the child: manual GC removed its
+managed `OUT_DIR`, and the subsequent write failed with `ENOENT`.
+[Python's process API](https://docs.python.org/3/library/subprocess.html),
+[repeatable audit](probes/README.md). This is a concrete counterexample, beyond
+the previously inferred compiler-broker boundary. Automatic GC staying off does
+not protect an explicit manual GC request.
+
+The user selected macOS first for stronger supervision. XNU's process kqueue
+filter rejects recursive `NOTE_TRACK` flags, so a fork notification or repeated
+PID scan is insufficient evidence for complete descendant tracking.
+[Apple's event-filter implementation](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/kern/kern_event.c).
+Apple's resource coalitions preserve membership across fork, exec, and
+posix_spawn; launchd creates them and IDs are not reused within a boot.
+Inference: a unique owned launchd job provides a useful kernel lifetime domain
+for Cargo and closed-FD descendants.
+[Apple's coalition design](https://github.com/apple-oss-distributions/xnu/blob/main/doc/observability/coalitions.md).
+Launching inside a terminal or IDE's existing coalition instead would retain
+storage for that application's entire lifetime, which does not satisfy useful
+independent project reclamation.
+
+The experimental `rgo-core` path now dynamically observes kernel membership and
+records it, with the boot-session UUID, in a synced file outside the evictable
+context. GC checks those receipts after acquiring its existing exclusion
+guards. Corrupt state or failed queries refuse cleanup; an absent coalition is
+never treated as an empty one. Receipts are bounded to 4 KiB and 32 coalition
+IDs. A single private launchd fixture on macOS 27.2 arm64 now demonstrates real
+GC preserving the writer after Cargo exits, rejection of a malformed receipt,
+a successful late write, and reclamation after the writer exits. Build and
+zero-warning Clippy passed locally.
+
+This remains a prototype: ordinary installed Cargo launchers do not register
+receipts, older daemon policies do not check them, and the private observation
+interfaces need supported-version evidence. Doctor now warns about the ordinary
+Unix cleanup gap. The detailed [macOS implementation checklist](macos-cargo-supervision.md)
+covers launchd job ownership, original descriptor/argument handoff, signals,
+startup failure, crash recovery, job reaping, admission/IPC revision changes,
+and actual launcher/IDE validation. P2 and the install-and-forget release gate
+remain open.
