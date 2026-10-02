@@ -374,6 +374,19 @@ The [18-job matrix](https://github.com/Augani/rgo/actions/runs/36969296634) pass
 zero-warning Clippy, version boundaries, installer/lifecycle pilots, btrfs, and
 100-project recovery. The wider P3 policy and accounting checklist remains open.
 
+**Small-volume default update (2026-10-02):** the former fixed 20 GiB floor
+made both automatic targets exceed the existing 2 GiB btrfs CI volume. The
+floor is now `min(20 GiB, capacity / 4)`: max-size remains 15% with its 150 GiB
+ceiling and that floor; the free-space reserve remains 10% with that floor.
+The two automatic targets sum to at most half the reported capacity. Ordinary
+volumes of at least 80 GiB keep their previous defaults, and explicit byte
+settings are preserved. Zero-capacity reports now fail policy resolution
+instead of inventing a limit. The existing default-config fixture covers small,
+normal, and very large capacities, while the existing btrfs pressure fixture
+checks the actual small mounted volume and retains its reclamation control.
+This establishes feasible capacity-based defaults, not a guarantee of available
+space or completion of the low-space/ENOSPC gate.
+
 **Suggested policy:** garbage/temp first; expired orphans next; stale documented incremental state when safely identifiable; then idle contexts and cold CAS entries by measured value/age. Keep the initial implementation explainable before attempting adaptive eviction.
 
 The private-daemon below-budget orphan fixture passed on Linux, macOS, and Windows in the [18-job matrix](https://github.com/Augani/rgo/actions/runs/36909576863). That run also passed the supervised-volume setup warning and Linux filesystem exclusions. The preceding Ubuntu beta run stopped a still-compiling Cargo fixture at its 30-second readiness deadline; the bounded readiness allowance now accommodates slow shared runners without delaying successful starts. The interrupted local full-suite command did not yield a final exit status, so this matrix provides the completed full-suite evidence.

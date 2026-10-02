@@ -229,6 +229,22 @@ fn pressure_gc_reclaims_idle_unpinned_only_contexts_in_private_home() {
         root: sandbox.rgo_home.clone(),
     };
     paths.ensure_layout().unwrap();
+    // This fixture also runs on the real 2 GiB btrfs CI volume. Resolve the
+    // actual root so a large fixed floor cannot make its default reserve
+    // impossible or make the two automatic targets consume all capacity.
+    let defaults = rgo_core::config::Config::default()
+        .resolve(&paths.root)
+        .unwrap();
+    assert!(defaults.max_size + defaults.min_free_space <= defaults.volume_total / 2);
+    if let Some(btrfs_root) = std::env::var_os("RGO_BTRFS_ROOT") {
+        assert!(paths.root.starts_with(PathBuf::from(btrfs_root)));
+        assert!(defaults.volume_total < 20 * (1u64 << 30));
+        assert!(
+            defaults.min_free_space
+                <= rgo_core::config::volume_free_bytes_checked(&paths.root).unwrap()
+        );
+    }
+
     std::fs::write(paths.state_dir().join("storage-mode"), b"supervised\n").unwrap();
     std::fs::write(
         paths.state_dir().join("owner-cargo-home"),

@@ -186,15 +186,26 @@ impl Config {
             bail!("storage.soft_watermark must be within 0.1..=1.0");
         }
         let volume_total = volume_total_bytes_checked(root).context("resolving storage volume")?;
+        self.resolve_for_capacity(volume_total)
+    }
+
+    fn resolve_for_capacity(&self, volume_total: u64) -> Result<Resolved> {
+        if volume_total == 0 {
+            bail!("storage volume reports zero capacity; cannot resolve storage policy");
+        }
         const GB: u64 = 1 << 30;
+        // The original floor is useful on ordinary volumes, but cannot exceed
+        // a quarter of a small volume. Both automatic targets together leave
+        // at least half the capacity outside rgo's budget and reserve.
+        let floor = (20 * GB).min(volume_total / 4);
         let max_size = match self.storage.max_size {
             Size::Bytes(b) => b,
-            // 15% of the volume, clamped to [20 GiB, 150 GiB]
-            Size::Auto => (volume_total * 15 / 100).clamp(20 * GB, 150 * GB),
+            // Saturation only affects capacities already above the 150 GiB cap.
+            Size::Auto => (volume_total.saturating_mul(15) / 100).clamp(floor, 150 * GB),
         };
         let min_free_space = match self.storage.min_free_space {
             Size::Bytes(b) => b,
-            Size::Auto => (volume_total / 10).max(20 * GB),
+            Size::Auto => (volume_total / 10).max(floor),
         };
         Ok(Resolved {
             max_size,
@@ -280,6 +291,34 @@ mod tests {
         assert!(!c.gc.auto);
         assert!(!c.cache.enabled);
         assert!(!c.remote.enabled);
+        const GB: u64 = 1 << 30;
+        assert!(c.resolve_for_capacity(0).is_err());
+        for capacity in [
+            16_384,
+            2 * GB,
+            32 * GB,
+            80 * GB,
+            128 * GB,
+            1024 * GB,
+            u64::MAX,
+        ] {
+            let resolved = c.resolve_for_capacity(capacity).unwrap();
+            assert!(resolved.max_size > 0);
+            assert!(resolved.min_free_space > 0);
+            assert!(resolved.max_size <= 150 * GB);
+            assert!(resolved.max_size + resolved.min_free_space <= capacity / 2);
+        }
+        // Ordinary-volume behavior is unchanged, and explicit limits remain
+        // owner policy even when they are larger than a small volume can meet.
+        let ordinary = c.resolve_for_capacity(128 * GB).unwrap();
+        assert_eq!(ordinary.max_size, 20 * GB);
+        assert_eq!(ordinary.min_free_space, 20 * GB);
+        let mut explicit = c.clone();
+        explicit.storage.max_size = Size::Bytes(60 * GB);
+        explicit.storage.min_free_space = Size::Bytes(40 * GB);
+        let resolved = explicit.resolve_for_capacity(2 * GB).unwrap();
+        assert_eq!(resolved.max_size, 60 * GB);
+        assert_eq!(resolved.min_free_space, 40 * GB);
         assert_eq!(c.remote.token_env, "RGO_REMOTE_TOKEN");
         assert!(!c.cache.remap_workspace_paths);
         assert_eq!(

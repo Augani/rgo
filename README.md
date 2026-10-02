@@ -225,10 +225,11 @@ for an installer-owned `--no-service` activation in the default Cargo home.
 `~/.rgo/config.toml` — all optional, machine-aware defaults:
 
 ```toml
+# auto floor = min(20GiB, 25% of storage volume)
 [storage]
-max_size = "auto"        # auto = clamp(15% of volume, 20GB, 150GB)
+max_size = "auto"        # auto = clamp(15% of volume, floor, 150GiB)
 soft_watermark = 0.80
-min_free_space = "auto"  # auto = max(10% of volume, 20GB)
+min_free_space = "auto"  # auto = max(10% of volume, floor)
 
 [gc]
 incremental_retention = "7d"
@@ -240,6 +241,12 @@ auto = false             # unattended deletion awaits the Cargo lifecycle safety
 [cache]                  # Phase 3 — off by default
 enabled = false
 ```
+
+Automatic sizes use the capacity of the volume containing `RGO_HOME`. The
+floor scales down on volumes below 80 GiB; a 2 GiB volume defaults to a
+512 MiB managed-size target and 512 MiB free-space reserve. Explicit byte
+settings are preserved. Active/pinned storage and data outside rgo can keep
+these recovery targets unmet.
 
 Retention durations measure time since a context's last use. When automatic
 cleanup is enabled in supervised mode, an hourly retention pass runs even below

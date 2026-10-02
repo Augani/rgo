@@ -198,11 +198,12 @@ and deleting a project never leaves a stray multi-GB directory behind.
 
 ```toml
 # ~/.rgo/config.toml — everything optional; defaults are machine-aware
+# auto floor = min(20GiB, 25% of storage volume)
 [storage]
 root = "~/.rgo"
-max_size = "auto"           # auto = clamp(15% of volume, 20GB, 150GB)
+max_size = "auto"           # auto = clamp(15% of volume, floor, 150GiB)
 soft_watermark = 0.80       # start background GC here
-min_free_space = "auto"     # auto = max(10% of volume, 20GB)
+min_free_space = "auto"     # auto = max(10% of volume, floor)
 
 [gc]
 incremental_retention = "7d"        # incremental/ dirs untouched this long are tier-2
