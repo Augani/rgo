@@ -6,6 +6,7 @@
 use anyhow::{Context, Result, bail, ensure};
 use rgo_core::macos_coalition::ResourceCoalition;
 use rgo_core::macos_jobs::{self, CargoJobOwner as Owner};
+use rgo_core::macos_terminal_hosts::Process;
 use rgo_core::paths::RgoPaths;
 use rgo_core::supervision::{self, SessionGuard};
 use serde::{Deserialize, Serialize};
@@ -365,6 +366,9 @@ struct EarlyCleanup<'a> {
     owner: &'a Owner,
     bytes: &'a [u8],
     safe_to_reap: bool,
+    // Only the caller, before any invocation bytes. Stream locals drop before
+    // this guard, so the peer sees EOF while our session still fences recovery.
+    peer: Option<(Process, Instant)>,
 }
 
 fn sync_pair(first: File, second: File) -> Result<()> {
@@ -385,6 +389,23 @@ fn sync_pair(first: File, second: File) -> Result<()> {
 impl Drop for EarlyCleanup<'_> {
     fn drop(&mut self) {
         if self.safe_to_reap {
+            if let Some((peer, deadline)) = &self.peer {
+                loop {
+                    match Process::observe(peer.pid) {
+                        Ok(None) => break,
+                        Ok(Some(current))
+                            if (current.started_seconds, current.started_microseconds)
+                                != (peer.started_seconds, peer.started_microseconds) =>
+                        {
+                            break;
+                        }
+                        Ok(Some(_)) if Instant::now() < *deadline => {
+                            std::thread::sleep(Duration::from_millis(10));
+                        }
+                        _ => return, // Unknown/live writer: retain its metadata.
+                    }
+                }
+            }
             let _ = macos_jobs::cleanup(self.directory, self.owner, self.bytes);
         }
     }
@@ -497,6 +518,7 @@ impl PreparedJob {
             owner: &owner,
             bytes: &bytes,
             safe_to_reap: true,
+            peer: None,
         };
         macos_jobs::bootstrap(&directory, &owner, &bytes, deadline)?;
         let bootstrapped = started.elapsed();
@@ -550,6 +572,31 @@ impl PreparedJob {
             bail!("Cargo guardian authentication failed");
         };
         ensure!(token == owner.token, "Cargo guardian authentication failed");
+        // A legacy guardian may log its startup EOF after its own cleanup
+        // attempt. Do not race that writer with a retirement fingerprint.
+        // This identity never authorizes context deletion: no invocation has
+        // been sent, and the caller retains its Cargo-session guard throughout.
+        early_cleanup.safe_to_reap = false;
+        let mut pid = 0_i32;
+        let mut length = std::mem::size_of_val(&pid) as libc::socklen_t;
+        ensure!(
+            unsafe {
+                libc::getsockopt(
+                    stream.as_raw_fd(),
+                    libc::SOL_LOCAL,
+                    libc::LOCAL_PEERPID,
+                    (&mut pid as *mut i32).cast(),
+                    &mut length,
+                )
+            } == 0
+                && length as usize == std::mem::size_of_val(&pid),
+            "cannot identify Cargo guardian peer"
+        );
+        early_cleanup.peer = Some((
+            Process::observe(pid)?.context("Cargo guardian peer exited before authentication")?,
+            deadline,
+        ));
+        early_cleanup.safe_to_reap = true;
         ensure!(
             inherited_fds,
             "Cargo guardian cannot preserve inherited descriptors"
@@ -1054,6 +1101,7 @@ pub fn guardian(directory: &Path, token: &str, context: Option<&Path>) -> Result
         owner: &owner,
         bytes: &bytes,
         safe_to_reap: true,
+        peer: None,
     };
     let mut stream = in_directory(directory, || Ok(UnixStream::connect(SOCKET_NAME)?))?;
     check_peer(&stream)?;

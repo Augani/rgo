@@ -13,6 +13,25 @@ use rgo_core::supervision;
 use rgo_protocol::{Request, Response};
 use rgo_testkit::Sandbox;
 
+/// CI can inherit an elevated priority which unprivileged launchd children
+/// cannot reproduce. Exercise managed behavior with an explicit supported
+/// caller priority; production preserves higher-priority calls via checkout.
+#[allow(unsafe_code)]
+fn pilot_command(sandbox: &Sandbox, program: &str) -> std::process::Command {
+    use std::os::unix::process::CommandExt;
+    let mut command = sandbox.cmd(program);
+    command.env("RGO_MACOS_SUPERVISOR_PILOT", "1");
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setpriority(libc::PRIO_PROCESS, 0, 20) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    command
+}
+
 struct ReleaseWorker(PathBuf);
 
 impl Drop for ReleaseWorker {
@@ -183,7 +202,7 @@ fn main() {{ unsafe {{
         std::fs::create_dir(&directory).unwrap();
         std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
         let log = directory.join("stderr");
-        let mut command = sandbox.cmd("cargo");
+        let mut command = pilot_command(sandbox, "cargo");
         command
             .current_dir(project)
             .env("PATH", &path)
@@ -499,8 +518,7 @@ while not pathlib.Path(os.environ['RGO_COALITION_READY']).exists():
             .chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
     )
     .unwrap();
-    let build = sandbox
-        .cmd("cargo")
+    let build = pilot_command(&sandbox, "cargo")
         .current_dir(&project)
         .env("PATH", &search_path)
         .env("RGO_MACOS_SUPERVISOR_PILOT", "1")
@@ -890,7 +908,7 @@ fn main() {
         let mut limit=Limit{soft:0,hard:0}; assert_eq!(getrlimit(8,&mut limit),0);
         assert_eq!(limit.soft,128,"caller NOFILE limit changed");
         assert_eq!(limit.hard,std::env::var("RGO_NATIVE_NOFILE_HARD").unwrap().parse::<u64>().unwrap());
-        assert_eq!(getpriority(0,0),10,"caller nice value changed");
+        assert_eq!(getpriority(0,0),20,"caller nice value changed");
         use std::os::unix::fs::PermissionsExt;
         let created=std::path::Path::new(&std::env::var_os("RGO_HOME").unwrap()).join("native-created");
         std::fs::write(&created,b"native permissions").unwrap();
@@ -946,7 +964,7 @@ fn main() {
             rlim_max: limit.rlim_max,
         }
     };
-    let mut command = sandbox.cmd("cargo");
+    let mut command = pilot_command(&sandbox, "cargo");
     command
         .current_dir(&project)
         .env("PATH", &search_path)
@@ -985,7 +1003,7 @@ fn main() {
             }
             if libc::fcntl(44, libc::F_SETFD, libc::FD_CLOEXEC) < 0
                 || libc::setrlimit(libc::RLIMIT_NOFILE, &nofile) != 0
-                || libc::setpriority(libc::PRIO_PROCESS, 0, 10) != 0
+                || libc::setpriority(libc::PRIO_PROCESS, 0, 20) != 0
             {
                 return Err(std::io::Error::last_os_error());
             }
@@ -1055,7 +1073,7 @@ fn main() {
         "{transport_stderr}"
     );
     println!(
-        "installed Cargo pilot: stdin/EOF, streams/native bytes, inherited file aliases/shared offset, jobserver pipe/token, close-on-exec exclusion, umask 077/mode 0600, NOFILE 128/hard limit, nice 10, managed exit 17 and actual idle GC passed"
+        "installed Cargo pilot: stdin/EOF, streams/native bytes, inherited file aliases/shared offset, jobserver pipe/token, close-on-exec exclusion, umask 077/mode 0600, NOFILE 128/hard limit, nice 20, managed exit 17 and actual idle GC passed"
     );
 
     // Extend the same real-Cargo fixture with an interactive zsh job, rather
@@ -1069,8 +1087,7 @@ fn main() {
     let event_audit = paths.state_dir().join("macos-supervisor-audit");
     std::fs::create_dir(&event_audit).unwrap();
     std::fs::set_permissions(&event_audit, std::fs::Permissions::from_mode(0o700)).unwrap();
-    let terminal = sandbox
-        .cmd("python3")
+    let terminal = pilot_command(&sandbox, "python3")
         .arg("-c")
         .arg(include_str!("fixtures/macos-terminal-shell.py"))
         .current_dir(&project)

@@ -116,9 +116,12 @@ impl Attributes {
                 && self.limits[libc::RLIMIT_CPU as usize].hard == libc::RLIM_INFINITY,
             "finite Cargo CPU budget requires checkout execution"
         );
+        let guardian_nice = priority()?;
         ensure!(
-            self.nice >= priority()?,
-            "Cargo scheduling priority cannot be restored by its guardian"
+            self.nice >= guardian_nice,
+            "Cargo scheduling priority cannot be restored by its guardian (caller {}, guardian {})",
+            self.nice,
+            guardian_nice
         );
         probe(|| unsafe { self.restore_in_child().map(|()| 0) })
             .context("preflighting Cargo native attributes")?;

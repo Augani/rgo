@@ -856,8 +856,20 @@ fn nested_cargo_build_keeps_both_contexts_safe_while_gc_reclaims_an_idle_one() {
     let path = std::env::join_paths(path).unwrap();
     let ready = sandbox.home.join("nested-ready");
     let release = sandbox.home.join("nested-release");
-    let mut running = sandbox
-        .cmd("cargo")
+    let mut parent_command = sandbox.cmd("cargo");
+    #[cfg(target_os = "macos")]
+    #[allow(unsafe_code)]
+    unsafe {
+        use std::os::unix::process::CommandExt;
+        // A supported priority independent of the runner's elevated nice value.
+        parent_command.pre_exec(|| {
+            if libc::setpriority(libc::PRIO_PROCESS, 0, 20) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut running = parent_command
         .current_dir(&parent)
         .env("PATH", &path)
         .env("RGO_NESTED_MANIFEST", nested.join("Cargo.toml"))

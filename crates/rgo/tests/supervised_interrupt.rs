@@ -146,7 +146,8 @@ fn main() {
                 let mut mask = std::mem::zeroed();
                 libc::sigemptyset(&mut mask);
                 libc::sigaddset(&mut mask, libc::SIGCONT);
-                if libc::signal(libc::SIGINT, libc::SIG_IGN) == libc::SIG_ERR
+                if libc::setpriority(libc::PRIO_PROCESS, 0, 20) != 0
+                    || libc::signal(libc::SIGINT, libc::SIG_IGN) == libc::SIG_ERR
                     || libc::signal(libc::SIGUSR1, libc::SIG_IGN) == libc::SIG_ERR
                     || libc::signal(libc::SIGCONT, libc::SIG_IGN) == libc::SIG_ERR
                     || libc::sigprocmask(libc::SIG_BLOCK, &mask, std::ptr::null_mut()) != 0
