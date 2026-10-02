@@ -138,10 +138,12 @@ fn cancellation_before_commit(sandbox: &Sandbox, project: &std::path::Path, rgo:
         (libc::SIGTERM, b"fail".as_slice(), false, true, false),
         (libc::SIGTERM, b"resume".as_slice(), false, true, true),
         (libc::SIGINT, b"resume".as_slice(), false, false, true),
+        (libc::SIGUSR2, b"resume".as_slice(), false, true, false),
+        (libc::SIGUSR2, b"fail".as_slice(), false, false, false),
     ] {
         if blocked {
             // Check the inherited mask before changing the application action.
-            // A queued TERM must kill the managed app or invoke the fallback
+            // A queued signal must kill the managed app or invoke the fallback
             // handler when unblocked; normal return is a lost notification.
             std::fs::write(
                 &source,
@@ -169,7 +171,7 @@ fn main() {{ unsafe {{
 }} }}
 "#,
                     setmask = libc::SIG_SETMASK,
-                    term = libc::SIGTERM,
+                    term = signal,
                     unblock = libc::SIG_UNBLOCK,
                     handled = action == b"fail" || cut,
                 ),
@@ -204,10 +206,10 @@ fn main() {{ unsafe {{
                 command.env("RGO_MACOS_SUPERVISOR_COMMIT_AUDIT", "1");
             }
             unsafe {
-                command.pre_exec(|| {
+                command.pre_exec(move || {
                     let mut mask = std::mem::zeroed();
                     libc::sigemptyset(&mut mask);
-                    libc::sigaddset(&mut mask, libc::SIGTERM);
+                    libc::sigaddset(&mut mask, signal);
                     if libc::sigprocmask(libc::SIG_BLOCK, &mask, std::ptr::null_mut()) != 0 {
                         return Err(std::io::Error::last_os_error());
                     }
@@ -271,11 +273,11 @@ fn main() {{ unsafe {{
             }
             let observed = std::fs::read(directory.join("pending-observed")).unwrap_or_default();
             println!(
-                "pending TERM before app unblocks: {:?}",
+                "pending signal {signal} before app unblocks: {:?}",
                 String::from_utf8_lossy(&observed)
             );
             if observed != b"pending" {
-                failures.push(format!("TERM was not pending before app code; release={action:?}, observed={observed:?}"));
+                failures.push(format!("signal {signal} was not pending before app code; release={action:?}, observed={observed:?}"));
             }
             if action == b"resume" && !cut {
                 publish_audit_release(&directory.join("delivery-release"), b"resume").unwrap();

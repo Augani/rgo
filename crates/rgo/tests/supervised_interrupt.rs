@@ -23,6 +23,18 @@ struct RunningCargo {
     release: PathBuf,
 }
 
+struct ShutdownDaemon(RgoPaths);
+
+impl Drop for ShutdownDaemon {
+    fn drop(&mut self) {
+        let _ = rgo_core::ipc::request_with_timeout(
+            &self.0.socket_path(),
+            rgo_protocol::Request::Shutdown,
+            Duration::from_secs(1),
+        );
+    }
+}
+
 impl Drop for RunningCargo {
     fn drop(&mut self) {
         let _ = std::fs::write(&self.release, b"release");
@@ -72,6 +84,8 @@ fn terminal_ctrl_c_keeps_a_surviving_cargo_descendant_protected() {
     search_path.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap()));
     let search_path = std::env::join_paths(search_path).unwrap();
     let ready = sandbox.home.join("interrupt-child-ready");
+    #[cfg(target_os = "macos")]
+    let user_ready = sandbox.home.join("interrupt-user-signal");
     let release = sandbox.home.join("interrupt-child-release");
     let log = sandbox.home.join("interrupt-cargo.log");
     std::fs::write(
@@ -83,20 +97,37 @@ unsafe extern "C" {
 }
 #[cfg(target_os = "macos")]
 extern "C" fn interrupted(_: i32) { unsafe { _exit(73) } }
+#[cfg(target_os = "macos")]
+static USER_SIGNAL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+#[cfg(target_os = "macos")]
+extern "C" fn user_signal(_: i32) { USER_SIGNAL.store(true, std::sync::atomic::Ordering::Relaxed); }
 fn main() {
     // A running application may replace the SIGINT action it inherited from
     // a background launch. Direct job-group signals must then reach it.
     #[cfg(target_os = "macos")]
     unsafe {
         assert_ne!(signal(2, interrupted as *const () as usize), usize::MAX);
+        assert_ne!(signal(30, user_signal as *const () as usize), usize::MAX);
     }
     let mut child = std::process::Command::new("sh")
         .arg("-c")
-        .arg("trap '' INT; printf '%s' \"$$\" > \"$RGO_INTERRUPT_READY\"; i=0; while [ ! -f \"$RGO_INTERRUPT_RELEASE\" ] && [ \"$i\" -lt 30 ]; do sleep 1; i=$((i+1)); done")
+        .arg("trap '' INT USR1; printf '%s' \"$$\" > \"$RGO_INTERRUPT_READY\"; i=0; while [ ! -f \"$RGO_INTERRUPT_RELEASE\" ] && [ \"$i\" -lt 30 ]; do sleep 1; i=$((i+1)); done")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn().unwrap();
+    #[cfg(target_os = "macos")]
+    loop {
+        if USER_SIGNAL.swap(false, std::sync::atomic::Ordering::Relaxed) {
+            let marker = std::path::PathBuf::from(std::env::var_os("RGO_INTERRUPT_USER_READY").unwrap());
+            let staging = marker.with_extension("pending");
+            std::fs::write(&staging, b"handled").unwrap();
+            std::fs::rename(staging, marker).unwrap();
+        }
+        if child.try_wait().unwrap().is_some() { break; }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    #[cfg(not(target_os = "macos"))]
     let _ = child.wait();
 }
 "#,
@@ -106,6 +137,7 @@ fn main() {
     #[cfg(target_os = "macos")]
     {
         command.env("RGO_MACOS_SUPERVISOR_PILOT", "1");
+        command.env("RGO_INTERRUPT_USER_READY", &user_ready);
         // Preserve ignored SIGINT during startup, then let the running
         // application change its action. SIGCONT is also ignored and blocked;
         // the separate Cargo group must still receive its kernel effect.
@@ -115,6 +147,7 @@ fn main() {
                 libc::sigemptyset(&mut mask);
                 libc::sigaddset(&mut mask, libc::SIGCONT);
                 if libc::signal(libc::SIGINT, libc::SIG_IGN) == libc::SIG_ERR
+                    || libc::signal(libc::SIGUSR1, libc::SIG_IGN) == libc::SIG_ERR
                     || libc::signal(libc::SIGCONT, libc::SIG_IGN) == libc::SIG_ERR
                     || libc::sigprocmask(libc::SIG_BLOCK, &mask, std::ptr::null_mut()) != 0
                 {
@@ -145,6 +178,7 @@ fn main() {
     let paths = RgoPaths {
         root: sandbox.rgo_home.clone(),
     };
+    let _shutdown_daemon = ShutdownDaemon(paths.clone());
     let contexts = paths.managed_build_dirs();
     assert_eq!(contexts.len(), 1);
     let active = &contexts[0];
@@ -155,6 +189,15 @@ fn main() {
     );
 
     let cargo_pid = running.child.id() as i32;
+    #[cfg(target_os = "macos")]
+    let user_forwarded = {
+        assert_eq!(unsafe { libc::kill(-cargo_pid, libc::SIGUSR1) }, 0);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !user_ready.exists() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        std::fs::read(&user_ready).unwrap_or_default() == b"handled"
+    };
     #[cfg(not(target_os = "macos"))]
     assert_eq!(unsafe { libc::getpgid(child_pid) }, cargo_pid);
     #[cfg(target_os = "macos")]
@@ -248,5 +291,24 @@ fn main() {
         supervision::try_lock_gc(&paths, Some(active))
             .unwrap()
             .is_some()
+    );
+    let gc = sandbox
+        .cmd(rgo)
+        .args(["gc", "--target", "0"])
+        .output()
+        .unwrap();
+    assert!(
+        gc.status.success(),
+        "{}",
+        String::from_utf8_lossy(&gc.stderr)
+    );
+    assert!(
+        !active.exists(),
+        "idle interrupted context was not reclaimed"
+    );
+    #[cfg(target_os = "macos")]
+    assert!(
+        user_forwarded,
+        "the running application's replacement SIGUSR1 handler was not reached"
     );
 }

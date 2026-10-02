@@ -1,0 +1,76 @@
+{
+  "purpose": "Actual prior/current binary handoffs and recovery of an already-running old guardian during a private upgrade",
+  "baseline_code": "e4744613a4a3394a76ef9db5bc92997a926f29f8",
+  "platform": "ProductName:\t\tmacOS\nProductVersion:\t\t27.2\nBuildVersion:\t\t26B5091g",
+  "toolchain": "cargo 1.98.0 (797e8a9bc 2026-08-05)",
+  "isolation": "Private HOME/CARGO_HOME/RGO_HOME; real Cargo offline; cache and automatic GC off; owned probe daemons shut down and waited",
+  "same_protocol_handoffs": {
+    "previous_debug_note": "Production code unchanged; debug pending observation extended for TERM/USR1/USR2",
+    "method": "Start the caller behind the existing session-lock barrier, atomically replace the installed binary pair, then release the caller",
+    "binary_sha256": {
+      "previous": {
+        "rgo": "2d20b160e15cc25184267aa1c6de46affca8c66fa21147fc66ba771d4b724602",
+        "rgo-rustc-wrapper": "88800eb94dbe104b2d10046e996d5cc1ca1ca0729d4b4b5fa90906b5cc6f5194"
+      },
+      "current": {
+        "rgo": "a9c7ea11f8fe74beb82674cd5539ae0d8cc4e8faa00467b4271d7c0c36a0d1d6",
+        "rgo-rustc-wrapper": "88800eb94dbe104b2d10046e996d5cc1ca1ca0729d4b4b5fa90906b5cc6f5194"
+      }
+    },
+    "observations": [
+      {
+        "caller": "previous",
+        "guardian": "current",
+        "caller_at_barrier": true,
+        "guardian_committed": true,
+        "application_exit_code": 17,
+        "application_invocations": 1,
+        "idle_metadata_retired": true,
+        "actual_idle_gc": true,
+        "storage": "managed context",
+        "stdout_stderr_preserved": true
+      },
+      {
+        "caller": "current",
+        "guardian": "previous",
+        "caller_at_barrier": true,
+        "guardian_committed": false,
+        "application_exit_code": 17,
+        "application_invocations": 1,
+        "idle_metadata_retired": true,
+        "actual_idle_gc": true,
+        "storage": "checkout target",
+        "stdout_stderr_preserved": true
+      }
+    ],
+    "current_caller_old_guardian": "Old greeting has pending_before_exec=true but no signal mask. Current caller explicitly reports Cargo guardian cannot forward required signals and falls back before commit",
+    "limits": "Basic healthy handoffs only; the old caller does not acquire USR1/USR2 support from the new guardian"
+  },
+  "already_running_old_guardian": {
+    "baseline_code": "e4744613a4a3394a76ef9db5bc92997a926f29f8",
+    "baseline_profile": "optimized, unmodified prior production pair",
+    "platform": "ProductName:\t\tmacOS\nProductVersion:\t\t27.2\nBuildVersion:\t\t26B5091g",
+    "cargo": "cargo 1.98.0 (797e8a9bc 2026-08-05)",
+    "old_guardian_survived_atomic_binary_switch": true,
+    "old_cargo_completed": true,
+    "new_cargo_completed": true,
+    "idle_new_context_reclaimed_while_old_writer_active": true,
+    "old_context_preserved_after_old_guardian_sigkill_and_new_daemon_restart": true,
+    "closed_fd_detached_writer_late_write": "write succeeded",
+    "old_context_receipt_and_owned_metadata_retired_after_writer_exit": true,
+    "limits": "Same protocol 9, admission revision 4, owner schema 4 and receipt schema 2. Nonterminal evaluation; direct atomic pair replacement, not a full installer/service rollback or every-version upgrade.",
+    "receipt_absence_verified_after_gc": true,
+    "receipt_check": "No macos-coalition-*.json remains in the private state/locks directory after final GC; all probe contexts and owned jobs have retired."
+  },
+  "optimized_binary_sha256": {
+    "previous": {
+      "rgo": "bedb2a1b55062c3c9eca6afdc3b6d5991e899162807f9cb909613c6735fa0d2f",
+      "rgo-rustc-wrapper": "848660768b445d1e71235e5e3bcb2aa500a2104401cec2ed3ada547fcaa3f885"
+    },
+    "current": {
+      "rgo": "de198dc9370f6d75f1710a3e126239ae9d5d972e37a71a9e8952215b767dbe08",
+      "rgo-rustc-wrapper": "848660768b445d1e71235e5e3bcb2aa500a2104401cec2ed3ada547fcaa3f885"
+    }
+  },
+  "limits": "Same protocol 9/admission 4/owner 4/receipt 2; direct atomic pair replacement in nonterminal private launches. Does not establish full installer/service rollback, terminal or signal-state version skew, downgrade or every-version upgrades; the broader upgrade gate remains open."
+}

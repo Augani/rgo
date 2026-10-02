@@ -1,0 +1,52 @@
+{
+  "purpose": "Preserve macOS SIGUSR1/SIGUSR2 across prepared and running Cargo handoffs; extend two existing cases only",
+  "baseline_code": "e4744613a4a3394a76ef9db5bc92997a926f29f8",
+  "platform": "macOS 27.2 build 26B5091g arm64; Cargo 1.98.0 stable",
+  "isolation": "Private HOME/CARGO_HOME/RGO_HOME; real Cargo offline; compiler cache and automatic GC off",
+  "before": {
+    "coalition_seconds": 6.81,
+    "blocked_usr2": "FAILED: inherited blocked mask was present, but the application observed missing in its kernel pending set before unblocking; managed commit true, exit 0 instead of signal 31",
+    "interrupt_seconds": 7.74,
+    "runtime_usr1": "FAILED: application replaced an originally ignored SIGUSR1 action, but its handler was never reached",
+    "controls": "All seven earlier startup subcases passed. Interrupt stop/resume, exact handler exit 73, surviving descendant protection, unrelated idle GC and released active-context GC passed before the final USR1 assertion failed",
+    "cleanup": "Each completed startup subcase required owned-job retirement and actual idle-context deletion before aggregate failure"
+  },
+  "after": {
+    "coalition_seconds": 32.6,
+    "startup_subcases": 9,
+    "blocked_usr2": "PASS: application observed pending before runtime relay, inherited blocked mask, managed commit true, actual signal exit 31",
+    "deliverable_usr2_preparation_failure": "PASS: actual signal exit 31, no managed commit or fallback application",
+    "interrupt_seconds": 3.99,
+    "runtime_usr1": "PASS: atomic marker from the running application proves its replacement handler was reached",
+    "retained_controls": "All seven earlier startup subcases, exact SIGINT-handler code 73, stop/resume, closed-FD writer protection, healthy and crash recovery, terminal behavior, and actual idle/released-active context deletion passed"
+  },
+  "implementation": {
+    "forwarded_signals": [
+      "INT",
+      "TERM",
+      "HUP",
+      "QUIT",
+      "TSTP",
+      "CONT",
+      "WINCH",
+      "USR1",
+      "USR2"
+    ],
+    "darwin_internal_mask_hex": "0xd00c800e",
+    "greeting": "Additive forwarded_signals defaults to zero when absent. Current caller requires all nine supported signals before terminal activation, relay installation or Cargo commit; absent/incomplete capabilities use checkout fallback",
+    "wire_compatibility": "New guardian retains legacy S and Q with the earlier seven-signal mask. Current Q validates queued bits against advertised signals and captured originally blocked, non-ignored state",
+    "cleanup_authority": "Unchanged: protocol 9, admission revision 4, owner schema 4, receipt schema 2"
+  },
+  "local_checks": {
+    "all_bin_debug_build": "PASS, 13.22 s",
+    "clippy_all_targets_deny_warnings": "PASS, 12.71 s",
+    "all_bin_release_build": "PASS, 19.68 s",
+    "format_and_diff": "PASS",
+    "release_audit_exclusion": "PASS for rgo and rgo-rustc-wrapper; debug rgo positive control",
+    "new_rust_test_cases": 0,
+    "new_ci_lanes": 0,
+    "full_workspace_suite": "Pending one existing remote matrix; no duplicate full local suite"
+  },
+  "upgrade_evidence": "2026-10-02-macos-user-signal-upgrade.json",
+  "limits": "Remaining mask/action and unsupported-state classes, later commit/exec timing, terminal/installer/service version skew, declared runtime range, IDE and representative performance remain open. Three earlier interrupt/terminal/CAS failures remain unexplained. Normal activation and automatic GC stay off."
+}

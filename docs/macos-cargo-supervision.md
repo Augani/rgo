@@ -1012,3 +1012,40 @@ the deterministic failure and correction. Duplication models a concurrent fork
 retaining a descriptor before exec closes it, without forking a multithreaded
 test runner. Explicit unlock ends an actual completed operation; it never
 weakens the shared locks protecting Cargo or authorizes cleanup of a live job.
+
+## User notifications and live guardian upgrade — October 2, 2026
+
+- [x] Reproduce lost blocked SIGUSR2 before exec and lost runtime SIGUSR1
+  after an application replaces an inherited ignored action. Extend the two
+  existing cases; retain their cleanup, signal and terminal assertions.
+- [x] Forward both user signals during runtime, preserve their queued blocked
+  state before exec, and include deliverable user signals in preparation
+  cancellation. Negotiate the actual nine-signal capability before commit;
+  old or insufficient greetings use checkout fallback.
+- [x] Pass all nine startup subcases and the existing interrupt case locally
+  in 32.60 s / 3.99 s. All-bin debug/release builds, zero-warning all-target
+  Clippy, format and diff checks passed. Release binaries exclude audit hooks.
+- [x] Exercise both live previous/current binary handoffs. The old caller
+  commits with the new guardian; the current caller rejects the old guardian's
+  missing mask. Each app runs once, returns 17, preserves output, retires its
+  owned metadata and permits actual idle-context deletion.
+- [x] Keep an already-running old optimized guardian across atomic replacement
+  of the installed pair. Start current Cargo and a current daemon, reclaim the
+  new idle context, then kill the freshly verified old guardian by PID and
+  restart the current daemon. Its closed-FD writer remains protected, completes
+  its late write, and then permits actual context/job/receipt retirement.
+- [ ] Verify this batch in the existing platform matrix, including the actual
+  macOS arm64 stable/beta/nightly and Intel cases. No new CI lane is needed.
+- [ ] Complete remaining mask/action and unsupported-state classes, later
+  commit/exec timing, terminal and installer/service version skew, rollback and
+  supported-runtime acceptance. Resolve the three earlier unexplained failures.
+  Normal activation and automatic GC remain disabled.
+
+The [signal observations](probes/2026-10-02-macos-user-signals.json) preserve
+both failures and their corrected outcomes. The
+[live upgrade observations](probes/2026-10-02-macos-user-signal-upgrade.json)
+include binary hashes and explicit scope limits: the previous debug pair has
+only additional pending-signal observation; the running old guardian uses the
+unmodified optimized baseline. These are nonterminal same-authority handoffs
+using protocol 9, admission 4, owner 4 and receipt 2, with direct binary
+replacement. They do not close the full installer/service upgrade gate.

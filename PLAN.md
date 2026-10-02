@@ -107,6 +107,20 @@ passed at `c24958d` without a retry, including both actual cases on arm64 and
 Intel and every existing platform lane. The wider inherited-signal/startup
 and release gates remain open.
 
+**2026-10-02 macOS user signals and live upgrade:** SIGUSR1/SIGUSR2 now
+retain preparation cancellation, blocked pending state before exec, and runtime
+forwarding when an application replaces an ignored action. An explicit greeting
+mask rejects insufficient guardians before commit. The two existing cases
+reproduced both losses and now pass locally, with all-bin debug/release builds
+and zero-warning Clippy. Live previous/current handoffs preserve one execution,
+exit 17, output and actual idle cleanup. An already-running old optimized
+guardian also retains closed-FD writer protection after binary replacement,
+guardian death and current-daemon restart, then permits real cleanup after the
+late write. One existing platform matrix is pending; broader release gates and
+three earlier unexplained failures remain open in the
+[macOS checklist](docs/macos-cargo-supervision.md#user-notifications-and-live-guardian-upgrade--october-2-2026).
+Normal activation and automatic GC stay off.
+
 ## 0. What changed vs. `doc.md`, and why
 
 **2026-10-02 queued macOS commit and completed GC locks:** the existing pilot

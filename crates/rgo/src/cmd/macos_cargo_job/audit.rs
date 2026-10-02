@@ -57,8 +57,12 @@ pub(super) fn prepared(paths: &RgoPaths) -> Result<()> {
             "cannot observe audit pending signals"
         );
         if !pending_observed
-            && (unsafe { libc::sigismember(&pending, libc::SIGTERM) } == 1
-                || SIGNALS.load(Ordering::Acquire) & (1 << libc::SIGTERM) != 0)
+            && [libc::SIGTERM, libc::SIGUSR1, libc::SIGUSR2]
+                .into_iter()
+                .any(|signal| {
+                    (unsafe { libc::sigismember(&pending, signal) }) == 1
+                        || SIGNALS.load(Ordering::Acquire) & (1 << signal) != 0
+                })
         {
             publish(&directory, "signal-observed")?;
             pending_observed = true;

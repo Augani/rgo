@@ -46,9 +46,12 @@ rebuild-over-migrate when the filesystem is the source of truth.
   Receipt schema 1 retains its strict zero-count policy, including protection
   when its ID cannot be queried. Neither schema enables normal pilot activation
   or automatic GC.
-  The per-job greeting now advertises `pending_before_exec`; a current caller
-  falls back before terminal activation/commit when it is absent or false.
-  The guardian accepts legacy `S`, and current callers send `Q` plus a four-byte
+  The per-job greeting advertises `pending_before_exec` and a
+  `forwarded_signals` mask. A current caller requires pending-before-exec and
+  all nine supported signals, including SIGUSR1/SIGUSR2, before terminal
+  activation/commit. Missing or insufficient capabilities use checkout fallback.
+  The guardian accepts legacy `S` and earlier seven-signal `Q` records; current
+  callers send `Q` plus a four-byte
   big-endian pending mask. Only forwarded, originally blocked, non-ignored
   signals are accepted. The complete five-byte record is required before spawn;
   queued signals are recreated while blocked in the child before exec. Incomplete

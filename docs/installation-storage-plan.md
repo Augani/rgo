@@ -292,6 +292,19 @@ locally in 22.87 s / 3.56 s and all 19 individual jobs in the
 on attempt 1. The recorded arm64 stable/beta/nightly and Intel outcomes close
 this batch's platform check, while normal activation remains disabled.
 
+**macOS user signals and running old guardians:** the pilot now negotiates
+its nine-signal capability and preserves SIGUSR1/SIGUSR2 during prepared and
+running handoffs. The two existing cases reproduce the earlier losses and pass
+locally, along with all-bin builds and zero-warning Clippy. Both private
+previous/current handoffs preserve exact output, one app invocation, exit 17
+and actual idle GC. A running old optimized guardian also retains its detached
+closed-FD writer through binary replacement, guardian death and a restarted
+current daemon; the late write succeeds before actual context/job/receipt
+retirement. [Evidence and the remaining checklist](macos-cargo-supervision.md#user-notifications-and-live-guardian-upgrade--october-2-2026)
+limit this to same-authority nonterminal binary replacement, with the full
+installer/service and terminal upgrade gates still open. The existing platform
+matrix is pending; normal activation and automatic GC remain off.
+
 **macOS priority (2026-10-02):** a private real-Cargo audit reproduced deletion
 while a detached child with closed inherited descriptors was still writing.
 The [macOS supervisor checklist](macos-cargo-supervision.md) records the selected

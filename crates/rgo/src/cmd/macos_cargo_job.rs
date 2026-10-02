@@ -35,7 +35,7 @@ pub fn terminal_host(action: TerminalHostAction, home: Option<&Path>) -> Result<
 
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(20);
 const SOCKET_NAME: &str = "control.sock";
-const FORWARDED_SIGNALS: [i32; 7] = [
+const FORWARDED_SIGNALS: [i32; 9] = [
     libc::SIGINT,
     libc::SIGTERM,
     libc::SIGHUP,
@@ -43,12 +43,27 @@ const FORWARDED_SIGNALS: [i32; 7] = [
     libc::SIGTSTP,
     libc::SIGCONT,
     libc::SIGWINCH,
+    libc::SIGUSR1,
+    libc::SIGUSR2,
 ];
+
+fn forwarded_mask() -> u32 {
+    FORWARDED_SIGNALS
+        .into_iter()
+        .fold(0_u32, |mask, signal| mask | (1 << signal))
+}
 static SIGNALS: AtomicU32 = AtomicU32::new(0);
 static RELAY_MASK: AtomicU32 = AtomicU32::new(0);
 static CANCEL_MASK: AtomicU32 = AtomicU32::new(0);
 static SIGNAL_WAKE: AtomicI32 = AtomicI32::new(-1);
-const TERMINATING_SIGNALS: [i32; 4] = [libc::SIGINT, libc::SIGTERM, libc::SIGHUP, libc::SIGQUIT];
+const TERMINATING_SIGNALS: [i32; 6] = [
+    libc::SIGINT,
+    libc::SIGTERM,
+    libc::SIGHUP,
+    libc::SIGQUIT,
+    libc::SIGUSR1,
+    libc::SIGUSR2,
+];
 
 fn cancelled_signal() -> Option<i32> {
     let pending = SIGNALS.load(Ordering::Acquire) & CANCEL_MASK.load(Ordering::Acquire);
@@ -104,6 +119,8 @@ enum Message {
         coalition: u64,
         #[serde(default)]
         pending_before_exec: bool,
+        #[serde(default)]
+        forwarded_signals: u32,
     },
     Configured,
     Started {
@@ -518,12 +535,17 @@ impl PreparedJob {
             Message::Prepared {
                 coalition,
                 pending_before_exec,
+                forwarded_signals,
             } => {
                 // A guardian launched during an upgrade may be older. Refuse
                 // this handoff before activating the terminal or committing.
                 ensure!(
                     pending_before_exec,
                     "Cargo guardian cannot queue signals before exec"
+                );
+                ensure!(
+                    forwarded_signals & forwarded_mask() == forwarded_mask(),
+                    "Cargo guardian cannot forward required signals"
                 );
                 coalition
             }
@@ -1022,6 +1044,7 @@ pub fn guardian(directory: &Path, token: &str, context: Option<&Path>) -> Result
             &Message::Prepared {
                 coalition: coalition.id(),
                 pending_before_exec: true,
+                forwarded_signals: forwarded_mask(),
             },
         )?;
         let mut initially_foreground = false;
@@ -1046,11 +1069,8 @@ pub fn guardian(directory: &Path, token: &str, context: Option<&Path>) -> Result
                 let mut bytes = [0_u8; 4];
                 stream.read_exact(&mut bytes)?;
                 let pending = u32::from_be_bytes(bytes);
-                let forwarded = FORWARDED_SIGNALS
-                    .into_iter()
-                    .fold(0_u32, |mask, signal| mask | (1 << signal));
                 ensure!(
-                    pending & !forwarded == 0 && request.signals.accepts_pending(pending),
+                    pending & !forwarded_mask() == 0 && request.signals.accepts_pending(pending),
                     "Cargo commit contains unsupported pending signals"
                 );
                 pending
