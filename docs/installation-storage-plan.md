@@ -251,6 +251,11 @@ object still present. Its cause remains unresolved. The existing assertion
 now includes its GC report; a manual-only core-suite diagnostic targets the
 affected runtime without rerunning the other lanes. This leaves the batch's
 full-platform acceptance open.
+That run completed with 18 of 19 jobs passing. The
+[focused core diagnostic](https://github.com/Augani/rgo/actions/runs/37052395428)
+passed all 116 existing tests on the matching macOS build and beta compiler;
+it did not reproduce or explain the first failure. No production GC change
+or weaker deletion assertion was made, and the original failure remains open.
 
 **macOS priority (2026-10-02):** a private real-Cargo audit reproduced deletion
 while a detached child with closed inherited descriptors was still writing.

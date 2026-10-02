@@ -913,3 +913,11 @@ from CI's 1.100.0-beta.2 and macOS 14 runtime. The assertion now includes its GC
 report, retaining the exact deletion requirement. A manual-only workflow runs
 the existing core suite on the affected macOS 14 beta lane, avoiding another
 full platform run just to obtain those diagnostics.
+
+The full run completed with 18 of 19 individual jobs passing on its first
+attempt. The [focused core diagnostic](https://github.com/Augani/rgo/actions/runs/37052395428)
+at `9452c3d` passed all 116 existing tests in 1.97 s on macOS 14.8.9 build
+23J631 arm64 with Cargo/rustc 1.100.0-beta.2, matching the failed lane. This is
+non-reproduction with stronger diagnostics, not an explanation or a GC fix.
+The original failure stays open; no retry or weaker assertion converts it into
+completed full-platform acceptance.
