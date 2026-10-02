@@ -126,7 +126,7 @@ the fixture no longer supplies a separate test-only helper.
   and bounds its bootout helper. The same coalition fixture verifies an edited
   idle job survives, then maintenance recovers it after restoration with
   automatic destructive GC disabled.
-- [x] Keep terminal invocations in checkout storage before pilot admission.
+- [x] Before the terminal transport batch, keep terminal invocations in checkout storage before pilot admission.
   Passing terminal descriptors to a different launchd session does not make
   that session own the shell's controlling terminal. The next transport batch
   must establish and verify this handoff before enabling terminal admission.
@@ -159,7 +159,7 @@ loaded-job replacement, every preparation/commit boundary, and the complete
 signal-disposition and terminal matrix still require work. Older pilot owner
 records are preserved when their schema cannot establish the recovery scope.
 
-## Next batch: terminal handoff and measured launch overhead
+## Terminal handoff and measured launch overhead
 
 The existing 24 no-op/12 edit-build paired probe, with cache and automatic GC
 off, measured the actual nonterminal guardian at `5557f94`. Every captured
@@ -193,33 +193,93 @@ implement or verify Cargo terminal behavior.
   evaluate an explicit Interactive job classification and readiness-driven
   SIGCHLD/control-socket waiting instead of periodic primary-exit sleeps.
   Preserve recognition of the exact historical owned job definition.
-- [ ] Preflight the caller's controlling terminal and descriptor identities
+- [x] Preflight the caller's controlling terminal and descriptor identities
   before admission. Pass pipes/files directly; unsupported terminal shapes
   stay in checkout storage.
-- [ ] Give the guardian its own session and PTY before starting Cargo. Validate
+- [x] Give the guardian its own session and PTY before starting Cargo. Validate
   the parent/session preconditions and fall back on errors. Keep Cargo in
   that session so its group has a living parent and ordinary job-control
   signals still work.
-- [ ] Pass the PTY master and original terminal descriptor over the existing
+- [x] Pass the PTY master and original terminal descriptor over the existing
   authenticated channel. Initialize the PTY with original terminal settings
   and window size; use bounded buffers and descriptor readiness.
-- [ ] Establish Cargo's foreground group before exec can read the terminal.
+- [x] Establish Cargo's foreground group before exec can read the terminal.
   Preserve redirected streams, native bytes, interactive input, `/dev/tty`,
   EOF, output draining, resize events, and primary exit/signal results.
 - [ ] Restore the caller's terminal before stopping or exiting; reapply relay
   mode only in the foreground. Handle `fg`, `bg`, TOSTOP, and nested terminal
   consumers. The guardian must restore its own known relay settings after
   caller failure without overwriting later shell edits.
-- [ ] Retain the master after the primary result while descendants survive;
+- [x] Retain the master after the primary result while descendants survive;
   hand off output draining so caller exit does not prematurely hang up their
   PTY. Keep the existing kernel receipt through the final possible writer.
-- [ ] Extend the existing fixture with a real interactive shell/PTY rather than
+- [x] Extend the existing fixture with a real interactive shell/PTY rather than
   add another equivalent Rust case. Verify stop/resume, resize, EOF, Ctrl-C,
   terminal restoration, and late descendant output.
 - [ ] Repeat the same paired latency probe after the combined transport change,
   then run the existing platform and Intel checks once for that batch.
 - [ ] Enable the normal installed macOS path only after terminal compatibility,
   startup/recovery boundaries, supported runtimes, and latency meet their gates.
+
+At `0bb4ee3`, the private pilot admits supported terminal invocations through a
+PTY owned by the guardian's separate session. Cargo receives its foreground
+group before exec; only terminal standard descriptors are replaced, while
+files and pipes pass through. The authenticated channel carries the original
+terminal and PTY master descriptors, bounded configuration frames, and signal
+or foreground updates. The caller uses bounded readiness-driven relay buffers.
+The guardian retains its master after the primary exits, so a detached child
+can write after the shell has regained its prompt. Original ignored signal
+dispositions and blocked signals are restored in Cargo's child before exec.
+
+The same existing real-Cargo fixture now drives an actual private `zsh -f`
+session. Local macOS 27.2 arm64 checks passed `/dev/tty`, isatty and color,
+input/EOF, resize, Ctrl-Z/fg/bg, background-input suspension, TOSTOP,
+Ctrl-C and status 130, application status 17, mixed pipes/redirection, normal
+terminal restoration, late detached output, and cleanup after caller SIGKILL.
+The existing coalition crash and interrupted-Cargo cases also passed. No new
+Rust test case was added; all-bin build and warning-free all-target Clippy passed.
+Platform validation of this combined batch is pending.
+
+**Remaining terminal crash defect:** the same observation reproduces incomplete
+terminal restoration after the caller is killed with SIGKILL. Zsh partly
+changes the original termios state before the guardian's exact-mode restoration
+check. The guardian preserves that changed state rather than overwriting it;
+some relay input/output and local-mode flags remain. Job retirement still
+completes. The fixture prints this limitation explicitly; it does not assert
+that crash restoration passed. Resolve mode ownership and verify prompt editing
+after this race before normal activation. Intentional later terminal edits,
+other shells, nested terminal consumers, and terminal-disconnect behavior remain
+separate compatibility work.
+
+New version-2 job definitions explicitly request Interactive scheduling; exact
+version-1 definitions remain recognizable. SIGCHLD and control-socket readiness
+replace the guardian's periodic primary-state sleep, and listener readiness
+replaces the caller's startup sleep. The
+[first combined samples](benchmarks/2026-10-02-macos-arm64-cargo-guardian-interactive.json)
+at `0bb4ee3` measured 25.4 ms plain versus 151.9 ms guardian for no-op builds,
+and 131.4 ms versus 259.3 ms for edits. Added medians of 126.5/127.9 ms remain
+above the proposed 100 ms allowance. These are nonterminal, cache-disabled
+single-crate results; they do not measure PTY or larger-workspace latency.
+
+Rust's [Unix process implementation](https://doc.rust-lang.org/src/std/sys/process/unix/unix.rs.html)
+rejects the posix_spawn path when a pre-exec callback is installed and otherwise
+inherits the parent's signal mask. The installed Rust 1.98 source confirms
+those conditions. The follow-up preserves that path for nonterminal Cargo
+when the guardian's mask and ignored dispositions already match the caller;
+terminal foreground setup and differing signal states still use the callback.
+The [follow-up samples](benchmarks/2026-10-02-macos-arm64-cargo-guardian-spawn.json)
+at `dd09d11` measured 22.8 ms plain versus 136.5 ms guardian for no-ops and
+128.1 ms versus 248.7 ms for edits. Added medians of 113.7/120.6 ms still exceed
+the proposed allowance. Both probes used debug binaries; measure the optimized
+installer pair before deciding the shipped-binary performance gate. Focused
+checks and warning-free all-target Clippy passed for this final source.
+
+The shell driver now waits for uniquely marked command completion rather than
+an asynchronously redrawn prompt, and waits for actual background suspension.
+The existing recovery check awaits launchd unload after metadata removal; those
+are distinct completion points. These corrections avoid requiring an arbitrary
+fixed pause or treating the first disappeared directory as completed bootout.
+Platform validation of the combined batch is pending.
 
 ## Integrate with unchanged Cargo commands
 

@@ -201,9 +201,9 @@ safety, an edited idle definition, and automatic metadata recovery with
 destructive automatic GC off. The existing interrupt fixture now runs the
 installed macOS pilot, passes stop/resume and Ctrl-C, preserves its surviving
 child, and reclaims an idle neighbor. Both passed locally on macOS 27.2 arm64.
-A focused Intel lane runs these same cases. Terminal invocations fall back to
-checkout storage before pilot admission until controlling-terminal handoff is
-implemented. No additional Rust test case was added. Full startup/recovery
+A focused Intel lane runs these same cases. This batch kept terminal invocations
+in checkout storage pending controlling-terminal handoff. No additional Rust
+test case was added. Full startup/recovery
 interruption and runtime gates remain open.
 
 The [19-job follow-up](https://github.com/Augani/rgo/actions/runs/36998573830)
@@ -212,9 +212,23 @@ guardian lane on macOS 15.7.9 build 24G830 with Cargo/rustc 1.99.0. The local
 1.98 latency probe found median no-op overhead of 241.1 ms and edit-build
 overhead of 154.2 ms, both above the proposed 100 ms allowance for this tiny
 crate. These [raw samples](benchmarks/2026-10-02-macos-arm64-cargo-guardian.json)
-keep performance open. The next [implementation batch](macos-cargo-supervision.md#next-batch-terminal-handoff-and-measured-launch-overhead)
+keep performance open. The next [implementation batch](macos-cargo-supervision.md#terminal-handoff-and-measured-launch-overhead)
 combines terminal handoff and measured startup/exit scheduling improvements;
 normal activation stays off until its gates pass.
+
+**macOS terminal transport follow-up:** supported terminal invocations now use
+a private PTY with Cargo's foreground group established before exec. The
+extended existing zsh/real-Cargo fixture passed controlling `/dev/tty`, color,
+input/EOF, resize, Ctrl-Z/fg/bg, TOSTOP, Ctrl-C, status codes, normal terminal
+restoration, mixed pipes/redirection, and output from a detached process after
+the caller exits. Cleanup after caller SIGKILL also passed, but that observation
+reproduces a terminal-mode restoration race with zsh. It is explicitly reported
+as an activation defect rather than a passed restoration check. Interactive
+scheduling and event readiness reduced the first combined median overhead to
+126.5 ms for no-ops and 127.9 ms for edits, still above the proposed allowance.
+The final spawn-path follow-up and platform results are tracked in the
+[macOS checklist](macos-cargo-supervision.md#terminal-handoff-and-measured-launch-overhead).
+Normal activation, automatic GC, and the broader P2 gates remain unchanged.
 
 - [ ] Document the exact lock/lifecycle protocol Cargo uses for each supported version and platform. Determine whether it covers build scripts, rustdoc, no-op commands, package/install operations, test execution, and waiting Cargo processes.
 - [ ] Build deterministic race fixtures that pause between liveness check, lock acquisition, rename, and removal. Require that GC actually deletes other eligible data while the target build remains protected.

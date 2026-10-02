@@ -96,16 +96,27 @@ GC off. Versioned, bounded owner records, exact generated definitions, and
 nonrecursive cleanup preserve edits and user-added files. The existing
 coalition fixture passed that recovery locally, and the existing interrupt
 fixture passed a stop/resume cycle, Ctrl-C, surviving-child protection, and idle
-neighbor reclamation through the actual pilot. Terminal invocations use
-checkout storage until controlling-terminal handoff is implemented. A focused
+neighbor reclamation through the actual pilot. Terminal invocations initially used
+checkout storage pending controlling-terminal handoff. A focused
 Intel CI lane covers these same two cases; full interruption and runtime gates
 remain open.
+
+**macOS terminal pilot:** a private PTY now gives Cargo a controlling terminal
+and preserves redirected streams. The existing real-Cargo fixture passed
+input/EOF, color, resizing, Ctrl-Z/fg/bg, TOSTOP, Ctrl-C, nonzero status,
+normal terminal restoration, and output after the caller exits. It also
+reproduces incomplete terminal restoration after caller SIGKILL; this remains
+an activation gate. Readiness-driven waiting and Interactive scheduling reduced
+the measured launch delay, but the first combined probe still exceeds the
+proposed 100 ms allowance. Normal activation remains disabled while crash,
+latency, recovery, runtime, and IDE gates are open. Details and checkboxes are in
+the [macOS checklist](docs/macos-cargo-supervision.md).
 
 The [19-job run](https://github.com/Augani/rgo/actions/runs/36998573830) passed
 at `5557f94`, including Intel macOS 15.7.9 and all existing platform suites.
 The [guardian latency samples](docs/benchmarks/2026-10-02-macos-arm64-cargo-guardian.json)
 show 241.1 ms median no-op overhead and 154.2 ms edit-build overhead, both above
-the proposed allowance. The next [implementation checklist](docs/macos-cargo-supervision.md#next-batch-terminal-handoff-and-measured-launch-overhead)
+the proposed allowance. The next [implementation checklist](docs/macos-cargo-supervision.md#terminal-handoff-and-measured-launch-overhead)
 combines controlling-terminal handoff and measured launch/exit improvements;
 the pilot remains opt-in.
 

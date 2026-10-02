@@ -623,6 +623,27 @@ and automatic GC off, requiring no guardian fallback. Its
 [recorded samples](benchmarks/2026-10-02-macos-arm64-cargo-guardian.json) show
 241.1 ms median cached-build overhead and 154.2 ms edit-build overhead, exceeding
 the proposed 100 ms allowance for this tiny crate. Performance is therefore
-still an activation gate. The next [concrete implementation checklist](macos-cargo-supervision.md#next-batch-terminal-handoff-and-measured-launch-overhead)
+still an activation gate. The next [concrete implementation checklist](macos-cargo-supervision.md#terminal-handoff-and-measured-launch-overhead)
 combines terminal handoff, latency attribution, and scheduling/notification
 improvements before normal activation.
+
+The terminal transport at `0bb4ee3` now creates a guardian-owned PTY and sets
+Cargo's foreground group before exec. The extended existing private zsh fixture
+locally exercised controlling `/dev/tty`, colors, input/EOF, resize,
+Ctrl-Z/fg/bg, TOSTOP, Ctrl-C, mixed redirected streams, normal mode restoration,
+and late detached output. It adds no Rust test case. Interactive job scheduling
+and child/socket readiness reduced the
+[first combined probe](benchmarks/2026-10-02-macos-arm64-cargo-guardian-interactive.json)
+to 126.5/127.9 ms added median no-op/edit latency, which still fails the proposed
+100 ms allowance. The
+[nonterminal spawn follow-up](benchmarks/2026-10-02-macos-arm64-cargo-guardian-spawn.json)
+at `dd09d11` measured 113.7/120.6 ms added medians, still above that allowance.
+These debug-binary probes do not settle optimized installer performance.
+
+Caller SIGKILL exposed another activation defect: zsh can partly alter the
+original terminal before the guardian's exact-mode restore. Job retirement
+completes, but remaining relay flags affect the terminal. The observation prints
+the before/after settings explicitly and does not claim crash restoration
+passed. Mode ownership, prompt editing after failure, other shells, and the
+remaining interruption/runtime matrix stay open in the
+[implementation checklist](macos-cargo-supervision.md#terminal-handoff-and-measured-launch-overhead).
