@@ -68,6 +68,16 @@ uninstall. The [18-job matrix](https://github.com/Augani/rgo/actions/runs/369872
 passed. GUI login/reboot, all service-manager interruption boundaries, and the
 broader P2/P4 release gates remain open.
 
+**2026-10-02 one-use Cargo jobs:** the macOS pilot now delegates registration
+retirement to launchd's `LaunchOnlyOnce` lifecycle and only cleans owned
+metadata. It never unloads a Cargo job by a potentially replaced label. New
+receipt schema 2 recognizes proven same-boot coalition reaping; legacy receipts
+remain strict. Owner schema 4, admission revision 4, and protocol 9 bind this
+policy. The existing fixture checks a foreign replacement surviving cleanup and
+journal replay. Local validation required one terminal-timeout retry; both that
+timeout and the prior platform interrupt failure remain unresolved. Platform
+validation and all remaining gates stay in the [macOS checklist](docs/macos-cargo-supervision.md#one-use-job-retirement--october-2-2026).
+
 ## 0. What changed vs. `doc.md`, and why
 
 **2026-10-02 macOS supervisor:** Unix cleanup with a detached closed-FD writer

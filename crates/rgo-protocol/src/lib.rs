@@ -6,7 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u32 = 8;
+pub const PROTOCOL_VERSION: u32 = 9;
 pub const MAX_FRAME_SIZE: usize = 1024 * 1024;
 pub const DEFAULT_LEASE_TTL_SECS: u32 = 30;
 pub const DEFAULT_HEARTBEAT_SECS: u32 = 10;
@@ -22,7 +22,7 @@ pub const BYPASS_ENV: &str = "RGO_BYPASS";
 pub const HOME_ENV: &str = "RGO_HOME";
 pub const LEASE_ENV: &str = "RGO_LEASE_ID";
 /// Revision of producer/lifecycle admission, independent of IPC compatibility.
-pub const SUPERVISED_CONTEXT_VERSION: u32 = 3;
+pub const SUPERVISED_CONTEXT_VERSION: u32 = 4;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContextSidecar {

@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 use crate::paths::RgoPaths;
 
 const MAX_RECORD_BYTES: u64 = 16 * 1024;
-const BOOTOUT_TIMEOUT: Duration = Duration::from_secs(2);
+const RECOVERY_BUDGET: Duration = Duration::from_secs(2);
 pub const JOB_PREFIX: &str = "macos-cargo-job-";
 
 mod command;
@@ -50,7 +50,7 @@ fn definition(directory: &Path, owner: &CargoJobOwner) -> Result<String> {
         ""
     };
     Ok(format!(
-        "<?xml version=\"1.0\"?><plist version=\"1.0\"><dict><key>Label</key><string>{}</string><key>ProgramArguments</key><array><string>{}</string><string>macos-cargo-job</string><string>--directory</string><string>{}</string><string>--token</string><string>{}</string><string>--context</string><string>{}</string></array><key>RunAtLoad</key><true/><key>AbandonProcessGroup</key><true/>{scheduling}<key>StandardOutPath</key><string>/dev/null</string><key>StandardErrorPath</key><string>{}</string></dict></plist>",
+        "<?xml version=\"1.0\"?><plist version=\"1.0\"><dict><key>Label</key><string>{}</string><key>ProgramArguments</key><array><string>{}</string><string>macos-cargo-job</string><string>--directory</string><string>{}</string><string>--token</string><string>{}</string><string>--context</string><string>{}</string></array><key>RunAtLoad</key><true/><key>LaunchOnlyOnce</key><true/><key>AbandonProcessGroup</key><true/>{scheduling}<key>StandardOutPath</key><string>/dev/null</string><key>StandardErrorPath</key><string>{}</string></dict></plist>",
         owner.label,
         xml(owner
             .executable
@@ -83,7 +83,7 @@ impl CargoJobOwner {
             "invalid Cargo job token"
         );
         let mut owner = Self {
-            version: 3,
+            version: 4,
             label: format!("com.rgo.cargo.{}", &token[..32]),
             domain: format!("gui/{}", unsafe { libc::geteuid() }),
             token,
@@ -105,7 +105,7 @@ impl CargoJobOwner {
 
     fn validate(&self, directory: &Path) -> Result<()> {
         ensure!(
-            self.version == 3
+            self.version == 4
                 && self.token.len() == 64
                 && self.token.bytes().all(|byte| byte.is_ascii_hexdigit())
                 && self.label == format!("com.rgo.cargo.{}", &self.token[..32])
@@ -208,8 +208,8 @@ pub fn recovery_owner(directory: &Path) -> Result<(CargoJobOwner, Vec<u8>)> {
 }
 
 /// The caller has not supplied any invocation yet. Registration failure can
-/// therefore fence the rendezvous and unload the owned job without admitting
-/// a managed writer. Keep its record until that cleanup is attempted.
+/// therefore fence the rendezvous without admitting a managed writer. The
+/// one-use job exits on startup failure and launchd removes that incarnation.
 pub fn bootstrap(
     directory: &Path,
     owner: &CargoJobOwner,
@@ -232,7 +232,8 @@ pub fn bootstrap(
 }
 
 /// Only call after durable retirement under a session guard, or while holding
-/// exclusive GC guards. Removing the one-use rendezvous fences job restarts.
+/// exclusive GC guards. This removes only owned metadata. Launchd retires its
+/// one-use job on exit; cleanup never unloads another registration by label.
 pub fn cleanup(directory: &Path, owner: &CargoJobOwner, bytes: &[u8]) -> Result<()> {
     ensure!(
         cleanup_step(directory, owner, bytes, 4)?,
@@ -289,8 +290,9 @@ impl RecoveryScanner {
                     "Cargo job root changed"
                 );
                 // Receipt validation observes every retained kernel identity.
-                // Missing/reaped or corrupt identities return an error. Hold
-                // the guard through removal, including the restart fence.
+                // Unresolved or corrupt identities return an error. Versioned
+                // receipts also recognize proven reaping. Hold the guard
+                // through metadata removal, including the restart fence.
                 let Some(_guard) = crate::supervision::try_lock_gc(paths, Some(&owner.context))?
                 else {
                     return Ok(false);
@@ -305,9 +307,9 @@ impl RecoveryScanner {
                     tracing::debug!(%error, path = %directory.display(), "retaining unresolved Cargo job")
                 }
             }
-            // Each external helper is separately bounded; do not start another
-            // after this pass's elapsed work budget has been spent.
-            if started.elapsed() >= BOOTOUT_TIMEOUT {
+            // Do not start another retirement after this pass's elapsed work
+            // budget has been spent.
+            if started.elapsed() >= RECOVERY_BUDGET {
                 break;
             }
         }

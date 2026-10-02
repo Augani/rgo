@@ -1,9 +1,7 @@
 //! Persisted retirement of identified job metadata. Context/receipt exclusion
 //! is supplied by the caller; this journal never establishes build-data safety.
 
-use super::{
-    BOOTOUT_TIMEOUT, CargoJobOwner, JOB_PREFIX, MAX_RECORD_BYTES, command, verify_directory,
-};
+use super::{CargoJobOwner, JOB_PREFIX, MAX_RECORD_BYTES, verify_directory};
 use crate::paths::RgoPaths;
 use anyhow::{Context, Result, ensure};
 use fs4::fs_std::FileExt;
@@ -13,8 +11,6 @@ use std::fs::{File, Metadata, OpenOptions};
 use std::io::{Read, Write};
 use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::time::Instant;
 
 const MAX_JOURNAL_BYTES: u64 = 64 * 1024;
 
@@ -353,20 +349,8 @@ pub(super) fn advance(
         Err(error) => return Err(error.into()),
     }
     File::open(parent)?.sync_all()?;
-    let status = command::run(
-        Command::new("/bin/launchctl")
-            .args(["bootout", &owner.target()])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null()),
-        Instant::now() + BOOTOUT_TIMEOUT,
-    )?;
-    // launchctl returns the underlying error code. ESRCH is the observed
-    // already-unloaded result; all other failures preserve the journal.
-    ensure!(
-        status.success() || status.code() == Some(libc::ESRCH),
-        "Cargo job bootout failed: {status}"
-    );
+    // LaunchOnlyOnce makes launchd remove the actual job incarnation on exit.
+    // A label may now belong to a foreign replacement; never boot it out.
     std::fs::remove_file(&marker)?;
     File::open(parent)?.sync_all()?;
     Ok(true)

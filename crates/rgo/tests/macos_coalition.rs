@@ -6,7 +6,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use fs4::fs_std::FileExt;
-use rgo_core::macos_coalition::ResourceCoalition;
+use rgo_core::macos_coalition::{ResourceCoalition, ResourceState};
 use rgo_core::macos_terminal_hosts::{self as terminal_hosts, Host, Process, ProcessState, Saved};
 use rgo_core::paths::RgoPaths;
 use rgo_core::supervision;
@@ -289,7 +289,7 @@ while not pathlib.Path(os.environ['RGO_COALITION_READY']).exists():
         supervision::try_lock_gc(&paths, Some(&contexts[0])).is_err(),
         "invalid durable protection was treated as an idle context"
     );
-    std::fs::write(&receipt, saved_receipt).unwrap();
+    std::fs::write(&receipt, &saved_receipt).unwrap();
     // Editing only the cleanup scope must invalidate the generated definition,
     // rather than redirect maintenance to a different, apparently idle context.
     let owner_path = job.directory.join("owner.json");
@@ -317,19 +317,84 @@ while not pathlib.Path(os.environ['RGO_COALITION_READY']).exists():
     redirected["version"] = serde_json::json!(2);
     let plist_path = job.directory.join("job.plist");
     let original_plist = std::fs::read(&plist_path).unwrap();
-    let old_definition = redirected["definition"].as_str().unwrap().replace(
-        &format!(
-            "<string>--context</string><string>{}</string>",
-            contexts[0].display()
-        ),
-        "",
-    );
+    let old_definition = redirected["definition"]
+        .as_str()
+        .unwrap()
+        .replace("<key>LaunchOnlyOnce</key><true/>", "")
+        .replace(
+            &format!(
+                "<string>--context</string><string>{}</string>",
+                contexts[0].display()
+            ),
+            "",
+        );
     redirected["definition"] = serde_json::json!(old_definition);
     std::fs::write(&plist_path, old_definition).unwrap();
     std::fs::write(&owner_path, serde_json::to_vec(&redirected).unwrap()).unwrap();
     assert!(rgo_core::macos_jobs::read_owner(&job.directory).is_err());
-    std::fs::write(&owner_path, original_owner).unwrap();
-    std::fs::write(&plist_path, original_plist).unwrap();
+    // Schema 3 bound the context but still used label-based bootout. Its
+    // exact historical definition cannot authorize the new retirement path.
+    redirected = serde_json::from_slice(&original_owner).unwrap();
+    redirected["version"] = serde_json::json!(3);
+    let old_definition = redirected["definition"]
+        .as_str()
+        .unwrap()
+        .replace("<key>LaunchOnlyOnce</key><true/>", "");
+    redirected["definition"] = serde_json::json!(old_definition);
+    std::fs::write(&plist_path, old_definition).unwrap();
+    std::fs::write(&owner_path, serde_json::to_vec(&redirected).unwrap()).unwrap();
+    assert!(rgo_core::macos_jobs::read_owner(&job.directory).is_err());
+    std::fs::write(&owner_path, &original_owner).unwrap();
+    std::fs::write(&plist_path, &original_plist).unwrap();
+    // The killed one-use job removes its own registration while the detached
+    // writer remains counted. A foreign replacement may now use this label.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while sandbox
+        .cmd("launchctl")
+        .args(["print", &job.target])
+        .output()
+        .unwrap()
+        .status
+        .success()
+    {
+        assert!(
+            Instant::now() < deadline,
+            "one-use registration remained after SIGKILL"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(coalition.active_tasks().unwrap(), 1);
+    let foreign_pid = sandbox.home.join("foreign-job-pid");
+    let foreign_plist = sandbox.home.join("foreign-job.plist");
+    let foreign_program = sandbox.home.join("foreign-job.py");
+    std::fs::write(&foreign_program, "import os, pathlib, sys, time\npathlib.Path(sys.argv[1]).write_text(str(os.getpid()))\ntime.sleep(90)\n").unwrap();
+    let foreign = format!(
+        "<?xml version=\"1.0\"?><plist version=\"1.0\"><dict><key>Label</key><string>{}</string><key>ProgramArguments</key><array><string>/usr/bin/python3</string><string>{}</string><string>{}</string></array><key>RunAtLoad</key><true/></dict></plist>",
+        owner["label"].as_str().unwrap(),
+        foreign_program.display(),
+        foreign_pid.display()
+    );
+    std::fs::write(&foreign_plist, foreign).unwrap();
+    let loaded = sandbox
+        .cmd("launchctl")
+        .args(["bootstrap", owner["domain"].as_str().unwrap()])
+        .arg(&foreign_plist)
+        .output()
+        .unwrap();
+    assert!(
+        loaded.status.success(),
+        "{}",
+        String::from_utf8_lossy(&loaded.stderr)
+    );
+    wait_for_file(&foreign_pid, Instant::now() + Duration::from_secs(10));
+    let foreign_process = Process::observe(
+        std::fs::read_to_string(&foreign_pid)
+            .unwrap()
+            .parse()
+            .unwrap(),
+    )
+    .unwrap()
+    .expect("foreign replacement exited before observation");
     // An edited definition must survive housekeeping even after its context
     // becomes idle. Restoring the exact owned definition permits recovery.
     let definition_path = job.directory.join("job.plist");
@@ -341,10 +406,18 @@ while not pathlib.Path(os.environ['RGO_COALITION_READY']).exists():
     wait_for_file(&result, Instant::now() + Duration::from_secs(10));
     assert_eq!(std::fs::read_to_string(&result).unwrap(), "write succeeded");
     let deadline = Instant::now() + Duration::from_secs(10);
-    while coalition.active_tasks().unwrap() != 0 && Instant::now() < deadline {
+    while coalition.state().unwrap() != ResourceState::Reaped && Instant::now() < deadline {
         thread::sleep(Duration::from_millis(20));
     }
-    assert_eq!(coalition.active_tasks().unwrap(), 0);
+    assert_eq!(coalition.state().unwrap(), ResourceState::Reaped);
+    // Old receipt policies remain strict even for this positively observed,
+    // now-reaped ID. Only the new policy can recognize kernel retirement.
+    let mut legacy: serde_json::Value = serde_json::from_slice(&saved_receipt).unwrap();
+    legacy["version"] = serde_json::json!(1);
+    std::fs::write(&receipt, serde_json::to_vec(&legacy).unwrap()).unwrap();
+    assert!(supervision::try_lock_gc(&paths, Some(&contexts[0])).is_err());
+    assert!(contexts[0].is_dir());
+    std::fs::write(&receipt, &saved_receipt).unwrap();
     assert!(
         supervision::try_lock_gc(&paths, Some(&contexts[0]))
             .unwrap()
@@ -427,30 +500,20 @@ while not pathlib.Path(os.environ['RGO_COALITION_READY']).exists():
         !job.directory.exists() && !journal.exists(),
         "idle crashed guardian was not recovered"
     );
-    // Recovery removes the rendezvous before bootout can reap the identity.
-    // Directory disappearance precedes completion of that external helper.
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while sandbox
-        .cmd("launchctl")
-        .args(["print", &job.target])
-        .output()
-        .unwrap()
-        .status
-        .success()
-    {
-        assert!(Instant::now() < deadline, "recovered job was not unloaded");
-        thread::sleep(Duration::from_millis(20));
-    }
-    // The observed already-unloaded result is the underlying ESRCH error,
-    // rather than a generic failure that would authorize discarding a journal.
-    let unloaded = sandbox
-        .cmd("launchctl")
-        .args(["bootout", &job.target])
-        .output()
-        .unwrap();
-    assert_eq!(unloaded.status.code(), Some(libc::ESRCH));
-    // Model interruption after successful bootout but before the journal's
-    // unlink: the exact durable journal can be acknowledged by another pass.
+    // Metadata cleanup never unloads a job by label: this replacement remains
+    // alive after both the old directory and retirement journal disappear.
+    assert!(foreign_process.state().unwrap() == ProcessState::Live);
+    assert!(
+        sandbox
+            .cmd("launchctl")
+            .args(["print", &job.target])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    // Model interruption after directory removal but before journal unlink.
+    // Replaying the exact journal also leaves the foreign job untouched.
     let guard = supervision::try_lock_gc(&paths, Some(&contexts[0]))
         .unwrap()
         .unwrap();
@@ -458,6 +521,7 @@ while not pathlib.Path(os.environ['RGO_COALITION_READY']).exists():
     std::fs::set_permissions(&journal, std::fs::Permissions::from_mode(0o600)).unwrap();
     rgo_core::macos_jobs::cleanup(&job.directory, &retiring_owner, &retiring_bytes).unwrap();
     assert!(!journal.exists());
+    assert!(foreign_process.state().unwrap() == ProcessState::Live);
     drop(guard);
     println!(
         "installed Cargo pilot: real detached writer protected through Cargo exit and guardian SIGKILL; late write succeeded; idle context reclaimed"

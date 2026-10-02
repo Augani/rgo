@@ -521,8 +521,8 @@ before its first unlink and keeps it through the unload acknowledgement.
   completed unload. No new Rust test case was added.
 - [ ] Complete every preparation/commit interruption and incomplete-record
   recovery path, including a full filesystem failure/cancellation matrix.
-- [ ] Prove ownership of the currently loaded definition before unloading a
-  job whose registration may have been replaced externally.
+- [ ] Eliminate Cargo-job unloading by label and verify that a foreign loaded
+  replacement survives original-job metadata cleanup on the platform matrix.
 - [x] Record optimized terminal-path timing for this batch.
 - [x] Record the full platform matrix and focused macOS 14 diagnostic run,
   including the initial failed attempt and its single retry.
@@ -670,3 +670,59 @@ the remaining startup, runtime, IDE, or performance release gates.
   writable namespace outside any guarantee until their contract is resolved.
 - [ ] Update the P2 safety argument and product claims before considering
   automatic cleanup defaults. Implement Linux supervision afterward.
+
+## One-use job retirement — October 2, 2026
+
+Loaded definitions can change after an ownership query. The private Cargo
+pilot now avoids that query/unload race entirely: owner schema 4 requires
+`LaunchOnlyOnce`, and rgo never sends Cargo-job `bootout` by label. Launchd
+retires the actual job incarnation after normal exit or SIGKILL; rgo's journal
+only retires its four known metadata entries. Historical schemas 1–3 and their
+journals remain preserved. The earlier schema-3 unload evidence above is
+implementation history, not the current mechanism.
+
+[Apple's launchd implementation](https://github.com/apple-oss-distributions/launchd/blob/d448a1c8f70a61202f8705f94337f686b87c30c4/src/core.c)
+removes inactive one-use jobs after their first start. This older source is a
+design clue; modern behavior also needs live evidence. The separate
+[manual audit](probes/macos-launch-once.py) and its [raw result](probes/2026-10-02-macos-launch-once.json)
+on macOS 27.2 arm64 observed both normal exit and SIGKILL: the registration
+vanished, a detached closed-FD writer remained counted, its late write
+succeeded, and only afterward did the resource-coalition query return exact
+`-1`/`ESRCH`. It never activates a Cargo home or adds an automatic Rust case.
+
+XNU's [reaping implementation](https://github.com/apple-oss-distributions/xnu/blob/f6217f891ac0bb64f3d375211650a4c1ff8ca1ea/osfmk/kern/coalition.c)
+requires termination and zero active references before removing the coalition
+lookup entry; its [syscall](https://github.com/apple-oss-distributions/xnu/blob/f6217f891ac0bb64f3d375211650a4c1ff8ca1ea/bsd/kern/sys_coalition.c)
+returns `ESRCH` when that lookup is absent. The same checks are present in
+[10063.141.1 reaping](https://github.com/apple-oss-distributions/xnu/blob/xnu-10063.141.1/osfmk/kern/coalition.c),
+[10063.141.1 lookup](https://github.com/apple-oss-distributions/xnu/blob/xnu-10063.141.1/bsd/kern/sys_coalition.c),
+[11215.81.4 reaping](https://github.com/apple-oss-distributions/xnu/blob/xnu-11215.81.4/osfmk/kern/coalition.c),
+and [11215.81.4 lookup](https://github.com/apple-oss-distributions/xnu/blob/xnu-11215.81.4/bsd/kern/sys_coalition.c).
+Inference: exact absence is retirement evidence only for a previously observed
+ID on the same boot. Other observation failures remain unresolved; private API
+or runtime changes still require the declared platform gate.
+
+Receipt schema 2 records IDs only after a positive live counter observation.
+It recognizes explicit reaping under GC's exclusion guards; schema 1 continues
+requiring a successful zero count. Admission revision 4, a new macOS namespace
+discriminator, and protocol 9 prevent older policies from accepting these new
+contexts. Setup's existing previous-protocol recovery case selects protocol 8;
+Shutdown compatibility still starts at protocol 6.
+
+The existing coalition fixture now replaces the killed guardian's registration
+with an independent job of the same name. The writer remains protected and
+completes its late write; after kernel reaping, an old receipt still refuses GC,
+while the new receipt allows actual reclamation. Edited metadata is retained;
+restarted maintenance and replay after directory removal leave the replacement
+process alive. No Rust test case was added.
+
+The first local run passed these checks, then timed out waiting for a later
+terminal command to start. Clippy was running concurrently, but no diagnostic
+established the cause. One focused retry passed the coalition/terminal fixture
+in 19.36 s and the existing interrupt fixture in 3.33 s. All-bin build,
+zero-warning all-target Clippy, formatting, and diff checks passed. The terminal
+driver now includes bounded process, foreground,
+terminal-mode, and private guardian-log diagnostics on future timeouts; its
+assertions and deadlines are unchanged. This observation remains open alongside
+the earlier macOS stable interrupt failure. Normal activation and automatic GC
+remain off; platform results for this new policy are still pending.

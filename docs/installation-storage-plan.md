@@ -192,6 +192,17 @@ medians with no accepted fallback and cache/automatic GC off. This small crate
 passes the proposed median allowance; tail variability and the representative
 performance gate remain open.
 
+**macOS one-use retirement:** owner schema 4 now requires `LaunchOnlyOnce`.
+Cargo-job cleanup removes only owned metadata and never unloads a registration
+by label. Receipt schema 2 distinguishes proven same-boot kernel reaping from
+other query failures; older receipts retain strict protection. Admission
+revision 4 and protocol 9 separate this policy from older contexts/daemons.
+The extended existing fixture checks a foreign replacement, a surviving writer,
+legacy protection, actual GC, restart, and journal replay. One local retry passed
+its terminal sequence after an unexplained startup timeout. Platform validation,
+that timeout, the earlier interrupt failure, and the wider P2 gates remain open
+in the [macOS checklist](macos-cargo-supervision.md#one-use-job-retirement--october-2-2026).
+
 **macOS priority (2026-10-02):** a private real-Cargo audit reproduced deletion
 while a detached child with closed inherited descriptors was still writing.
 The [macOS supervisor checklist](macos-cargo-supervision.md) records the selected

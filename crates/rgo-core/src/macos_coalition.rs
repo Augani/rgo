@@ -56,6 +56,14 @@ pub struct ResourceCoalition {
     id: u64,
 }
 
+/// A registered, same-boot ID is never reused. XNU removes its lookup entry
+/// only after termination and zero active references, including every task.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResourceState {
+    Active(u64),
+    Reaped,
+}
+
 impl ResourceCoalition {
     /// Observe a live process's resource coalition. This does not establish that
     /// the coalition contains only rgo's job or that a PID was not reused.
@@ -98,6 +106,16 @@ impl ResourceCoalition {
     /// reads these two counters while holding its coalition lock. A failed or
     /// inconsistent query remains an error; absence never means safe to delete.
     pub fn active_tasks(self) -> Result<u64> {
+        match self.state()? {
+            ResourceState::Active(count) => Ok(count),
+            ResourceState::Reaped => bail!("macOS resource coalition {} was reaped", self.id),
+        }
+    }
+
+    /// Interpret ESRCH only for a previously observed ID. Other syscall,
+    /// library, response, or counter failures remain errors. Receipts from the
+    /// earlier observer policy must continue to use strict `active_tasks`.
+    pub fn state(self) -> Result<ResourceState> {
         let library = Library::open(c"/usr/lib/libSystem.B.dylib")?;
         let symbol = library.symbol(c"coalition_info_resource_usage")?;
         let query: ResourceUsage = unsafe { std::mem::transmute(symbol) };
@@ -113,19 +131,25 @@ impl ResourceCoalition {
             )
         };
         if result != 0 {
+            let error = std::io::Error::last_os_error();
+            if result == -1 && error.raw_os_error() == Some(libc::ESRCH) {
+                return Ok(ResourceState::Reaped);
+            }
             bail!(
                 "macOS resource coalition {} query failed: {}",
                 self.id,
-                std::io::Error::last_os_error()
+                error
             );
         }
         counters[0]
             .checked_sub(counters[1])
+            .map(ResourceState::Active)
             .context("macOS coalition task counters are inconsistent")
     }
 }
 
 #[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct Receipt {
     version: u32,
     boot_session: String,
@@ -230,7 +254,7 @@ fn read_receipt(path: &Path, context: Option<&Path>) -> Result<Option<Receipt>> 
     );
     let receipt: Receipt = serde_json::from_slice(&bytes)?;
     ensure!(
-        receipt.version == 1 && receipt.context.as_deref() == context,
+        matches!(receipt.version, 1 | 2) && receipt.context.as_deref() == context,
         "unsupported or mismatched macOS coalition receipt"
     );
     ensure!(
@@ -261,9 +285,15 @@ pub(crate) fn register_current(paths: &RgoPaths, context: Option<&Path>) -> Resu
     let _lock = receipt_lock(paths)?;
     let previous = read_receipt(&path, context)?;
     let mut receipt = match previous {
-        Some(receipt) if receipt.boot_session == boot_session => receipt,
+        Some(receipt) if receipt.boot_session == boot_session => {
+            ensure!(
+                receipt.version == 2,
+                "older coalition receipt remains protected"
+            );
+            receipt
+        }
         _ => Receipt {
-            version: 1,
+            version: 2,
             boot_session,
             context: context.map(Path::to_owned),
             coalitions: Vec::new(),
@@ -272,12 +302,13 @@ pub(crate) fn register_current(paths: &RgoPaths, context: Option<&Path>) -> Resu
     if receipt.coalitions.contains(&coalition.id()) {
         return Ok(());
     }
-    // An absent coalition cannot be treated as empty. Retain unresolved IDs;
-    // bounded admission falls back rather than growing this list indefinitely.
+    // These v2 IDs were positively observed before publication. Reaped IDs
+    // cannot acquire a new task. Other unresolved observations remain retained.
     receipt.coalitions.retain(|id| {
-        ResourceCoalition { id: *id }
-            .active_tasks()
-            .map_or(true, |count| count != 0)
+        ResourceCoalition { id: *id }.state().map_or(
+            true,
+            |state| matches!(state, ResourceState::Active(count) if count != 0),
+        )
     });
     ensure!(
         receipt.coalitions.len() < MAX_COALITIONS,
@@ -314,8 +345,8 @@ fn write_receipt(paths: &RgoPaths, path: &Path, receipt: &Receipt) -> Result<()>
 }
 
 /// A dedicated guardian is the last task in its own coalition and has fenced
-/// all future managed work. Retire before bootout can reap that coalition. Its
-/// caller holds the context's session guard through this durable completion.
+/// all future managed work. Retire before its one-use job exit reaps the
+/// coalition. Its caller holds the context guard through durable completion.
 pub(crate) fn retire_current(paths: &RgoPaths, context: Option<&Path>) -> Result<()> {
     let current = ResourceCoalition::for_pid(std::process::id().try_into()?)?;
     ensure!(
@@ -327,7 +358,9 @@ pub(crate) fn retire_current(paths: &RgoPaths, context: Option<&Path>) -> Result
     let _lock = receipt_lock(paths)?;
     let mut receipt = read_receipt(&path, context)?.context("macOS guardian receipt is missing")?;
     ensure!(
-        receipt.boot_session == boot_session && receipt.coalitions.contains(&current.id()),
+        receipt.version == 2
+            && receipt.boot_session == boot_session
+            && receipt.coalitions.contains(&current.id()),
         "macOS guardian receipt does not contain its kernel identity"
     );
     receipt.coalitions.retain(|id| *id != current.id());
@@ -358,13 +391,20 @@ pub(crate) fn permits_gc(paths: &RgoPaths, context: Option<&Path>) -> Result<boo
         };
         if receipt.boot_session == boot_session {
             for id in receipt.coalitions {
-                if (ResourceCoalition { id }).active_tasks()? != 0 {
+                let coalition = ResourceCoalition { id };
+                let busy = if receipt.version == 2 {
+                    matches!(coalition.state()?, ResourceState::Active(count) if count != 0)
+                } else {
+                    coalition.active_tasks()? != 0
+                };
+                if busy {
                     return Ok(false);
                 }
             }
         }
         // A validated record from an earlier boot cannot name a current task.
-        // On this boot only successful zero-count observations permit pruning.
+        // On this boot v1 requires a zero count; v2 also recognizes a reaped,
+        // previously observed ID. Every other error retains the receipt.
         std::fs::remove_file(&path)?;
         std::fs::File::open(path.parent().context("coalition receipt has no parent")?)?
             .sync_all()?;

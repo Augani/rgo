@@ -42,7 +42,7 @@ pub fn context_for_workspace(paths: &RgoPaths, workspace_root: &Path) -> Result<
     #[cfg(target_os = "macos")]
     if std::env::var_os("RGO_MACOS_SUPERVISOR_PILOT").as_deref() == Some(std::ffi::OsStr::new("1"))
     {
-        identity.update(b"macos-resource-coalition\0");
+        identity.update(b"macos-resource-coalition-once\0");
     }
     identity.update(hash_path(workspace_root).as_bytes());
     let digest = identity.finalize();

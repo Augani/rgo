@@ -1,0 +1,57 @@
+{
+  "platform": "macOS-27.2-arm64-arm-64bit-Mach-O",
+  "cases": [
+    {
+      "mode": "exit",
+      "coalition": 155078,
+      "before": {
+        "result": 0,
+        "errno": 0,
+        "started": 6,
+        "exited": 4,
+        "active": 2
+      },
+      "after_job_exit_with_writer_alive": {
+        "result": 0,
+        "errno": 0,
+        "started": 6,
+        "exited": 5,
+        "active": 1
+      },
+      "after_writer_exit": {
+        "result": -1,
+        "errno": 3,
+        "started": 0,
+        "exited": 0,
+        "active": null
+      },
+      "late_write": "detached writer survived"
+    },
+    {
+      "mode": "sigkill",
+      "coalition": 155080,
+      "before": {
+        "result": 0,
+        "errno": 0,
+        "started": 6,
+        "exited": 4,
+        "active": 2
+      },
+      "after_job_exit_with_writer_alive": {
+        "result": 0,
+        "errno": 0,
+        "started": 6,
+        "exited": 5,
+        "active": 1
+      },
+      "after_writer_exit": {
+        "result": -1,
+        "errno": 3,
+        "started": 0,
+        "exited": 0,
+        "active": null
+      },
+      "late_write": "detached writer survived"
+    }
+  ]
+}

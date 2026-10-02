@@ -25,11 +25,32 @@ shell_sequence = 0
 caller_groups = set()
 shell_reaped = False
 
+def failure_state():
+    # Collect private-fixture state only on failure; keep healthy runs cheap.
+    root = pathlib.Path(os.environ["RGO_HOME"])
+    details = {"foreground": os.tcgetpgrp(master), "shell": pid,
+               "modes": termios.tcgetattr(master), "guardian_stderr": {}}
+    for directory in list((root / "state").glob("macos-cargo-job-*"))[:8]:
+        try:
+            with (directory / "guardian.stderr").open("rb") as stream:
+                details["guardian_stderr"][directory.name] = stream.read(4096)
+        except OSError as error:
+            details["guardian_stderr"][directory.name] = str(error)
+    try:
+        rows = subprocess.check_output(
+            ["ps", "-axo", "pid=,ppid=,pgid=,stat=,etime=,command="],
+            text=True, timeout=2)
+        details["processes"] = [row[:1024] for row in rows.splitlines()
+            if str(root) in row or row.split()[0] in (str(pid), str(details["foreground"]))][:16]
+    except (OSError, subprocess.TimeoutExpired) as error:
+        details["processes"] = str(error)
+    return details
+
 def expect(value, timeout=20):
     deadline = time.monotonic() + timeout
     while value not in pending:
         if time.monotonic() >= deadline:
-            raise RuntimeError(f"missing {value!r}; transcript={bytes(transcript)!r}")
+            raise RuntimeError(f"missing {value!r}; state={failure_state()!r}; transcript={bytes(transcript)!r}")
         ready, _, _ = select.select([master], [], [], min(0.2, deadline - time.monotonic()))
         if ready:
             try:

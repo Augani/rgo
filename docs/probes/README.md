@@ -29,3 +29,11 @@ late_write=[Errno 2] No such file or directory: .../out/late-build-output
 
 This expected-bug assertion must be replaced with a protected-context and
 successful-write regression when the independent supervisor is integrated.
+
+`macos-launch-once.py` is a separate manual launchd/kernel audit. It creates only
+unique jobs in temporary private directories; it never runs Cargo or setup.
+It observes one-use registration removal after normal exit and SIGKILL while a
+detached closed-FD writer survives, then kernel reaping after its late write.
+Run `python3 docs/probes/macos-launch-once.py /tmp/rgo-launch-once.json` on macOS.
+The [recorded local result](2026-10-02-macos-launch-once.json) is mechanism evidence;
+the installed-launcher regression and declared platform matrix remain required.
