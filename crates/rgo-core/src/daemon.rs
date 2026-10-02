@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use fs4::fs_std::FileExt;
@@ -31,6 +31,9 @@ use rgo_remote::{Client as RemoteClient, Config as RemoteConfig, Fetch as Remote
 
 const POLL_INTERVAL: Duration = Duration::from_secs(30);
 const AUTO_SCAN_INTERVAL: Duration = Duration::from_secs(120);
+// Protected storage and outside volume usage can keep pressure unresolved.
+// Avoid repeating a full inventory on every poll when a pass made no progress.
+const AUTO_GC_RETRY_INTERVAL: Duration = Duration::from_secs(120);
 const MAX_AUTO_SCAN_ENTRIES_PER_PASS: usize = 8192;
 const MAX_EVENT_DRAINS_PER_PASS: usize = 4;
 const MAX_EVENT_SCAN_ENTRIES_PER_PASS: usize = 256;
@@ -112,6 +115,7 @@ struct State {
     pin_pruner: Arc<Mutex<context::PinPruneScanner>>,
     pending_scanner: Arc<Mutex<crate::supervision::PendingMaintenanceScanner>>,
     trigger_scan: Arc<Mutex<crate::size::TriggerScan>>,
+    auto_gc_retry_at: Arc<Mutex<Option<Instant>>>,
     event_drainer: Arc<Mutex<CacheEventDrainScanner>>,
     legacy_metadata_scanner: Arc<Mutex<LegacyMetadataScanner>>,
     batch_prune_cursor: Arc<Mutex<i64>>,
@@ -257,6 +261,7 @@ pub fn run(paths: RgoPaths, cfg: Resolved) -> Result<()> {
             crate::supervision::PendingMaintenanceScanner::default(),
         )),
         trigger_scan: Arc::new(Mutex::new(crate::size::TriggerScan::default())),
+        auto_gc_retry_at: Arc::new(Mutex::new(None)),
         event_drainer: Arc::new(Mutex::new(event_drainer)),
         legacy_metadata_scanner: Arc::new(Mutex::new(LegacyMetadataScanner::default())),
         batch_prune_cursor: Arc::new(Mutex::new(batch_prune_cursor)),
@@ -2518,7 +2523,15 @@ fn maintenance(state: &State) -> Result<()> {
                 completed.is_some_and(|bytes| bytes > state.cfg.soft_watermark)
                     || scan.observed_bytes() > state.cfg.soft_watermark
             };
-            if urgent || pressure || idle_launch {
+            // A newly idle Cargo session or durable unpin signal can change
+            // eligibility immediately and bypasses the no-progress cooldown.
+            // Explicit GC requests also remain independent of this scheduler.
+            let retry_due = state
+                .auto_gc_retry_at
+                .lock()
+                .unwrap()
+                .is_none_or(|retry| Instant::now() >= retry);
+            if idle_launch || ((urgent || pressure) && retry_due) {
                 match run_gc(state, false, false, true, None) {
                     Ok(report) => {
                         state.trigger_scan.lock().unwrap().mark_completed();
@@ -2528,6 +2541,9 @@ fn maintenance(state: &State) -> Result<()> {
                             || report
                                 .volume_free_after_bytes
                                 .is_none_or(|free| free < state.cfg.min_free_space);
+                        *state.auto_gc_retry_at.lock().unwrap() = (unmet
+                            && report.reclaimed_bytes == 0)
+                            .then(|| Instant::now() + AUTO_GC_RETRY_INTERVAL);
                         for record in &pending {
                             let retry = unmet
                                 .then(|| {
@@ -2555,6 +2571,8 @@ fn maintenance(state: &State) -> Result<()> {
                         }
                     }
                     Err(error) => {
+                        *state.auto_gc_retry_at.lock().unwrap() =
+                            Some(Instant::now() + AUTO_GC_RETRY_INTERVAL);
                         state.trigger_scan.lock().unwrap().invalidate();
                         return Err(error);
                     }
@@ -3319,6 +3337,7 @@ mod tests {
                 crate::supervision::PendingMaintenanceScanner::default(),
             )),
             trigger_scan: Arc::new(Mutex::new(crate::size::TriggerScan::default())),
+            auto_gc_retry_at: Arc::new(Mutex::new(None)),
             event_drainer: Arc::new(Mutex::new(CacheEventDrainScanner::default())),
             legacy_metadata_scanner: Arc::new(Mutex::new(LegacyMetadataScanner::default())),
             batch_prune_cursor: Arc::new(Mutex::new(0)),

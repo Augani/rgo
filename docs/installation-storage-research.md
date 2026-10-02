@@ -428,3 +428,17 @@ historical benchmark table distinguish allocation estimates from returned
 volume space; snapshots, CoW sharing, outside links, and concurrent outside
 writes prevent an exact physical-savings claim. This is reporting progress;
 it does not close the broader P2/P3 release gates.
+
+## Automatic defaults on small volumes — 2026-10-02
+
+The fixed 20 GiB automatic floor exceeded the capacity of the existing 2 GiB
+btrfs fixture. Automatic policy resolution now uses a floor of
+`min(20 GiB, capacity / 4)` for both the managed-size target and free-space
+reserve. Their sum stays within half the reported capacity; defaults on volumes
+of at least 80 GiB and explicit byte settings are preserved. A zero-capacity
+report fails resolution. The existing configuration fixture covers capacity
+boundaries and large inputs, and the existing pressure fixture checks the actual
+mounted btrfs root while retaining positive reclamation controls. The
+[18-job matrix](https://github.com/Augani/rgo/actions/runs/36972164863) passed all
+jobs. This corrects capacity feasibility, not current free-space availability or
+safe behavior after every ENOSPC/publication failure.

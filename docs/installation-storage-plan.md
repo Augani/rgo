@@ -384,8 +384,21 @@ settings are preserved. Zero-capacity reports now fail policy resolution
 instead of inventing a limit. The existing default-config fixture covers small,
 normal, and very large capacities, while the existing btrfs pressure fixture
 checks the actual small mounted volume and retains its reclamation control.
+The [18-job matrix](https://github.com/Augani/rgo/actions/runs/36972164863) passed,
+including that btrfs job and every full workspace/platform suite.
 This establishes feasible capacity-based defaults, not a guarantee of available
 space or completion of the low-space/ENOSPC gate.
+
+**No-progress retry update (2026-10-02):** automatic GC now waits two minutes
+after a pass reclaims nothing while a size/reserve target remains unmet. The
+bounded metadata and launch-record scans continue between attempts; queued
+unpins and newly idle supervised launches can bypass that delay, and explicit
+GC is unchanged. The delay uses a monotonic clock and resets on daemon restart.
+The existing pinned-budget fixture now observes several completed maintenance
+ticks without a repeated full GC record, then requires unpin recovery before
+the delay expires. This bounds repeated no-progress passes, not the work of a
+single full inventory or maintenance driven by a stream of new launch signals;
+the broader hysteresis/bounded-work checklist item remains open.
 
 **Suggested policy:** garbage/temp first; expired orphans next; stale documented incremental state when safely identifiable; then idle contexts and cold CAS entries by measured value/age. Keep the initial implementation explainable before attempting adaptive eviction.
 

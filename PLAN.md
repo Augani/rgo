@@ -34,6 +34,13 @@ passed in the [18-job matrix](https://github.com/Augani/rgo/actions/runs/3696929
 are explicitly separate from returned volume space; broader policy/safety work
 remains on the accepted checklist.
 
+**2026-10-02 small-volume defaults:** automatic size and reserve floors now
+scale down to one quarter of the selected volume's capacity, capped at 20 GiB.
+Explicit byte settings and defaults on volumes of at least 80 GiB are unchanged.
+The [18-job matrix](https://github.com/Augani/rgo/actions/runs/36972164863) passed,
+including the actual 2 GiB btrfs pressure fixture. Available-space guarantees
+and publication/staging failures remain separate P3 gates.
+
 ## 0. What changed vs. `doc.md`, and why
 
 `doc.md` treats the rustc-wrapper + CAS as the core and the managed build roots as a

@@ -1208,10 +1208,12 @@ fn opted_in_maintenance_reclaims_idle_bytes_and_reports_pinned_excess() {
     )
     .unwrap();
 
+    let maintenance_ticks = sb.home.join("budget-maintenance-ticks");
     let mut daemon = StopDaemon(
         sb.cmd(cargo_bin("rgo"))
             .args(["daemon", "--foreground"])
             .env("RGO_DAEMON_POLL_SECS", "1")
+            .env("RGO_TEST_MAINTENANCE_TICK_LOG", &maintenance_ticks)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
@@ -1244,6 +1246,59 @@ fn opted_in_maintenance_reclaims_idle_bytes_and_reports_pinned_excess() {
             .unwrap()
             .contains("protected build contexts")
     );
+
+    // Once the pinned-only pass makes no progress, several completed ticks
+    // must leave the full-GC record unchanged. Unpin below must still recover
+    // promptly, well before the two-minute retry delay expires.
+    #[cfg(debug_assertions)]
+    {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let quiet_gc_at = loop {
+            let Response::Status(status) = ipc::request_with_timeout(
+                &paths.socket_path(),
+                Request::QueryStatus,
+                Duration::from_secs(5),
+            )
+            .unwrap() else {
+                panic!("daemon did not return status during protected-storage retry");
+            };
+            if status.last_gc_at > 0 && status.last_gc_reclaimed_bytes == 0 {
+                break status.last_gc_at;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "no pinned-only GC pass completed"
+            );
+            thread::sleep(Duration::from_millis(100));
+        };
+        let tick_count = || {
+            std::fs::read_to_string(&maintenance_ticks)
+                .unwrap_or_default()
+                .lines()
+                .count()
+        };
+        let ticks_before = tick_count();
+        while tick_count() < ticks_before + 3 && Instant::now() < deadline {
+            assert!(daemon.0.try_wait().unwrap().is_none());
+            thread::sleep(Duration::from_millis(100));
+        }
+        assert!(
+            tick_count() >= ticks_before + 3,
+            "maintenance ticks stopped"
+        );
+        let Response::Status(status) = ipc::request_with_timeout(
+            &paths.socket_path(),
+            Request::QueryStatus,
+            Duration::from_secs(5),
+        )
+        .unwrap() else {
+            panic!("daemon did not return status after retry ticks");
+        };
+        assert_eq!(
+            status.last_gc_at, quiet_gc_at,
+            "GC repeated without progress"
+        );
+    }
 
     let response = ipc::request_with_timeout(
         &paths.socket_path(),

@@ -254,6 +254,12 @@ the storage watermark. A missing workspace manifest becomes eligible after
 `orphan_grace` of inactivity, provided its volume is still available and the
 context has no active build or pin. The grace is not a timer from project deletion.
 
+When an automatic cleanup pass reclaims nothing and storage pressure remains,
+the daemon waits two minutes before repeating the full pass. Maintenance still
+runs between attempts. A queued unpin or a completed supervised Cargo session
+can prompt earlier recovery, and explicit GC remains available. The retry delay
+uses elapsed time and starts fresh after a daemon restart.
+
 The storage budget is a recovery target. Active builds, pins, or filesystem
 constraints can keep usage above it; `rgo status` reports protected storage and
 the unmet target. Status reports a free-space reserve deficit separately,
