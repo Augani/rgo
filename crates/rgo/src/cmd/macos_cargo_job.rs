@@ -754,22 +754,27 @@ pub fn guardian(directory: &Path, token: &str) -> Result<()> {
             .stdout(Stdio::from(stdout))
             .stderr(Stdio::from(stderr))
             .process_group(0);
-        unsafe {
-            command.pre_exec(move || {
-                if let Some(slave) = slave.filter(|_| initially_foreground) {
-                    // Command has established the child's process group. Make
-                    // it foreground before exec can read its controlling PTY.
-                    let mut blocked = std::mem::zeroed();
-                    libc::sigemptyset(&mut blocked);
-                    libc::sigaddset(&mut blocked, libc::SIGTTOU);
-                    if libc::sigprocmask(libc::SIG_BLOCK, &blocked, std::ptr::null_mut()) != 0
-                        || libc::tcsetpgrp(slave, libc::getpgrp()) != 0
-                    {
-                        return Err(std::io::Error::last_os_error());
+        // A pre_exec callback forces Command off Darwin's posix_spawn path.
+        // Exec already resets caught handlers. Pipes need no callback when
+        // the remaining inherited mask/ignored dispositions match the caller.
+        if slave.is_some() || request.signals != events::NativeSignals::capture()? {
+            unsafe {
+                command.pre_exec(move || {
+                    if let Some(slave) = slave.filter(|_| initially_foreground) {
+                        // Command has established the child's process group. Make
+                        // it foreground before exec can read its controlling PTY.
+                        let mut blocked = std::mem::zeroed();
+                        libc::sigemptyset(&mut blocked);
+                        libc::sigaddset(&mut blocked, libc::SIGTTOU);
+                        if libc::sigprocmask(libc::SIG_BLOCK, &blocked, std::ptr::null_mut()) != 0
+                            || libc::tcsetpgrp(slave, libc::getpgrp()) != 0
+                        {
+                            return Err(std::io::Error::last_os_error());
+                        }
                     }
-                }
-                request.signals.restore_in_child()
-            });
+                    request.signals.restore_in_child()
+                });
+            }
         }
         let child = command
             .spawn()

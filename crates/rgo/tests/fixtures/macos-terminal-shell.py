@@ -19,6 +19,7 @@ if pid == 0:
 pending = bytearray()
 transcript = bytearray()
 prompt = b"rgo-probe> "
+shell_sequence = 0
 
 def expect(value, timeout=20):
     deadline = time.monotonic() + timeout
@@ -45,6 +46,15 @@ def send(value):
 
 def command(value):
     send(value.encode() + b"\n")
+
+def shell_command(value):
+    # Asynchronous job notifications can redraw a second prompt. Synchronize
+    # completion with a unique expanded marker, rather than a stale prompt.
+    global shell_sequence
+    shell_sequence += 1
+    command(f"{value}; print -r RGO_SHELL_DONE:$(({shell_sequence}))_")
+    expect(f"RGO_SHELL_DONE:{shell_sequence}_".encode())
+    expect(prompt)
 
 def status(expected):
     command("print -r RGO_STATUS:$?")
@@ -113,12 +123,17 @@ try:
         expect(b"RGO_TERMINAL_READY")
         send(b"\x1a")
         expect(prompt)
-        command("bg")
-        expect(prompt)
-        command("sleep 0.2; jobs -s")
-        expect(b"suspended")
-        expect(prompt)
+        shell_command("bg")
+        deadline = time.monotonic() + 10
+        while True:
+            shell_command("jobs -s > background-state")
+            if b"suspended" in pathlib.Path("background-state").read_bytes():
+                break
+            if time.monotonic() >= deadline:
+                raise RuntimeError(f"background job did not stop; transcript={bytes(transcript)!r}")
+            time.sleep(0.02)
         command("fg")
+        expect(b"RGO_CONTINUED")
         send(b"quit\n")
         expect(prompt)
         status(17)

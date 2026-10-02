@@ -13,7 +13,7 @@ static CHILD_WAKE: AtomicI32 = AtomicI32::new(-1);
 
 // Exec preserves ignored dispositions and the caller's signal mask. The
 // guardian's own SIGCHLD/SIGHUP handlers must not leak into real Cargo.
-#[derive(Clone, Copy, Default, Deserialize, Serialize)]
+#[derive(Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub(super) struct NativeSignals {
     ignored: u32,
     blocked: u32,

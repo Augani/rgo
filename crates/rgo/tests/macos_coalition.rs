@@ -281,15 +281,20 @@ while not pathlib.Path(os.environ['RGO_COALITION_READY']).exists():
         !job.directory.exists(),
         "idle crashed guardian was not recovered"
     );
-    assert!(
-        !sandbox
-            .cmd("launchctl")
-            .args(["print", &job.target])
-            .output()
-            .unwrap()
-            .status
-            .success()
-    );
+    // Recovery removes the rendezvous before bootout can reap the identity.
+    // Directory disappearance precedes completion of that external helper.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while sandbox
+        .cmd("launchctl")
+        .args(["print", &job.target])
+        .output()
+        .unwrap()
+        .status
+        .success()
+    {
+        assert!(Instant::now() < deadline, "recovered job was not unloaded");
+        thread::sleep(Duration::from_millis(20));
+    }
     println!(
         "installed Cargo pilot: real detached writer protected through Cargo exit and guardian SIGKILL; late write succeeded; idle context reclaimed"
     );
