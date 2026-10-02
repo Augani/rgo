@@ -548,7 +548,14 @@ never treated as an empty one. Receipts are bounded to 4 KiB and 32 coalition
 IDs. A single private launchd fixture on macOS 27.2 arm64 now demonstrates real
 GC preserving the writer after Cargo exits, rejection of a malformed receipt,
 a successful late write, and reclamation after the writer exits. Build and
-zero-warning Clippy passed locally.
+zero-warning Clippy passed locally. The
+[18-job matrix](https://github.com/Augani/rgo/actions/runs/36992158237) passed at
+`325b2e5`, including macOS stable/beta/nightly workspace suites, source builds
+on Rust 1.85, installer lifecycle probes, and existing 100-project recovery.
+The macOS beta job's log identifies macOS 14.8.9 build 23J631, arm64, and a
+successful coalition fixture. This does not establish Intel or the full macOS
+runtime range. One new automatic Rust regression was added; the expected-bug
+audit remains outside the routine suite.
 
 This remains a prototype: ordinary installed Cargo launchers do not register
 receipts, older daemon policies do not check them, and the private observation

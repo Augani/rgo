@@ -75,7 +75,10 @@ is a reproduced corruption case. A local isolated launchd fixture verifies
 durable kernel-coalition protection through real GC and idle reclamation;
 ordinary Cargo launchers are not integrated yet. The user selected macOS first.
 The [implementation checklist](docs/macos-cargo-supervision.md) records the
-remaining transport, lifecycle, compatibility, and platform gates. P2 remains
+remaining transport, lifecycle, compatibility, and platform gates. The
+[18-job matrix](https://github.com/Augani/rgo/actions/runs/36992158237) passed at
+`325b2e5`, including the macOS coalition fixture and existing budget recovery.
+P2 remains
 open and automatic GC remains off by default.
 
 `doc.md` treats the rustc-wrapper + CAS as the core and the managed build roots as a

@@ -170,6 +170,9 @@ kernel-coalition design and remaining integration steps. Its experimental
 receipt/GC path passed a local real deletion-and-reclamation fixture, but the
 ordinary launcher does not register receipts yet. Manual cleanup and opted-in
 automatic cleanup retain the known Unix descriptor gap; doctor now reports it.
+The [18-job matrix](https://github.com/Augani/rgo/actions/runs/36992158237) passed
+at `325b2e5`, including macOS stable/beta/nightly workspace suites and the
+existing platform installer and 100-project recovery checks.
 Full P2 and unattended cleanup remain open.
 
 - [ ] Document the exact lock/lifecycle protocol Cargo uses for each supported version and platform. Determine whether it covers build scripts, rustdoc, no-op commands, package/install operations, test execution, and waiting Cargo processes.

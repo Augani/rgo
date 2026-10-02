@@ -156,7 +156,9 @@ process-level session guard.
   The experimental coalition fixture then registered an isolated launchd job
   before Cargo, required real GC to preserve its closed-FD writer, rejected a
   corrupted receipt, and reclaimed the context after the writer exited. Local
-  evidence is macOS 27.2 arm64. Ordinary launchers do not register this receipt
+  evidence is macOS 27.2 arm64; the
+  [18-job matrix](https://github.com/Augani/rgo/actions/runs/36992158237) also
+  passed the fixture on macOS 14.8.9 arm64. Ordinary launchers do not register this receipt
   yet; this is a prototype proof for one process shape, not a production fix.
   [Design and remaining checklist](macos-cargo-supervision.md),
   [repeatable counterexample](probes/README.md).

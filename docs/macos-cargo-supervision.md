@@ -60,8 +60,16 @@ storage before admission, or preserve an already admitted context.
   a corrupt receipt refuses exclusion, the late write succeeds, and real GC
   reclaims the context after the writer exits.
 - [x] Make doctor report the ordinary Unix launcher's known descriptor gap.
-- [ ] Record supported macOS version/architecture results. Local evidence is
-  macOS 27.2 build 26B5091g, arm64; platform CI evidence remains separate.
+- [ ] Complete the supported macOS version/architecture matrix. Local evidence
+  is macOS 27.2 build 26B5091g, arm64. The prototype also passed the macOS
+  14.8.9 build 23J631 arm64 beta workspace suite at `325b2e5` in
+  [platform CI](https://github.com/Augani/rgo/actions/runs/36992158237).
+  Intel and the full supported runtime range remain unverified.
+
+The complete [18-job run](https://github.com/Augani/rgo/actions/runs/36992158237)
+passed at `325b2e5`, including macOS stable/beta/nightly suites and the existing
+100-project checks. This confirms the prototype's current integration does not
+break those workflows; it does not validate a shipping Cargo supervisor.
 
 The normal launcher still uses the earlier descriptor mechanism. Registering
 its existing process directly would bind a context to Terminal, an IDE, or
@@ -89,6 +97,8 @@ helper is test code; it is not a shipping activation option.
 - [ ] Return Cargo's exit status while retaining descendant protection until
   kernel membership drains. Define Ctrl-C, termination, shell closure, nested
   Cargo, and terminal job-control behavior without changing everyday commands.
+  Verify process-group and session behavior explicitly; descriptor passing
+  alone does not establish compatibility with terminal job control.
 - [ ] Fence job restart and namespace reuse. A zero-count snapshot alone is
   insufficient if a loaded job can admit future unguarded work.
 - [ ] Recover owned jobs and receipts after launcher, guardian, or daemon
