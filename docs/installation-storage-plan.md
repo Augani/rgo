@@ -125,7 +125,7 @@ A later [Windows stable CI run](https://github.com/Augani/rgo/actions/runs/36882
 - [ ] Add a setup transaction: validate destination and binaries; prepare directories/state; atomically apply owned settings; start the service; verify effective behavior; report degraded maintenance explicitly if startup fails.
 - [ ] Protect against concurrent setup/undo and user edits between read and write. Restore only settings still owned by rgo; never overwrite a later user change during undo.
 - [ ] Ensure custom `RGO_HOME` stays discoverable by wrapper and daemon from a fresh terminal and GUI-launched IDE without inheriting the setup shell's environment.
-- [ ] Preserve existing sccache/custom wrappers. Default to storage-only when composition cannot be established safely. Treat rust-analyzer's environment wrapper independently of global configured wrappers.
+- [x] Preserve existing sccache/custom wrappers. Native setup retains configured wrappers or chooses storage-only activation where composition is unknown; supervised Cargo preserves custom environment/configured producers and uses ordinary storage. It checks environment wrappers independently of global settings, including workspace-wrapper keys used by IDEs. Only a matched rgo wrapper without an inner wrapper is admitted to managed cleanup. Actual rust-analyzer launch/path validation remains a separate P5 item.
 - [ ] Make `rgo doctor` report effective final/build locations, wrapper chain, maintenance state, actual toolchain capability, filesystem limits, and unmanaged reason independently.
 - [x] Add machine-readable doctor output and an installer verification mode with a useful failure exit status; keep ordinary diagnostic inspection read-only. `rgo doctor --json` emits a versioned report; `rgo doctor --verify` builds a disposable offline crate with plain Cargo in debug and release, requires both Cargo-emitted output paths to meet at a build directory that rgo can enumerate, and checks rgo's sidecar when a wrapper is configured. This rejects an unfamiliar `{workspace-path-hash}` expansion even in storage-only mode, without parsing Cargo's private build subdirectories. The write-based filesystem probe runs only in verification mode.
 - [ ] Make `--dry-run`, repeated setup, repeated undo, and missing-wrapper recovery work with the same ownership rules.
@@ -186,8 +186,9 @@ settings are inspected conservatively; doctor explains the exception. Admission
 revision 2 creates a fresh namespace and prevents older contexts from becoming
 cleanup candidates after refresh. Protocol 7 rejects older daemon policies;
 no-service setup can shut down a recorded protocol-6 daemon before activation.
-The existing Unix/Windows passthrough and GC-origin fixtures exercise this
-boundary. External brokers launched by build scripts/linkers and configuration
+The [green 18-job matrix](https://github.com/Augani/rgo/actions/runs/36967189762)
+passed the Unix/Windows passthrough, GC-origin, recorded-daemon upgrade, full
+workspace, installer, and 100-project recovery checks. External brokers launched by build scripts/linkers and configuration
 changes after admission still leave the broader lifecycle checklist open.
 
 **Feasibility decision:** a rustc wrapper cannot by itself provide complete Cargo-session exclusion. If Cargo's available locks cannot support safe deletion for a version, disable unattended destructive cleanup for that mode and report the limitation. First seek a cooperative upstream lifecycle mechanism. An optional supervised Cargo shim is a separate decision only after documenting why it is needed, what launches bypass it, and how mixed supervised/unsupervised use stays safe. No fallback alias is silently introduced.

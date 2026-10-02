@@ -162,7 +162,9 @@ process-level session guard.
   planning and execution while reclaiming a current idle neighbor. The
   no-service lifecycle fixture verifies recorded protocol-6 shutdown followed
   by protocol-7 activation. These checks cover the configured producer and
-  upgrade boundary; they do not prove arbitrary broker lifetimes.
+  upgrade boundary. The [18-job matrix](https://github.com/Augani/rgo/actions/runs/36967189762)
+  passed, including Windows compiler-wrapper passthrough and recorded legacy
+  shutdown. They do not prove arbitrary broker lifetimes.
 - A focused origin fixture requires a native-origin context to stay protected
   while a supervised neighbor is reclaimed under pressure. It also calls the
   deletion executor on the native context and requires refusal. The local

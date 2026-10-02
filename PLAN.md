@@ -19,6 +19,14 @@
 | One-command installation and lifecycle | Partial setup and installer pilots, no published endpoint | Fresh-process custom-root, recovery, and activation-probe sandbox tests | Incomplete | Open: distribution, repair, upgrade, uninstall |
 | Compiler RAM control | No | No claim | No claim | Outside storage release |
 
+**2026-10-02 producer admission:** custom compilers/wrappers keep their Cargo
+commands and use ordinary storage; only a matched rgo wrapper without an inner
+wrapper is admitted. Revision 2 protects older contexts and selects a fresh
+namespace; protocol 7 rejects older daemon policies while setup retains recorded
+protocol-6 shutdown recovery. The [18-job matrix](https://github.com/Augani/rgo/actions/runs/36967189762)
+passed. Wrapper preservation is checked off in P1; actual IDE workflow validation
+and the broader P2/release gates remain open.
+
 ## 0. What changed vs. `doc.md`, and why
 
 `doc.md` treats the rustc-wrapper + CAS as the core and the managed build roots as a

@@ -398,6 +398,12 @@ request only the unchanged Shutdown operation using a recorded protocol 6.
 The existing no-service lifecycle fixture passed that wire-version upgrade and
 required release of the daemon singleton before activating the new record.
 
+The [green 18-job matrix](https://github.com/Augani/rgo/actions/runs/36967189762)
+passed all workspace suites, zero-warning Clippy, installation/lifecycle pilots,
+Cargo-version boundaries, btrfs, and 100-project recovery on the declared lanes.
+The revised custom-rustdoc fixture also passed ordinary-storage passthrough and
+global-guard release. No new test cases were added: existing fixtures were extended.
+
 External brokers launched by build scripts, linkers, runners, or custom toolchains
 and settings changed after inspection remain unproven. The default still leaves
 automatic GC and compiler caching off. This is progress on the configured
