@@ -221,7 +221,7 @@ def main() -> None:
             forced = environment.copy()
             forced[signal] = "1"
             stopped = subprocess.run(upgrade_installer, env=forced, text=True, capture_output=True, timeout=120)
-            assert stopped.returncode == code, stopped.stderr
+            assert stopped.returncode == code, f"{signal}: {stopped.stderr}"
         run(upgrade_installer, environment)
         upgraded = json.loads((cargo_home / ".rgo-install.json").read_text())
         assert upgraded["binary_version"] == new_version
@@ -295,6 +295,16 @@ def main() -> None:
             shutil.rmtree(root)
         else:
             print(f"retained failed private service probe at {root}", file=sys.stderr)
+            if platform.system() == "Linux":
+                for unit in (home / ".config/systemd/user").glob("rgo-*.service"):
+                    for command in (
+                        ["systemctl", "--user", "status", unit.name, "--no-pager", "--full"],
+                        ["journalctl", "--user", "--unit", unit.name, "--lines", "30", "--no-pager"],
+                    ):
+                        try:
+                            subprocess.run(command, env=environment, timeout=15, check=False)
+                        except (OSError, subprocess.TimeoutExpired) as error:
+                            print(f"service diagnostic failed: {error}", file=sys.stderr)
 
 
 if __name__ == "__main__":

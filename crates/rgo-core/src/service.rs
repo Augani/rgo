@@ -569,14 +569,18 @@ pub fn install(
             .path
             .to_str()
             .context("systemd unit path must be UTF-8")?;
+        command("systemctl", ["--user", "enable", unit_path])?;
+        // Explicit setup/repair must recover an owned unit whose earlier
+        // failed starts exhausted systemd's rate limit. Automatic restarts
+        // retain the manager's normal limit.
+        command("systemctl", ["--user", "reset-failed", &rendered.label])?;
         if previous_executable.is_some() {
             // `enable --now` does not restart an already active unit after its
             // ExecStart changes. A verified replacement must run the daemon
             // from the newly installed definition before setup reports health.
-            command("systemctl", ["--user", "enable", unit_path])?;
             command("systemctl", ["--user", "restart", &rendered.label])?;
         } else {
-            command("systemctl", ["--user", "enable", "--now", unit_path])?;
+            command("systemctl", ["--user", "start", &rendered.label])?;
         }
         Ok(rendered)
     }
