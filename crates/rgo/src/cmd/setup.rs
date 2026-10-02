@@ -685,7 +685,10 @@ pub fn run(
     // after a service manager has stopped it. Hold the singleton lock through
     // removal (or through any no-service activation change) to close that gap.
     let _activation_daemon_guard = if !dry_run && (no_service || undo) {
-        Some(lock_daemon_for_activation(&paths)?)
+        Some(lock_daemon_for_activation(
+            &paths,
+            old_record.as_ref().map(|record| record.protocol_version),
+        )?)
     } else {
         None
     };
@@ -1214,6 +1217,10 @@ fn wait_for_daemon(executable: &Path, paths: &RgoPaths) -> Result<()> {
 
 fn wrapper_path() -> Result<String> {
     let exe = std::env::current_exe()?;
+    matching_wrapper_path(&exe)
+}
+
+pub(super) fn matching_wrapper_path(exe: &Path) -> Result<String> {
     let dir = exe.parent().context("exe has no parent")?;
     let name = if cfg!(windows) {
         "rgo-rustc-wrapper.exe"
@@ -1526,7 +1533,7 @@ fn lock_root_setup(paths: &RgoPaths) -> Result<File> {
     lock_named(&paths.state_dir(), ".rgo-service.lock")
 }
 
-fn lock_daemon_for_activation(paths: &RgoPaths) -> Result<File> {
+fn lock_daemon_for_activation(paths: &RgoPaths, recorded_protocol: Option<u32>) -> Result<File> {
     let path = paths.state_dir().join("daemon.lock");
     match std::fs::symlink_metadata(&path) {
         Ok(metadata) if !metadata.is_file() || metadata.file_type().is_symlink() => {
@@ -1545,9 +1552,9 @@ fn lock_daemon_for_activation(paths: &RgoPaths) -> Result<File> {
         .open(&path)
         .with_context(|| format!("opening {}", path.display()))?;
     if !file.try_lock_exclusive()? {
-        let shutdown_error = match ipc::request_with_timeout(
+        let shutdown_error = match ipc::shutdown_recorded_daemon(
             &paths.socket_path(),
-            Request::Shutdown,
+            recorded_protocol,
             Duration::from_secs(5),
         ) {
             Ok(Response::Ok) => None,

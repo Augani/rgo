@@ -77,6 +77,12 @@ an isolated Cargo home. This installs an owned launcher at
 Put that directory first on `PATH` to use unchanged `cargo` commands; `rgo
 doctor --verify` checks the active path and runs a disposable build. The mode
 keeps direct Cargo invocations outside rgo's managed GC area by default.
+Custom compiler and wrapper settings (including sccache) keep their Cargo
+behavior and use ordinary storage: an external compiler broker may outlive the
+supervised Cargo session. A matched rgo wrapper with no inner wrapper remains
+eligible. `rgo doctor` reports this exception. Revised admission uses a new
+context namespace; existing contexts remain accounted and protected from GC,
+so this upgrade may temporarily increase storage until old data is reviewed.
 The launcher is tied to its installing Cargo home and storage root. If a
 different installation's shim is first on `PATH`, it forwards to the real
 Cargo proxy and uses that home's ordinary local storage; put the matching

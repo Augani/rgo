@@ -302,6 +302,24 @@ pub fn run(json: bool, verify: bool) -> Result<()> {
         );
     }
     check_project_configs(&cargo_home, &mut check, &mut info);
+    #[cfg(any(unix, windows))]
+    if supervised.is_some() {
+        match super::cargo_shim::compiler_override_issue(&e.paths, None) {
+            Ok(Some(issue)) => check(
+                false,
+                format!(
+                    "{issue}; supervised Cargo preserves the selected producer and uses ordinary Cargo storage"
+                ),
+            ),
+            Ok(None) => {}
+            Err(error) => check(
+                false,
+                format!(
+                    "compiler settings cannot be verified: {error:#}; supervised Cargo uses ordinary Cargo storage"
+                ),
+            ),
+        }
+    }
     check(
         e.paths.builds_dir().is_dir(),
         format!(

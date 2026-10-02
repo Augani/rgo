@@ -59,6 +59,13 @@ impl Sandbox {
                 "CARGO_BUILD_BUILD_DIR",
                 "RUSTC_WRAPPER",
                 "RUSTC_WORKSPACE_WRAPPER",
+                "CARGO_BUILD_RUSTC_WRAPPER",
+                "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER",
+                "RUSTC",
+                "RUSTDOC",
+                "CARGO_BUILD_RUSTC",
+                "CARGO_BUILD_RUSTDOC",
+                "RGO_INNER_RUSTC_WRAPPER",
                 "RGO_BYPASS",
                 "RGO_LEASE_ID",
             ] {

@@ -1547,6 +1547,7 @@ fn shimmed_cargo_isolated_from_direct_cargo_and_holds_gc_lock_through_run() {
             .is_some()
     );
     let killed_ready = sandbox.home.join("killed-cargo-wrapper-pid");
+    let before_custom_wrapper = context::read_sidecar(context).unwrap().last_seen;
     let slow_wrapper = sandbox.home.join("slow-rustc-wrapper");
     std::fs::write(
         &slow_wrapper,
@@ -1604,6 +1605,82 @@ fn shimmed_cargo_isolated_from_direct_cargo_and_holds_gc_lock_through_run() {
             .unwrap()
             .is_some()
     );
+    std::fs::write(
+        &slow_wrapper,
+        "#!/bin/sh\nprintf wrapper > \"$RGO_KILLED_READY\"\nexec \"$@\"\n",
+    )
+    .unwrap();
+    let passthrough = sandbox
+        .cmd("cargo")
+        .current_dir(&project)
+        .env("PATH", &search_path)
+        .env("RUSTC_WRAPPER", &slow_wrapper)
+        .env("RGO_KILLED_READY", &killed_ready)
+        .args(["build", "--offline"])
+        .output()
+        .unwrap();
+    assert!(
+        passthrough.status.success(),
+        "{}",
+        String::from_utf8_lossy(&passthrough.stderr)
+    );
+    assert!(String::from_utf8_lossy(&passthrough.stderr).contains("custom compiler or wrapper"));
+    assert_eq!(std::fs::read_to_string(&killed_ready).unwrap(), "wrapper");
+    assert_eq!(
+        context::read_sidecar(context).unwrap().last_seen,
+        before_custom_wrapper
+    );
+    assert_eq!(
+        paths.checked_managed_build_dirs().unwrap(),
+        vec![context.clone()]
+    );
+    assert_eq!(
+        std::process::Command::new(project.join("target/debug/supervised-pilot"))
+            .output()
+            .unwrap()
+            .stdout,
+        b"after kill\n"
+    );
+
+    let include = project.join(".cargo/config.toml");
+    let included = project.join(".cargo/producer.toml");
+    std::fs::write(&include, "include = ['producer.toml']\n").unwrap();
+    std::fs::write(
+        &included,
+        format!(
+            "[build]\nrustc-wrapper = {}\n",
+            serde_json::to_string(slow_wrapper.to_str().unwrap()).unwrap()
+        ),
+    )
+    .unwrap();
+    let configured = sandbox
+        .cmd("cargo")
+        .current_dir(&project)
+        .env("PATH", &search_path)
+        .env("RGO_KILLED_READY", &killed_ready)
+        .args(["build", "--offline"])
+        .output()
+        .unwrap();
+    assert!(
+        configured.status.success(),
+        "{}",
+        String::from_utf8_lossy(&configured.stderr)
+    );
+    assert!(String::from_utf8_lossy(&configured.stderr).contains("custom compiler or wrapper"));
+    assert_eq!(
+        context::read_sidecar(context).unwrap().last_seen,
+        before_custom_wrapper
+    );
+    let diagnosed = sandbox
+        .cmd(rgo)
+        .current_dir(&project)
+        .env("PATH", &search_path)
+        .args(["doctor", "--json"])
+        .output()
+        .unwrap();
+    assert!(String::from_utf8_lossy(&diagnosed.stdout).contains("custom compiler or wrapper"));
+    std::fs::remove_file(include).unwrap();
+    std::fs::remove_file(included).unwrap();
     gc::remove_atomically(&paths, context).unwrap();
     assert!(!context.exists());
 

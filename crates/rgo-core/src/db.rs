@@ -1991,6 +1991,7 @@ mod tests {
                         version: 1,
                         workspace_verified: true,
                         supervised_origin: true,
+                        supervision_version: rgo_protocol::SUPERVISED_CONTEXT_VERSION,
                         workspace_root: if index < 2 { "shared" } else { "other" }.into(),
                         manifest_path: String::new(),
                         workspace_device: None,

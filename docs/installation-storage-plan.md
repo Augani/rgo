@@ -178,6 +178,18 @@ The layout initializer now rejects a filesystem-root `RGO_HOME` and a pre-existi
 
 The current [GC lifecycle safety argument](gc-safety-argument.md) records the proposed exclusion protocol, existing platform evidence, concrete bypasses, and fail-closed decision. This checklist item remains open until the real-Cargo race matrix and supported-platform results accompany it.
 
+**Compiler-producer admission update (2026-10-02):** the supervised launcher
+preserves custom compiler/wrapper commands and uses ordinary Cargo storage when
+their writer lifetime is unverified. Only the adjacent version/protocol-matched
+rgo wrapper without an inner wrapper is allowed. Environment and include-chain
+settings are inspected conservatively; doctor explains the exception. Admission
+revision 2 creates a fresh namespace and prevents older contexts from becoming
+cleanup candidates after refresh. Protocol 7 rejects older daemon policies;
+no-service setup can shut down a recorded protocol-6 daemon before activation.
+The existing Unix/Windows passthrough and GC-origin fixtures exercise this
+boundary. External brokers launched by build scripts/linkers and configuration
+changes after admission still leave the broader lifecycle checklist open.
+
 **Feasibility decision:** a rustc wrapper cannot by itself provide complete Cargo-session exclusion. If Cargo's available locks cannot support safe deletion for a version, disable unattended destructive cleanup for that mode and report the limitation. First seek a cooperative upstream lifecycle mechanism. An optional supervised Cargo shim is a separate decision only after documenting why it is needed, what launches bypass it, and how mixed supervised/unsupervised use stays safe. No fallback alias is silently introduced.
 
 **Current feasibility finding:** Cargo creates profile-scoped build locks and may omit them on NFS. Its current source does not expose one stable context-wide lock that rgo can acquire before all ordinary Cargo launches. Inference: scanning existing profile locks cannot exclude a newly started profile, and renaming a context can strand an already waiting process on the old lock inode. A bounded, unattended, whole-context policy remains unproven under the current native-only integration; keep `gc.auto` off while exploring an upstream coordination hook or a specifically reviewed interception design. See the source-backed research follow-up.

@@ -31,7 +31,13 @@ pub fn context_for_workspace(paths: &RgoPaths, workspace_root: &Path) -> Result<
             workspace_root.display()
         );
     }
-    let digest = hash_path(workspace_root);
+    // Older contexts may have admitted external compiler brokers. Do not
+    // reuse that mutable namespace under the revised admission rules.
+    let mut identity = blake3::Hasher::new();
+    identity.update(b"rgo-supervised-context\0");
+    identity.update(&rgo_protocol::SUPERVISED_CONTEXT_VERSION.to_le_bytes());
+    identity.update(hash_path(workspace_root).as_bytes());
+    let digest = identity.finalize();
     let hex = digest.to_hex().to_string();
     Ok(paths.builds_dir().join(&hex[..2]).join(&hex[2..]))
 }
@@ -686,6 +692,14 @@ mod tests {
         assert_eq!(one.to_string_lossy(), two.to_string_lossy());
         let first = context_for_workspace(&paths, &one).unwrap();
         let second = context_for_workspace(&paths, &two).unwrap();
+        let old_identity = hash_path(&one).to_hex().to_string();
+        assert_ne!(
+            first,
+            paths
+                .builds_dir()
+                .join(&old_identity[..2])
+                .join(&old_identity[2..])
+        );
         assert_ne!(first, second);
         assert_ne!(
             lock_path(&paths, Some(&first), false).unwrap(),

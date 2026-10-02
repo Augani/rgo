@@ -210,18 +210,55 @@ pub fn request_with_response_timeout(
     connection_timeout: Duration,
     response_timeout: Duration,
 ) -> Result<Response> {
+    request_for_protocol(
+        path,
+        message,
+        connection_timeout,
+        response_timeout,
+        PROTOCOL_VERSION,
+    )
+}
+
+/// Activation recovery may only shut down a recorded older daemon. Ordinary
+/// operations retain strict protocol equality, including GC admission.
+pub fn shutdown_recorded_daemon(
+    path: &Path,
+    recorded_version: Option<u32>,
+    timeout: Duration,
+) -> Result<Response> {
+    let current = request_with_timeout(path, Request::Shutdown, timeout);
+    if current.is_ok() {
+        return current;
+    }
+    // Shutdown's wire shape has been unchanged since protocol 6. Never use an
+    // unrecorded or future protocol to issue maintenance or recovery requests.
+    match recorded_version {
+        Some(version) if (6..PROTOCOL_VERSION).contains(&version) => {
+            request_for_protocol(path, Request::Shutdown, timeout, timeout, version)
+        }
+        _ => current,
+    }
+}
+
+fn request_for_protocol(
+    path: &Path,
+    message: Request,
+    connection_timeout: Duration,
+    response_timeout: Duration,
+    protocol_version: u32,
+) -> Result<Response> {
     let mut connection = connect(path, connection_timeout)?;
     write_message(
         &mut connection,
         &Request::Hello {
-            version: PROTOCOL_VERSION,
+            version: protocol_version,
             client: client_name(),
         },
     )?;
     match read_message::<Response>(&mut connection)? {
-        Response::Hello { version } if version == PROTOCOL_VERSION => {}
+        Response::Hello { version } if version == protocol_version => {}
         Response::Hello { version } => {
-            bail!("daemon protocol mismatch: server={version}, client={PROTOCOL_VERSION}")
+            bail!("daemon protocol mismatch: server={version}, client={protocol_version}")
         }
         Response::Error { code, message } => bail!("daemon handshake failed ({code}): {message}"),
         other => bail!("invalid daemon handshake response: {other:?}"),

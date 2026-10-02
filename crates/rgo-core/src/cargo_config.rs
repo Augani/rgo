@@ -59,7 +59,79 @@ pub fn effective_home_config(cargo_home: &Path) -> std::path::PathBuf {
 /// Cargo's complete merge rules. Unknown or unreadable files fail closed;
 /// external edits after this check remain a separate lifecycle limitation.
 pub fn may_set_build_dir_in_file(path: &Path) -> Result<bool> {
-    fn inspect(path: &Path, stack: &mut Vec<PathBuf>, remaining: &mut usize) -> Result<bool> {
+    config_matches_includes(path, &|doc| {
+        doc.get("build")
+            .and_then(|build| build.get("build-dir"))
+            .is_some()
+    })
+}
+
+/// Conservative producer admission: custom compilers and wrappers may delegate
+/// output writes to a broker outside Cargo's guarded process tree. Only an
+/// absolute, caller-verified rgo wrapper is admitted; unrelated Cargo options
+/// and a blank wrapper setting do not imply a custom producer.
+pub fn may_set_unverified_compiler_in_file(
+    path: &Path,
+    approved_wrapper: Option<&Path>,
+) -> Result<bool> {
+    config_matches_includes(path, &|doc| {
+        if let Some(build) = doc.get("build") {
+            if ["rustc", "rustdoc"]
+                .iter()
+                .any(|key| build.get(key).is_some())
+            {
+                return true;
+            }
+            for key in ["rustc-wrapper", "rustc-workspace-wrapper"] {
+                if let Some(item) = build.get(key) {
+                    let Some(value) = item.as_str() else {
+                        return true;
+                    };
+                    if !wrapper_is_approved(value, approved_wrapper) {
+                        return true;
+                    }
+                }
+            }
+        }
+        doc.get("env").is_some_and(|env| {
+            COMPILER_ENV_KEYS.iter().any(|key| env.get(key).is_some())
+                || ["RGO_HOME", "CARGO_HOME"]
+                    .iter()
+                    .any(|key| env.get(key).is_some())
+        })
+    })
+}
+
+pub const COMPILER_ENV_KEYS: &[&str] = &[
+    "RUSTC",
+    "RUSTDOC",
+    "CARGO_BUILD_RUSTC",
+    "CARGO_BUILD_RUSTDOC",
+    "RUSTC_WRAPPER",
+    "RUSTC_WORKSPACE_WRAPPER",
+    "CARGO_BUILD_RUSTC_WRAPPER",
+    "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER",
+    "RGO_INNER_RUSTC_WRAPPER",
+];
+
+pub fn wrapper_is_approved(value: &str, approved_wrapper: Option<&Path>) -> bool {
+    value.is_empty()
+        || (Path::new(value).is_absolute()
+            && approved_wrapper.is_some_and(|approved| {
+                Path::new(value)
+                    .canonicalize()
+                    .ok()
+                    .is_some_and(|path| approved.canonicalize().ok() == Some(path))
+            }))
+}
+
+fn config_matches_includes(path: &Path, matches: &impl Fn(&DocumentMut) -> bool) -> Result<bool> {
+    fn inspect(
+        path: &Path,
+        stack: &mut Vec<PathBuf>,
+        remaining: &mut usize,
+        matches: &impl Fn(&DocumentMut) -> bool,
+    ) -> Result<bool> {
         ensure!(*remaining > 0, "Cargo include chain exceeds 64 files");
         *remaining -= 1;
         let metadata = std::fs::symlink_metadata(path)
@@ -89,11 +161,7 @@ pub fn may_set_build_dir_in_file(path: &Path) -> Result<bool> {
             let doc: DocumentMut = text
                 .parse()
                 .with_context(|| format!("parsing Cargo configuration {}", path.display()))?;
-            if doc
-                .get("build")
-                .and_then(|build| build.get("build-dir"))
-                .is_some()
-            {
+            if matches(&doc) {
                 return Ok(true);
             }
             let Some(includes) = doc.get("include") else {
@@ -149,7 +217,7 @@ pub fn may_set_build_dir_in_file(path: &Path) -> Result<bool> {
                         }
                     }
                 }
-                if inspect(&included, stack, remaining)? {
+                if inspect(&included, stack, remaining, matches)? {
                     return Ok(true);
                 }
             }
@@ -159,7 +227,7 @@ pub fn may_set_build_dir_in_file(path: &Path) -> Result<bool> {
         result
     }
 
-    inspect(path, &mut Vec::new(), &mut 64)
+    inspect(path, &mut Vec::new(), &mut 64, matches)
 }
 
 /// What `rgo setup` wants Cargo to know.
@@ -601,6 +669,21 @@ mod tests {
         .unwrap();
         std::fs::write(&nested, "[net]\noffline = true\n").unwrap();
         assert!(!may_set_build_dir_in_file(&config).unwrap());
+        assert!(may_set_unverified_compiler_in_file(&config, None).unwrap());
+        let approved = home.path().join("rgo-rustc-wrapper");
+        std::fs::write(&approved, b"verified by the caller").unwrap();
+        std::fs::write(
+            &wrapper,
+            format!(
+                "include = ['nested.toml']\n[build]\nrustc-wrapper = {}\n",
+                serde_json::to_string(approved.to_str().unwrap()).unwrap()
+            ),
+        )
+        .unwrap();
+        assert!(!may_set_unverified_compiler_in_file(&config, Some(&approved)).unwrap());
+        assert!(may_set_unverified_compiler_in_file(&config, None).unwrap());
+        std::fs::write(&nested, "[env]\nRGO_INNER_RUSTC_WRAPPER = 'sccache'\n").unwrap();
+        assert!(may_set_unverified_compiler_in_file(&config, Some(&approved)).unwrap());
 
         std::fs::write(&config, "build.build-dir = '/tmp/managed'\n").unwrap();
         assert!(may_set_build_dir_in_file(&config).unwrap());
@@ -615,8 +698,10 @@ mod tests {
 
         std::fs::write(&nested, "include = ['config.toml']\n").unwrap();
         assert!(may_set_build_dir_in_file(&config).is_err());
+        assert!(may_set_unverified_compiler_in_file(&config, Some(&approved)).is_err());
 
         std::fs::remove_file(&nested).unwrap();
         assert!(may_set_build_dir_in_file(&config).is_err());
+        assert!(may_set_unverified_compiler_in_file(&config, Some(&approved)).is_err());
     }
 }

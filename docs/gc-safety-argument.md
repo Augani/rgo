@@ -58,26 +58,44 @@ documented [build-directory configuration](https://doc.rust-lang.org/cargo/refer
 establishes where intermediates go; it does not give rgo a context-wide
 ownership lock. The profile `.cargo-build-lock` probe is only an additional
 liveness heuristic. Fresh contexts created by supervised Cargo carry a
-`supervised_origin` sidecar field. The supervised GC planner protects contexts
-without that origin for orphan, age, incremental, and pressure cleanup; its
+`supervised_origin` sidecar field and current `supervision_version` (2). The
+supervised GC planner protects contexts without that current admission revision for orphan, age, incremental, and pressure cleanup; its
 executor checks the origin again after acquiring the lifecycle guard. For
 eligible supervised contexts, GC can skip the ten-minute timestamp grace while
 still refusing a held or unreadable profile lock and holding rgo's guard
 through deletion. This does not detect direct Cargo writing into an already
 supervised context without running the wrapper.
 
-The custom-wrapper boundary needs an admission decision before enabling the
-supervised default. Sccache's [execution-mode documentation](https://github.com/mozilla/sccache/blob/main/docs/Architecture.md#execution-modes)
+The launcher now routes custom compiler/wrapper settings to ordinary Cargo
+storage without changing their selected commands. It scans inherited compiler
+and wrapper environment keys and the effective Cargo config filename in the
+working directory's ancestors and Cargo home, including bounded include chains.
+Unreadable or unsupported settings use ordinary storage. An absolute wrapper
+path is allowed only when it resolves to the adjacent matched rgo wrapper and
+neither inherited nor persisted inner-wrapper configuration is present.
+`doctor` exposes the reason. The no-wrapper case needs no extra wrapper process
+probe. These checks are conservative and do not recreate Cargo merge precedence.
+
+Sccache's [execution-mode documentation](https://github.com/mozilla/sccache/blob/main/docs/Architecture.md#execution-modes)
 says its default background server runs the compiler and writes output files.
 That server is outside the current Cargo process tree. Inference: rgo's inherited
 descriptor or Windows Job Object alone cannot establish exclusion for that writer
-after the client exits or crashes. The current launcher rejects build-directory
-overrides but does not separately classify custom compiler wrappers. Before this
-path is admitted to unattended cleanup, route uncertain compiler/wrapper settings
-to ordinary Cargo storage or establish a cooperative broker lease. Client-side
-sccache mode alone is insufficient as an admission signal: its documentation says
-some options cause the setting to be ignored. This is an unproven boundary, not a
-reproduced sccache corruption report.
+after the client exits or crashes. Client-side sccache mode is not an admission
+signal: its documentation says some options cause that setting to be ignored.
+This remains an inferred lifecycle risk, not a reproduced corruption report.
+
+New contexts use a namespace salted with admission revision 2. Older contexts
+lack that revision and stay protected; neither the launcher nor wrapper can
+promote them on refresh. GC checks the revision in planning and again before
+rename. Protocol 7 prevents a new client from trusting an older daemon's cleanup
+policy. Setup alone can request the unchanged Shutdown operation from a recorded
+protocol-6 daemon and waits for its singleton lock before changing activation.
+
+This narrows the known configured compiler-broker boundary. Arbitrary external
+brokers invoked by build scripts, linkers, runners, or a custom toolchain remain
+outside the demonstrated process-tree proof. Configuration edits between the
+check and execution remain an additional boundary. Full P2 safety stays open;
+`gc.auto` remains off by default.
 
 ## Proposed exclusion protocol
 

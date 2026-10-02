@@ -103,6 +103,33 @@ fn setup_activates_unchanged_cargo_exe_and_undo_restores_direct_cargo() {
         String::from_utf8_lossy(&doctor.stderr)
     );
     ensure_workspace_bins_built().unwrap();
+    let foreign_wrapper = sandbox.home.join("foreign-rustc-wrapper.exe");
+    std::fs::copy(
+        PathBuf::from(&cli).with_file_name("rgo-rustc-wrapper.exe"),
+        &foreign_wrapper,
+    )
+    .unwrap();
+    let foreign_project = sandbox.simple_bin("windows-custom-wrapper").unwrap();
+    let wrapped = sandbox
+        .cmd("cmd.exe")
+        .current_dir(&foreign_project)
+        .env("PATH", &path)
+        .env("RUSTC_WRAPPER", &foreign_wrapper)
+        .args(["/C", "cargo", "build", "--offline"])
+        .output()
+        .unwrap();
+    assert!(
+        wrapped.status.success(),
+        "{}",
+        String::from_utf8_lossy(&wrapped.stderr)
+    );
+    assert!(String::from_utf8_lossy(&wrapped.stderr).contains("custom compiler or wrapper"));
+    assert!(
+        foreign_project
+            .join("target/debug/windows-custom-wrapper.exe")
+            .is_file()
+    );
+    assert_eq!(paths.checked_managed_build_dirs().unwrap(), contexts);
     let workspace = sandbox
         .workspace("windows-virtual-workspace", &["member"])
         .unwrap();

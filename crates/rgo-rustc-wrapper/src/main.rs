@@ -1237,14 +1237,20 @@ fn attribute(args: &[OsString]) -> Option<PathBuf> {
             return Some(build_dir);
         }
     }
+    let supervised_origin = existing.as_ref().is_some_and(|sidecar| {
+        sidecar.is_current_supervised()
+            && sidecar.workspace_root == workspace_root.to_string_lossy()
+            && sidecar.manifest_path == manifest_path.to_string_lossy()
+    });
     let sc = ContextSidecar {
         version: PROTOCOL_VERSION,
         workspace_verified: true,
-        supervised_origin: existing.as_ref().is_some_and(|sidecar| {
-            sidecar.supervised_origin
-                && sidecar.workspace_root == workspace_root.to_string_lossy()
-                && sidecar.manifest_path == manifest_path.to_string_lossy()
-        }),
+        supervised_origin,
+        supervision_version: if supervised_origin {
+            rgo_protocol::SUPERVISED_CONTEXT_VERSION
+        } else {
+            0
+        },
         workspace_root: workspace_root.to_string_lossy().into_owned(),
         manifest_path: manifest_path.to_string_lossy().into_owned(),
         workspace_device: {

@@ -24,7 +24,7 @@ pub const AGE_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(3600);
 /// by the supervised launcher. Older or native contexts retain the timestamp
 /// grace because their earlier writers may not have used that guard.
 pub fn profile_lock_grace(sidecar: Option<&rgo_protocol::ContextSidecar>) -> Duration {
-    if sidecar.is_some_and(|sidecar| sidecar.supervised_origin) {
+    if sidecar.is_some_and(|sidecar| sidecar.is_current_supervised()) {
         Duration::ZERO
     } else {
         LIVE_WINDOW
@@ -168,7 +168,7 @@ pub fn plan(inp: &Inputs) -> Result<Plan> {
                     && !c
                         .sidecar
                         .as_ref()
-                        .is_some_and(|sidecar| sidecar.supervised_origin))
+                        .is_some_and(|sidecar| sidecar.is_current_supervised()))
         })
         .count();
     let eligible = |c: &BuildContext| {
@@ -177,7 +177,7 @@ pub fn plan(inp: &Inputs) -> Result<Plan> {
             && (!inp.require_supervised_origin
                 || c.sidecar
                     .as_ref()
-                    .is_some_and(|sidecar| sidecar.supervised_origin))
+                    .is_some_and(|sidecar| sidecar.is_current_supervised()))
             && !inp.pinned.iter().any(|path| same_path(path, &c.dir))
             && !inp.leased.iter().any(|path| same_path(path, &c.dir))
             && !lock_protected.contains(c.dir.as_path())
@@ -336,7 +336,7 @@ pub fn pressure_candidates(inp: &Inputs) -> Result<Vec<Action>> {
                 && !context
                     .sidecar
                     .as_ref()
-                    .is_some_and(|sidecar| sidecar.supervised_origin))
+                    .is_some_and(|sidecar| sidecar.is_current_supervised()))
             || inp.pinned.iter().any(|path| same_path(path, &context.dir))
             || inp.leased.iter().any(|path| same_path(path, &context.dir))
         {
@@ -492,7 +492,7 @@ fn stage_atomically_with(
                 victim.display()
             );
         }
-        if !sidecar.supervised_origin {
+        if !sidecar.is_current_supervised() {
             anyhow::bail!(
                 "build context at {} lacks verified supervised origin",
                 victim.display()
@@ -1257,7 +1257,8 @@ mod tests {
         paths.ensure_layout().unwrap();
         let native = paths.builds_dir().join("aa/native");
         let supervised = paths.builds_dir().join("bb/supervised");
-        for context in [&native, &supervised] {
+        let legacy = paths.builds_dir().join("cc/legacy-supervised");
+        for context in [&native, &supervised, &legacy] {
             std::fs::create_dir_all(context).unwrap();
             std::fs::write(context.join("output"), b"build data").unwrap();
         }
@@ -1266,6 +1267,14 @@ mod tests {
         crate::context::write_sidecar(&native, root.path(), &manifest, None).unwrap();
         crate::context::write_supervised_sidecar(&supervised, root.path(), &manifest, true)
             .unwrap();
+        crate::context::write_supervised_sidecar(&legacy, root.path(), &manifest, true).unwrap();
+        let mut older = crate::context::read_sidecar(&legacy).unwrap();
+        older.supervision_version = 0;
+        std::fs::write(
+            legacy.join(rgo_protocol::SIDECAR_FILE),
+            serde_json::to_vec(&older).unwrap(),
+        )
+        .unwrap();
 
         let contexts = crate::context::list(&paths).unwrap();
         let cfg = test_cfg();
@@ -1286,11 +1295,14 @@ mod tests {
         .unwrap();
         assert!(plan.actions.iter().any(|action| action.path == supervised));
         assert!(plan.actions.iter().all(|action| action.path != native));
-        assert_eq!(plan.skipped_unavailable, 1);
+        assert!(plan.actions.iter().all(|action| action.path != legacy));
+        assert_eq!(plan.skipped_unavailable, 2);
         assert!(remove_atomically(&paths, &native).is_err());
+        assert!(remove_atomically(&paths, &legacy).is_err());
         let result = execute(&paths, &plan, false).unwrap();
         assert!(result.reclaimed_bytes > 0);
         assert!(native.join("output").is_file());
+        assert!(legacy.join("output").is_file());
         assert!(!supervised.exists());
     }
 
@@ -1625,6 +1637,7 @@ mod tests {
                 version: rgo_protocol::PROTOCOL_VERSION,
                 workspace_verified: true,
                 supervised_origin: false,
+                supervision_version: 0,
                 workspace_root: root.path().display().to_string(),
                 manifest_path: manifest.display().to_string(),
                 workspace_device: crate::context::workspace_device(root.path()),
@@ -1701,6 +1714,7 @@ mod tests {
             version: rgo_protocol::PROTOCOL_VERSION,
             workspace_verified: true,
             supervised_origin: false,
+            supervision_version: 0,
             workspace_root: root.path().display().to_string(),
             manifest_path: manifest.display().to_string(),
             workspace_device: crate::context::workspace_device(root.path()),
@@ -1792,6 +1806,7 @@ mod tests {
                 version: rgo_protocol::PROTOCOL_VERSION,
                 workspace_verified: true,
                 supervised_origin: false,
+                supervision_version: 0,
                 workspace_root: manifest.parent().unwrap().display().to_string(),
                 manifest_path: manifest.display().to_string(),
                 workspace_device: crate::context::workspace_device(manifest.parent().unwrap()),
@@ -1886,6 +1901,7 @@ mod tests {
                     version: rgo_protocol::PROTOCOL_VERSION,
                     workspace_verified: true,
                     supervised_origin: false,
+                    supervision_version: 0,
                     workspace_root: workspace.display().to_string(),
                     manifest_path: manifest.display().to_string(),
                     workspace_device: crate::context::workspace_device(&workspace),
@@ -1960,6 +1976,7 @@ mod tests {
                         version: rgo_protocol::PROTOCOL_VERSION,
                         workspace_verified: true,
                         supervised_origin: false,
+                        supervision_version: 0,
                         workspace_root: workspace.display().to_string(),
                         manifest_path: manifest.display().to_string(),
                         workspace_device: crate::context::workspace_device(&workspace),

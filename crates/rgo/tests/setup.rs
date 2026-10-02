@@ -546,6 +546,90 @@ fn no_service_undo_stops_daemon_before_removing_activation() {
     };
     assert!(exited, "undo did not stop the private daemon");
     assert!(!sandbox.cargo_home.join(".rgo-install.json").exists());
+
+    // Exercise the same activation transition with a recorded protocol-6
+    // daemon: current clients must reject it, but setup can request only its
+    // unchanged Shutdown operation and wait for the singleton to release.
+    let setup = sandbox
+        .cmd(&cli)
+        .args(["setup", "--no-service"])
+        .output()
+        .unwrap();
+    assert!(
+        setup.status.success(),
+        "{}",
+        String::from_utf8_lossy(&setup.stderr)
+    );
+    let record_path = sandbox.cargo_home.join(".rgo-install.json");
+    let mut record: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&record_path).unwrap()).unwrap();
+    record["protocol_version"] = 6.into();
+    std::fs::write(&record_path, serde_json::to_vec(&record).unwrap()).unwrap();
+    let singleton = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(paths.state_dir().join("daemon.lock"))
+        .unwrap();
+    fs4::fs_std::FileExt::lock_exclusive(&singleton).unwrap();
+    let listener = ipc::Listener::bind(&paths.socket_path()).unwrap();
+    let old_daemon = thread::spawn(move || {
+        let mut current = listener.accept().unwrap();
+        current.set_timeout(Duration::from_secs(5)).unwrap();
+        assert!(
+            matches!(ipc::read_message::<Request>(&mut current).unwrap(),
+            Request::Hello { version, .. } if version == rgo_protocol::PROTOCOL_VERSION)
+        );
+        ipc::write_message(
+            &mut current,
+            &Response::Error {
+                code: "protocol_mismatch".into(),
+                message: "server=6".into(),
+            },
+        )
+        .unwrap();
+        drop(current);
+        let mut legacy = listener.accept().unwrap();
+        legacy.set_timeout(Duration::from_secs(5)).unwrap();
+        assert!(matches!(
+            ipc::read_message::<Request>(&mut legacy).unwrap(),
+            Request::Hello { version: 6, .. }
+        ));
+        ipc::write_message(&mut legacy, &Response::Hello { version: 6 }).unwrap();
+        assert!(matches!(
+            ipc::read_message::<Request>(&mut legacy).unwrap(),
+            Request::Shutdown
+        ));
+        ipc::write_message(&mut legacy, &Response::Ok).unwrap();
+        drop(singleton);
+    });
+    let upgraded = sandbox
+        .cmd(&cli)
+        .args(["setup", "--no-service"])
+        .output()
+        .unwrap();
+    assert!(
+        upgraded.status.success(),
+        "{}",
+        String::from_utf8_lossy(&upgraded.stderr)
+    );
+    old_daemon.join().unwrap();
+    let upgraded_record: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&record_path).unwrap()).unwrap();
+    assert_eq!(
+        upgraded_record["protocol_version"],
+        rgo_protocol::PROTOCOL_VERSION
+    );
+    let undone = sandbox
+        .cmd(&cli)
+        .args(["setup", "--undo", "--no-service"])
+        .output()
+        .unwrap();
+    assert!(
+        undone.status.success(),
+        "{}",
+        String::from_utf8_lossy(&undone.stderr)
+    );
+    assert!(!record_path.exists());
     assert!(
         !std::fs::read_to_string(sandbox.cargo_home.join("config.toml"))
             .unwrap()

@@ -6,7 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u32 = 6;
+pub const PROTOCOL_VERSION: u32 = 7;
 pub const MAX_FRAME_SIZE: usize = 1024 * 1024;
 pub const DEFAULT_LEASE_TTL_SECS: u32 = 30;
 pub const DEFAULT_HEARTBEAT_SECS: u32 = 10;
@@ -21,6 +21,8 @@ pub const SIDECAR_FILE: &str = ".rgo-context.json";
 pub const BYPASS_ENV: &str = "RGO_BYPASS";
 pub const HOME_ENV: &str = "RGO_HOME";
 pub const LEASE_ENV: &str = "RGO_LEASE_ID";
+/// Revision of the producer admission rules, independent of IPC compatibility.
+pub const SUPERVISED_CONTEXT_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContextSidecar {
@@ -33,6 +35,9 @@ pub struct ContextSidecar {
     /// launcher. Older/native contexts keep the conservative lock-time grace.
     #[serde(default)]
     pub supervised_origin: bool,
+    /// Older supervised contexts predate compiler-broker admission checks.
+    #[serde(default)]
+    pub supervision_version: u32,
     pub workspace_root: String,
     pub manifest_path: String,
     /// Unix device ID or Windows volume serial at attribution time. Older
@@ -46,6 +51,12 @@ pub struct ContextSidecar {
     pub toolchain: Option<String>,
     pub first_seen: u64,
     pub last_seen: u64,
+}
+
+impl ContextSidecar {
+    pub fn is_current_supervised(&self) -> bool {
+        self.supervised_origin && self.supervision_version == SUPERVISED_CONTEXT_VERSION
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -501,6 +512,8 @@ mod tests {
         let old = r#"{"version":5,"workspace_root":"/work","manifest_path":"/work/Cargo.toml","toolchain":null,"first_seen":1,"last_seen":2}"#;
         let sidecar: ContextSidecar = serde_json::from_str(old).unwrap();
         assert!(!sidecar.supervised_origin);
+        assert_eq!(sidecar.supervision_version, 0);
+        assert!(!sidecar.is_current_supervised());
         assert_eq!(sidecar.workspace_device, None);
         assert_eq!(sidecar.workspace_mount_id, None);
         assert!(

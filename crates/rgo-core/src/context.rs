@@ -821,7 +821,7 @@ pub fn write_supervised_sidecar(
     let prior = read_sidecar(dir);
     let supervised_origin = newly_created
         || prior.is_some_and(|s| {
-            s.supervised_origin
+            s.is_current_supervised()
                 && s.workspace_root == workspace_root.display().to_string()
                 && s.manifest_path == manifest_path.display().to_string()
         });
@@ -841,6 +841,11 @@ fn write_sidecar_with_origin(
         version: PROTOCOL_VERSION,
         workspace_verified: true,
         supervised_origin,
+        supervision_version: if supervised_origin {
+            rgo_protocol::SUPERVISED_CONTEXT_VERSION
+        } else {
+            0
+        },
         workspace_root: workspace_root.display().to_string(),
         manifest_path: manifest_path.display().to_string(),
         workspace_device: workspace_device(workspace_root),
@@ -1025,6 +1030,15 @@ mod tests {
         assert!(!ensure_managed_context_dir(&paths, &fresh).unwrap());
         write_supervised_sidecar(&fresh, &workspace, &manifest, false).unwrap();
         assert!(read_sidecar(&fresh).unwrap().supervised_origin);
+        let mut old_admission = read_sidecar(&fresh).unwrap();
+        old_admission.supervision_version = 0;
+        std::fs::write(
+            fresh.join(SIDECAR_FILE),
+            serde_json::to_vec(&old_admission).unwrap(),
+        )
+        .unwrap();
+        write_supervised_sidecar(&fresh, &workspace, &manifest, false).unwrap();
+        assert!(!read_sidecar(&fresh).unwrap().is_current_supervised());
 
         let legacy = paths.builds_dir().join("bb/legacy");
         std::fs::create_dir_all(&legacy).unwrap();
@@ -1302,6 +1316,7 @@ mod tests {
             version: PROTOCOL_VERSION,
             workspace_verified: true,
             supervised_origin: false,
+            supervision_version: 0,
             workspace_root: workspace.display().to_string(),
             manifest_path: manifest.display().to_string(),
             workspace_device: workspace_device(&workspace),

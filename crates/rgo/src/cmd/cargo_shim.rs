@@ -77,7 +77,7 @@ pub fn run(
     let mut selection = if std::env::var_os(BYPASS_ENV).is_some() {
         None
     } else {
-        select_context(real_cargo, toolchain, cargo_args, &paths)?
+        select_context(real_cargo, toolchain, cargo_args, &paths, daemon_exe)?
     };
     let mut session = match supervision::lock_cargo_session(
         &paths,
@@ -343,6 +343,7 @@ fn select_context(
     toolchain: Option<&OsStr>,
     args: &[OsString],
     paths: &RgoPaths,
+    daemon_exe: Option<&Path>,
 ) -> Result<Option<(PathBuf, PathBuf)>> {
     if workspace_command(args).is_none() || has_unmanaged_global_option(args) {
         return Ok(None);
@@ -351,6 +352,19 @@ fn select_context(
     // would build. Keep the command available under the global session guard.
     if config_may_override_build_dir().unwrap_or(true) {
         return Ok(None);
+    }
+    match compiler_override_issue(paths, daemon_exe) {
+        Ok(None) => {}
+        Ok(Some(issue)) => {
+            eprintln!("rgo: {issue}; using ordinary Cargo storage");
+            return Ok(None);
+        }
+        Err(error) => {
+            eprintln!(
+                "rgo: compiler settings cannot be verified ({error:#}); using ordinary Cargo storage"
+            );
+            return Ok(None);
+        }
     }
 
     let mut version = Command::new(real_cargo);
@@ -457,6 +471,17 @@ fn config_may_override_build_dir() -> Result<bool> {
 
 #[cfg(any(unix, windows))]
 fn config_directory_may_override(directory: &Path) -> bool {
+    config_directory_matches(directory, |path| {
+        cargo_config::may_set_build_dir_in_file(path)
+    })
+    .unwrap_or(true)
+}
+
+#[cfg(any(unix, windows))]
+fn config_directory_matches(
+    directory: &Path,
+    inspect: impl FnOnce(&Path) -> Result<bool>,
+) -> Result<bool> {
     let legacy = directory.join("config");
     let modern = directory.join("config.toml");
     let path = match std::fs::symlink_metadata(&legacy) {
@@ -464,13 +489,73 @@ fn config_directory_may_override(directory: &Path) -> bool {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             match std::fs::symlink_metadata(&modern) {
                 Ok(_) => modern,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return false,
-                Err(_) => return true,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+                Err(error) => return Err(error.into()),
             }
         }
-        Err(_) => return true,
+        Err(error) => return Err(error.into()),
     };
-    cargo_config::may_set_build_dir_in_file(&path).unwrap_or(true)
+    inspect(&path)
+}
+
+/// Share the admission reason with doctor. The common no-wrapper case needs
+/// no extra process probe; only an explicitly selected rgo wrapper is checked.
+#[cfg(any(unix, windows))]
+pub(super) fn compiler_override_issue(
+    paths: &RgoPaths,
+    daemon_exe: Option<&Path>,
+) -> Result<Option<String>> {
+    fn unverified(approved: Option<&Path>) -> Result<bool> {
+        for key in cargo_config::COMPILER_ENV_KEYS {
+            if let Some(value) = std::env::var_os(key) {
+                if key.ends_with("WRAPPER")
+                    && *key != "RGO_INNER_RUSTC_WRAPPER"
+                    && value
+                        .to_str()
+                        .is_some_and(|value| cargo_config::wrapper_is_approved(value, approved))
+                {
+                    continue;
+                }
+                return Ok(true);
+            }
+        }
+        let cwd = std::env::current_dir()?;
+        for directory in cwd
+            .ancestors()
+            .map(|path| path.join(".cargo"))
+            .chain(std::iter::once(cargo_home()?))
+        {
+            if config_directory_matches(&directory, |path| {
+                cargo_config::may_set_unverified_compiler_in_file(path, approved)
+            })? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+    if !unverified(None)? {
+        return Ok(None);
+    }
+    let issue =
+        "custom compiler or wrapper has no verified full-session writer protection".to_owned();
+    if std::env::var_os("RGO_INNER_RUSTC_WRAPPER").is_some() {
+        return Ok(Some(issue));
+    }
+    match std::fs::read_to_string(paths.state_dir().join("inner-wrapper")) {
+        Ok(value) if !value.trim().is_empty() => return Ok(Some(issue)),
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    let current = std::env::current_exe()?;
+    let approved = super::setup::matching_wrapper_path(daemon_exe.unwrap_or(&current))
+        .ok()
+        .map(PathBuf::from);
+    if approved.is_some() && !unverified(approved.as_deref())? {
+        Ok(None)
+    } else {
+        Ok(Some(issue))
+    }
 }
 
 #[cfg(any(unix, windows))]
