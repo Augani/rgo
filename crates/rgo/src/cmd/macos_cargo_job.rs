@@ -316,6 +316,8 @@ impl PreparedJob {
         paths: &RgoPaths,
         context: &Path,
     ) -> Result<Self> {
+        let started = Instant::now();
+        let deadline = started + STARTUP_TIMEOUT;
         let mut terminal = terminal::Caller::open()?;
         paths.ensure_layout()?;
         let invocation = Invocation {
@@ -368,19 +370,17 @@ impl PreparedJob {
             file.sync_all()?;
         }
         File::open(directory)?.sync_all()?;
-        let bootstrap = Command::new("/bin/launchctl")
-            .arg("bootstrap")
-            .arg(&owner.domain)
-            .arg(directory.join("job.plist"))
-            .output()?;
-        ensure!(
-            bootstrap.status.success(),
-            "Cargo job bootstrap failed: {}",
-            String::from_utf8_lossy(&bootstrap.stderr)
-        );
+        let files_ready = started.elapsed();
         // The guardian owns this directory now, including after the caller exits.
         let _directory = temporary.keep();
-        let deadline = Instant::now() + STARTUP_TIMEOUT;
+        let mut early_cleanup = EarlyCleanup {
+            directory: &_directory,
+            owner: &owner,
+            bytes: &bytes,
+            safe_to_reap: true,
+        };
+        macos_jobs::bootstrap(&_directory, &owner, &bytes, deadline)?;
+        let bootstrapped = started.elapsed();
         let mut stream = loop {
             match listener.accept() {
                 Ok((stream, _)) => break stream,
@@ -410,7 +410,6 @@ impl PreparedJob {
                         .unwrap_or_default();
                     // No request or commit was sent, so this job cannot have
                     // started Cargo or registered a managed context.
-                    let _ = macos_jobs::cleanup(&_directory, &owner, &bytes);
                     bail!("waiting for Cargo guardian: {error}; {diagnostic}");
                 }
             }
@@ -418,13 +417,19 @@ impl PreparedJob {
         // Darwin accept inherits the listener's O_NONBLOCK state. Only the
         // accept loop is nonblocking; framed startup reads have a deadline.
         stream.set_nonblocking(false)?;
-        stream.set_read_timeout(Some(STARTUP_TIMEOUT))?;
-        stream.set_write_timeout(Some(STARTUP_TIMEOUT))?;
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        ensure!(!remaining.is_zero(), "Cargo guardian startup timed out");
+        stream.set_read_timeout(Some(remaining))?;
+        stream.set_write_timeout(Some(remaining))?;
         check_peer(&stream)?;
         ensure!(
             matches!(read_frame::<Message>(&mut stream)?, Message::Greeting { token } if token == owner.token),
             "Cargo guardian authentication failed"
         );
+        let connected = started.elapsed();
+        // From the first request byte the guardian may publish a receipt. It
+        // alone decides when that receipt and loaded job can be retired.
+        early_cleanup.safe_to_reap = false;
         write_frame(&mut stream, &invocation)?;
         let mut descriptors = vec![0, 1, 2];
         if let Some(terminal) = &terminal {
@@ -457,6 +462,13 @@ impl PreparedJob {
             );
             terminal.activate()?;
         }
+        tracing::debug!(
+            files_ms = files_ready.as_secs_f64() * 1000.0,
+            bootstrap_ms = (bootstrapped - files_ready).as_secs_f64() * 1000.0,
+            connection_ms = (connected - bootstrapped).as_secs_f64() * 1000.0,
+            admission_ms = (started.elapsed() - connected).as_secs_f64() * 1000.0,
+            "macOS Cargo guardian preparation"
+        );
         Ok(Self {
             stream,
             terminal,
@@ -467,6 +479,7 @@ impl PreparedJob {
     pub(super) fn run(mut self, mut session: SessionGuard) -> Result<()> {
         session.release_local_for_macos_guardian();
         self.stream.set_read_timeout(None)?;
+        let committed = Instant::now();
         self.stream.write_all(b"S")?; // From here failure cannot retry Cargo.
         let mut reader = self.stream.try_clone()?;
         let (sender, receiver) = std::sync::mpsc::channel();
@@ -508,7 +521,12 @@ impl PreparedJob {
             } else {
                 Duration::from_millis(20)
             }) {
-                Ok(Ok(Message::Started { .. })) => {}
+                Ok(Ok(Message::Started { .. })) => {
+                    tracing::debug!(
+                        elapsed_ms = committed.elapsed().as_secs_f64() * 1000.0,
+                        "macOS Cargo guardian started primary"
+                    );
+                }
                 Ok(Ok(Message::Stopped)) => {
                     if let Some(terminal) = &mut self.terminal {
                         terminal.restore();
@@ -518,6 +536,10 @@ impl PreparedJob {
                     unsafe { libc::raise(libc::SIGSTOP) };
                 }
                 Ok(Ok(Message::Exited { code, signal })) => {
+                    tracing::debug!(
+                        elapsed_ms = committed.elapsed().as_secs_f64() * 1000.0,
+                        "macOS Cargo guardian primary result"
+                    );
                     if let Some(terminal) = &mut self.terminal {
                         terminal.drain_output()?;
                         terminal.restore();

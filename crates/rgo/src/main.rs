@@ -164,7 +164,7 @@ fn main() -> Result<()> {
             previous(panic);
         }));
     } else {
-        subscriber.init();
+        subscriber.with_writer(std::io::stderr).init();
     }
 
     let result = match cli.cmd {

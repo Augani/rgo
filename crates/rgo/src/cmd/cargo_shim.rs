@@ -39,6 +39,7 @@ pub fn run(
     daemon_exe: Option<&Path>,
     args: Vec<OsString>,
 ) -> Result<()> {
+    let started = std::time::Instant::now();
     if !real_cargo.is_absolute() {
         bail!("--real-cargo must be an absolute path to the existing Cargo executable");
     }
@@ -79,6 +80,7 @@ pub fn run(
     } else {
         select_context(real_cargo, toolchain, cargo_args, &paths, daemon_exe)?
     };
+    let selected = started.elapsed();
     let mut session = match supervision::lock_cargo_session(
         &paths,
         selection.as_ref().map(|(dir, _)| dir.as_path()),
@@ -178,6 +180,11 @@ pub fn run(
         command_args.push(OsString::from(setting));
     }
     command_args.extend(cargo_args.iter().cloned());
+    tracing::debug!(
+        selection_ms = selected.as_secs_f64() * 1000.0,
+        activation_ms = (started.elapsed() - selected).as_secs_f64() * 1000.0,
+        "supervised Cargo launch preparation"
+    );
     // Private pilot: exercise the installed unchanged-command launcher
     // before making launchd transport part of the supported activation mode.
     #[cfg(target_os = "macos")]
@@ -367,6 +374,7 @@ fn select_context(
     paths: &RgoPaths,
     daemon_exe: Option<&Path>,
 ) -> Result<Option<(PathBuf, PathBuf)>> {
+    let started = std::time::Instant::now();
     if workspace_command(args).is_none() || has_unmanaged_global_option(args) {
         return Ok(None);
     }
@@ -389,22 +397,12 @@ fn select_context(
         }
     }
 
+    let validated = started.elapsed();
     let mut version = Command::new(real_cargo);
     if let Some(toolchain) = toolchain {
         version.arg(toolchain);
     }
-    let Ok(version) = version.arg("--version").output() else {
-        return Ok(None);
-    };
-    if !version.status.success()
-        || !cargo_config::supports_build_dir(&String::from_utf8_lossy(&version.stdout))
-    {
-        eprintln!(
-            "rgo: active Cargo does not support managed build storage (requires 1.91+); using ordinary Cargo storage"
-        );
-        return Ok(None);
-    }
-
+    version.arg("--version");
     let mut locate = Command::new(real_cargo);
     if let Some(toolchain) = toolchain {
         locate.arg(toolchain);
@@ -413,7 +411,33 @@ fn select_context(
     if let Some(manifest) = argument_value(args, "--manifest-path") {
         locate.arg("--manifest-path").arg(manifest);
     }
-    let Ok(output) = locate.output() else {
+    // Both are independent queries against the exact same Cargo selection.
+    // Verify fresh results every time; a rustup proxy's bytes alone do not
+    // identify the active toolchain or workspace. Thread creation/query failure
+    // keeps the invocation outside managed storage.
+    let queries = std::thread::scope(|scope| -> Result<_> {
+        let version = std::thread::Builder::new()
+            .name("rgo-cargo-version".to_owned())
+            .spawn_scoped(scope, move || version.output())?;
+        let workspace = locate.output();
+        let version = version
+            .join()
+            .map_err(|_| anyhow::anyhow!("Cargo version query panicked"))?;
+        Ok((version, workspace))
+    });
+    let Ok((Ok(version), output)) = queries else {
+        return Ok(None);
+    };
+    let queried = started.elapsed();
+    if !version.status.success()
+        || !cargo_config::supports_build_dir(&String::from_utf8_lossy(&version.stdout))
+    {
+        eprintln!(
+            "rgo: active Cargo does not support managed build storage (requires 1.91+); using ordinary Cargo storage"
+        );
+        return Ok(None);
+    }
+    let Ok(output) = output else {
         return Ok(None);
     };
     if !output.status.success() {
@@ -442,6 +466,12 @@ fn select_context(
     let Ok(dir) = supervision::context_for_workspace(paths, root) else {
         return Ok(None);
     };
+    tracing::debug!(
+        validation_ms = validated.as_secs_f64() * 1000.0,
+        queries_ms = (queried - validated).as_secs_f64() * 1000.0,
+        identity_ms = (started.elapsed() - queried).as_secs_f64() * 1000.0,
+        "supervised Cargo context selection"
+    );
     Ok(Some((dir, root.to_path_buf())))
 }
 

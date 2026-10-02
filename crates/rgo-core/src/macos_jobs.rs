@@ -19,6 +19,8 @@ const MAX_RECORD_BYTES: u64 = 16 * 1024;
 const BOOTOUT_TIMEOUT: Duration = Duration::from_secs(2);
 pub const JOB_PREFIX: &str = "macos-cargo-job-";
 
+mod command;
+
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct CargoJobOwner {
@@ -186,6 +188,30 @@ pub fn verify_owner(directory: &Path, owner: &CargoJobOwner, bytes: &[u8]) -> Re
     Ok(())
 }
 
+/// The caller has not supplied any invocation yet. Registration failure can
+/// therefore fence the rendezvous and unload the owned job without admitting
+/// a managed writer. Keep its record until that cleanup is attempted.
+pub fn bootstrap(
+    directory: &Path,
+    owner: &CargoJobOwner,
+    bytes: &[u8],
+    deadline: Instant,
+) -> Result<()> {
+    verify_owner(directory, owner, bytes)?;
+    let status = command::run(
+        Command::new("/bin/launchctl")
+            .arg("bootstrap")
+            .arg(&owner.domain)
+            .arg(directory.join("job.plist"))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null()),
+        deadline,
+    )?;
+    ensure!(status.success(), "Cargo job bootstrap failed: {status}");
+    Ok(())
+}
+
 /// Only call after durable retirement under a session guard, or while holding
 /// exclusive GC guards. Removing the one-use rendezvous fences job restarts.
 pub fn cleanup(directory: &Path, owner: &CargoJobOwner, bytes: &[u8]) -> Result<()> {
@@ -222,24 +248,15 @@ pub fn cleanup(directory: &Path, owner: &CargoJobOwner, bytes: &[u8]) -> Result<
     }
     std::fs::remove_dir(directory)?;
     File::open(directory.parent().context("Cargo job has no parent")?)?.sync_all()?;
-    let mut command = Command::new("/bin/launchctl")
-        .args(["bootout", &owner.target()])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
-    let deadline = Instant::now() + BOOTOUT_TIMEOUT;
-    loop {
-        if command.try_wait()?.is_some() {
-            return Ok(()); // An already unloaded job is also safe.
-        }
-        if Instant::now() >= deadline {
-            let _ = command.kill();
-            let _ = command.wait();
-            anyhow::bail!("Cargo job bootout timed out");
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
+    let _status = command::run(
+        Command::new("/bin/launchctl")
+            .args(["bootout", &owner.target()])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null()),
+        Instant::now() + BOOTOUT_TIMEOUT,
+    )?;
+    Ok(()) // An already unloaded job is also safe.
 }
 
 /// Retain the directory iterator across maintenance passes, so busy or edited
