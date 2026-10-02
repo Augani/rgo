@@ -490,7 +490,7 @@ path never opens the terminal and never applies saved terminal modes.
   format or adding dependencies to the rustc wrapper.
 - [x] Preserve current-boot live shells or lease callers, uncertain process
   queries, unsupported records, nonlocal volumes, unknown entries, and changed
-  bytes or file identities. Explicit undo instead requires the same current
+  bytes or file identities during journaled retirement. Explicit undo instead requires the same current
   shell, boot, and terminal and still refuses a live caller.
 - [x] Use nonblocking owned locks and check their boolean acquisition result.
   The earlier `fs4` call ignored `Ok(false)` under contention; both host and
@@ -507,7 +507,7 @@ path never opens the terminal and never applies saved terminal modes.
   counter, and restart of the real daemon after the first journaled unlink.
 - [ ] Complete interruption coverage while publishing registration/counters,
   including temporary or incomplete records lacking enough ownership evidence.
-- [ ] Validate this batch in platform CI before counting its platform evidence.
+- [x] Validate this batch in platform CI before counting its platform evidence.
 
 Maintenance retains its directory iterator, considers at most 16 entries per
 pass, and removes at most two metadata files per entry. A 50 ms elapsed budget
@@ -519,7 +519,13 @@ the full terminal runtime matrix, or the performance activation gate.
 Local macOS 27.2 arm64 validation passed the all-bin build, the two existing
 focused macOS cases, all-target Clippy with warnings denied, format, and diff
 checks. The extended coalition case completed in 17.86 seconds; no equivalent
-Rust test case or redundant full local suite was added. Platform CI is pending.
+Rust test case or redundant full local suite was added. The
+[19-job platform run](https://github.com/Augani/rgo/actions/runs/37020240840)
+passed at `95d7358`, including the extended case in the Intel guardian lane and
+full macOS stable/beta/nightly suites, all three Rust 1.85 source builds,
+Linux/Windows workspace and installer checks, and the existing 100-project
+recovery probes. This completes this batch's platform evidence without closing
+the remaining startup, runtime, IDE, or performance release gates.
 
 ## Integrate with unchanged Cargo commands
 

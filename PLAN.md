@@ -151,8 +151,11 @@ header is removed; exact file identities and digests preserve added or edited
 content. Busy nonblocking locks now refuse recovery instead of ignoring the
 lock API's `false` result. The existing fixture checks real contention and
 daemon restart during retirement. Registration interruptions and platform
-validation remain open in the
+coverage beyond the current matrix remain open in the
 [macOS checklist](docs/macos-cargo-supervision.md#abandoned-terminal-host-retirement).
+The [19-job platform run](https://github.com/Augani/rgo/actions/runs/37020240840)
+passed at `95d7358`, including the extended Intel/macOS fixture and full
+existing platform suites, installers, source builds, and recovery probes.
 
 The [19-job run](https://github.com/Augani/rgo/actions/runs/36998573830) passed
 at `5557f94`, including Intel macOS 15.7.9 and all existing platform suites.

@@ -684,3 +684,12 @@ and continuation by a real daemon restarted after the first unlink. It adds
 no Rust test case. Incomplete registrations and all interruption points remain
 outside this completed-record design; the broader activation and performance
 gates remain open in the [checklist](macos-cargo-supervision.md#abandoned-terminal-host-retirement).
+
+The [19-job platform run](https://github.com/Augani/rgo/actions/runs/37020240840)
+passed at `95d7358`, including the extended registered-shell fixture in the
+Intel guardian lane and full macOS stable/beta/nightly suites, all three Rust
+1.85 source builds, Linux/Windows suites and installer checks, and the existing
+100-project recovery probes. Local macOS 27.2 arm64 all-bin build, the two
+existing focused cases, all-target Clippy with warnings denied, format, and
+diff checks also passed. This is completed-batch evidence, not normal activation
+or an unattended-storage release claim.

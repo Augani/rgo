@@ -168,9 +168,12 @@ have a separate daemon retirement path with a synced sibling journal, exact
 byte/file identity checks, and live-process exclusion. It never changes terminal
 modes or authorizes build-data deletion. The existing fixture exercises busy
 locks and continuation by a restarted daemon after the first removal. Incomplete
-registration, the remaining lifecycle/runtime matrix, and platform validation
+registration and the remaining lifecycle/runtime matrix
 are still open in the
 [macOS checklist](macos-cargo-supervision.md#abandoned-terminal-host-retirement).
+The [19-job platform run](https://github.com/Augani/rgo/actions/runs/37020240840)
+passed at `95d7358`, including this fixture in the Intel and full macOS lanes,
+all existing platform suites, source builds, installers, and recovery checks.
 
 **macOS priority (2026-10-02):** a private real-Cargo audit reproduced deletion
 while a detached child with closed inherited descriptors was still writing.
