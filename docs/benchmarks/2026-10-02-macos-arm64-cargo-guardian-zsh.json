@@ -1,0 +1,116 @@
+{
+  "platform": "macOS-27.2-arm64-arm-64bit-Mach-O",
+  "cargo": "cargo 1.98.0 (797e8a9bc 2026-08-05)",
+  "rustc": "rustc 1.98.0 (88d9e12ae 2026-08-18)",
+  "rgo": "rgo 0.1.0",
+  "source_commit": "ba023fadc0ccb7ef5ee61c2228a75bce4ea416a1",
+  "source_dirty": false,
+  "percentile_method": "nearest_rank",
+  "rgo_binary_sha256": "8428983de26b671044ab851fdf4d207f01b17969278e87e24a20b59b170552af",
+  "wrapper_binary_sha256": "abaa307441b3062aa2fec65258983c81a23ba82064850210d2228a63be69847a",
+  "cache_enabled": false,
+  "automatic_gc_enabled": false,
+  "macos_supervisor_pilot": true,
+  "terminal_shell": "zsh 5.9",
+  "sample_boundary": "command dispatch through completed prompt",
+  "warm_noop": {
+    "plain": {
+      "median_ms": 28.8,
+      "p95_ms": 34.8,
+      "samples_ms": [
+        28.2,
+        25.2,
+        21.3,
+        32.1,
+        24.2,
+        31.0,
+        24.7,
+        31.7,
+        27.8,
+        35.0,
+        29.3,
+        31.3,
+        23.9,
+        31.4,
+        24.7,
+        34.8,
+        27.2,
+        30.7,
+        24.2,
+        32.5,
+        25.2,
+        29.6,
+        24.5,
+        31.3
+      ]
+    },
+    "supervised": {
+      "median_ms": 138.9,
+      "p95_ms": 154.7,
+      "samples_ms": [
+        138.4,
+        138.8,
+        121.0,
+        137.4,
+        124.4,
+        146.3,
+        130.8,
+        144.1,
+        140.7,
+        163.4,
+        139.0,
+        153.4,
+        140.4,
+        154.7,
+        128.1,
+        148.3,
+        131.2,
+        146.7,
+        143.8,
+        142.1,
+        125.1,
+        138.3,
+        128.2,
+        137.2
+      ]
+    }
+  },
+  "edit_build": {
+    "plain": {
+      "median_ms": 130.9,
+      "p95_ms": 146.2,
+      "samples_ms": [
+        123.5,
+        138.4,
+        109.9,
+        139.8,
+        110.4,
+        139.9,
+        109.4,
+        141.4,
+        111.9,
+        139.9,
+        110.8,
+        146.2
+      ]
+    },
+    "supervised": {
+      "median_ms": 250.5,
+      "p95_ms": 279.9,
+      "samples_ms": [
+        242.0,
+        279.9,
+        232.1,
+        270.6,
+        229.4,
+        262.6,
+        234.0,
+        258.9,
+        230.0,
+        260.0,
+        240.9,
+        264.1
+      ]
+    }
+  }
+}

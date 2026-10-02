@@ -138,6 +138,11 @@ PID identities; no Rust test case was added. Normal activation remains disabled
 while runtime, nested Cargo, IDE, metadata recovery, and performance
 gates remain open. Details are in the
 [macOS checklist](docs/macos-cargo-supervision.md#shell-cooperation-feasibility).
+The optimized terminal-path [paired samples](docs/benchmarks/2026-10-02-macos-arm64-cargo-guardian-zsh.json)
+at clean `ba023fa` add 110.1 ms for no-ops and 119.6 ms for edits, including
+dispatch through the recovered prompt. Both exceed the proposed 100 ms target.
+The [19-job platform run](https://github.com/Augani/rgo/actions/runs/37014509991)
+passed at `ba023fa`, including Intel/macOS and all existing platform suites.
 
 The [19-job run](https://github.com/Augani/rgo/actions/runs/36998573830) passed
 at `5557f94`, including Intel macOS 15.7.9 and all existing platform suites.

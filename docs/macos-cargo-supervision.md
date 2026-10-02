@@ -459,9 +459,24 @@ compare separate private interactive zsh sessions. Only the managed session
 registers recovery. Alternating paired commands use the same disposable crate
 and Cargo home; their timer includes command dispatch, hooks, Cargo, and the
 completed prompt. Any guardian fallback invalidates the measurement. A short
-debug run verified this measurement path and bounded PTY teardown; optimized
-24-no-op/12-edit samples are the next performance observation. This does not
-replace the representative-workload gate.
+debug run verified this measurement path and bounded PTY teardown. The
+[optimized 24-no-op/12-edit samples](benchmarks/2026-10-02-macos-arm64-cargo-guardian-zsh.json)
+come from clean `ba023fa` with exact binary hashes, cache and automatic GC off,
+and no accepted guardian fallback. No-op medians were 28.8 ms plain versus
+138.9 ms registered guardian, adding 110.1 ms; edit medians were 130.9 ms versus
+250.5 ms, adding 119.6 ms. Both exceed the proposed 100 ms allowance. Timers end
+at the completed prompt, so these samples include shell recovery overhead and
+are kept separate from the previous nonterminal subprocess measurements.
+Normal activation remains off; this tiny-crate result does not replace the
+representative-workload gate.
+
+The [19-job platform run](https://github.com/Augani/rgo/actions/runs/37014509991)
+passed at `ba023fa`, including the actual registered-shell fixture in the
+Intel guardian lane and full macOS stable/beta/nightly suites, all three Rust
+1.85 source builds, Linux/Windows suites, installer checks, and the existing
+100-project recovery probes. This closes this batch's platform validation;
+it does not close the broader supported-shell, lifecycle, IDE, or performance
+release gates.
 
 ## Integrate with unchanged Cargo commands
 
