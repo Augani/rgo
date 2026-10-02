@@ -1381,7 +1381,7 @@ impl StateDb {
     }
 
     /// Keep diagnostic rows finite while retaining cumulative bypasses and the
-    /// most recent real GC run used by the age-maintenance clock.
+    /// most recent real GC run. The retention clock lives in schema_meta.
     pub fn prune_operational_history(&self) -> Result<()> {
         let transaction = self.connection.unchecked_transaction()?;
         let last_event: i64 = transaction.query_row(
@@ -1627,14 +1627,17 @@ impl StateDb {
         &self,
         dry_run: bool,
         aggressive: bool,
+        age_maintenance: bool,
         report: &rgo_protocol::GcReport,
         error: Option<&str>,
     ) -> Result<()> {
-        self.connection.execute(
+        let transaction = self.connection.unchecked_transaction()?;
+        let finished_at = unix_now();
+        transaction.execute(
             "INSERT INTO gc_runs(started_at, finished_at, dry_run, aggressive, reclaimed_bytes, skipped_live, skipped_leased, error)
              VALUES(?1, ?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
-                unix_now(),
+                finished_at,
                 i64::from(dry_run),
                 i64::from(aggressive),
                 report.reclaimed_bytes as i64,
@@ -1643,7 +1646,36 @@ impl StateDb {
                 error,
             ],
         )?;
+        if !dry_run && age_maintenance {
+            transaction.execute(
+                "INSERT INTO schema_meta(key, value) VALUES('last_age_maintenance_at', ?1)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                params![finished_at.to_string()],
+            )?;
+        }
+        transaction.commit()?;
         Ok(())
+    }
+
+    /// A missing clock requests retention on the next automatic tick, including
+    /// after an upgrade. Pressure/manual passes and previews never advance it.
+    /// A backwards clock jump requests one pass to establish a new baseline.
+    pub fn age_maintenance_due(&self, now: u64) -> Result<bool> {
+        let last: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT value FROM schema_meta WHERE key = 'last_age_maintenance_at'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let last = last
+            .map(|value| value.parse::<u64>())
+            .transpose()
+            .context("reading age-maintenance clock")?;
+        Ok(last.is_none_or(|last| {
+            now < last || now - last >= crate::gc::AGE_MAINTENANCE_INTERVAL.as_secs()
+        }))
     }
 
     pub fn last_gc(&self) -> Result<Option<LastGc>> {
@@ -2398,6 +2430,12 @@ mod tests {
                 [],
             )
             .unwrap();
+        transaction
+            .execute(
+                "INSERT INTO schema_meta(key, value) VALUES('last_age_maintenance_at', '77')",
+                [],
+            )
+            .unwrap();
         transaction.commit().unwrap();
 
         db.prune_operational_history().unwrap();
@@ -2440,6 +2478,9 @@ mod tests {
         );
         assert_eq!(db.cache_stats(false, 0).unwrap().bypasses, 5_002);
         assert_eq!(db.last_real_gc_at().unwrap(), 77);
+        assert!(!db.age_maintenance_due(77).unwrap());
+        assert!(db.age_maintenance_due(76).unwrap());
+        assert!(db.age_maintenance_due(3677).unwrap());
         assert_eq!(
             db.connection
                 .query_row("SELECT COUNT(*) FROM gc_runs", [], |row| row
@@ -2457,6 +2498,16 @@ mod tests {
                 .unwrap(),
             1
         );
+        db.record_gc(false, false, false, &Default::default(), None)
+            .unwrap();
+        db.record_gc(true, false, true, &Default::default(), None)
+            .unwrap();
+        assert!(db.age_maintenance_due(3677).unwrap());
+        db.record_gc(false, false, true, &Default::default(), None)
+            .unwrap();
+        drop(db);
+        let db = StateDb::open(&paths).unwrap();
+        assert!(!db.age_maintenance_due(unix_now()).unwrap());
     }
 
     #[test]

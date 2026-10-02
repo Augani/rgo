@@ -16,8 +16,7 @@ pub fn run(dry_run: bool, aggressive: bool, auto: bool, target: Option<String>) 
         let managed_bytes = rgo_core::size::managed_snapshot(&e.paths)?.total_bytes();
         let free_bytes = config::volume_free_bytes_checked(&e.paths.root)?;
         let age_due = rgo_core::db::StateDb::open_read_only(&e.paths)
-            .and_then(|db| db.last_real_gc_at())
-            .map(|at| context::unix_now().saturating_sub(at) >= 3600)
+            .and_then(|db| db.age_maintenance_due(context::unix_now()))
             .unwrap_or(managed_bytes > 0);
         if managed_bytes <= e.cfg.soft_watermark && free_bytes >= e.cfg.min_free_space && !age_due {
             return Ok(());

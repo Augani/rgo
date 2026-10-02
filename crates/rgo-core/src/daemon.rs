@@ -31,7 +31,6 @@ use rgo_remote::{Client as RemoteClient, Config as RemoteConfig, Fetch as Remote
 
 const POLL_INTERVAL: Duration = Duration::from_secs(30);
 const AUTO_SCAN_INTERVAL: Duration = Duration::from_secs(120);
-const AGE_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(3600);
 const MAX_AUTO_SCAN_ENTRIES_PER_PASS: usize = 8192;
 const MAX_EVENT_DRAINS_PER_PASS: usize = 4;
 const MAX_EVENT_SCAN_ENTRIES_PER_PASS: usize = 256;
@@ -1269,8 +1268,11 @@ fn run_gc(
     let free_bytes = volume_free_bytes_checked(&state.paths.root)?;
     let trigger = managed_bytes > state.cfg.soft_watermark || free_bytes < state.cfg.min_free_space;
     let age_due = auto
-        && crate::context::unix_now().saturating_sub(state.db.lock().unwrap().last_real_gc_at()?)
-            >= AGE_MAINTENANCE_INTERVAL.as_secs();
+        && state
+            .db
+            .lock()
+            .unwrap()
+            .age_maintenance_due(crate::context::unix_now())?;
     if auto && !trigger && !age_due {
         return Ok(GcReport {
             dry_run,
@@ -1788,13 +1790,14 @@ fn run_gc(
         db.record_gc(
             dry_run,
             aggressive,
+            age_due,
             &report,
             report.first_execution_skip.as_deref(),
         )?;
         return Ok(report);
     }
     let db = state.db.lock().unwrap();
-    db.record_gc(dry_run, aggressive, &report, None)?;
+    db.record_gc(dry_run, aggressive, age_due, &report, None)?;
     Ok(report)
 }
 
@@ -2488,8 +2491,7 @@ fn maintenance(state: &State) -> Result<()> {
                     }
                 })?;
             let free_bytes = volume_free_bytes_checked(&state.paths.root)?;
-            let age_due = now.saturating_sub(state.db.lock().unwrap().last_real_gc_at()?)
-                >= AGE_MAINTENANCE_INTERVAL.as_secs();
+            let age_due = state.db.lock().unwrap().age_maintenance_due(now)?;
             let urgent = free_bytes < state.cfg.min_free_space || age_due;
             // This advisory scan runs outside the operation lock. It visits a
             // bounded number of entries per tick; the GC pass takes a fresh

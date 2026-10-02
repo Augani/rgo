@@ -233,6 +233,12 @@ auto = false             # unattended deletion awaits the Cargo lifecycle safety
 enabled = false
 ```
 
+Retention durations measure time since a context's last use. When automatic
+cleanup is enabled in supervised mode, an hourly retention pass runs even below
+the storage watermark. A missing workspace manifest becomes eligible after
+`orphan_grace` of inactivity, provided its volume is still available and the
+context has no active build or pin. The grace is not a timer from project deletion.
+
 ## License
 
 MIT OR Apache-2.0

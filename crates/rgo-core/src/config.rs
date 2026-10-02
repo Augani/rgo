@@ -35,6 +35,8 @@ pub struct Gc {
     pub incremental_retention: Duration,
     #[serde(with = "humantime_serde")]
     pub context_retention: Duration,
+    /// Minimum inactivity before reclaiming a confirmed missing manifest;
+    /// measured from last use, not from when deletion was first observed.
     #[serde(with = "humantime_serde")]
     pub orphan_grace: Duration,
     /// Age limit for unused compiler-result manifests. Shared objects remain

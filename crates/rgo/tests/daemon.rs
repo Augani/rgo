@@ -1094,6 +1094,11 @@ fn automatic_maintenance_reclaims_an_orphan_without_storage_pressure() {
     };
     paths.ensure_layout().unwrap();
     let project = sb.simple_bin("age-orphan").unwrap();
+    // A recent pressure/manual pass must not postpone scheduled retention.
+    rgo_core::db::StateDb::open(&paths)
+        .unwrap()
+        .record_gc(false, false, false, &Default::default(), None)
+        .unwrap();
     let context = paths.builds_dir().join("aa/orphan");
     std::fs::create_dir_all(&context).unwrap();
     std::fs::write(context.join("intermediates"), vec![0u8; 1024 * 1024]).unwrap();

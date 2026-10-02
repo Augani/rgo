@@ -17,6 +17,9 @@ use crate::size::Scanner;
 /// Phase 2 replaces this with daemon leases).
 pub const LIVE_WINDOW: Duration = Duration::from_secs(10 * 60);
 
+/// Retention runs on its own clock so pressure passes cannot postpone it.
+pub const AGE_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(3600);
+
 /// The full-session guard and final held-lock check protect a context created
 /// by the supervised launcher. Older or native contexts retain the timestamp
 /// grace because their earlier writers may not have used that guard.
