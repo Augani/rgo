@@ -823,9 +823,9 @@ signal without a commit; ignored SIGINT still committed successfully. The
 existing interrupt fixture also passed after starting the caller with SIGCONT
 both ignored and blocked. Local macOS 27.2 arm64 passed the two existing cases
 in 31.09 s and 3.41 s, plus all-bin build and zero-warning all-target Clippy.
-The debug-only handshake hook is not compiled into release binaries. Platform
-verification is pending; this evidence covers the observed late-preparation
-point, not every startup cut or a signal arriving after the cancellation check.
+The debug-only handshake hook is not compiled into release binaries. This
+evidence covers the observed late-preparation point, not every startup cut or
+a signal arriving after the cancellation check.
 
 The original macOS stable interrupt failure completed in 0.91 s according to
 its archived job log, so its child's thirty-second expiry does not explain that
@@ -838,3 +838,13 @@ retain the three before/after subcase statuses. Optimized all-bin build,
 formatting, and diff checks passed; audit markers are absent from release
 `rgo`/`rgo-rustc-wrapper` and present in debug `rgo` as a positive control. The previous
 `b4f9e46` performance sample does not measure this change.
+
+The [19-job platform run](https://github.com/Augani/rgo/actions/runs/37042790239)
+passed at `db8bbfe` without a retry. The actual coalition and interrupt cases
+passed on macOS 14.8.9 arm64 in 9.53 s / 1.40 s and macOS 15.7.9 Intel in
+20.89 s / 2.14 s, using Cargo/rustc 1.99.0. The Intel log also records all three
+cancellation subcases with the expected commit/status outcomes. Full macOS
+stable/beta/nightly and Linux/Windows suites, all source-build and compatibility
+lanes, installers/services, and existing budget recovery checks passed. This
+completes this batch's platform verification; broader inherited-signal, startup,
+IDE, runtime-range and performance gates remain open.

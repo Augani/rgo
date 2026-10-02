@@ -36,5 +36,121 @@
     "cargo fmt --all -- --check: passed",
     "git diff --check: passed"
   ],
-  "limits": "Observed late-preparation point only. Signal timing after the cancellation check, other startup cuts, supported runtime matrix, the earlier unexplained interrupt failure and separate terminal startup timeout remain open. Historical b4f9e46 performance measurements do not measure this change."
+  "limits": "Observed late-preparation point only. Signal timing after the cancellation check, other startup cuts, supported runtime matrix, the earlier unexplained interrupt failure and separate terminal startup timeout remain open. Historical b4f9e46 performance measurements do not measure this change.",
+  "platform_verification": {
+    "native_commit": "db8bbfe86e8b69ced8bc39e63c7cb14c576daca1",
+    "run_url": "https://github.com/Augani/rgo/actions/runs/37042790239",
+    "result": "19 of 19 jobs succeeded without retry",
+    "macos_arm64": {
+      "os": "macOS 14.8.9 build 23J631",
+      "toolchain": "Cargo/rustc 1.99.0 stable",
+      "coalition_case_seconds": 9.53,
+      "interrupt_case_seconds": 1.4,
+      "result": "Complete workspace, installers, recovery, Clippy, format and diff checks passed"
+    },
+    "macos_intel": {
+      "os": "macOS 15.7.9 build 24G830",
+      "toolchain": "Cargo/rustc 1.99.0 stable",
+      "coalition_case_seconds": 20.89,
+      "interrupt_case_seconds": 2.14,
+      "result": "Three cancellation subcase statuses match the local after-fix observations; both existing cases passed"
+    },
+    "jobs": [
+      {
+        "name": "Linux btrfs smoke",
+        "result": "success",
+        "url": "https://github.com/Augani/rgo/actions/runs/37042790239/job/110956742216"
+      },
+      {
+        "name": "Pinned nightly layout / windows-latest",
+        "result": "success",
+        "url": "https://github.com/Augani/rgo/actions/runs/37042790239/job/110956742498"
+      },
+      {
+        "name": "Cargo 1.90/1.91 activation / macos-14",
+        "result": "success",
+        "url": "https://github.com/Augani/rgo/actions/runs/37042790239/job/110956742541"
+      },
+      {
+        "name": "windows-latest / stable",
+        "result": "success",
+        "url": "https://github.com/Augani/rgo/actions/runs/37042790239/job/110956742545"
+      },
+      {
+        "name": "Cargo 1.90/1.91 activation / windows-latest",
+        "result": "success",
+        "url": "https://github.com/Augani/rgo/actions/runs/37042790239/job/110956742577"
+      },
+      {
+        "name": "Pinned nightly layout / ubuntu-latest",
+        "result": "success",
+        "url": "https://github.com/Augani/rgo/actions/runs/37042790239/job/110956742597"
+      },
+      {
+        "name": "Source build / Rust 1.85 / ubuntu-latest",
+        "result": "success",
+        "url": "https://github.com/Augani/rgo/actions/runs/37042790239/job/110956742650"
+      },
+      {
+        "name": "Pinned nightly layout / macos-14",
+        "result": "success",
+        "url": "https://github.com/Augani/rgo/actions/runs/37042790239/job/110956742658"
+      },
+      {
+        "name": "macOS Intel Cargo guardian",
+        "result": "success",
+        "url": "https://github.com/Augani/rgo/actions/runs/37042790239/job/110956742694"
+      },
+      {
+        "name": "Source build / Rust 1.85 / windows-latest",
+        "result": "success",
+        "url": "https://github.com/Augani/rgo/actions/runs/37042790239/job/110956742700"
+      },
+      {
+        "name": "Cargo 1.90/1.91 activation / ubuntu-latest",
+        "result": "success",
+        "url": "https://github.com/Augani/rgo/actions/runs/37042790239/job/110956742735"
+      },
+      {
+        "name": "ubuntu-latest / nightly",
+        "result": "success",
+        "url": "https://github.com/Augani/rgo/actions/runs/37042790239/job/110956742809"
+      },
+      {
+        "name": "Source build / Rust 1.85 / macos-14",
+        "result": "success",
+        "url": "https://github.com/Augani/rgo/actions/runs/37042790239/job/110956742821"
+      },
+      {
+        "name": "windows-latest / beta",
+        "result": "success",
+        "url": "https://github.com/Augani/rgo/actions/runs/37042790239/job/110956742869"
+      },
+      {
+        "name": "ubuntu-latest / stable",
+        "result": "success",
+        "url": "https://github.com/Augani/rgo/actions/runs/37042790239/job/110956742885"
+      },
+      {
+        "name": "macos-14 / stable",
+        "result": "success",
+        "url": "https://github.com/Augani/rgo/actions/runs/37042790239/job/110956742886"
+      },
+      {
+        "name": "macos-14 / nightly",
+        "result": "success",
+        "url": "https://github.com/Augani/rgo/actions/runs/37042790239/job/110956743021"
+      },
+      {
+        "name": "macos-14 / beta",
+        "result": "success",
+        "url": "https://github.com/Augani/rgo/actions/runs/37042790239/job/110956743056"
+      },
+      {
+        "name": "ubuntu-latest / beta",
+        "result": "success",
+        "url": "https://github.com/Augani/rgo/actions/runs/37042790239/job/110956743081"
+      }
+    ]
+  }
 }

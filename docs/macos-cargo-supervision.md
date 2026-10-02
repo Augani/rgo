@@ -766,12 +766,18 @@ cancellation, runtime, and performance gates stay open.
   handshake audit requires a private owned directory, is enabled explicitly,
   and is excluded from release binaries. Each cancellation subcase requires
   owned job retirement and actual idle-context deletion before continuing.
-- [ ] Verify this change across the existing platform lanes. Local all-bin
+- [x] Verify this change across the existing platform lanes. Local all-bin
   build and zero-warning all-target Clippy passed; the coalition/terminal case
   passed in 31.09 s and the interrupt case in 3.41 s on macOS 27.2 arm64.
 - [ ] Cover the remaining startup cuts and signal timing after the cancellation
   check, and complete the inherited signal/mask and terminal compatibility
   matrix before normal activation.
+- [ ] Verify originally blocked termination and pending signals across exec;
+  classify unsupported caller states before admission rather than losing
+  notifications when Cargo starts in a different process.
+- [ ] Verify post-exec changes to an initially ignored action, including a
+  running application that installs its own handler and direct signals to a
+  background shell job's process group.
 - [ ] Resolve the original macOS stable interrupt failure and the later local
   terminal startup timeout. The original failed job's archived log reports
   0.91 s for the interrupt case; its child's thirty-second expiry cannot explain
@@ -789,6 +795,17 @@ open. Protocol 9 and admission revision 4 are unchanged.
 The [captured subcase observations](probes/2026-10-02-macos-preparation-cancellation.json)
 record the baseline instrumentation, before/after statuses, and exact local
 command. Optimized all-bin build, formatting and diff checks also passed.
-Audit strings are absent from release `rgo`/`rgo-rustc-wrapper`, with their presence in
-debug `rgo` as the positive control. The earlier `b4f9e46` benchmark is historical
-performance evidence and does not measure this signal-handling change.
+Audit strings are absent from release `rgo`/`rgo-rustc-wrapper`, with their
+presence in debug `rgo` as the positive control. The earlier `b4f9e46` benchmark
+is historical performance evidence and does not measure this signal-handling
+change.
+
+The [19-job platform run](https://github.com/Augani/rgo/actions/runs/37042790239)
+passed at `db8bbfe` without a retry. Actual coalition/interrupt times were
+9.53 s / 1.40 s on macOS 14.8.9 build 23J631 arm64 and 20.89 s / 2.14 s on
+macOS 15.7.9 build 24G830 Intel, both with Cargo/rustc 1.99.0. The Intel lane
+recorded all three expected cancellation statuses. Full macOS
+stable/beta/nightly, Linux/Windows workspace suites, source builds, Cargo
+boundaries, nightly layouts, installers/services, btrfs and budget recovery
+checks all passed. Normal activation and automatic GC remain off while the
+remaining startup, inherited-signal, IDE/runtime and performance gates are open.

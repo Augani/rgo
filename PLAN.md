@@ -88,9 +88,11 @@ originally ignored signals remain ignored, while continuation/window effects
 reach the separate Cargo group and PTY. The two existing macOS cases passed
 locally, including deterministic SIGINT/SIGTERM cancellation, ignored-SIGINT
 admission, and stop/resume with ignored and blocked SIGCONT. All-bin build and
-zero-warning Clippy passed. Platform verification is pending. This closes the
-two reproduced late-preparation paths, not every startup interruption boundary
-or the two earlier unexplained failures.
+zero-warning Clippy passed. The [19-job platform run](https://github.com/Augani/rgo/actions/runs/37042790239)
+passed at `db8bbfe` without a retry, including the actual cases on arm64 and
+Intel and all existing platform suites. This closes the two reproduced
+late-preparation paths, not every startup interruption boundary or the two
+earlier unexplained failures.
 
 ## 0. What changed vs. `doc.md`, and why
 

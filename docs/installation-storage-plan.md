@@ -214,9 +214,11 @@ continuation and window notifications still reproduce the effects on the
 separate Cargo group/PTY. The two existing local macOS cases passed, including
 an ignored-SIGINT positive control and ignored/blocked SIGCONT stop/resume.
 No additional Rust test case was added; deterministic handshake auditing is
-excluded from release binaries. Platform verification is pending. The broader
-cancellation and runtime gates, plus the two earlier unexplained failures,
-remain open in the
+excluded from release binaries. The [19-job platform run](https://github.com/Augani/rgo/actions/runs/37042790239)
+passed at `db8bbfe` without a retry, including both actual cases on arm64/Intel
+and all existing suites, installers, source builds and recovery checks. The
+broader cancellation and runtime gates, plus the two earlier unexplained
+failures, remain open in the
 [macOS checklist](macos-cargo-supervision.md#preparation-cancellation--october-2-2026).
 
 **macOS priority (2026-10-02):** a private real-Cargo audit reproduced deletion
