@@ -524,8 +524,10 @@ before its first unlink and keeps it through the unload acknowledgement.
 - [ ] Prove ownership of the currently loaded definition before unloading a
   job whose registration may have been replaced externally.
 - [x] Record optimized terminal-path timing for this batch.
-- [ ] Resolve the observed macOS stable interrupt failure and complete platform
-  validation before considering normal activation.
+- [x] Record the full platform matrix and focused macOS 14 diagnostic run,
+  including the initial failed attempt and its single retry.
+- [ ] Resolve the observed macOS stable interrupt failure before considering
+  normal activation.
 
 The journal holds at most four known entries, regular reads remain bounded to
 16 KiB, and the journal is limited to 64 KiB. Removal steps are bounded; the
@@ -542,11 +544,21 @@ interrupt case failed when sending Ctrl-C immediately after resume: its
 launcher group was no longer reachable. The initial assertion recorded no
 errno, exit status, or stderr, so the cause is unresolved. A focused local run
 and eight bounded repeats passed; the fixture now includes those diagnostics
-without weakening its assertions. Only the failed CI job is being rerun. CI
+without weakening its assertions. The single failed-job retry passed. CI
 also supports a manual, focused run of these same two cases on `macos-14` or
 `macos-15-intel`; normal push/PR runs keep the full matrix. This lets subsequent
 signal diagnostics target the affected runtime without repeating unrelated
 platform suites. This failure remains evidence and an open activation gate.
+
+All 19 jobs have passing results in the
+[completed platform run](https://github.com/Augani/rgo/actions/runs/37031117420),
+including the two advisory nightly lanes, all source-minimum builds, and the
+existing installer and 100-project checks. The native source is `779397e`.
+The [focused diagnostic run](https://github.com/Augani/rgo/actions/runs/37033579731)
+at `c6df6b8` passed both existing cases on macOS 14.8.9 build 23J631 arm64,
+Cargo 1.99.0. That follow-up changes test diagnostics, CI selection and evidence,
+and leaves the native implementation unchanged. Its five unrelated job
+definitions are intentionally skipped, rather than counted as platform passes.
 
 The optimized [24 no-op/12 edit-build paired samples](benchmarks/2026-10-02-macos-arm64-cargo-guardian-job-recovery.json)
 used clean source `779397e`, Cargo/rustc 1.98.0, registered stock zsh 5.9, and

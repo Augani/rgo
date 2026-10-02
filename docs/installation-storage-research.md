@@ -713,7 +713,8 @@ argument, the owner, and the invocation, and rechecks ownership after acquiring
 the guard. Older schemas are preserved. The existing real-Cargo fixture covers
 the edited field while its detached writer is alive, an actual old definition,
 partial removal, later edits, daemon restart, and journal retry after unload.
-Final platform validation and performance measurements remain pending.
+Platform results, the initial interrupt failure and optimized measurements are
+recorded below.
 
 The terminal relay now uses an owned wake pipe for replies and signal delivery
 instead of its recurring foreground timer. It retains a background-only
@@ -722,7 +723,8 @@ attaches an already-running job's terminal without sending `SIGCONT`. A silent
 running background process is therefore included in the existing terminal
 fixture. Independent startup flushes now overlap, but all file flushes complete
 before directory flushes, and every required flush completes before bootstrap.
-Optimized measurement is still required before claiming improved launch time.
+The optimized measurements below assess the combined path; they do not isolate
+each change's causal contribution.
 
 The local `launchctl(1)` manual states that `print` output is not an API, so
 its human-readable structure must not become a production ownership proof.
@@ -752,5 +754,9 @@ interrupt fixture could not signal the launcher group immediately after
 resume. The original assertion lacked errno, child status and stderr, so the
 failure is not classified as a harness race or a runtime defect. Eight focused
 local repeats passed. Failure diagnostics were added to the same fixture with
-all assertions retained; the single failed platform job is being rerun. This
-does not establish a resolved interrupt gate.
+all assertions retained. The single failed platform job's retry passed, giving
+all 19 jobs passing results. A separate
+[focused macOS 14 run](https://github.com/Augani/rgo/actions/runs/37033579731)
+at `c6df6b8` passed both existing cases with the new diagnostics; unrelated
+platform jobs were intentionally skipped. Neither success establishes the cause
+of the initial failure or a resolved interrupt gate.

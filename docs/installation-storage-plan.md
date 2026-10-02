@@ -181,8 +181,11 @@ schema 3 binds its context into the generated program arguments; older unbound
 schemas are preserved. Startup rechecks ownership after acquiring its guard,
 and later preparation failures preserve incomplete or unknown content. The
 existing fixture covers scope edits, interrupted removal, daemon restart, and
-an already-unloaded journal retry. Full cancellation, currently loaded-definition
-ownership, final platform validation, and latency remain open in the
+an already-unloaded journal retry. The [19-job run](https://github.com/Augani/rgo/actions/runs/37031117420)
+has passing results after one macOS stable interrupt retry, and the
+[focused macOS 14 diagnostic run](https://github.com/Augani/rgo/actions/runs/37033579731)
+also passed. The initial interrupt failure remains unresolved. Full cancellation,
+currently loaded-definition ownership, and broader performance remain open in the
 [macOS checklist](macos-cargo-supervision.md#cargo-job-retirement-and-scope-binding).
 The optimized registered-zsh probe at `779397e` adds 94.1/93.0 ms to no-op/edit
 medians with no accepted fallback and cache/automatic GC off. This small crate
