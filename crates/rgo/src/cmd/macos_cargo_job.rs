@@ -21,15 +21,19 @@ use std::process::{Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
+mod events;
+mod terminal;
+
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(20);
 const SOCKET_NAME: &str = "control.sock";
-const FORWARDED_SIGNALS: [i32; 6] = [
+const FORWARDED_SIGNALS: [i32; 7] = [
     libc::SIGINT,
     libc::SIGTERM,
     libc::SIGHUP,
     libc::SIGQUIT,
     libc::SIGTSTP,
     libc::SIGCONT,
+    libc::SIGWINCH,
 ];
 static SIGNALS: AtomicU32 = AtomicU32::new(0);
 
@@ -41,6 +45,12 @@ struct Invocation {
     directory: Vec<u8>,
     root: PathBuf,
     context: PathBuf,
+    #[serde(default)]
+    terminal: bool,
+    #[serde(default)]
+    framed_control: bool,
+    #[serde(default)]
+    signals: events::NativeSignals,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -51,6 +61,7 @@ enum Message {
     Prepared {
         coalition: u64,
     },
+    Configured,
     Started {
         pid: u32,
     },
@@ -62,6 +73,56 @@ enum Message {
     Failed {
         detail: String,
     },
+}
+
+#[derive(Serialize, Deserialize)]
+enum Control {
+    Signal(i32),
+    Terminal(terminal::Configuration),
+    Foreground(bool),
+}
+
+#[derive(Default)]
+struct Controls(Vec<u8>);
+
+impl Controls {
+    fn read(&mut self, stream: &mut UnixStream, framed: bool) -> Result<Option<Vec<Control>>> {
+        let mut bytes = [0_u8; 4096];
+        let length = match stream.read(&mut bytes) {
+            Ok(0) => return Ok(None),
+            Ok(length) => length,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                ) =>
+            {
+                return Ok(Some(Vec::new()));
+            }
+            Err(error) => return Err(error.into()),
+        };
+        if !framed {
+            return Ok(Some(
+                bytes[..length]
+                    .iter()
+                    .map(|signal| Control::Signal(i32::from(*signal)))
+                    .collect(),
+            ));
+        }
+        self.0.extend_from_slice(&bytes[..length]);
+        ensure!(self.0.len() <= 8192, "Cargo control buffer is too large");
+        let mut commands = Vec::new();
+        while self.0.len() >= 4 {
+            let length = u32::from_be_bytes(self.0[..4].try_into()?) as usize;
+            ensure!(length <= 4096, "Cargo control frame is too large");
+            if self.0.len() < 4 + length {
+                break;
+            }
+            commands.push(serde_json::from_slice(&self.0[4..4 + length])?);
+            self.0.drain(..4 + length);
+        }
+        Ok(Some(commands))
+    }
 }
 
 fn write_frame<T: Serialize>(stream: &mut UnixStream, value: &T) -> Result<()> {
@@ -99,9 +160,12 @@ fn check_peer(stream: &UnixStream) -> Result<()> {
     Ok(())
 }
 
-fn send_stdio(stream: &UnixStream) -> Result<()> {
-    let descriptors = [0_i32, 1, 2];
-    for descriptor in descriptors {
+fn send_descriptors(stream: &UnixStream, descriptors: &[i32]) -> Result<()> {
+    ensure!(
+        (1..=4).contains(&descriptors.len()),
+        "invalid descriptor transfer count"
+    );
+    for &descriptor in descriptors {
         ensure!(
             unsafe { libc::fcntl(descriptor, libc::F_GETFD) } >= 0,
             "Cargo job cannot transfer a closed standard descriptor"
@@ -117,17 +181,16 @@ fn send_stdio(stream: &UnixStream) -> Result<()> {
     message.msg_iov = &mut io;
     message.msg_iovlen = 1;
     message.msg_control = control.as_mut_ptr().cast();
-    message.msg_controllen =
-        unsafe { libc::CMSG_SPACE(std::mem::size_of_val(&descriptors) as u32) };
+    message.msg_controllen = unsafe { libc::CMSG_SPACE(std::mem::size_of_val(descriptors) as u32) };
     unsafe {
         let header = libc::CMSG_FIRSTHDR(&message);
         (*header).cmsg_level = libc::SOL_SOCKET;
         (*header).cmsg_type = libc::SCM_RIGHTS;
-        (*header).cmsg_len = libc::CMSG_LEN(std::mem::size_of_val(&descriptors) as u32);
+        (*header).cmsg_len = libc::CMSG_LEN(std::mem::size_of_val(descriptors) as u32);
         std::ptr::copy_nonoverlapping(
             descriptors.as_ptr().cast::<u8>(),
             libc::CMSG_DATA(header),
-            std::mem::size_of_val(&descriptors),
+            std::mem::size_of_val(descriptors),
         );
     }
     loop {
@@ -143,7 +206,11 @@ fn send_stdio(stream: &UnixStream) -> Result<()> {
     }
 }
 
-fn receive_stdio(stream: &UnixStream) -> Result<[OwnedFd; 3]> {
+fn receive_descriptors(stream: &UnixStream, expected: usize) -> Result<Vec<OwnedFd>> {
+    ensure!(
+        (1..=4).contains(&expected),
+        "invalid descriptor receive count"
+    );
     let mut marker = [0_u8; 1];
     let mut io = libc::iovec {
         iov_base: marker.as_mut_ptr().cast(),
@@ -194,8 +261,8 @@ fn receive_stdio(stream: &UnixStream) -> Result<[OwnedFd; 3]> {
         received == 1
             && marker == *b"F"
             && message.msg_flags & libc::MSG_CTRUNC == 0
-            && files.len() == 3,
-        "Cargo job did not receive exactly three standard descriptors"
+            && files.len() == expected,
+        "Cargo job received an unexpected descriptor count"
     );
     for file in &files {
         ensure!(
@@ -203,9 +270,7 @@ fn receive_stdio(stream: &UnixStream) -> Result<[OwnedFd; 3]> {
             "cannot close Cargo descriptor on guardian exec"
         );
     }
-    files
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("invalid standard descriptor count"))
+    Ok(files)
 }
 
 // Relative Unix socket names avoid macOS's short sockaddr path limit even when
@@ -239,6 +304,8 @@ impl Drop for EarlyCleanup<'_> {
 
 pub(super) struct PreparedJob {
     stream: UnixStream,
+    terminal: Option<terminal::Caller>,
+    signals: Option<SignalRelay>,
 }
 
 impl PreparedJob {
@@ -249,10 +316,7 @@ impl PreparedJob {
         paths: &RgoPaths,
         context: &Path,
     ) -> Result<Self> {
-        ensure!(
-            (0..=2).all(|fd| unsafe { libc::isatty(fd) } == 0),
-            "the private macOS pilot has not enabled controlling-terminal handoff"
-        );
+        let mut terminal = terminal::Caller::open()?;
         paths.ensure_layout()?;
         let invocation = Invocation {
             executable: executable.as_os_str().as_bytes().to_vec(),
@@ -263,6 +327,9 @@ impl PreparedJob {
             directory: std::env::current_dir()?.as_os_str().as_bytes().to_vec(),
             root: paths.root.clone(),
             context: context.to_owned(),
+            terminal: terminal.is_some(),
+            framed_control: true,
+            signals: events::NativeSignals::capture()?,
         };
         // Serialize before registering any job, including the frame size check.
         ensure!(
@@ -321,7 +388,22 @@ impl PreparedJob {
                     if error.kind() == std::io::ErrorKind::WouldBlock
                         && Instant::now() < deadline =>
                 {
-                    std::thread::sleep(Duration::from_millis(10))
+                    let mut readiness = libc::pollfd {
+                        fd: listener.as_raw_fd(),
+                        events: libc::POLLIN,
+                        revents: 0,
+                    };
+                    let remaining = deadline
+                        .saturating_duration_since(Instant::now())
+                        .as_millis()
+                        .min(i32::MAX as u128) as i32;
+                    let ready = unsafe { libc::poll(&mut readiness, 1, remaining.max(1)) };
+                    if ready < 0
+                        && std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted
+                    {
+                        return Err(std::io::Error::last_os_error())
+                            .context("waiting for Cargo guardian readiness");
+                    }
                 }
                 Err(error) => {
                     let diagnostic = std::fs::read_to_string(_directory.join("guardian.stderr"))
@@ -344,7 +426,11 @@ impl PreparedJob {
             "Cargo guardian authentication failed"
         );
         write_frame(&mut stream, &invocation)?;
-        send_stdio(&stream)?;
+        let mut descriptors = vec![0, 1, 2];
+        if let Some(terminal) = &terminal {
+            descriptors.push(terminal.fd());
+        }
+        send_descriptors(&stream, &descriptors)?;
         let coalition = match read_frame::<Message>(&mut stream)? {
             Message::Prepared { coalition } => coalition,
             Message::Failed { detail } => {
@@ -356,11 +442,29 @@ impl PreparedJob {
             coalition != ResourceCoalition::for_pid(std::process::id().try_into()?)?.id(),
             "Cargo guardian inherited its caller's coalition"
         );
-        Ok(Self { stream })
+        let signals = SignalRelay::new()?;
+        if let Some(terminal) = &mut terminal {
+            terminal.attach(
+                receive_descriptors(&stream, 1)?
+                    .pop()
+                    .context("PTY descriptor is missing")?,
+            );
+            stream.write_all(b"T")?;
+            write_frame(&mut stream, &terminal.configuration()?)?;
+            ensure!(
+                matches!(read_frame::<Message>(&mut stream)?, Message::Configured),
+                "Cargo terminal was not configured"
+            );
+            terminal.activate()?;
+        }
+        Ok(Self {
+            stream,
+            terminal,
+            signals: Some(signals),
+        })
     }
 
     pub(super) fn run(mut self, mut session: SessionGuard) -> Result<()> {
-        let signals = SignalRelay::new()?;
         session.release_local_for_macos_guardian();
         self.stream.set_read_timeout(None)?;
         self.stream.write_all(b"S")?; // From here failure cannot retry Cargo.
@@ -376,22 +480,50 @@ impl PreparedJob {
             }
         });
         loop {
+            if let Some(terminal) = &mut self.terminal {
+                if let Some(foreground) = terminal.changed_foreground()? {
+                    if foreground {
+                        write_frame(
+                            &mut self.stream,
+                            &Control::Terminal(terminal.configuration()?),
+                        )?;
+                    }
+                    write_frame(&mut self.stream, &Control::Foreground(foreground))?;
+                    if foreground {
+                        terminal.activate()?;
+                    }
+                }
+            }
             let pending = SIGNALS.swap(0, Ordering::Relaxed);
             for signal in FORWARDED_SIGNALS {
                 if pending & (1 << signal) != 0 {
-                    self.stream.write_all(&[signal as u8])?;
+                    match (signal, self.terminal.as_ref()) {
+                        (libc::SIGWINCH, Some(terminal)) => terminal.resize()?,
+                        _ => write_frame(&mut self.stream, &Control::Signal(signal))?,
+                    }
                 }
             }
-            match receiver.recv_timeout(Duration::from_millis(20)) {
+            match receiver.recv_timeout(if self.terminal.is_some() {
+                Duration::ZERO
+            } else {
+                Duration::from_millis(20)
+            }) {
                 Ok(Ok(Message::Started { .. })) => {}
                 Ok(Ok(Message::Stopped)) => {
+                    if let Some(terminal) = &mut self.terminal {
+                        terminal.restore();
+                    }
                     // Reflect an observed primary stop in the shell's actual
                     // job. SIGCONT after `fg`/`bg` is relayed on the next loop.
                     unsafe { libc::raise(libc::SIGSTOP) };
                 }
                 Ok(Ok(Message::Exited { code, signal })) => {
+                    if let Some(terminal) = &mut self.terminal {
+                        terminal.drain_output()?;
+                        terminal.restore();
+                    }
                     drop(session);
-                    drop(signals);
+                    drop(self.signals.take());
                     if let Some(signal) = signal {
                         unsafe {
                             libc::signal(signal, libc::SIG_DFL);
@@ -407,7 +539,11 @@ impl PreparedJob {
                 Ok(Err(error)) => {
                     return Err(error).context("Cargo guardian disconnected after commit");
                 }
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    if let Some(terminal) = &mut self.terminal {
+                        terminal.pump(terminal.foreground(), 10)?;
+                    }
+                }
                 Err(error) => return Err(error.into()),
             }
         }
@@ -533,7 +669,21 @@ pub fn guardian(directory: &Path, token: &str) -> Result<()> {
         },
     )?;
     let request = read_frame::<Invocation>(&mut stream)?;
-    let [stdin, stdout, stderr] = receive_stdio(&stream)?;
+    let mut descriptors = receive_descriptors(&stream, if request.terminal { 4 } else { 3 })?;
+    let mut terminal = if request.terminal {
+        Some(terminal::Guardian::new(
+            descriptors.pop().context("original terminal is missing")?,
+        )?)
+    } else {
+        None
+    };
+    let mut descriptors: [OwnedFd; 3] = descriptors
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("standard descriptors are missing"))?;
+    if let Some(terminal) = &terminal {
+        terminal.replace_stdio(&mut descriptors)?;
+    }
+    let [stdin, stdout, stderr] = descriptors;
     let paths = RgoPaths { root: request.root };
     ensure!(
         paths.root.is_absolute()
@@ -567,13 +717,30 @@ pub fn guardian(directory: &Path, token: &str) -> Result<()> {
                 coalition: coalition.id(),
             },
         )?;
+        let mut initially_foreground = false;
+        if let Some(terminal) = &mut terminal {
+            send_descriptors(&stream, &[terminal.master_fd()])?;
+            let mut marker = [0_u8];
+            stream.read_exact(&mut marker)?;
+            ensure!(
+                marker == *b"T",
+                "Cargo terminal configuration was not supplied"
+            );
+            let configuration = read_frame::<terminal::Configuration>(&mut stream)?;
+            initially_foreground = configuration.foreground;
+            terminal.configure(configuration, true)?;
+            write_frame(&mut stream, &Message::Configured)?;
+        }
         let mut commit = [0_u8];
         stream.read_exact(&mut commit)?;
         ensure!(commit == *b"S", "Cargo job was not committed");
         stream.set_read_timeout(None)?;
         stream.set_nonblocking(true)?;
         session.retain_across_exec()?;
-        let child = Command::new(OsString::from_vec(request.executable))
+        let mut events = events::ChildEvents::new()?;
+        let slave = terminal.as_ref().map(terminal::Guardian::slave_fd);
+        let mut command = Command::new(OsString::from_vec(request.executable));
+        command
             .args(request.args.into_iter().map(OsString::from_vec))
             .current_dir(PathBuf::from(OsString::from_vec(request.directory)))
             .env_clear()
@@ -586,18 +753,43 @@ pub fn guardian(directory: &Path, token: &str) -> Result<()> {
             .stdin(Stdio::from(stdin))
             .stdout(Stdio::from(stdout))
             .stderr(Stdio::from(stderr))
-            .process_group(0)
+            .process_group(0);
+        unsafe {
+            command.pre_exec(move || {
+                if let Some(slave) = slave.filter(|_| initially_foreground) {
+                    // Command has established the child's process group. Make
+                    // it foreground before exec can read its controlling PTY.
+                    let mut blocked = std::mem::zeroed();
+                    libc::sigemptyset(&mut blocked);
+                    libc::sigaddset(&mut blocked, libc::SIGTTOU);
+                    if libc::sigprocmask(libc::SIG_BLOCK, &blocked, std::ptr::null_mut()) != 0
+                        || libc::tcsetpgrp(slave, libc::getpgrp()) != 0
+                    {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                }
+                request.signals.restore_in_child()
+            });
+        }
+        let child = command
             .spawn()
             .context("starting real Cargo in its launchd coalition")?;
+        // Command retains its configured Stdio after spawn. Closing those
+        // parent copies lets pipe readers observe EOF at primary completion.
+        drop(command);
         let _ = write_frame(&mut stream, &Message::Started { pid: child.id() });
         let mut primary_exited = false;
         let mut disconnected = false;
+        let mut controls = Controls::default();
         loop {
             if !primary_exited {
                 match poll_child(&child)? {
                     ChildChange::Exited(status) => {
                         send_exit(&mut stream, status);
                         primary_exited = true;
+                        if let Some(terminal) = &terminal {
+                            terminal.foreground(unsafe { libc::getpgrp() })?;
+                        }
                     }
                     ChildChange::Stopped => {
                         let _ = write_frame(&mut stream, &Message::Stopped);
@@ -606,38 +798,68 @@ pub fn guardian(directory: &Path, token: &str) -> Result<()> {
                 }
             }
             if !disconnected {
-                let mut commands = [0_u8; 32];
-                match stream.read(&mut commands) {
-                    Ok(0) => {
+                match controls.read(&mut stream, request.framed_control) {
+                    Ok(None) | Err(_) => {
                         disconnected = true;
+                        if let Some(terminal) = &terminal {
+                            terminal.restore_original();
+                        }
                         if !primary_exited {
                             signal_group(&child, libc::SIGKILL);
                         }
                     }
-                    Ok(length) => {
-                        for signal in &commands[..length] {
-                            let signal = i32::from(*signal);
-                            if !primary_exited && FORWARDED_SIGNALS.contains(&signal) {
-                                signal_group(&child, signal);
+                    Ok(Some(commands)) => {
+                        for command in commands {
+                            match command {
+                                Control::Signal(signal)
+                                    if !primary_exited && FORWARDED_SIGNALS.contains(&signal) =>
+                                {
+                                    signal_group(&child, signal)
+                                }
+                                Control::Terminal(configuration) => {
+                                    if let Some(terminal) = &mut terminal {
+                                        terminal.configure(configuration, false)?;
+                                    }
+                                }
+                                Control::Foreground(foreground) if !primary_exited => {
+                                    if let Some(terminal) = &terminal {
+                                        terminal.foreground(if foreground {
+                                            child.id().try_into()?
+                                        } else {
+                                            unsafe { libc::getpgrp() }
+                                        })?;
+                                    }
+                                }
+                                _ => {}
                             }
-                        }
-                    }
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
-                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
-                    Err(_) => {
-                        disconnected = true;
-                        if !primary_exited {
-                            signal_group(&child, libc::SIGKILL);
                         }
                     }
                 }
             }
+            if let Some(terminal) = terminal.as_mut().filter(|_| disconnected) {
+                terminal.pump_output()?;
+            }
             // The guardian itself is the remaining task. Query failures retain
             // its lock; they cannot retire a receipt or release managed storage.
-            if primary_exited && coalition.active_tasks().is_ok_and(|count| count == 1) {
+            if primary_exited
+                && (terminal.is_none() || disconnected)
+                && !terminal
+                    .as_ref()
+                    .is_some_and(terminal::Guardian::output_pending)
+                && coalition.active_tasks().is_ok_and(|count| count == 1)
+            {
                 break;
             }
-            std::thread::sleep(Duration::from_millis(if primary_exited { 100 } else { 20 }));
+            let output = terminal
+                .as_ref()
+                .filter(|_| disconnected)
+                .map(terminal::Guardian::output_events);
+            events.wait(
+                &stream,
+                disconnected,
+                if primary_exited { 100 } else { -1 },
+                output.as_ref().map_or(&[], |events| events.as_slice()),
+            )?;
         }
         Ok(())
     })();

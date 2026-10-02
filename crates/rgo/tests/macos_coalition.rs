@@ -302,6 +302,10 @@ while not pathlib.Path(os.environ['RGO_COALITION_READY']).exists():
         r#"use std::io::{Read, Write};
 use std::os::unix::ffi::OsStrExt;
 fn main() {
+    if std::env::var_os("RGO_TERMINAL_PROBE").is_some() {
+        let status = std::process::Command::new("python3").arg("terminal-child.py").status().unwrap();
+        std::process::exit(status.code().unwrap_or(130));
+    }
     let mut input = Vec::new(); std::io::stdin().read_to_end(&mut input).unwrap();
     let mut out = std::io::stdout(); out.write_all(&input).unwrap();
     out.write_all(std::env::args_os().nth(1).unwrap().as_bytes()).unwrap();
@@ -380,4 +384,32 @@ fn main() {
     println!(
         "installed Cargo pilot: stdin/EOF, stdout/stderr, non-UTF-8 args/environment, exit 17, and healthy job retirement passed"
     );
+
+    // Extend the same real-Cargo fixture with an interactive zsh job, rather
+    // than adding a second copy of the guardian setup and crash checks.
+    std::fs::write(
+        project.join("terminal-child.py"),
+        include_str!("fixtures/macos-terminal-child.py"),
+    )
+    .unwrap();
+    let terminal = sandbox
+        .cmd("python3")
+        .arg("-c")
+        .arg(include_str!("fixtures/macos-terminal-shell.py"))
+        .current_dir(&project)
+        .env("PATH", &search_path)
+        .env("RGO_MACOS_SUPERVISOR_PILOT", "1")
+        .env("RGO_TERMINAL_PROBE", "1")
+        .env("RGO_COALITION_READY", &ready)
+        .env("RGO_COALITION_RELEASE", &release)
+        .env("RGO_COALITION_RESULT", &result)
+        .output()
+        .unwrap();
+    assert!(
+        terminal.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&terminal.stdout),
+        String::from_utf8_lossy(&terminal.stderr)
+    );
+    println!("{}", String::from_utf8_lossy(&terminal.stdout));
 }

@@ -41,8 +41,13 @@ fn xml(value: &str) -> String {
 }
 
 fn definition(directory: &Path, owner: &CargoJobOwner) -> Result<String> {
+    let scheduling = if owner.version >= 2 {
+        "<key>ProcessType</key><string>Interactive</string>"
+    } else {
+        ""
+    };
     Ok(format!(
-        "<?xml version=\"1.0\"?><plist version=\"1.0\"><dict><key>Label</key><string>{}</string><key>ProgramArguments</key><array><string>{}</string><string>macos-cargo-job</string><string>--directory</string><string>{}</string><string>--token</string><string>{}</string></array><key>RunAtLoad</key><true/><key>AbandonProcessGroup</key><true/><key>StandardOutPath</key><string>/dev/null</string><key>StandardErrorPath</key><string>{}</string></dict></plist>",
+        "<?xml version=\"1.0\"?><plist version=\"1.0\"><dict><key>Label</key><string>{}</string><key>ProgramArguments</key><array><string>{}</string><string>macos-cargo-job</string><string>--directory</string><string>{}</string><string>--token</string><string>{}</string></array><key>RunAtLoad</key><true/><key>AbandonProcessGroup</key><true/>{scheduling}<key>StandardOutPath</key><string>/dev/null</string><key>StandardErrorPath</key><string>{}</string></dict></plist>",
         owner.label,
         xml(owner
             .executable
@@ -71,7 +76,7 @@ impl CargoJobOwner {
             "invalid Cargo job token"
         );
         let mut owner = Self {
-            version: 1,
+            version: 2,
             label: format!("com.rgo.cargo.{}", &token[..32]),
             domain: format!("gui/{}", unsafe { libc::geteuid() }),
             token,
@@ -93,7 +98,7 @@ impl CargoJobOwner {
 
     fn validate(&self, directory: &Path) -> Result<()> {
         ensure!(
-            self.version == 1
+            matches!(self.version, 1 | 2)
                 && self.token.len() == 64
                 && self.token.bytes().all(|byte| byte.is_ascii_hexdigit())
                 && self.label == format!("com.rgo.cargo.{}", &self.token[..32])

@@ -31,6 +31,8 @@ def command(argv, cwd, env):
             f"{' '.join(map(str, argv))} failed ({result.returncode}):\n"
             + result.stderr.decode(errors="replace")[-4000:]
         )
+    if env.get("RGO_MACOS_SUPERVISOR_PILOT") == "1" and b"guardian unavailable" in result.stderr:
+        raise RuntimeError("latency sample fell back outside the macOS guardian")
     return elapsed_ms, result.stdout.decode(errors="replace").strip()
 
 
@@ -74,11 +76,14 @@ def main():
     parser.add_argument("--warm-samples", type=int, default=24)
     parser.add_argument("--edit-samples", type=int, default=12)
     parser.add_argument("--output", type=pathlib.Path)
+    parser.add_argument("--macos-guardian", action="store_true", help="Measure the private macOS launchd guardian instead of descriptor-only supervision")
     args = parser.parse_args()
     if not args.real_cargo or not args.real_cargo.is_absolute():
         parser.error("--real-cargo must name an absolute Cargo executable")
     if args.warm_samples < 2 or args.edit_samples < 2:
         parser.error("both sample counts must be at least two")
+    if args.macos_guardian and platform.system() != "Darwin":
+        parser.error("--macos-guardian requires macOS")
 
     real_rustup_home = os.environ.get("RUSTUP_HOME", str(pathlib.Path.home() / ".rustup"))
     with tempfile.TemporaryDirectory(prefix="rgo-bench-") as temporary:
@@ -90,6 +95,10 @@ def main():
         )
         (project / "src/main.rs").write_text('fn main() { println!("initial"); }\n')
         env = os.environ.copy()
+        if args.macos_guardian:
+            env["RGO_MACOS_SUPERVISOR_PILOT"] = "1"
+        else:
+            env.pop("RGO_MACOS_SUPERVISOR_PILOT", None)
         env.update(
             HOME=str(root / "home"),
             CARGO_HOME=str(root / "home/.cargo"),
@@ -127,6 +136,7 @@ def main():
             "wrapper_binary_sha256": sha256(pathlib.Path(rgo).with_name("rgo-rustc-wrapper")),
             "cache_enabled": False,
             "automatic_gc_enabled": False,
+            "macos_supervisor_pilot": args.macos_guardian,
             "warm_noop": warm,
             "edit_build": edit,
         }
