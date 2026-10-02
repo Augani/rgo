@@ -263,12 +263,15 @@ fn request_for_protocol(
         Response::Error { code, message } => bail!("daemon handshake failed ({code}): {message}"),
         other => bail!("invalid daemon handshake response: {other:?}"),
     }
-    write_message(&mut connection, &message)?;
     if response_timeout != connection_timeout {
+        // A quick response can close the peer before setsockopt runs. Darwin
+        // refuses socket options after shutdown, even with unread reply bytes.
+        // Configure the exchange before sending an operation; never repeat it.
         connection
             .set_timeout(response_timeout)
             .context("setting IPC response timeout")?;
     }
+    write_message(&mut connection, &message)?;
     read_message(&mut connection)
 }
 

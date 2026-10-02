@@ -335,6 +335,14 @@ blocking maintenance. [Evidence and remaining gates](macos-cargo-supervision.md#
 keep the broader process-state, workflow and five unexplained failures open.
 Normal activation and automatic GC stay disabled.
 
+The initial descriptor matrix passed Intel/beta but added an unresolved arm64
+stable startup failure. Nightly's separate fast-response clean failure was
+reproduced as a Darwin socket-option-after-shutdown race; timeout setup now
+precedes the request, without retrying the operation. The same private Cargo
+comparison reproduced lost umask/NOFILE settings. The
+[follow-up checklist](macos-cargo-supervision.md#ipc-response-ordering-and-remaining-native-state--october-2-2026)
+keeps all six unexplained failures and native-state restoration/admission open.
+
 **macOS priority (2026-10-02):** a private real-Cargo audit reproduced deletion
 while a detached child with closed inherited descriptors was still writing.
 The [macOS supervisor checklist](macos-cargo-supervision.md) records the selected

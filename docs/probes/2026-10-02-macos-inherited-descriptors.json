@@ -195,8 +195,116 @@
     "all_bins_release": "passed (30.73s)",
     "format": "passed",
     "diff": "passed",
-    "full_workspace_suite": "pending existing remote matrix; no duplicate full local suite",
+    "full_workspace_suite": "First matrix failed on macOS stable startup and advisory nightly IPC response timeout; final source verification pending.",
     "release_audit_hooks_present": false
   },
-  "limits": "Both cases were extended, with no new Rust test case or CI lane. Five prior unexplained failures remain open. Build-script Cargo with an inherited RUSTC override uses existing unverified-compiler fallback. This does not close every inherited process-state or nested-build class. Native supervisor remains a private pilot and automatic GC remains disabled. Regular files, shared aliases and jobserver pipes are verified here; other descriptor/native process-state classes retain their existing acceptance gates."
+  "limits": "Both cases were extended, with no new Rust test case or CI lane. Five prior unexplained failures remain open. Build-script Cargo with an inherited RUSTC override uses existing unverified-compiler fallback. This does not close every inherited process-state or nested-build class. Native supervisor remains a private pilot and automatic GC remains disabled. Regular files, shared aliases and jobserver pipes are verified here; other descriptor/native process-state classes retain their existing acceptance gates.",
+  "private_probe_cleanup": {
+    "archive": "/tmp/rgo-inherited-descriptors-private-probes.zip",
+    "removed_owned_roots": [
+      {
+        "root": "/private/tmp/rgofdver-3vuumpj6",
+        "no_owned_jobs": true,
+        "no_coalition_receipts": true,
+        "no_sockets": true,
+        "no_matching_processes": true,
+        "remaining_locks_available": true,
+        "archived_files": 65
+      },
+      {
+        "root": "/private/tmp/rgofds-j112d5nq",
+        "no_owned_jobs": true,
+        "no_coalition_receipts": true,
+        "no_sockets": true,
+        "no_matching_processes": true,
+        "remaining_locks_available": true,
+        "archived_files": 11
+      },
+      {
+        "root": "/private/tmp/rgofds-pw5a54bn",
+        "no_owned_jobs": true,
+        "no_coalition_receipts": true,
+        "no_sockets": true,
+        "no_matching_processes": true,
+        "remaining_locks_available": true,
+        "archived_files": 12
+      }
+    ]
+  },
+  "followup_failures": {
+    "source": "4adb00f72ca9a8b74aac4d36e9d95e76455dd3c2",
+    "run_url": "https://github.com/Augani/rgo/actions/runs/37071010880",
+    "nightly_clean": {
+      "job_id": 111050188095,
+      "case": "explicit_clean_reports_a_locked_context_instead_of_claiming_removal",
+      "error": "setting IPC response timeout: Invalid argument (os error 22)",
+      "diagnosis": "Request sent before timeout adjustment; Darwin refuses setsockopt after peer shutdown while buffered reply remains readable. Deterministic private primitive reproduces the error. Move adjustment before request; never retry the operation.",
+      "primitive_log": "after completed exchange: recv=Err(Os { code: 22, kind: InvalidInput, message: \"Invalid argument\" }), send=Err(Os { code: 22, kind: InvalidInput, message: \"Invalid argument\" })\nbefore_request=false: exact buffered reply preserved\nbefore_request=true: exact buffered reply preserved\n",
+      "primitive_sha256": "3064a8b845db7bc263997b78a4e2a6f0f7f2b5982819fccf5731898960598a39"
+    },
+    "stable_startup": {
+      "job_id": 111050188363,
+      "case": "launchd_coalition_observes_closed_fd_writer_after_cargo_exits",
+      "seconds": 11.26,
+      "last_completed_startup_subcase": 3,
+      "missing_prepared_marker_subcase": 4,
+      "signal": 15,
+      "blocked": true,
+      "diagnosis": "unresolved; original log omits caller/guardian state. Existing fixture now emits stderr, exit state, owned launchctl fields and private events at the same deadline."
+    }
+  },
+  "followup_checks": {
+    "all_bins_debug": {
+      "sha256": "b264f5516b96dfdcf3f3c9d8a908c88b0729e0535b1284cd3c4d45ac52d86917",
+      "results": [
+        "    Finished `dev` profile [unoptimized + debuginfo] target(s) in 6.74s"
+      ]
+    },
+    "clean_case": {
+      "sha256": "9fe786fbdf91d6f3ec97c0ae3430b6668bb976e08d0f24c385b5b59b2ce9b165",
+      "results": [
+        "    Finished `test` profile [unoptimized + debuginfo] target(s) in 6.97s",
+        "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 8 filtered out; finished in 54.33s"
+      ]
+    },
+    "clippy_all_targets": {
+      "sha256": "a13dbb24346dae36913f4f7374f52eee1c6ef6a612cedd1004c7f96f8298a040",
+      "results": [
+        "    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1m 18s"
+      ]
+    },
+    "all_bins_release": {
+      "sha256": "743215d5d2b78b04427ee56e485f880182f4832e4446b159aee73053a3c4b996",
+      "results": [
+        "    Finished `release` profile [optimized] target(s) in 35.87s"
+      ]
+    },
+    "clean_case_initial_harness_failures": {
+      "first": "Testkit artifact contained /tmp/rgo-mixed-version-q4l4sk6c/previous-source/crates/rgo-testkit; that checkout was removed, so ensure_workspace_bins_built failed ENOENT before exercising the case.",
+      "explicit_cargo_attempt": "Same cached compile-time directory; overriding CARGO did not correct it.",
+      "correction": "Selective cargo clean -p rgo-testkit, rebuild all bins; fixture then passed. No production or fixture assertion change.",
+      "startup_sample": "Before test execution, a sample showed _dyld_start only with 96 KiB footprint. The fixture later started and passed in 54.33s; no deadline was extended."
+    },
+    "format": "passed",
+    "diff": "passed",
+    "release_audit_hooks_present": false,
+    "startup_case": {
+      "sha256": "e83a966456c9767a612393182009c3c8970ea6dbcc35827a7869e820fe4f22d7",
+      "result": "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 28.09s",
+      "startup_subcases": 10,
+      "limits": "Passes the current diagnostic fixture; does not explain the earlier missing-prepared failure."
+    },
+    "final_clippy_all_targets": {
+      "result": "passed with -D warnings after last diagnostic edit",
+      "sha256": "dd621e9ff7c9eac161c730aa8a79332dd68698435a7a84d044d9ad39dfa1f5d2"
+    }
+  },
+  "initial_platform_verification": {
+    "record": "2026-10-02-macos-inherited-descriptors-initial-ci.json",
+    "code_sha": "4adb00f72ca9a8b74aac4d36e9d95e76455dd3c2",
+    "run_url": "https://github.com/Augani/rgo/actions/runs/37071010880",
+    "individual_jobs_passed": 17,
+    "individual_jobs_total": 19,
+    "run_attempt": 1
+  }
 }

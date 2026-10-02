@@ -1153,6 +1153,9 @@ failures, and does not close the broader activation and release gates.
   build-script/compiler-override shapes, terminal/IDE/workflow and upgrade
   acceptance. The five prior unexplained failures remain open. Normal
   activation and automatic GC remain disabled.
+- [ ] Preserve or decline caller file-creation masks and soft/hard resource
+  limits before managed admission. Compare actual ordinary and managed Cargo
+  behavior; descriptor preservation alone does not prove these attributes.
 
 The [record](probes/2026-10-02-macos-inherited-descriptors.json) distinguishes
 production failures from two probe corrections: an ordinary-Unix context ID
@@ -1160,3 +1163,31 @@ expectation and a checkout-PID assertion applied to a managed guardian. It also
 records the build-script shape that uses the existing unverified-compiler
 fallback when Cargo exports `RUSTC`. Neither that fallback nor the verified
 regular-file/pipe classes prove every nested or native-state shape.
+
+The first [platform run](https://github.com/Augani/rgo/actions/runs/37071010880)
+passed Intel and arm64 beta. Advisory arm64 nightly passed the coalition case
+but stopped on a separate IPC timeout race before the nested case. Arm64 stable
+failed to publish the fourth startup subcase's prepared marker (blocked TERM,
+11.26 s overall); its log did not include caller/guardian state. A later green
+run cannot explain that failure. It joins the five earlier unexplained failures.
+
+## IPC response ordering and remaining native state — October 2, 2026
+
+- [x] Reproduce Darwin refusing receive/send timeout changes after peer
+  shutdown even while the exact response remains buffered. The client previously
+  sent the clean request before changing its response timeout.
+- [x] Set the response timeout before sending the request. Preserve handshake
+  verification and a single operation; do not retry destructive requests.
+- [x] Add failure-only caller status/stderr, owned launchctl state and private
+  event diagnostics to the existing startup subcase at its unchanged deadline.
+- [ ] Verify the corrected source on the existing platform matrix. A passing
+  startup case alone does not diagnose the earlier stable failure.
+- [ ] Resolve the sixth unexplained failure: arm64 stable did not prepare the
+  fourth, blocked-TERM startup subcase in the initial descriptor matrix.
+- [x] Compare ordinary and managed Cargo with caller umask 077 and NOFILE soft
+  limit 128. Ordinary retained 077/128 and created mode 0600; managed used
+  022/256 and created mode 0644. Descriptor, one-execution and actual GC checks
+  still passed. [Exact evidence](probes/2026-10-02-macos-native-state-gap.json).
+- [ ] Restore or decline unsupported file masks and resource limits before
+  admission; verify the same ordinary/managed comparison and live version skew.
+  Normal activation and automatic GC remain disabled.

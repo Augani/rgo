@@ -189,6 +189,7 @@ fn main() {{ unsafe {{
             .env("PATH", &path)
             .env("RGO_MACOS_SUPERVISOR_PILOT", "1")
             .env("RGO_MACOS_SUPERVISOR_AUDIT", "1")
+            .env("RGO_MACOS_SUPERVISOR_EVENT_AUDIT", "1")
             .args([if blocked { "run" } else { "build" }, "--offline"])
             .stdout(std::process::Stdio::null())
             .stderr(std::fs::File::create(&log).unwrap());
@@ -226,10 +227,65 @@ fn main() {{ unsafe {{
             child: command.spawn().unwrap(),
             release: directory.join("release"),
         };
-        wait_for_file(
-            &directory.join("prepared"),
-            Instant::now() + Duration::from_secs(10),
-        );
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !directory.join("prepared").is_file()
+            && probe.child.try_wait().unwrap().is_none()
+            && Instant::now() < deadline
+        {
+            thread::sleep(Duration::from_millis(20));
+        }
+        if !directory.join("prepared").is_file() {
+            let jobs: Vec<_> = paths
+                .state_dir()
+                .read_dir()
+                .unwrap()
+                .filter_map(Result::ok)
+                .map(|entry| entry.path())
+                .filter(|path| {
+                    path.file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .starts_with("macos-cargo-job-")
+                })
+                .map(|path| {
+                    let log =
+                        std::fs::read_to_string(path.join("guardian.stderr")).unwrap_or_default();
+                    let state = rgo_core::macos_jobs::read_owner(&path)
+                        .ok()
+                        .and_then(|(owner, _)| {
+                            sandbox
+                                .cmd("launchctl")
+                                .args(["print", &format!("{}/{}", owner.domain, owner.label)])
+                                .output()
+                                .ok()
+                        })
+                        .map(|output| {
+                            let text = String::from_utf8_lossy(&output.stdout);
+                            let fields: Vec<_> = text
+                                .lines()
+                                .filter(|line| {
+                                    ["state =", "pid =", "last exit code =", "runs ="]
+                                        .iter()
+                                        .any(|field| line.trim().starts_with(field))
+                                })
+                                .take(12)
+                                .collect();
+                            format!(
+                                "{:?}: {fields:?}; {}",
+                                output.status,
+                                String::from_utf8_lossy(&output.stderr)
+                            )
+                        });
+                    (path, log, state)
+                })
+                .collect();
+            panic!(
+                "startup preparation missing: signal={signal}, ignored={ignored}, blocked={blocked}, cut={cut}, caller={:?}; stderr={}; jobs={jobs:?}; events={}",
+                probe.child.try_wait().unwrap(),
+                std::fs::read_to_string(&log).unwrap_or_default(),
+                std::fs::read_to_string(directory.join("events")).unwrap_or_default()
+            );
+        }
         assert!(probe.child.try_wait().unwrap().is_none());
         if !cut || blocked {
             assert_eq!(unsafe { libc::kill(probe.child.id() as i32, signal) }, 0);
@@ -351,6 +407,7 @@ fn main() {{ unsafe {{
             "commit-cancel-observed",
             "cut-release",
             "stderr",
+            "events",
         ] {
             match std::fs::remove_file(directory.join(name)) {
                 Ok(()) => {}

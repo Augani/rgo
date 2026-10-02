@@ -139,8 +139,6 @@ advisory nightly and actual arm64/Intel cases. These results verify the mask
 fallback without explaining the five open failures. Normal activation and
 automatic GC remain disabled.
 
-## 0. What changed vs. `doc.md`, and why
-
 **2026-10-02 macOS descriptors and nested completion:** the existing I/O case
 reproduced a lost inherited file descriptor and a disconnected Make jobserver.
 The pilot now captures and transfers exec-visible descriptors, restores their
@@ -154,6 +152,18 @@ idle-neighbor reclamation and final actual GC. See the
 [evidence and checklist](docs/macos-cargo-supervision.md#inherited-descriptors-and-nested-completion--october-2-2026).
 The five earlier unexplained failures and broader release gates remain open;
 normal activation and automatic GC stay disabled.
+
+**2026-10-02 IPC/native-state follow-up:** the initial descriptor matrix passed
+Intel and arm64 beta but failed stable's fourth startup subcase and nightly's
+fast clean response. A private socket exchange reproduced Darwin rejecting
+timeout changes after peer shutdown; response timeouts now precede the request,
+without retrying it. Startup diagnostics retain the same deadline; that failure
+remains unexplained alongside the five earlier failures. A private Cargo
+comparison also reproduced lost umask 077 and NOFILE limit 128 (managed used
+022/256). Their restoration/admission gate remains open in the
+[checklist](docs/macos-cargo-supervision.md#ipc-response-ordering-and-remaining-native-state--october-2-2026).
+
+## 0. What changed vs. `doc.md`, and why
 
 **2026-10-02 queued macOS commit and completed GC locks:** the existing pilot
 case reproduced blocked TERM missing from the application's pending set and

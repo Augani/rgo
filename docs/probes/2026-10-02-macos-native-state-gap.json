@@ -1,0 +1,53 @@
+{
+  "root": "/private/tmp/rgostate-vmi4z49o",
+  "current": "/Users/augustusotu/Projects/rgo/target/debug",
+  "previous": "/Users/augustusotu/Projects/rgo/target/debug",
+  "source_sha": "4adb00f72ca9a8b74aac4d36e9d95e76455dd3c2",
+  "observations": [
+    {
+      "caller": "current",
+      "guardian": "current",
+      "ordinary_native_state": "63 128 9223372036854775807",
+      "ordinary_created_mode": "0o600",
+      "managed_native_state": "18 256 9223372036854775807",
+      "managed_created_mode": "0o644",
+      "caller_at_barrier": true,
+      "guardian_committed": true,
+      "application_exit_code": 17,
+      "application_invocations": 1,
+      "caller_pid": 1773,
+      "application_pid": 1779,
+      "same_pid": false,
+      "file_aliases_shared_offset": 6,
+      "original_low_source_fd": 4,
+      "jobserver_token_round_trip": true,
+      "close_on_exec_excluded": true,
+      "out_dir": "/private/tmp/rgostate-vmi4z49o/c/home/.rgo/builds/dd/f4759c15bafd661f1c7a2e7b868c16fdb4ea604b6621eeaab6ea9442105c21/debug/build/mixed-version-probe-71f15912d806ce2b/out",
+      "idle_metadata_retired": true,
+      "actual_idle_gc": true
+    }
+  ],
+  "platform": "ProductName:\t\tmacOS\nProductVersion:\t\t27.2\nBuildVersion:\t\t26B5091g",
+  "toolchain": "cargo 1.98.0 (797e8a9bc 2026-08-05)",
+  "binaries": {
+    "previous": {
+      "rgo": "e168d6e82c8537e0553c1c65d220930868313095e3855f43b4c9b47bc1f45113",
+      "rgo-rustc-wrapper": "88800eb94dbe104b2d10046e996d5cc1ca1ca0729d4b4b5fa90906b5cc6f5194"
+    },
+    "current": {
+      "rgo": "e168d6e82c8537e0553c1c65d220930868313095e3855f43b4c9b47bc1f45113",
+      "rgo-rustc-wrapper": "88800eb94dbe104b2d10046e996d5cc1ca1ca0729d4b4b5fa90906b5cc6f5194"
+    }
+  },
+  "date": "2026-10-02",
+  "status": "reproduced open compatibility defect; not fixed",
+  "interpretation": {
+    "ordinary_umask": "077",
+    "managed_umask": "022",
+    "ordinary_nofile_soft": 128,
+    "managed_nofile_soft": 256,
+    "created_file_modes_differ": true,
+    "descriptor_and_cleanup_assertions_passed": true
+  },
+  "limits": "Only this mask and NOFILE comparison is observed. Normal activation and automatic GC remain disabled. Restoration/admission implementation and cross-platform verification remain open."
+}

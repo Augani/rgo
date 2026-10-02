@@ -958,3 +958,26 @@ retirement-lock contention error during simultaneous healthy completion. A
 bounded retry of only that typed error resolves it after receipt retirement;
 maintenance stays nonblocking. Other native-state/nested classes and the five
 prior unexplained failures remain open, with normal activation and auto-GC off.
+
+The next native-state check is file creation and resource limits. The
+[POSIX exec contract](https://pubs.opengroup.org/onlinepubs/007904875/functions/exec.html)
+retains the caller's file-creation mask and limits; a separate launchd job does
+not obtain them through that exec. Apple's
+[launchd definition](https://github.com/apple-oss-distributions/launchd/blob/main/man/launchd.plist.5)
+provides explicit mask and soft/hard-limit settings. The
+[resource-limit contract](https://pubs.opengroup.org/onlinepubs/7908799/xsh/getrlimit.html)
+also restricts raising hard limits. Compare actual ordinary/managed Cargo before
+choosing restoration or checkout admission; the descriptor results do not
+establish equivalence for these attributes.
+
+The [ordinary/managed comparison](probes/2026-10-02-macos-native-state-gap.json)
+then reproduced that gap at `4adb00f`: ordinary Cargo retained umask 077 and a
+128-file soft limit, creating mode 0600; managed Cargo used 022/256 and created
+0644. Restoration/admission is still open. In the first platform matrix, arm64
+stable also missed its fourth startup prepared marker; new failure diagnostics
+do not explain that occurrence. Nightly's separate fast clean response error
+was reproduced with a socket pair: Darwin rejected timeout changes after the
+peer closed while its exact reply remained buffered. Apple's
+[socket implementation](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/kern/uipc_socket.c)
+rejects options on a fully shut-down socket. The client now sets its response
+timeout before sending the operation, retaining the single-request contract.
