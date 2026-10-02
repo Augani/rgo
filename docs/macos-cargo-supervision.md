@@ -897,3 +897,19 @@ Apple documents that exec preserves the signal mask and ignored actions in its
 [execve reference](https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man2/execve.2.html).
 The fixture checks that contract with real Cargo in private homes; it does not
 replace evidence for notifications at every handoff boundary.
+
+The [platform run](https://github.com/Augani/rgo/actions/runs/37051245534) at
+`43dfe6a` passed the signal fixtures on macOS 14.8.9 build 23J631 arm64 stable
+(11.38 s coalition / 1.47 s interrupt) and macOS 15.7.9 build 24G830 Intel
+(34.41 s / 3.57 s), both with Cargo/rustc 1.99.0. The full arm64 nightly lane
+also passed. Full-matrix acceptance remains open: macOS beta's existing
+`cas_only_pressure_eviction_respects_active_cache_leases` failed because an
+evicted manifest's object remained. That core code was unchanged by the signal
+batch; the failure's cause is unresolved, not classified as harmless or fixed.
+
+The isolated existing core test passed locally in 0.64 s; all 116 core tests
+passed under the locally installed beta 1.99.0-beta.8 in 2.38 s. This differs
+from CI's 1.100.0-beta.2 and macOS 14 runtime. The assertion now includes its GC
+report, retaining the exact deletion requirement. A manual-only workflow runs
+the existing core suite on the affected macOS 14 beta lane, avoiding another
+full platform run just to obtain those diagnostics.

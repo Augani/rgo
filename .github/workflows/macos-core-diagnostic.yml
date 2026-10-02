@@ -1,0 +1,26 @@
+name: macOS core diagnostic
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  core:
+    name: Existing core suite / macOS 14 beta
+    runs-on: macos-14
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: beta
+      - name: Record runtime and toolchain
+        run: |
+          sw_vers
+          uname -m
+          cargo --version --verbose
+          rustc --version --verbose
+      - name: Run existing core suite with failure diagnostics
+        run: cargo test -p rgo-core --lib -- --nocapture

@@ -3520,9 +3520,12 @@ mod tests {
         assert!(queued.actions.iter().any(|action| {
             action.path == state.cas.manifest_path(&new_key).display().to_string()
         }));
-        run_gc(&state, false, false, false, Some(target)).unwrap();
+        let final_gc = run_gc(&state, false, false, false, Some(target)).unwrap();
         assert!(!state.cas.manifest_path(&new_key).exists());
-        assert!(!state.cas.object_path(&new_object.digest).exists());
+        assert!(
+            !state.cas.object_path(&new_object.digest).exists(),
+            "evicted manifest's object remains: {final_gc:#?}"
+        );
         assert_eq!(state.db.lock().unwrap().next_remote_job().unwrap(), None);
     }
 

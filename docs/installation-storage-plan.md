@@ -244,6 +244,13 @@ the result signal. The combined local coalition/terminal/recovery case passed
 in 21.58 s with all five preparation subcases. Other mask/action classes and
 commit/exec timing remain open in the
 [macOS checklist](macos-cargo-supervision.md#blocked-pending-termination--october-2-2026).
+The actual signal cases passed on arm64 stable/nightly and Intel in the
+[platform run](https://github.com/Augani/rgo/actions/runs/37051245534), but
+macOS beta's existing CAS-reclamation test failed with an evicted manifest's
+object still present. Its cause remains unresolved. The existing assertion
+now includes its GC report; a manual-only core-suite diagnostic targets the
+affected runtime without rerunning the other lanes. This leaves the batch's
+full-platform acceptance open.
 
 **macOS priority (2026-10-02):** a private real-Cargo audit reproduced deletion
 while a detached child with closed inherited descriptors was still writing.

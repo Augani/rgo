@@ -30,5 +30,40 @@
     "git diff --check: passed",
     "All three debug audit strings present in debug rgo and absent from release rgo and rgo-rustc-wrapper"
   ],
-  "limits": "This proves queued SIGTERM at the existing preparation pause. Other masks/actions, unsupported signal classes, commit/child creation/exec timing, IDE/runtime and representative performance remain open. Automatic GC and normal pilot activation remain off. Two earlier unexplained interrupt/terminal failures remain unresolved. No new Rust test case; debug audit excluded from release binaries. Protocol 9/admission revision 4 unchanged."
+  "limits": "This proves queued SIGTERM at the existing preparation pause. Other masks/actions, unsupported signal classes, commit/child creation/exec timing, IDE/runtime and representative performance remain open. Automatic GC and normal pilot activation remain off. Two earlier unexplained interrupt/terminal failures remain unresolved. No new Rust test case; debug audit excluded from release binaries. Protocol 9/admission revision 4 unchanged.",
+  "platform_verification": {
+    "native_commit": "43dfe6ad602e25323f3fe9d4603645674f0e49e7",
+    "run_url": "https://github.com/Augani/rgo/actions/runs/37051245534",
+    "run_attempt": 1,
+    "result": "Signal fixtures passed on arm64 stable/nightly and Intel; full run has a macOS beta core-suite failure, so the batch platform gate is open",
+    "macos_arm64": {
+      "os": "macOS 14.8.9 build 23J631",
+      "toolchain": "Cargo/rustc 1.99.0 stable",
+      "coalition_case_seconds": 11.38,
+      "interrupt_case_seconds": 1.47,
+      "result": "Existing cases and full lane passed"
+    },
+    "macos_intel": {
+      "os": "macOS 15.7.9 build 24G830",
+      "toolchain": "Cargo/rustc 1.99.0 stable",
+      "coalition_case_seconds": 34.41,
+      "interrupt_case_seconds": 3.57,
+      "result": "Both existing cases and all five required preparation outcomes passed"
+    },
+    "failure": {
+      "job_url": "https://github.com/Augani/rgo/actions/runs/37051245534/job/110984895252",
+      "test": "daemon::tests::cas_only_pressure_eviction_respects_active_cache_leases",
+      "location": "crates/rgo-core/src/daemon.rs:3525 at native commit 43dfe6a",
+      "assertion": "!state.cas.object_path(&new_object.digest).exists()",
+      "observed": "The prior assertion requires the evicted manifest to be gone; its object was still present. Cause unresolved; no classification as harmless or fixed.",
+      "toolchain": "Cargo/rustc 1.100.0-beta.2 on macOS 14 arm64",
+      "local_followup": [
+        "Stable 1.98 isolated existing test passed in 0.64 s",
+        "Installed local beta 1.99.0-beta.8 existing 116-test core suite passed in 2.38 s; this is a different compiler/runtime from the failing CI lane",
+        "Existing failure assertion now includes the complete GC report without changing its requirement",
+        "Manual-only macOS 14 beta core diagnostic runs the existing suite without repeating the other platform lanes"
+      ],
+      "diagnostic_checks": "Zero-warning all-target Clippy, format and diff checks passed for the added assertion diagnostic"
+    }
+  }
 }
