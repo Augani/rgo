@@ -131,9 +131,16 @@ fn render_flavor(executable: &Path, flavor: Flavor) -> Result<RenderedService> {
             Flavor::Scoped => systemd_quote(&executable.display().to_string(), true),
             Flavor::Legacy => systemd_escape(&executable.display().to_string()),
         };
+        // default.target already orders itself after its wanted services.
+        // Ordering the scoped service after it would introduce a startup cycle.
+        let ordering = if flavor == Flavor::Legacy {
+            "After=default.target\n"
+        } else {
+            ""
+        };
         let contents = format!(
-            "[Unit]\nDescription=rgo build storage daemon\nAfter=default.target\n\n[Service]\nExecStart={} daemon --foreground\n{}Restart=on-failure\nRestartSec=2\n\n[Install]\nWantedBy=default.target\n",
-            command, environment
+            "[Unit]\nDescription=rgo build storage daemon\n{}\n[Service]\nExecStart={} daemon --foreground\n{}Restart=on-failure\nRestartSec=2\n\n[Install]\nWantedBy=default.target\n",
+            ordering, command, environment
         );
         Ok(RenderedService {
             path,
@@ -228,6 +235,15 @@ fn former_scoped_definition(executable: &Path, root: &Path) -> String {
         "[Unit]\nDescription=rgo build storage daemon\nAfter=default.target\n\n[Service]\nExecStart={} daemon --foreground\nEnvironment=RGO_HOME={}\nRestart=on-failure\nRestartSec=2\n\n[Install]\nWantedBy=default.target\n",
         systemd_escape(&executable.display().to_string()),
         systemd_escape(&root.display().to_string())
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn former_ordered_scoped_definition(contents: &str) -> String {
+    contents.replacen(
+        "\n\n[Service]\n",
+        "\nAfter=default.target\n\n[Service]\n",
+        1,
     )
 }
 
@@ -444,7 +460,9 @@ fn verify_service_ownership_flavor(
             #[cfg(target_os = "linux")]
             let matches_former_scoped = flavor == Flavor::Scoped
                 && (existing == former_scoped_definition(executable, &root)
-                    || existing == former_scoped_definition(previous_executable, &root));
+                    || existing == former_scoped_definition(previous_executable, &root)
+                    || existing == former_ordered_scoped_definition(&rendered.contents)
+                    || existing == former_ordered_scoped_definition(&previous.contents));
             #[cfg(target_os = "macos")]
             let matches_former_scoped = flavor == Flavor::Scoped
                 && (existing == former_scoped_macos_logs_definition(&rendered.contents, &root)
@@ -545,14 +563,20 @@ pub fn install(
             std::process::exit(90);
         }
         command("systemctl", ["--user", "daemon-reload"])?;
+        // A persistent user manager can have a different HOME/config search
+        // path from this setup process. Link the exact owned definition.
+        let unit_path = rendered
+            .path
+            .to_str()
+            .context("systemd unit path must be UTF-8")?;
         if previous_executable.is_some() {
             // `enable --now` does not restart an already active unit after its
             // ExecStart changes. A verified replacement must run the daemon
             // from the newly installed definition before setup reports health.
-            command("systemctl", ["--user", "enable", &rendered.label])?;
+            command("systemctl", ["--user", "enable", unit_path])?;
             command("systemctl", ["--user", "restart", &rendered.label])?;
         } else {
-            command("systemctl", ["--user", "enable", "--now", &rendered.label])?;
+            command("systemctl", ["--user", "enable", "--now", unit_path])?;
         }
         Ok(rendered)
     }

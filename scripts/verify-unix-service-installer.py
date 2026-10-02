@@ -22,10 +22,8 @@ def run(command: list[str], environment: dict[str, str], cwd: Path | None = None
     subprocess.run(command, env=environment, cwd=cwd, check=True, timeout=120)
 
 
-def verify_launchd_restart(cli: Path, rgo_home: Path, environment: dict[str, str]) -> None:
+def wait_for_service_restart(cli: Path, rgo_home: Path, environment: dict[str, str], original: int, reason: str) -> None:
     pid_file = rgo_home / "state/daemon.pid"
-    original = int(pid_file.read_text().strip())
-    os.kill(original, signal.SIGKILL)
     deadline = time.monotonic() + 45
     while time.monotonic() < deadline:
         try:
@@ -46,16 +44,46 @@ def verify_launchd_restart(cli: Path, rgo_home: Path, environment: dict[str, str
                     entry["message"].startswith(f"daemon pid {current}:")
                     for entry in entries
                 ):
-                    print(f"launchd restarted private daemon {original} -> {current}")
+                    print(f"{reason}: private daemon {original} -> {current}")
                     return
         time.sleep(0.5)
-    raise RuntimeError("launchd did not restart the private rgo daemon after SIGKILL")
+    raise RuntimeError(f"{reason}: private daemon did not restart")
+
+
+def verify_service_restart(cli: Path, rgo_home: Path, environment: dict[str, str]) -> None:
+    manager = "launchd" if platform.system() == "Darwin" else "systemd"
+    original = int((rgo_home / "state/daemon.pid").read_text().strip())
+    os.kill(original, signal.SIGKILL)
+    wait_for_service_restart(cli, rgo_home, environment, original, f"{manager} crash recovery")
+
+
+def verify_systemd_manager_restart(cli: Path, rgo_home: Path, environment: dict[str, str]) -> None:
+    if environment.get("GITHUB_ACTIONS") != "true" or environment.get("RGO_PROBE_RESTART_USER_MANAGER") != "1":
+        raise RuntimeError("fresh Linux user-manager probe requires an explicit disposable CI opt-in")
+    unit = f"user@{os.getuid()}.service"
+    if unit in Path("/proc/self/cgroup").read_text():
+        raise RuntimeError("refusing to restart the user manager containing this CI worker")
+    original = int((rgo_home / "state/daemon.pid").read_text().strip())
+    run(["sudo", "systemctl", "restart", unit], environment)
+    # Read-only doctor queries cannot start the daemon. Persisted enablement
+    # must activate it through default.target in the new manager.
+    wait_for_service_restart(cli, rgo_home, environment, original, "fresh systemd user manager")
 
 
 def main() -> None:
-    if platform.system() != "Darwin":
-        raise RuntimeError("this service probe requires macOS launchd")
-    target = "aarch64-apple-darwin" if platform.machine().lower() in {"arm64", "aarch64"} else "x86_64-apple-darwin"
+    if platform.system() == "Darwin":
+        target = "aarch64-apple-darwin" if platform.machine().lower() in {"arm64", "aarch64"} else "x86_64-apple-darwin"
+        shell = "/bin/zsh"
+    elif platform.system() == "Linux" and platform.machine().lower() == "x86_64":
+        if os.environ.get("GITHUB_ACTIONS") != "true" or os.environ.get("RGO_PROBE_RESTART_USER_MANAGER") != "1":
+            raise RuntimeError("Linux service probe requires an explicit disposable CI opt-in")
+        if f"user@{os.getuid()}.service" in Path("/proc/self/cgroup").read_text():
+            raise RuntimeError("refusing to restart the user manager containing this CI worker")
+        run(["systemctl", "--user", "show", "default.target", "--property=ActiveState"], os.environ.copy())
+        target = "x86_64-unknown-linux-gnu"
+        shell = "/bin/bash"
+    else:
+        raise RuntimeError("this service probe requires macOS launchd or x86_64 Linux user systemd")
     version = "v" + subprocess.check_output([ROOT / "target/debug/rgo", "--version"], text=True).split()[1]
     root = Path(tempfile.mkdtemp(prefix="rgo svc ü ", dir="/tmp"))
     home = root / "h"
@@ -75,7 +103,7 @@ def main() -> None:
         RGO_HOME=str(rgo_home),
         RUSTUP_HOME=os.environ.get("RUSTUP_HOME", str(Path.home() / ".rustup")),
         RUSTUP_TOOLCHAIN="stable",
-        SHELL="/bin/zsh",
+        SHELL=shell,
     )
     installer = [
         sys.executable, str(ROOT / "scripts/install-unix.py"),
@@ -112,7 +140,9 @@ def main() -> None:
         run(["cargo", "build", "--offline"], fresh, project)
         assert list((rgo_home / "builds").glob("*/*/.rgo-context.json"))
         active_cli = Path(record["rgo_binary"])
-        verify_launchd_restart(active_cli, rgo_home, fresh)
+        verify_service_restart(active_cli, rgo_home, fresh)
+        if platform.system() == "Linux":
+            verify_systemd_manager_restart(active_cli, rgo_home, fresh)
         active_cli.unlink()
         run([*installer, "--repair"], environment)
         assert active_cli.is_file()
@@ -151,6 +181,18 @@ def main() -> None:
         upgrade_installer[upgrade_installer.index("--sha256") + 1] = hashlib.sha256(
             upgrade_archive.read_bytes()
         ).hexdigest()
+
+        if platform.system() == "Linux":
+            units = list((home / ".config/systemd/user").glob("rgo-*.service"))
+            assert len(units) == 1, units
+            unit = units[0]
+            contents = unit.read_text()
+            assert "After=default.target" not in contents
+            # Exercise ownership-checked replacement of the historical quoted
+            # definition through real setup before the installer upgrade.
+            unit.write_text(contents.replace("\n\n[Service]\n", "\nAfter=default.target\n\n[Service]\n", 1))
+            run([str(active_cli), "setup", "--supervised", "--real-cargo", record["supervised_cargo"]["real_cargo"]], environment)
+            assert unit.read_text() == contents
 
         failed_environment = environment.copy()
         failed_environment["RGO_BYPASS"] = "1"

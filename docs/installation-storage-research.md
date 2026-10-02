@@ -485,3 +485,22 @@ check preserved it. The [18-job matrix](https://github.com/Augani/rgo/actions/ru
 passed, including the live Windows installer recovery and running-Cargo/PATH
 controls, full workspace suites, and 100-project recovery. These boundaries do not prove every internal
 core undo or service-manager write, power-loss durability, or safe data purge.
+
+## Linux service activation — 2026-10-02
+
+A persistent systemd user manager can search a different configuration root from
+the setup process. Enabling the owned unit by absolute path lets systemd create
+the required link into its load path ([systemctl enable semantics](https://github.com/systemd/systemd/blob/main/man/systemctl.xml)).
+New scoped units also omit `After=default.target`: the target automatically
+orders itself after wanted services, so the former reverse ordering could create
+a startup cycle ([target default dependencies](https://github.com/systemd/systemd/blob/main/man/systemd.target.xml)).
+Ownership checks still recognize the exact historical scoped definitions.
+
+The existing Unix service-installer probe now covers Linux stable with a real
+user manager and private Cargo/storage homes. It exercises crash recovery, a
+fresh manager start observed through read-only doctor queries, replacement of
+the historical definition, and the existing native/supervised repair, interrupted
+upgrade, and uninstall sequence. Restarting the user manager requires explicit
+disposable CI opt-in and refuses a worker running inside that manager. Local
+build/Clippy and CI results are pending. This does not establish GUI login,
+reboot, WSL/container behavior, or every service-manager interruption boundary.

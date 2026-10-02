@@ -60,6 +60,29 @@ jobs:
           python3 scripts/verify-local-installer.py
           python3 scripts/verify-local-installer.py --supervised
           if [ "$RUNNER_OS" = "macOS" ]; then python3 scripts/verify-unix-service-installer.py; fi
+      - name: Verify Linux user-systemd installer lifecycle
+        if: matrix.toolchain == 'stable' && matrix.os == 'ubuntu-latest'
+        run: |
+          set -euo pipefail
+          rgo_probe_user="$(id -un)"
+          rgo_probe_uid="$(id -u)"
+          rgo_probe_changed_linger=false
+          cleanup_rgo_user_manager() {
+            if [ "$rgo_probe_changed_linger" = true ]; then sudo loginctl disable-linger "$rgo_probe_user"; fi
+          }
+          trap cleanup_rgo_user_manager EXIT
+          # show-user can fail before logind has registered this CI account.
+          # Preserve an already enabled linger policy while bootstrapping it.
+          if [ ! -e "/var/lib/systemd/linger/$rgo_probe_user" ]; then
+            sudo loginctl enable-linger "$rgo_probe_user"
+            rgo_probe_changed_linger=true
+          fi
+          sudo systemctl start "user@$rgo_probe_uid.service"
+          export XDG_RUNTIME_DIR="/run/user/$rgo_probe_uid"
+          export DBUS_SESSION_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/bus"
+          export RGO_PROBE_RESTART_USER_MANAGER=1
+          systemctl --user show default.target --property=ActiveState
+          python3 scripts/verify-unix-service-installer.py
       - name: Probe nightly build-dir layouts
         if: matrix.toolchain == 'nightly'
         run: python3 scripts/verify-nightly-layout.py
