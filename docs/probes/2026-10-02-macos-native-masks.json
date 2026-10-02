@@ -1,0 +1,182 @@
+{
+  "date": "2026-10-02",
+  "baseline_code": "8d1ea1f2568edfef8de3947844c36ea9b2665d23",
+  "platform": "ProductName:\t\tmacOS\nProductVersion:\t\t27.2\nBuildVersion:\t\t26B5091g",
+  "toolchain": "cargo 1.98.0 (797e8a9bc 2026-08-05)",
+  "change": "Reject blocked signals outside the nine-signal macOS relay contract before preparing a new job, and reject old callers at guardian admission before receipt/commit/spawn.",
+  "fixtures": "One SIGALRM subcase added to the existing coalition case; no new Rust test case or CI lane. Existing terminal deadlines/assertions unchanged.",
+  "local_runs": {
+    "baseline": {
+      "sha256": "ebef0113744c97258c876841972b1e1d80cc4f414f1f1295ea146406d6fc6bac",
+      "local_path": "/tmp/rgo-macos-native-mask-before.log",
+      "results": [
+        "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 7.95s"
+      ],
+      "startup_outcomes": [
+        "startup cancellation: signal=2, ignored=false, blocked=false, cut=false, committed=false, status=ExitStatus(unix_wait_status(2))",
+        "startup cancellation: signal=15, ignored=false, blocked=false, cut=false, committed=false, status=ExitStatus(unix_wait_status(15))",
+        "startup cancellation: signal=2, ignored=true, blocked=false, cut=false, committed=true, status=ExitStatus(unix_wait_status(0))",
+        "startup cancellation: signal=15, ignored=false, blocked=true, cut=false, committed=true, status=ExitStatus(unix_wait_status(15))",
+        "startup cancellation: signal=15, ignored=false, blocked=true, cut=false, committed=false, status=ExitStatus(unix_wait_status(18944))",
+        "startup cancellation: signal=15, ignored=false, blocked=true, cut=true, committed=false, status=ExitStatus(unix_wait_status(18944))",
+        "startup cancellation: signal=2, ignored=false, blocked=false, cut=true, committed=false, status=ExitStatus(unix_wait_status(2))",
+        "startup cancellation: signal=31, ignored=false, blocked=true, cut=false, committed=true, status=ExitStatus(unix_wait_status(31))",
+        "startup cancellation: signal=31, ignored=false, blocked=false, cut=false, committed=false, status=ExitStatus(unix_wait_status(31))",
+        "startup cancellation: signal=14, ignored=false, blocked=true, cut=false, committed=true, status=ExitStatus(unix_wait_status(0))"
+      ],
+      "alarm_pending": [
+        "pending signal 14 before app unblocks: \"missing\""
+      ]
+    },
+    "guard_first": {
+      "sha256": "7f493e4127a79a28e00dd939313c63bdb5bb92c9fd1f138025d70ca2be9469be",
+      "local_path": "/tmp/rgo-macos-native-mask-after.log",
+      "results": [
+        "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 27.71s"
+      ],
+      "startup_outcomes": [
+        "startup cancellation: signal=2, ignored=false, blocked=false, cut=false, committed=false, status=ExitStatus(unix_wait_status(2))",
+        "startup cancellation: signal=15, ignored=false, blocked=false, cut=false, committed=false, status=ExitStatus(unix_wait_status(15))",
+        "startup cancellation: signal=2, ignored=true, blocked=false, cut=false, committed=true, status=ExitStatus(unix_wait_status(0))",
+        "startup cancellation: signal=15, ignored=false, blocked=true, cut=false, committed=true, status=ExitStatus(unix_wait_status(15))",
+        "startup cancellation: signal=15, ignored=false, blocked=true, cut=false, committed=false, status=ExitStatus(unix_wait_status(18944))",
+        "startup cancellation: signal=15, ignored=false, blocked=true, cut=true, committed=false, status=ExitStatus(unix_wait_status(18944))",
+        "startup cancellation: signal=2, ignored=false, blocked=false, cut=true, committed=false, status=ExitStatus(unix_wait_status(2))",
+        "startup cancellation: signal=31, ignored=false, blocked=true, cut=false, committed=true, status=ExitStatus(unix_wait_status(31))",
+        "startup cancellation: signal=31, ignored=false, blocked=false, cut=false, committed=false, status=ExitStatus(unix_wait_status(31))",
+        "startup cancellation: signal=14, ignored=false, blocked=true, cut=false, committed=false, status=ExitStatus(unix_wait_status(18944))"
+      ],
+      "alarm_pending": [
+        "pending signal 14 before app unblocks: \"pending\""
+      ],
+      "failure_excerpt": "    raise RuntimeError(f\"background job did not stop; transcript={bytes(transcript)!r}\")"
+    },
+    "guard_failure_diagnostics": {
+      "sha256": "5eca85024ddf4af3301799d234d7c43ee39495b5d66d1b86bb728d4eb9c77517",
+      "local_path": "/tmp/rgo-macos-native-mask-after-diagnostic.log",
+      "results": [
+        "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 28.31s",
+        "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.54s"
+      ],
+      "startup_outcomes": [
+        "startup cancellation: signal=2, ignored=false, blocked=false, cut=false, committed=false, status=ExitStatus(unix_wait_status(2))",
+        "startup cancellation: signal=15, ignored=false, blocked=false, cut=false, committed=false, status=ExitStatus(unix_wait_status(15))",
+        "startup cancellation: signal=2, ignored=true, blocked=false, cut=false, committed=true, status=ExitStatus(unix_wait_status(0))",
+        "startup cancellation: signal=15, ignored=false, blocked=true, cut=false, committed=true, status=ExitStatus(unix_wait_status(15))",
+        "startup cancellation: signal=15, ignored=false, blocked=true, cut=false, committed=false, status=ExitStatus(unix_wait_status(18944))",
+        "startup cancellation: signal=15, ignored=false, blocked=true, cut=true, committed=false, status=ExitStatus(unix_wait_status(18944))",
+        "startup cancellation: signal=2, ignored=false, blocked=false, cut=true, committed=false, status=ExitStatus(unix_wait_status(2))",
+        "startup cancellation: signal=31, ignored=false, blocked=true, cut=false, committed=true, status=ExitStatus(unix_wait_status(31))",
+        "startup cancellation: signal=31, ignored=false, blocked=false, cut=false, committed=false, status=ExitStatus(unix_wait_status(31))",
+        "startup cancellation: signal=14, ignored=false, blocked=true, cut=false, committed=false, status=ExitStatus(unix_wait_status(18944))"
+      ],
+      "alarm_pending": [
+        "pending signal 14 before app unblocks: \"pending\""
+      ],
+      "failure_excerpt": "    raise RuntimeError(f\"background job did not stop; state={failure_state()!r}; \""
+    },
+    "descendant_diagnostics": {
+      "sha256": "0d108ef30bd4b3848b3da79e132d48da1dcdd880a5e57b300f2f2e98f2c11da5",
+      "local_path": "/tmp/rgo-macos-native-mask-terminal-state.log",
+      "results": [
+        "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 29.86s"
+      ],
+      "startup_outcomes": [
+        "startup cancellation: signal=2, ignored=false, blocked=false, cut=false, committed=false, status=ExitStatus(unix_wait_status(2))",
+        "startup cancellation: signal=15, ignored=false, blocked=false, cut=false, committed=false, status=ExitStatus(unix_wait_status(15))",
+        "startup cancellation: signal=2, ignored=true, blocked=false, cut=false, committed=true, status=ExitStatus(unix_wait_status(0))",
+        "startup cancellation: signal=15, ignored=false, blocked=true, cut=false, committed=true, status=ExitStatus(unix_wait_status(15))",
+        "startup cancellation: signal=15, ignored=false, blocked=true, cut=false, committed=false, status=ExitStatus(unix_wait_status(18944))",
+        "startup cancellation: signal=15, ignored=false, blocked=true, cut=true, committed=false, status=ExitStatus(unix_wait_status(18944))",
+        "startup cancellation: signal=2, ignored=false, blocked=false, cut=true, committed=false, status=ExitStatus(unix_wait_status(2))",
+        "startup cancellation: signal=31, ignored=false, blocked=true, cut=false, committed=true, status=ExitStatus(unix_wait_status(31))",
+        "startup cancellation: signal=31, ignored=false, blocked=false, cut=false, committed=false, status=ExitStatus(unix_wait_status(31))",
+        "startup cancellation: signal=14, ignored=false, blocked=true, cut=false, committed=false, status=ExitStatus(unix_wait_status(18944))"
+      ],
+      "alarm_pending": [
+        "pending signal 14 before app unblocks: \"pending\""
+      ]
+    },
+    "event_diagnostics": {
+      "sha256": "992a849dcb8030057939cd30bfc4a0ca2a0b94eab3598d55ee7b9a073b3904e2",
+      "local_path": "/tmp/rgo-macos-native-mask-events.log",
+      "results": [
+        "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 22.85s"
+      ],
+      "startup_outcomes": [
+        "startup cancellation: signal=2, ignored=false, blocked=false, cut=false, committed=false, status=ExitStatus(unix_wait_status(2))",
+        "startup cancellation: signal=15, ignored=false, blocked=false, cut=false, committed=false, status=ExitStatus(unix_wait_status(15))",
+        "startup cancellation: signal=2, ignored=true, blocked=false, cut=false, committed=true, status=ExitStatus(unix_wait_status(0))",
+        "startup cancellation: signal=15, ignored=false, blocked=true, cut=false, committed=true, status=ExitStatus(unix_wait_status(15))",
+        "startup cancellation: signal=15, ignored=false, blocked=true, cut=false, committed=false, status=ExitStatus(unix_wait_status(18944))",
+        "startup cancellation: signal=15, ignored=false, blocked=true, cut=true, committed=false, status=ExitStatus(unix_wait_status(18944))",
+        "startup cancellation: signal=2, ignored=false, blocked=false, cut=true, committed=false, status=ExitStatus(unix_wait_status(2))",
+        "startup cancellation: signal=31, ignored=false, blocked=true, cut=false, committed=true, status=ExitStatus(unix_wait_status(31))",
+        "startup cancellation: signal=31, ignored=false, blocked=false, cut=false, committed=false, status=ExitStatus(unix_wait_status(31))",
+        "startup cancellation: signal=14, ignored=false, blocked=true, cut=false, committed=false, status=ExitStatus(unix_wait_status(18944))"
+      ],
+      "alarm_pending": [
+        "pending signal 14 before app unblocks: \"pending\""
+      ]
+    }
+  },
+  "live_upgrade": {
+    "root": "/var/folders/8f/l7zyp8_15jl68g9stnzw7lvw0000gn/T/rgo-macos-native-mask-uv37pk79",
+    "baseline_code": "8d1ea1f2568edfef8de3947844c36ea9b2665d23",
+    "baseline_docs": "8d6d9e8",
+    "previous_release": "/var/folders/8f/l7zyp8_15jl68g9stnzw7lvw0000gn/T/rgo-macos-native-mask-uv37pk79/previous-release",
+    "previous_debug": "/var/folders/8f/l7zyp8_15jl68g9stnzw7lvw0000gn/T/rgo-macos-native-mask-uv37pk79/previous-debug",
+    "previous_debug_note": "Production code unchanged from 8d1ea1f; debug pending observation additionally includes SIGALRM",
+    "previous": "/var/folders/8f/l7zyp8_15jl68g9stnzw7lvw0000gn/T/rgo-macos-native-mask-uv37pk79/previous-debug",
+    "current": "/Users/augustusotu/Projects/rgo/target/debug",
+    "case": "/private/tmp/rgomask-0wzsikmx",
+    "observation": {
+      "old_caller_new_guardian": true,
+      "blocked_signal": "SIGALRM",
+      "kernel_pending_before_unblock": true,
+      "checkout_fallback": true,
+      "guardian_committed": false,
+      "handler_exit": 74,
+      "application_invocations": 1,
+      "same_pid": 64384,
+      "out_dir": "/private/tmp/rgomask-0wzsikmx/project/target/debug/build/native-mask-upgrade-21f2b0f20affccb4/out",
+      "owned_metadata_retired": true,
+      "actual_idle_gc": true
+    },
+    "platform": "ProductName:\t\tmacOS\nProductVersion:\t\t27.2\nBuildVersion:\t\t26B5091g",
+    "toolchain": "cargo 1.98.0 (797e8a9bc 2026-08-05)",
+    "binaries": {
+      "previous": {
+        "rgo": "cc126bdd0c7447cc7397dc2dddb0ac00806153feeb0b8bdd9a0d557e430cf665",
+        "rgo-rustc-wrapper": "88800eb94dbe104b2d10046e996d5cc1ca1ca0729d4b4b5fa90906b5cc6f5194"
+      },
+      "current": {
+        "rgo": "5732014adf6e919f65020e6efcc30f16314dbd2c676c37f460e2d91f70cab45d",
+        "rgo-rustc-wrapper": "88800eb94dbe104b2d10046e996d5cc1ca1ca0729d4b4b5fa90906b5cc6f5194"
+      }
+    }
+  },
+  "probe_correction": "The first private upgrade setup was refused because its temporary Cargo socket path exceeded the Unix limit; the probe used a shorter private /tmp root and then completed.",
+  "open_failures": [
+    "Two local background terminal-stop failures (27.71s and 28.31s), followed by passes with process/event diagnostics. No cause established; later passes do not resolve these failures.",
+    "Three earlier unexplained failures documented in the macOS checklist remain open."
+  ],
+  "release_status": "Native supervisor remains a private pilot; normal activation and automatic GC disabled. Final platform checks pending.",
+  "required_local_checks": {
+    "all_bins_debug": "passed (7.88s)",
+    "all_targets_clippy": "passed with -D warnings (9.14s)",
+    "all_bins_release": "passed (17.69s)",
+    "format": "passed",
+    "diff": "passed",
+    "release_audit_hooks_present": {
+      "rgo": {
+        "RGO_MACOS_SUPERVISOR_EVENT_AUDIT": false,
+        "RGO_MACOS_SUPERVISOR_AUDIT": false
+      },
+      "rgo-rustc-wrapper": {
+        "RGO_MACOS_SUPERVISOR_EVENT_AUDIT": false,
+        "RGO_MACOS_SUPERVISOR_AUDIT": false
+      }
+    }
+  }
+}

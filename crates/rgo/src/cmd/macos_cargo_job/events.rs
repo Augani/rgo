@@ -13,7 +13,7 @@ static CHILD_WAKE: AtomicI32 = AtomicI32::new(-1);
 
 // Exec preserves ignored dispositions and the caller's signal mask. The
 // guardian's own SIGCHLD/SIGHUP handlers must not leak into real Cargo.
-#[derive(Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub(super) struct NativeSignals {
     ignored: u32,
     blocked: u32,
@@ -48,6 +48,17 @@ impl NativeSignals {
 
     pub(super) fn accepts_pending(self, pending: u32) -> bool {
         pending & !(self.blocked & !self.ignored) == 0
+    }
+
+    pub(super) fn validate_for_managed(self) -> Result<()> {
+        // A child cannot inherit its parent's pending set. Decline every
+        // blocked signal outside the relay contract, even if ignored now:
+        // the application may later replace that action and unblock it.
+        ensure!(
+            self.blocked & !super::forwarded_mask() == 0,
+            "Cargo caller has blocked signals outside the guardian relay contract"
+        );
+        Ok(())
     }
 
     // Only async-signal-safe syscalls: this runs between fork and exec.

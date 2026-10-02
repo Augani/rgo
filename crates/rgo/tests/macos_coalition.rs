@@ -140,7 +140,9 @@ fn cancellation_before_commit(sandbox: &Sandbox, project: &std::path::Path, rgo:
         (libc::SIGINT, b"resume".as_slice(), false, false, true),
         (libc::SIGUSR2, b"resume".as_slice(), false, true, false),
         (libc::SIGUSR2, b"fail".as_slice(), false, false, false),
+        (libc::SIGALRM, b"resume".as_slice(), false, true, false),
     ] {
+        let checkout_only = signal == libc::SIGALRM;
         if blocked {
             // Check the inherited mask before changing the application action.
             // A queued signal must kill the managed app or invoke the fallback
@@ -173,7 +175,7 @@ fn main() {{ unsafe {{
                     setmask = libc::SIG_SETMASK,
                     term = signal,
                     unblock = libc::SIG_UNBLOCK,
-                    handled = action == b"fail" || cut,
+                    handled = action == b"fail" || cut || checkout_only,
                 ),
             )
             .unwrap();
@@ -258,7 +260,7 @@ fn main() {{ unsafe {{
             publish_audit_release(&directory.join("cut-release"), b"resume").unwrap();
         }
         if blocked {
-            if action == b"resume" && !cut {
+            if action == b"resume" && !cut && !checkout_only {
                 wait_for_file(
                     &directory.join("caller-committed"),
                     Instant::now() + Duration::from_secs(3),
@@ -295,8 +297,8 @@ fn main() {{ unsafe {{
         println!(
             "startup cancellation: signal={signal}, ignored={ignored}, blocked={blocked}, cut={cut}, committed={committed}, status={status:?}"
         );
-        let fallback = blocked && (action == b"fail" || cut);
-        let expected_commit = ignored || (blocked && action == b"resume" && !cut);
+        let fallback = blocked && (action == b"fail" || cut || checkout_only);
+        let expected_commit = ignored || (blocked && action == b"resume" && !cut && !checkout_only);
         if committed != expected_commit
             || (ignored && !status.success())
             || (fallback && status.code() != Some(74))
@@ -906,6 +908,9 @@ fn main() {
     )
     .unwrap();
     let worker_release = ReleaseWorker(project.join("release-shell-worker"));
+    let event_audit = paths.state_dir().join("macos-supervisor-audit");
+    std::fs::create_dir(&event_audit).unwrap();
+    std::fs::set_permissions(&event_audit, std::fs::Permissions::from_mode(0o700)).unwrap();
     let terminal = sandbox
         .cmd("python3")
         .arg("-c")
@@ -914,6 +919,7 @@ fn main() {
         .env("PATH", &search_path)
         .env("RGO_MACOS_SUPERVISOR_PILOT", "1")
         .env("RGO_TERMINAL_PROBE", "1")
+        .env("RGO_MACOS_SUPERVISOR_EVENT_AUDIT", "1")
         .env("RGO_TERMINAL_HELPER", rgo)
         .env("RGO_COALITION_READY", &ready)
         .env("RGO_COALITION_RELEASE", &release)

@@ -309,6 +309,15 @@ at `8d1ea1f`, including advisory nightly and the actual arm64/Intel cases.
 Normal activation and automatic GC remain off; three earlier failures remain
 unexplained.
 
+**macOS unsupported blocked masks:** a pending SIGALRM reproduces loss across
+the guardian fork. Caller and guardian admission now refuse blocked signals
+outside the negotiated nine-signal relay contract. Checkout exec preserves the
+alarm; the existing fixture and an old-caller/new-guardian live handoff reach
+the application's handler with exit 74, one invocation and actual idle GC.
+Two local background terminal-stop failures remain unexplained after later
+passes. The [mask observations and remaining checklist](macos-cargo-supervision.md#unsupported-blocked-masks--october-2-2026)
+record this explicitly; normal activation and automatic GC stay disabled.
+
 **macOS priority (2026-10-02):** a private real-Cargo audit reproduced deletion
 while a detached child with closed inherited descriptors was still writing.
 The [macOS supervisor checklist](macos-cargo-supervision.md) records the selected

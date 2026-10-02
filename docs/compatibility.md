@@ -50,6 +50,11 @@ rebuild-over-migrate when the filesystem is the source of truth.
   `forwarded_signals` mask. A current caller requires pending-before-exec and
   all nine supported signals, including SIGUSR1/SIGUSR2, before terminal
   activation/commit. Missing or insufficient capabilities use checkout fallback.
+  A caller with any blocked signal outside that nine-signal contract also uses
+  checkout fallback, preserving its kernel pending state through exec. The
+  guardian repeats this admission check for older callers before publishing
+  a receipt or accepting a commit. Even a currently ignored blocked signal is
+  refused because the application may change its action later.
   The guardian accepts legacy `S` and earlier seven-signal `Q` records; current
   callers send `Q` plus a four-byte
   big-endian pending mask. Only forwarded, originally blocked, non-ignored

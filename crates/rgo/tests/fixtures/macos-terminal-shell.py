@@ -30,6 +30,10 @@ def failure_state():
     root = pathlib.Path(os.environ["RGO_HOME"])
     details = {"foreground": os.tcgetpgrp(master), "shell": pid,
                "modes": termios.tcgetattr(master), "guardian_stderr": {}}
+    try:
+        details["events"] = (root / "state/macos-supervisor-audit/events").read_bytes()[-16000:]
+    except OSError as error:
+        details["events"] = str(error)
     for directory in list((root / "state").glob("macos-cargo-job-*"))[:8]:
         try:
             with (directory / "guardian.stderr").open("rb") as stream:
@@ -38,10 +42,17 @@ def failure_state():
             details["guardian_stderr"][directory.name] = str(error)
     try:
         rows = subprocess.check_output(
-            ["ps", "-axo", "pid=,ppid=,pgid=,stat=,etime=,command="],
+            ["ps", "-axo", "pid=,ppid=,pgid=,stat=,etime=,sigmask=,command="],
             text=True, timeout=2)
-        details["processes"] = [row[:1024] for row in rows.splitlines()
-            if str(root) in row or row.split()[0] in (str(pid), str(details["foreground"]))][:16]
+        rows = rows.splitlines()
+        owned = {str(pid), str(details["foreground"])}
+        owned.update(row.split()[0] for row in rows if str(root) in row)
+        while True:
+            children = {row.split()[0] for row in rows if row.split()[1] in owned}
+            if children <= owned:
+                break
+            owned.update(children)
+        details["processes"] = [row[:1024] for row in rows if row.split()[0] in owned][:32]
     except (OSError, subprocess.TimeoutExpired) as error:
         details["processes"] = str(error)
     return details
@@ -199,7 +210,8 @@ try:
             if b"suspended" in pathlib.Path("background-state").read_bytes():
                 break
             if time.monotonic() >= deadline:
-                raise RuntimeError(f"background job did not stop; transcript={bytes(transcript)!r}")
+                raise RuntimeError(f"background job did not stop; state={failure_state()!r}; "
+                    f"jobs={pathlib.Path('background-state').read_bytes()!r}; transcript={bytes(transcript[-6000:])!r}")
             time.sleep(0.02)
         command("fg")
         expect(b"RGO_CONTINUED")

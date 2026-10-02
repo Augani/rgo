@@ -34,6 +34,21 @@ fn publish(directory: &std::path::Path, name: &str) -> Result<()> {
     Ok(())
 }
 
+pub(super) fn event(paths: &RgoPaths, enabled: bool, event: std::fmt::Arguments<'_>) {
+    let Ok(Some(directory)) = directory(paths, enabled) else {
+        return;
+    };
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(directory.join("events"))
+    {
+        let _ = writeln!(file, "{} {event}", std::process::id());
+    }
+}
+
 pub(super) fn prepared(paths: &RgoPaths) -> Result<()> {
     let enabled = std::env::var_os("RGO_MACOS_SUPERVISOR_AUDIT").as_deref()
         == Some(std::ffi::OsStr::new("1"));
@@ -57,7 +72,7 @@ pub(super) fn prepared(paths: &RgoPaths) -> Result<()> {
             "cannot observe audit pending signals"
         );
         if !pending_observed
-            && [libc::SIGTERM, libc::SIGUSR1, libc::SIGUSR2]
+            && [libc::SIGTERM, libc::SIGUSR1, libc::SIGUSR2, libc::SIGALRM]
                 .into_iter()
                 .any(|signal| {
                     (unsafe { libc::sigismember(&pending, signal) }) == 1

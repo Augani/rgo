@@ -123,6 +123,18 @@ and three earlier unexplained failures remain open in the
 [macOS checklist](docs/macos-cargo-supervision.md#user-notifications-and-live-guardian-upgrade--october-2-2026).
 Normal activation and automatic GC stay off.
 
+**2026-10-02 macOS unsupported blocked masks:** a pending SIGALRM was lost
+across the guardian fork. The caller now declines masks outside its nine-signal
+relay contract before creating a job; the guardian independently refuses older
+callers with those masks before receipt/commit/spawn. The existing fixture and
+a live old-caller/new-guardian handoff retain the pending alarm through checkout
+exec, run the app once and reach its handler with exit 74. Two local background
+terminal-stop failures remain unexplained despite later passes. Process and
+event diagnostics now capture that path without changing assertions/deadlines.
+See the [recorded observations](docs/probes/2026-10-02-macos-native-masks.json)
+and [checklist](docs/macos-cargo-supervision.md#unsupported-blocked-masks--october-2-2026).
+Normal activation and automatic GC remain disabled.
+
 ## 0. What changed vs. `doc.md`, and why
 
 **2026-10-02 queued macOS commit and completed GC locks:** the existing pilot

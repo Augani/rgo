@@ -1067,3 +1067,38 @@ and both signal-31 exits. The
 [individual job record](probes/2026-10-02-macos-user-signals-ci.json) records all
 19 conclusions and exact source/toolchain data. These greens verify the batch;
 they do not explain the three earlier failures or close the wider release gates.
+
+## Unsupported blocked masks — October 2, 2026
+
+- [x] Reproduce pending SIGALRM loss by extending the existing startup loop.
+  The original launcher commits, the app inherits a blocked mask but no pending
+  alarm, and exits 0 instead of reaching its fallback handler.
+- [x] Decline every blocked signal outside the nine-signal relay contract
+  before opening a terminal or registering a job. Repeat admission in the
+  guardian for older callers before receipt, commit and spawn.
+- [x] Verify checkout exec preserves the app's kernel pending alarm and reaches
+  its handler with exit 74 without a managed commit. All ten startup outcomes,
+  detached-writer protection, real idle GC, I/O and terminal assertions pass in
+  the instrumented existing coalition case (22.85 s). The existing interrupt
+  case passed in 3.54 s in the earlier combined diagnostic run.
+- [x] Exercise a live old-caller/new-guardian switch at the existing session
+  barrier. The new guardian refuses the old mask; checkout Cargo/app keeps the
+  caller PID, runs once, preserves output and pending SIGALRM, exits 74, retires
+  owned metadata and permits actual prepared-context deletion.
+- [x] Build all bins in debug and release, pass zero-warning all-target Clippy,
+  formatting and diff checks. Release binaries exclude the private audit hooks.
+- [ ] Resolve the two background terminal-stop failures seen in local runs
+  (27.71 s and 28.31 s). Later passes do not explain them. Failure diagnostics
+  now include private descendant state, signal masks and caller/guardian events;
+  deadlines and assertions are unchanged.
+- [ ] Validate this batch on the existing platform matrix and complete the
+  remaining native-state, timing, terminal and upgrade gates. The three earlier
+  unexplained failures remain open; normal activation and automatic GC stay off.
+
+The [observations](probes/2026-10-02-macos-native-masks.json) distinguish the
+reproduced signal defect, the live admission check and the unresolved terminal
+failures. The first live probe used a socket path that was too long; shortening
+its private temporary root corrected probe setup without a production change.
+This does not expand the relay contract or change protocol 9, admission 4,
+owner 4 or receipt 2. A currently ignored blocked signal is also refused because
+the application can change its action before unblocking.

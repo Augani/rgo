@@ -899,3 +899,26 @@ and Linux/Windows suites, source builds, Cargo boundaries, nightly layouts,
 installers/services, btrfs and budget recovery checks all passed. This verifies
 this runtime-forwarding change across the existing lanes; it does not resolve
 the remaining inherited-signal/timing or release gates.
+
+## macOS blocked signals outside the relay contract — October 2, 2026
+
+The [POSIX fork contract](https://pubs.opengroup.org/onlinepubs/9799919799/functions/fork.html)
+starts a child with an empty pending set, while the
+[exec contract](https://pubs.opengroup.org/onlinepubs/9799919799/functions/exec.html)
+preserves pending signals. Apple's
+[exec documentation](https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man2/execve.2.html)
+also preserves the blocked mask and ignored actions. A guardian fork therefore
+cannot substitute for caller exec unless pending state is transferred or the
+invocation is declined. The existing startup loop reproduced this distinction
+with blocked SIGALRM: the old pilot committed and lost the alarm.
+
+Caller and guardian now refuse blocked masks outside the nine-signal relay
+contract before commit. The app then sees the pending alarm through checkout
+exec and reaches its handler with exit 74. A live old-caller/new-guardian
+replacement independently verifies refusal, one execution with the same PID,
+checkout storage and actual idle cleanup. These
+[observations](probes/2026-10-02-macos-native-masks.json) establish this specific
+mask fallback, not complete native process-state equivalence. Two background
+terminal-stop failures remain unexplained despite later passes; the existing
+fixture now captures private process and event diagnostics on that path without
+relaxing its checks. Normal activation and automatic GC remain disabled.

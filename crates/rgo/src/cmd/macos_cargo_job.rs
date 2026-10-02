@@ -407,6 +407,14 @@ impl PreparedJob {
     ) -> Result<Self> {
         let started = Instant::now();
         let deadline = started + STARTUP_TIMEOUT;
+        let signals = events::NativeSignals::capture()?;
+        if let Err(error) = signals.validate_for_managed() {
+            // Keep the same private observation barrier on a rejected caller,
+            // before opening a terminal or registering any guardian job.
+            #[cfg(debug_assertions)]
+            audit::prepared(paths)?;
+            return Err(error);
+        }
         let terminal = terminal::Caller::open(paths)?;
         paths.ensure_layout()?;
         let invocation = Invocation {
@@ -420,7 +428,7 @@ impl PreparedJob {
             context: context.to_owned(),
             terminal: terminal.is_some(),
             framed_control: true,
-            signals: events::NativeSignals::capture()?,
+            signals,
         };
         // Serialize before registering any job, including the frame size check.
         ensure!(
@@ -646,9 +654,18 @@ impl RunningJob {
         let mut reader = self.stream.try_clone()?;
         let wake = wake::Wake::get()?;
         let (sender, receiver) = std::sync::mpsc::channel();
+        #[cfg(debug_assertions)]
+        let event_audit = std::env::var_os("RGO_MACOS_SUPERVISOR_EVENT_AUDIT").as_deref()
+            == Some(std::ffi::OsStr::new("1"));
+        #[cfg(debug_assertions)]
+        let reader_paths = self.audit_paths.clone();
         std::thread::spawn(move || {
             loop {
                 let message = read_frame::<Message>(&mut reader);
+                #[cfg(debug_assertions)]
+                if matches!(message, Ok(Message::Stopped)) {
+                    audit::event(&reader_paths, event_audit, format_args!("reader stopped"));
+                }
                 let terminal = !matches!(message, Ok(Message::Started { .. } | Message::Stopped));
                 if sender.send(message).is_err() {
                     break;
@@ -663,6 +680,12 @@ impl RunningJob {
             wake.drain()?;
             if let Some(terminal) = &mut self.terminal {
                 if let Some(foreground) = terminal.changed_foreground()? {
+                    #[cfg(debug_assertions)]
+                    audit::event(
+                        &self.audit_paths,
+                        event_audit,
+                        format_args!("caller foreground={foreground}"),
+                    );
                     if foreground {
                         write_frame(
                             &mut self.stream,
@@ -678,6 +701,12 @@ impl RunningJob {
             let pending = SIGNALS.swap(0, Ordering::AcqRel) & RELAY_MASK.load(Ordering::Acquire);
             for signal in FORWARDED_SIGNALS {
                 if pending & (1 << signal) != 0 {
+                    #[cfg(debug_assertions)]
+                    audit::event(
+                        &self.audit_paths,
+                        event_audit,
+                        format_args!("caller signal={signal}"),
+                    );
                     match (signal, self.terminal.as_ref()) {
                         (libc::SIGWINCH, Some(terminal)) => terminal.resize()?,
                         _ => write_frame(&mut self.stream, &Control::Signal(signal))?,
@@ -692,6 +721,12 @@ impl RunningJob {
                     );
                 }
                 Ok(Ok(Message::Stopped)) => {
+                    #[cfg(debug_assertions)]
+                    audit::event(
+                        &self.audit_paths,
+                        event_audit,
+                        format_args!("caller stopped"),
+                    );
                     if let Some(terminal) = &mut self.terminal {
                         terminal.restore();
                     }
@@ -995,6 +1030,17 @@ pub fn guardian(directory: &Path, token: &str, context: Option<&Path>) -> Result
     )?;
     let request = read_frame::<Invocation>(&mut stream)?;
     let mut descriptors = receive_descriptors(&stream, if request.terminal { 4 } else { 3 })?;
+    // An older caller can still send a mask outside the current relay policy.
+    // Refuse it before preparing a PTY, publishing a receipt or accepting Q/S.
+    if let Err(error) = request.signals.validate_for_managed() {
+        let _ = write_frame(
+            &mut stream,
+            &Message::Failed {
+                detail: format!("{error:#}"),
+            },
+        );
+        return Err(error);
+    }
     let mut terminal = if request.terminal {
         Some(terminal::Guardian::new(
             descriptors.pop().context("original terminal is missing")?,
@@ -1015,6 +1061,16 @@ pub fn guardian(directory: &Path, token: &str, context: Option<&Path>) -> Result
             && directory.parent() == Some(paths.state_dir().as_path())
             && request.context == owner.context,
         "Cargo job scope must be absolute"
+    );
+    #[cfg(debug_assertions)]
+    let event_audit = request.environment.iter().any(|(key, value)| {
+        key.as_slice() == b"RGO_MACOS_SUPERVISOR_EVENT_AUDIT" && value.as_slice() == b"1"
+    });
+    #[cfg(debug_assertions)]
+    audit::event(
+        &paths,
+        event_audit,
+        format_args!("guardian native={:?}", request.signals),
     );
     let mut session = supervision::lock_cargo_session(&paths, Some(&request.context))?;
     // Recovery can fence a startup waiting for this scope. Revalidate after
@@ -1147,6 +1203,12 @@ pub fn guardian(directory: &Path, token: &str, context: Option<&Path>) -> Result
                         }
                     }
                     ChildChange::Stopped => {
+                        #[cfg(debug_assertions)]
+                        audit::event(
+                            &paths,
+                            event_audit,
+                            format_args!("guardian child-stopped pid={}", child.id()),
+                        );
                         let _ = write_frame(&mut stream, &Message::Stopped);
                     }
                     ChildChange::None => {}
@@ -1169,6 +1231,12 @@ pub fn guardian(directory: &Path, token: &str, context: Option<&Path>) -> Result
                                 Control::Signal(signal)
                                     if !primary_exited && FORWARDED_SIGNALS.contains(&signal) =>
                                 {
+                                    #[cfg(debug_assertions)]
+                                    audit::event(
+                                        &paths,
+                                        event_audit,
+                                        format_args!("guardian signal={signal}"),
+                                    );
                                     signal_group(&child, signal)
                                 }
                                 Control::Terminal(configuration) => {
@@ -1177,6 +1245,12 @@ pub fn guardian(directory: &Path, token: &str, context: Option<&Path>) -> Result
                                     }
                                 }
                                 Control::Foreground(foreground) if !primary_exited => {
+                                    #[cfg(debug_assertions)]
+                                    audit::event(
+                                        &paths,
+                                        event_audit,
+                                        format_args!("guardian foreground={foreground}"),
+                                    );
                                     if let Some(terminal) = &terminal {
                                         terminal.foreground(if foreground {
                                             child.id().try_into()?
