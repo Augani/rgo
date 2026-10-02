@@ -883,9 +883,19 @@ and deadlines are unchanged. This fixes the partial-publication synchronization
 defect without treating an empty result as success.
 
 All-bin debug/release builds, zero-warning all-target Clippy, formatting and
-diff checks passed on macOS 27.2 arm64 with Cargo 1.98.0. Platform verification
-is pending. The [captured observations](probes/2026-10-02-macos-runtime-signals.json)
+diff checks passed on macOS 27.2 arm64 with Cargo 1.98.0.
+The [captured observations](probes/2026-10-02-macos-runtime-signals.json)
 separate the initial repro, final callback proof and publication failure.
 Protocol 9, admission revision 4, kernel receipts and job-retirement policy are
 unchanged. Pending masked signals, commit timing, other signal/action classes,
 IDE behavior and the broader release gates remain open.
+
+The [19-job platform run](https://github.com/Augani/rgo/actions/runs/37046807684)
+passed at `c24958d` on its first attempt. The actual coalition and custom-handler
+interrupt cases passed on macOS 14.8.9 arm64 in 12.73 s / 1.64 s and macOS
+15.7.9 Intel in 30.46 s / 2.84 s, using Cargo/rustc 1.99.0. The Intel log retains
+all three expected preparation subcase statuses. Full macOS stable/beta/nightly
+and Linux/Windows suites, source builds, Cargo boundaries, nightly layouts,
+installers/services, btrfs and budget recovery checks all passed. This verifies
+this runtime-forwarding change across the existing lanes; it does not resolve
+the remaining inherited-signal/timing or release gates.

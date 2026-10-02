@@ -102,8 +102,10 @@ handler's exit code 73, stop/resume, surviving-descendant protection, and idle
 reclamation. Local validation passed alongside the existing coalition/terminal
 case, all-bin debug/release builds and zero-warning Clippy. A partial result-file
 publication in that fixture was corrected with atomic completion markers;
-assertions and deadlines remain unchanged. Platform verification is pending.
-The wider inherited-signal/startup and release gates remain open.
+assertions and deadlines remain unchanged. The [19-job platform run](https://github.com/Augani/rgo/actions/runs/37046807684)
+passed at `c24958d` without a retry, including both actual cases on arm64 and
+Intel and every existing platform lane. The wider inherited-signal/startup
+and release gates remain open.
 
 ## 0. What changed vs. `doc.md`, and why
 

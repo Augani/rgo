@@ -229,8 +229,10 @@ requires a custom SIGINT handler's exit code 73 while retaining stop/resume,
 writer protection and actual idle GC. The existing coalition/terminal case
 also passed after correcting its non-atomic completion-marker publication.
 No new Rust case was added; all-bin debug/release builds and zero-warning
-Clippy passed. Platform verification is pending; the broader signal/timing
-matrix remains open in the
+Clippy passed. The [19-job platform run](https://github.com/Augani/rgo/actions/runs/37046807684)
+passed at `c24958d` without a retry, including the actual cases on arm64/Intel
+and all existing suites, installers and recovery checks. The broader
+signal/timing matrix remains open in the
 [macOS checklist](macos-cargo-supervision.md#runtime-signal-forwarding--october-2-2026).
 
 **macOS priority (2026-10-02):** a private real-Cargo audit reproduced deletion

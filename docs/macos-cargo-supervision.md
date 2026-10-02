@@ -755,8 +755,8 @@ cancellation, runtime, and performance gates stay open.
 - [x] Refuse the commit and fallback after captured termination, returning the
   requested signal. Restore terminal state before original signal actions on
   every subsequent preparation error.
-- [x] Preserve originally ignored termination signals during preparation. The ignored-SIGINT
-  positive control must commit real Cargo and finish successfully.
+- [x] Preserve originally ignored termination signals during preparation. The
+  ignored-SIGINT positive control must commit real Cargo and finish successfully.
 - [x] Observe continuation/window notifications in the caller even when its
   original dispositions/mask would suppress delivery. Cargo retains its
   captured mask/dispositions. The existing interrupt case starts with SIGCONT
@@ -831,7 +831,7 @@ remaining startup, inherited-signal, IDE/runtime and performance gates are open.
   variant passed in 5.15 s; the three preparation subcases retain their prior
   expected commit/status outcomes. All-bin debug/release build, zero-warning
   all-target Clippy, format and diff checks passed.
-- [ ] Verify this batch across the existing platform lanes.
+- [x] Verify this batch across the existing platform lanes.
 - [ ] Complete the remaining inherited-signal matrix and timing cuts, including
   masked pending termination, failures during the commit handoff, other changed
   actions, and notifications around child creation/exec. Keep normal activation
@@ -844,3 +844,13 @@ interrupt failure and local terminal timeout remain unresolved. This batch
 does not measure performance or close the complete inherited-signal contract;
 the earlier benchmark remains historical evidence. Protocol/admission and
 receipt/job ownership schemas are unchanged.
+
+The [19-job platform run](https://github.com/Augani/rgo/actions/runs/37046807684)
+passed at `c24958d` on its first attempt. Coalition/custom-handler interrupt
+times were 12.73 s / 1.64 s on macOS 14.8.9 build 23J631 arm64 and 30.46 s /
+2.84 s on macOS 15.7.9 build 24G830 Intel, both with Cargo/rustc 1.99.0.
+The exact exit-code-73 assertion passed in both cases; the Intel log also records
+all three expected preparation outcomes. Every existing macOS
+stable/beta/nightly, Linux/Windows, source-build, Cargo-boundary, nightly-layout,
+installer/service, btrfs and budget-recovery lane passed. The broader timing,
+masked-signal, IDE/runtime and performance gates remain open.
