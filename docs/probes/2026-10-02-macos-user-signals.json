@@ -45,8 +45,16 @@
     "release_audit_exclusion": "PASS for rgo and rgo-rustc-wrapper; debug rgo positive control",
     "new_rust_test_cases": 0,
     "new_ci_lanes": 0,
-    "full_workspace_suite": "Pending one existing remote matrix; no duplicate full local suite"
+    "full_workspace_suite": "PASS in the existing remote platform matrix; no duplicate full local suite"
   },
   "upgrade_evidence": "2026-10-02-macos-user-signal-upgrade.json",
-  "limits": "Remaining mask/action and unsupported-state classes, later commit/exec timing, terminal/installer/service version skew, declared runtime range, IDE and representative performance remain open. Three earlier interrupt/terminal/CAS failures remain unexplained. Normal activation and automatic GC stay off."
+  "limits": "Remaining mask/action and unsupported-state classes, later commit/exec timing, terminal/installer/service version skew, declared runtime range, IDE and representative performance remain open. Three earlier interrupt/terminal/CAS failures remain unexplained. Normal activation and automatic GC stay off.",
+  "platform_verification": {
+    "record": "2026-10-02-macos-user-signals-ci.json",
+    "code_sha": "8d1ea1f2568edfef8de3947844c36ea9b2665d23",
+    "run_url": "https://github.com/Augani/rgo/actions/runs/37062187982",
+    "individual_jobs_passed": 19,
+    "individual_jobs_total": 19,
+    "run_attempt": 1
+  }
 }

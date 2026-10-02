@@ -302,8 +302,12 @@ closed-FD writer through binary replacement, guardian death and a restarted
 current daemon; the late write succeeds before actual context/job/receipt
 retirement. [Evidence and the remaining checklist](macos-cargo-supervision.md#user-notifications-and-live-guardian-upgrade--october-2-2026)
 limit this to same-authority nonterminal binary replacement, with the full
-installer/service and terminal upgrade gates still open. The existing platform
-matrix is pending; normal activation and automatic GC remain off.
+installer/service and terminal upgrade gates still open. All 19 individual
+jobs passed on attempt 1 in the
+[existing platform matrix](https://github.com/Augani/rgo/actions/runs/37062187982)
+at `8d1ea1f`, including advisory nightly and the actual arm64/Intel cases.
+Normal activation and automatic GC remain off; three earlier failures remain
+unexplained.
 
 **macOS priority (2026-10-02):** a private real-Cargo audit reproduced deletion
 while a detached child with closed inherited descriptors was still writing.

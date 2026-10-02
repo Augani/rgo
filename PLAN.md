@@ -116,8 +116,10 @@ and zero-warning Clippy. Live previous/current handoffs preserve one execution,
 exit 17, output and actual idle cleanup. An already-running old optimized
 guardian also retains closed-FD writer protection after binary replacement,
 guardian death and current-daemon restart, then permits real cleanup after the
-late write. One existing platform matrix is pending; broader release gates and
-three earlier unexplained failures remain open in the
+late write. All 19 individual jobs passed on attempt 1 at `8d1ea1f` in the
+[existing platform matrix](https://github.com/Augani/rgo/actions/runs/37062187982),
+including advisory nightly and actual arm64/Intel cases. Broader release gates
+and three earlier unexplained failures remain open in the
 [macOS checklist](docs/macos-cargo-supervision.md#user-notifications-and-live-guardian-upgrade--october-2-2026).
 Normal activation and automatic GC stay off.
 

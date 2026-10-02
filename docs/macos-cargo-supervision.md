@@ -624,35 +624,39 @@ the remaining startup, runtime, IDE, or performance release gates.
 
 ## Integrate with unchanged Cargo commands
 
-- [ ] Add a private per-invocation launchd job with a unique owned label, no
-  `KeepAlive`, sockets, Mach services, or demand triggers. Verify ownership
-  before inspecting, starting, stopping, or removing a job. Preserve an edited
-  or unrelated definition.
-- [ ] Have the owned PATH launcher start that job without replacing rustup's
-  Cargo proxy. Keep the caller's exact `+toolchain`, flags, working directory,
-  environment, and selected compiler/wrapper behavior.
-- [ ] Transfer stdin/stdout/stderr over an authenticated local Unix socket
-  using descriptor passing. Preserve terminals, pipes, redirected files,
-  interactive input, EOF, and Cargo's output/exit status. Private request
-  records must preserve non-UTF-8 arguments and environments.
-- [ ] Establish the startup handshake while the caller holds its existing
-  lifecycle guard. The job must obtain its bound guard and sync its coalition
-  receipt before Cargo can write managed intermediates. Startup failure must
-  fall back to checkout storage before any managed write.
-- [ ] Return Cargo's exit status while retaining descendant protection until
-  kernel membership drains. Define Ctrl-C, termination, shell closure, nested
-  Cargo, and terminal job-control behavior without changing everyday commands.
-  Verify process-group and session behavior explicitly; descriptor passing
-  alone does not establish compatibility with terminal job control.
-- [ ] Fence job restart and namespace reuse. A zero-count snapshot alone is
-  insufficient if a loaded job can admit future unguarded work.
-- [ ] Recover owned jobs and receipts after launcher, guardian, or daemon
-  crashes. A missing/reaped coalition is an error, not evidence of zero tasks.
-  Define durable completion before removing a job that can reap its coalition.
-- [ ] Introduce a fresh admission namespace and IPC policy revision. Older
-  contexts remain protected, and older daemons must not delete new contexts
-  without checking coalition receipts. Retain explicit old-daemon shutdown
-  during installation upgrades.
+Checked entries describe the explicit macOS pilot; normal installation and the
+shipping checks below remain gated.
+
+- [x] Add a private per-invocation launchd job with a unique owned label, no
+  `KeepAlive`, sockets, Mach services, or demand triggers. Validate its exact
+  owned definition and preserve edited or unrelated metadata. `LaunchOnlyOnce`
+  owns registration retirement; rgo never unloads Cargo jobs by label.
+- [x] Have the owned PATH launcher start that job without replacing rustup's
+  Cargo proxy. Preserve native arguments/environment and working directory;
+  retain toolchain selection and decline unsupported compiler/wrapper admission.
+- [x] Transfer stdin/stdout/stderr over an authenticated local Unix socket
+  using descriptor passing. Preserve pipes, redirected files, native bytes,
+  input/EOF and output/status. The cooperating-zsh pilot additionally verifies
+  controlling-terminal and foreground-group behavior with a private PTY.
+- [x] Establish the startup handshake while the caller holds its existing
+  lifecycle guard. Obtain the job's bound guard and sync its coalition receipt
+  before commit. Preparation and incomplete-commit failures restore caller
+  state before checkout fallback; completed commits never launch Cargo again.
+- [ ] Complete the command/lifecycle matrix, including nested Cargo, test/run,
+  terminal job control, shell closure and remaining inherited signal states.
+  Current cases verify exact exit codes, Ctrl-C, stop/resume and descendant
+  protection, but do not establish every ordinary Cargo invocation.
+- [x] Fence restart and namespace reuse with exact one-use definitions and
+  kernel receipt policy. A zero-count snapshot never authorizes unloading a
+  replaceable job label or admitting future unguarded work.
+- [ ] Complete every interrupted preparation, receipt and recovery boundary.
+  Schema 2 accepts exact same-boot ESRCH only for a positively recorded kernel
+  identity; missing records and all other query failures preserve protection.
+  Schema 1 retains strict zero-count behavior. Existing cases cover caller,
+  guardian and daemon crashes; the full interruption matrix remains open.
+- [x] Introduce a fresh admission namespace and IPC policy revision. Older
+  contexts remain protected; mismatched daemon policy uses checkout fallback.
+  Installation retains explicit recorded old-daemon shutdown recovery.
 
 ## Shipping checks
 
@@ -775,9 +779,10 @@ cancellation, runtime, and performance gates stay open.
 - [ ] Verify originally blocked termination and pending signals across exec;
   classify unsupported caller states before admission rather than losing
   notifications when Cargo starts in a different process.
-- [ ] Verify post-exec changes to an initially ignored action, including a
-  running application that installs its own handler and direct signals to a
-  background shell job's process group.
+- [x] Verify post-exec changes to initially ignored SIGINT and SIGUSR1 actions
+  with a running application that installs its own handlers and direct signals
+  to a background job group. The runtime and user-notification evidence below
+  retains exact handler outcomes, stop/resume and actual idle reclamation.
 - [ ] Resolve the original macOS stable interrupt failure and the later local
   terminal startup timeout. The original failed job's archived log reports
   0.91 s for the interrupt case; its child's thirty-second expiry cannot explain
@@ -1034,8 +1039,9 @@ weakens the shared locks protecting Cargo or authorizes cleanup of a live job.
   new idle context, then kill the freshly verified old guardian by PID and
   restart the current daemon. Its closed-FD writer remains protected, completes
   its late write, and then permits actual context/job/receipt retirement.
-- [ ] Verify this batch in the existing platform matrix, including the actual
-  macOS arm64 stable/beta/nightly and Intel cases. No new CI lane is needed.
+- [x] Verify this batch in the existing platform matrix: all 19 individual
+  jobs passed on attempt 1 at `8d1ea1f`, including advisory nightly, actual
+  macOS arm64 stable/beta/nightly and Intel cases. No new CI lane was added.
 - [ ] Complete remaining mask/action and unsupported-state classes, later
   commit/exec timing, terminal and installer/service version skew, rollback and
   supported-runtime acceptance. Resolve the three earlier unexplained failures.
@@ -1049,3 +1055,15 @@ only additional pending-signal observation; the running old guardian uses the
 unmodified optimized baseline. These are nonterminal same-authority handoffs
 using protocol 9, admission 4, owner 4 and receipt 2, with direct binary
 replacement. They do not close the full installer/service upgrade gate.
+
+The [full platform run](https://github.com/Augani/rgo/actions/runs/37062187982)
+passed every existing job without a retry. On macOS 14.8.9 build 23J631 arm64,
+coalition/interrupt durations were 13.51 s / 1.52 s with stable 1.99.0,
+13.54 s / 1.70 s with beta 1.100.0-beta.2, and 15.32 s / 1.66 s with advisory
+nightly 1.101.0. Each lane passed all 116 core cases, including strict CAS
+reclamation. Intel macOS 15.7.9 build 24G830 with Cargo 1.99.0 passed in
+26.91 s / 2.54 s and emitted all nine startup outcomes, including pending USR2
+and both signal-31 exits. The
+[individual job record](probes/2026-10-02-macos-user-signals-ci.json) records all
+19 conclusions and exact source/toolchain data. These greens verify the batch;
+they do not explain the three earlier failures or close the wider release gates.

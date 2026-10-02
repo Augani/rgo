@@ -1,0 +1,240 @@
+{
+  "url": "https://github.com/Augani/rgo/actions/runs/37062187982",
+  "head_sha": "8d1ea1f2568edfef8de3947844c36ea9b2665d23",
+  "status": "completed",
+  "conclusion": "success",
+  "run_attempt": 1,
+  "individual_jobs": [
+    {
+      "databaseId": 111021225380,
+      "name": "Linux btrfs smoke",
+      "status": "completed",
+      "conclusion": "success",
+      "startedAt": "2026-10-02T20:41:29Z",
+      "completedAt": "2026-10-02T20:42:32Z",
+      "url": "https://github.com/Augani/rgo/actions/runs/37062187982/job/111021225380"
+    },
+    {
+      "databaseId": 111021225573,
+      "name": "Pinned nightly layout / macos-14",
+      "status": "completed",
+      "conclusion": "success",
+      "startedAt": "2026-10-02T20:41:34Z",
+      "completedAt": "2026-10-02T20:42:42Z",
+      "url": "https://github.com/Augani/rgo/actions/runs/37062187982/job/111021225573"
+    },
+    {
+      "databaseId": 111021225632,
+      "name": "Pinned nightly layout / ubuntu-latest",
+      "status": "completed",
+      "conclusion": "success",
+      "startedAt": "2026-10-02T20:41:28Z",
+      "completedAt": "2026-10-02T20:42:19Z",
+      "url": "https://github.com/Augani/rgo/actions/runs/37062187982/job/111021225632"
+    },
+    {
+      "databaseId": 111021225653,
+      "name": "Pinned nightly layout / windows-latest",
+      "status": "completed",
+      "conclusion": "success",
+      "startedAt": "2026-10-02T20:41:29Z",
+      "completedAt": "2026-10-02T20:43:31Z",
+      "url": "https://github.com/Augani/rgo/actions/runs/37062187982/job/111021225653"
+    },
+    {
+      "databaseId": 111021225674,
+      "name": "Source build / Rust 1.85 / windows-latest",
+      "status": "completed",
+      "conclusion": "success",
+      "startedAt": "2026-10-02T20:41:29Z",
+      "completedAt": "2026-10-02T20:43:09Z",
+      "url": "https://github.com/Augani/rgo/actions/runs/37062187982/job/111021225674"
+    },
+    {
+      "databaseId": 111021225683,
+      "name": "ubuntu-latest / nightly",
+      "status": "completed",
+      "conclusion": "success",
+      "startedAt": "2026-10-02T20:41:29Z",
+      "completedAt": "2026-10-02T20:45:14Z",
+      "url": "https://github.com/Augani/rgo/actions/runs/37062187982/job/111021225683"
+    },
+    {
+      "databaseId": 111021225685,
+      "name": "macos-14 / beta",
+      "status": "completed",
+      "conclusion": "success",
+      "startedAt": "2026-10-02T20:41:33Z",
+      "completedAt": "2026-10-02T20:46:21Z",
+      "url": "https://github.com/Augani/rgo/actions/runs/37062187982/job/111021225685"
+    },
+    {
+      "databaseId": 111021225688,
+      "name": "macOS Intel Cargo guardian",
+      "status": "completed",
+      "conclusion": "success",
+      "startedAt": "2026-10-02T20:41:31Z",
+      "completedAt": "2026-10-02T20:45:32Z",
+      "url": "https://github.com/Augani/rgo/actions/runs/37062187982/job/111021225688"
+    },
+    {
+      "databaseId": 111021225708,
+      "name": "Source build / Rust 1.85 / macos-14",
+      "status": "completed",
+      "conclusion": "success",
+      "startedAt": "2026-10-02T20:41:33Z",
+      "completedAt": "2026-10-02T20:42:28Z",
+      "url": "https://github.com/Augani/rgo/actions/runs/37062187982/job/111021225708"
+    },
+    {
+      "databaseId": 111021225709,
+      "name": "Cargo 1.90/1.91 activation / ubuntu-latest",
+      "status": "completed",
+      "conclusion": "success",
+      "startedAt": "2026-10-02T20:41:29Z",
+      "completedAt": "2026-10-02T20:42:31Z",
+      "url": "https://github.com/Augani/rgo/actions/runs/37062187982/job/111021225709"
+    },
+    {
+      "databaseId": 111021225733,
+      "name": "Cargo 1.90/1.91 activation / windows-latest",
+      "status": "completed",
+      "conclusion": "success",
+      "startedAt": "2026-10-02T20:41:28Z",
+      "completedAt": "2026-10-02T20:43:42Z",
+      "url": "https://github.com/Augani/rgo/actions/runs/37062187982/job/111021225733"
+    },
+    {
+      "databaseId": 111021225745,
+      "name": "macos-14 / nightly",
+      "status": "completed",
+      "conclusion": "success",
+      "startedAt": "2026-10-02T20:42:35Z",
+      "completedAt": "2026-10-02T20:47:22Z",
+      "url": "https://github.com/Augani/rgo/actions/runs/37062187982/job/111021225745"
+    },
+    {
+      "databaseId": 111021225757,
+      "name": "Source build / Rust 1.85 / ubuntu-latest",
+      "status": "completed",
+      "conclusion": "success",
+      "startedAt": "2026-10-02T20:41:29Z",
+      "completedAt": "2026-10-02T20:42:17Z",
+      "url": "https://github.com/Augani/rgo/actions/runs/37062187982/job/111021225757"
+    },
+    {
+      "databaseId": 111021225760,
+      "name": "windows-latest / beta",
+      "status": "completed",
+      "conclusion": "success",
+      "startedAt": "2026-10-02T20:41:29Z",
+      "completedAt": "2026-10-02T20:46:24Z",
+      "url": "https://github.com/Augani/rgo/actions/runs/37062187982/job/111021225760"
+    },
+    {
+      "databaseId": 111021225768,
+      "name": "Cargo 1.90/1.91 activation / macos-14",
+      "status": "completed",
+      "conclusion": "success",
+      "startedAt": "2026-10-02T20:42:48Z",
+      "completedAt": "2026-10-02T20:44:05Z",
+      "url": "https://github.com/Augani/rgo/actions/runs/37062187982/job/111021225768"
+    },
+    {
+      "databaseId": 111021225777,
+      "name": "windows-latest / stable",
+      "status": "completed",
+      "conclusion": "success",
+      "startedAt": "2026-10-02T20:41:28Z",
+      "completedAt": "2026-10-02T20:55:27Z",
+      "url": "https://github.com/Augani/rgo/actions/runs/37062187982/job/111021225777"
+    },
+    {
+      "databaseId": 111021225808,
+      "name": "macos-14 / stable",
+      "status": "completed",
+      "conclusion": "success",
+      "startedAt": "2026-10-02T20:44:12Z",
+      "completedAt": "2026-10-02T20:51:44Z",
+      "url": "https://github.com/Augani/rgo/actions/runs/37062187982/job/111021225808"
+    },
+    {
+      "databaseId": 111021225842,
+      "name": "ubuntu-latest / stable",
+      "status": "completed",
+      "conclusion": "success",
+      "startedAt": "2026-10-02T20:41:28Z",
+      "completedAt": "2026-10-02T20:47:49Z",
+      "url": "https://github.com/Augani/rgo/actions/runs/37062187982/job/111021225842"
+    },
+    {
+      "databaseId": 111021225866,
+      "name": "ubuntu-latest / beta",
+      "status": "completed",
+      "conclusion": "success",
+      "startedAt": "2026-10-02T20:41:28Z",
+      "completedAt": "2026-10-02T20:45:23Z",
+      "url": "https://github.com/Augani/rgo/actions/runs/37062187982/job/111021225866"
+    }
+  ],
+  "macos_observations": [
+    {
+      "job_id": 111021225808,
+      "job": "macos-14 / stable",
+      "cargo": "1.99.0 (5f94df478 2026-08-27)",
+      "os": "macOS 14.8.9",
+      "os_build": "23J631",
+      "arch": "arm64",
+      "rustc": "1.99.0 (b940084d7 2026-09-28)",
+      "core_cases": 116,
+      "core_seconds": 2.11,
+      "strict_cas_pressure_passed": true,
+      "coalition_seconds": 13.51,
+      "interrupt_seconds": 1.52
+    },
+    {
+      "job_id": 111021225685,
+      "job": "macos-14 / beta",
+      "cargo": "1.100.0-beta.2 (3d7cf6e93 2026-09-25)",
+      "os": "macOS 14.8.9",
+      "os_build": "23J631",
+      "arch": "arm64",
+      "rustc": "1.100.0-beta.2 (2311729bc 2026-10-01)",
+      "core_cases": 116,
+      "core_seconds": 2.26,
+      "strict_cas_pressure_passed": true,
+      "coalition_seconds": 13.54,
+      "interrupt_seconds": 1.7
+    },
+    {
+      "job_id": 111021225745,
+      "job": "macos-14 / nightly",
+      "cargo": "1.101.0-nightly (f3865b2a4 2026-09-29)",
+      "os": "macOS 14.8.9",
+      "os_build": "23J631",
+      "arch": "arm64",
+      "rustc": "1.101.0-nightly (c36f14571 2026-10-01)",
+      "core_cases": 116,
+      "core_seconds": 1.8,
+      "strict_cas_pressure_passed": true,
+      "advisory": true,
+      "coalition_seconds": 15.32,
+      "interrupt_seconds": 1.66
+    },
+    {
+      "job_id": 111021225688,
+      "job": "macOS Intel Cargo guardian",
+      "cargo": "1.99.0 (5f94df478 2026-08-27)",
+      "os": "macOS 15.7.9",
+      "os_build": "24G830",
+      "arch": "x86_64",
+      "startup_subcases": 9,
+      "pending_usr2_observed": true,
+      "managed_usr2_signal_exit": 31,
+      "preparation_usr2_signal_exit": 31,
+      "coalition_seconds": 26.91,
+      "interrupt_seconds": 2.54
+    }
+  ],
+  "limits": "Verifies this source batch on the existing 19 jobs, including advisory lanes. Does not explain the three earlier interrupt/terminal/CAS failures or establish full activation, unsupported signal-state, installer/terminal version-skew, IDE or performance acceptance."
+}
