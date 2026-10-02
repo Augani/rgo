@@ -89,9 +89,11 @@ in a private Cargo home; `rgo setup --dry-run` previews the config edit.
    (An absolute path is written; moving `CARGO_HOME` later requires a new setup.)
 3. Stores a small activation pointer and ownership record in Cargo home for
    fresh-process discovery and recovery.
-4. Attempts to install a per-user background service (launchd agent / systemd user
-   unit / Windows Task Scheduler). Service failure is reported as degraded setup.
-   Unattended destructive GC is disabled by default pending the P2 safety gate.
+4. Installs and verifies a per-user background service (launchd agent / systemd
+   user unit / Windows Task Scheduler). A requested service failure returns an
+   unsuccessful setup status and rolls back a new activation; an existing
+   installation reports incomplete maintenance. Unattended destructive GC is
+   disabled by default pending the P2 safety gate.
 
 After that, **users use plain `cargo` as before.** No project changes. Existing
 `target/` dirs are untouched (Cargo just stops writing intermediates into them);

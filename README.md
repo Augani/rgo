@@ -59,8 +59,10 @@ lifecycle remains release work:
    configuring a second `CARGO_HOME`.
 3. Installs a per-user background service (launchd/systemd/Task Scheduler) running
    `rgo daemon`, then checks that the service is running and its daemon answers
-   IPC. Failed startup is reported as degraded maintenance. `--no-service`
-   skips this. In native mode plain Cargo will not start background maintenance;
+   IPC. If startup fails, setup exits unsuccessfully and rolls back a new
+   activation; an existing installation reports incomplete maintenance.
+   `--no-service` skips registration. In native mode plain Cargo will not start
+   background maintenance;
    the opt-in supervised launchers on Unix and Windows start a daemon on Cargo
    use only when `[gc].auto = true` is explicitly configured for evaluation.
    Native setup rejects `[gc].auto = true`, and destructive `rgo gc` and
@@ -238,6 +240,10 @@ cleanup is enabled in supervised mode, an hourly retention pass runs even below
 the storage watermark. A missing workspace manifest becomes eligible after
 `orphan_grace` of inactivity, provided its volume is still available and the
 context has no active build or pin. The grace is not a timer from project deletion.
+
+The storage budget is a recovery target. Active builds, pins, or filesystem
+constraints can keep usage above it; `rgo status` reports protected storage and
+the unmet target. Cleanup works toward the budget when safe eligible data exists.
 
 ## License
 

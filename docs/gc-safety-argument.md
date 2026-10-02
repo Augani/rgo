@@ -66,6 +66,19 @@ still refusing a held or unreadable profile lock and holding rgo's guard
 through deletion. This does not detect direct Cargo writing into an already
 supervised context without running the wrapper.
 
+The custom-wrapper boundary needs an admission decision before enabling the
+supervised default. Sccache's [execution-mode documentation](https://github.com/mozilla/sccache/blob/main/docs/Architecture.md#execution-modes)
+says its default background server runs the compiler and writes output files.
+That server is outside the current Cargo process tree. Inference: rgo's inherited
+descriptor or Windows Job Object alone cannot establish exclusion for that writer
+after the client exits or crashes. The current launcher rejects build-directory
+overrides but does not separately classify custom compiler wrappers. Before this
+path is admitted to unattended cleanup, route uncertain compiler/wrapper settings
+to ordinary Cargo storage or establish a cooperative broker lease. Client-side
+sccache mode alone is insufficient as an admission signal: its documentation says
+some options cause the setting to be ignored. This is an unproven boundary, not a
+reproduced sccache corruption report.
+
 ## Proposed exclusion protocol
 
 1. Supervised setup must remove the global managed `build.build-dir` setting.
