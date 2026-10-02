@@ -175,6 +175,19 @@ at `325b2e5`, including macOS stable/beta/nightly workspace suites and the
 existing platform installer and 100-project recovery checks.
 Full P2 and unattended cleanup remain open.
 
+**macOS launcher follow-up (2026-10-02):** the installed Cargo launcher's private
+`RGO_MACOS_SUPERVISOR_PILOT=1` path now creates its own launchd guardian and passes
+native arguments/environment plus the original standard descriptors through an
+authenticated, bounded Unix socket. Cargo starts only after its guard and kernel
+receipt are established. The extended existing fixture passed a real guardian
+SIGKILL with a surviving closed-FD writer, subsequent reclamation, stdin/EOF,
+separate output, native bytes, exit 17, and healthy job cleanup locally. Admission
+revision 3, a distinct coalition namespace, and protocol 8 protect it from older
+cleanup policies; setup retains recorded protocol-6/7 Shutdown recovery.
+Normal activation remains descriptor-only while terminal control, abandoned-job
+recovery, supported runtimes, and the full P2 matrix remain open. See the
+[detailed checklist](macos-cargo-supervision.md).
+
 - [ ] Document the exact lock/lifecycle protocol Cargo uses for each supported version and platform. Determine whether it covers build scripts, rustdoc, no-op commands, package/install operations, test execution, and waiting Cargo processes.
 - [ ] Build deterministic race fixtures that pause between liveness check, lock acquisition, rename, and removal. Require that GC actually deletes other eligible data while the target build remains protected.
 - [ ] Exercise long-running builds beyond the ten-minute recency window and wrapper lease TTL; use injected time only where it preserves the actual synchronization behavior being tested.

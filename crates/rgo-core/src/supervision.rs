@@ -36,6 +36,14 @@ pub fn context_for_workspace(paths: &RgoPaths, workspace_root: &Path) -> Result<
     let mut identity = blake3::Hasher::new();
     identity.update(b"rgo-supervised-context\0");
     identity.update(&rgo_protocol::SUPERVISED_CONTEXT_VERSION.to_le_bytes());
+    // Never reuse a namespace with histories from the descriptor-only pilot.
+    // Strong macOS activation will keep this discriminator when it becomes
+    // the normal launcher path; it is currently enabled only for the pilot.
+    #[cfg(target_os = "macos")]
+    if std::env::var_os("RGO_MACOS_SUPERVISOR_PILOT").as_deref() == Some(std::ffi::OsStr::new("1"))
+    {
+        identity.update(b"macos-resource-coalition\0");
+    }
     identity.update(hash_path(workspace_root).as_bytes());
     let digest = identity.finalize();
     let hex = digest.to_hex().to_string();
@@ -243,18 +251,33 @@ pub struct SessionGuard {
     #[cfg(target_os = "macos")]
     scope: (RgoPaths, Option<PathBuf>),
     #[cfg(unix)]
-    _local: File,
+    _local: Option<File>,
     #[cfg(unix)]
     _descendants: File,
 }
 
 impl SessionGuard {
-    /// Experimental macOS guardian admission, not used by ordinary Cargo
-    /// launchers yet. Without an isolated launchd job this conservatively
+    /// Experimental macOS guardian admission used by the private launcher
+    /// pilot. Without an isolated launchd job this conservatively
     /// protects the context for the launching application's entire lifetime.
     #[cfg(target_os = "macos")]
     pub fn record_macos_coalition(&self) -> Result<()> {
         crate::macos_coalition::register_current(&self.scope.0, self.scope.1.as_deref())
+    }
+
+    /// A dedicated guardian never performs GC in its own process. After its
+    /// context locks and durable receipt are established it may release the
+    /// same-process guard, allowing GC to reclaim unrelated idle contexts.
+    #[cfg(target_os = "macos")]
+    pub fn release_local_for_macos_guardian(&mut self) {
+        self._local.take();
+    }
+
+    /// Finish a dedicated guardian after its last managed descendant exited.
+    /// This consumes the session: no managed work may be started afterward.
+    #[cfg(target_os = "macos")]
+    pub fn finish_macos_coalition(self) -> Result<()> {
+        crate::macos_coalition::retire_current(&self.scope.0, self.scope.1.as_deref())
     }
 
     /// Keep both lifecycle descriptors open when a Unix launcher replaces
@@ -496,7 +519,7 @@ pub fn lock_cargo_session(paths: &RgoPaths, context: Option<&Path>) -> Result<Se
         #[cfg(target_os = "macos")]
         scope: (paths.clone(), context.map(Path::to_owned)),
         #[cfg(unix)]
-        _local: local,
+        _local: Some(local),
         #[cfg(unix)]
         _descendants: descendants,
     })

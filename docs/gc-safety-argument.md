@@ -58,7 +58,7 @@ documented [build-directory configuration](https://doc.rust-lang.org/cargo/refer
 establishes where intermediates go; it does not give rgo a context-wide
 ownership lock. The profile `.cargo-build-lock` probe is only an additional
 liveness heuristic. Fresh contexts created by supervised Cargo carry a
-`supervised_origin` sidecar field and current `supervision_version` (2). The
+`supervised_origin` sidecar field and current `supervision_version` (3). The
 supervised GC planner protects contexts without that current admission revision
 for orphan, age, incremental, and pressure cleanup; its executor checks the
 revision again after acquiring the lifecycle guard. For
@@ -85,12 +85,25 @@ after the client exits or crashes. Client-side sccache mode is not an admission
 signal: its documentation says some options cause that setting to be ignored.
 This remains an inferred lifecycle risk, not a reproduced corruption report.
 
-New contexts use a namespace salted with admission revision 2. Older contexts
+New contexts use a namespace salted with admission revision 3. Older contexts
 lack that revision and stay protected; neither the launcher nor wrapper can
 promote them on refresh. GC checks the revision in planning and again before
-rename. Protocol 7 prevents a new client from trusting an older daemon's cleanup
-policy. Setup alone can request the unchanged Shutdown operation from a recorded
-protocol-6 daemon and waits for its singleton lock before changing activation.
+rename. Protocol 8 prevents a new client from trusting an older daemon's cleanup
+policy. Setup alone can request the unchanged Shutdown operation from recorded
+protocol-6/7 daemons and waits for the singleton lock before changing activation.
+
+The macOS private launcher pilot adds a separate resource-coalition namespace,
+so it cannot reuse descriptor-only contexts with unobserved process histories.
+Its guardian holds the context guard, syncs its kernel receipt, and then accepts
+the caller's one-use start commit. Cargo's original streams and native argument
+and environment bytes cross an authenticated Unix socket. After the primary
+exits, the guardian remains until it is its coalition's only task; it retires its
+receipt while holding the session guard, performs no further managed work, and
+removes the rendezvous before bootout can reap the coalition. If it is killed
+while a writer survives, the receipt still protects that scope. The existing
+private fixture now verifies that actual launcher/guardian crash shape and
+healthy completion. Only `RGO_MACOS_SUPERVISOR_PILOT=1` selects this path; normal
+activation, full terminal behavior, and abandoned-job recovery are not proved.
 
 This narrows the known configured compiler-broker boundary. Arbitrary external
 brokers invoked by build scripts, linkers, runners, or a custom toolchain remain

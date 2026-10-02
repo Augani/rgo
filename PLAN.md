@@ -81,6 +81,15 @@ remaining transport, lifecycle, compatibility, and platform gates. The
 P2 remains
 open and automatic GC remains off by default.
 
+**macOS launcher follow-up:** the private installed-launcher pilot now starts
+its own launchd guardian, preserves native arguments/environment and standard
+descriptors, and holds kernel-backed exclusion after Cargo or guardian exit.
+The extended existing fixture passed guardian SIGKILL, a surviving closed-FD
+writer, later reclamation, stdin/EOF, separate output, native bytes, exit 17,
+and healthy cleanup locally. Revision 3/protocol 8 isolate the new policy;
+normal activation awaits terminal-control, recovery, and platform evidence in
+the [macOS checklist](docs/macos-cargo-supervision.md).
+
 `doc.md` treats the rustc-wrapper + CAS as the core and the managed build roots as a
 supporting piece. After checking what Cargo actually supports today (Cargo 1.98), the
 priorities invert:

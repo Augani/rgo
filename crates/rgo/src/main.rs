@@ -21,6 +21,14 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
+    #[cfg(target_os = "macos")]
+    #[command(hide = true)]
+    MacosCargoJob {
+        #[arg(long)]
+        directory: std::path::PathBuf,
+        #[arg(long)]
+        token: String,
+    },
     /// Experimental supervised Cargo launcher used only in private probes.
     #[command(hide = true)]
     CargoShim {
@@ -160,6 +168,10 @@ fn main() -> Result<()> {
     }
 
     let result = match cli.cmd {
+        #[cfg(target_os = "macos")]
+        Some(Cmd::MacosCargoJob { directory, token }) => {
+            cmd::macos_cargo_job::guardian(&directory, &token)
+        }
         Some(Cmd::CargoShim {
             real_cargo,
             cargo_home,

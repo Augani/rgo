@@ -547,7 +547,7 @@ fn no_service_undo_stops_daemon_before_removing_activation() {
     assert!(exited, "undo did not stop the private daemon");
     assert!(!sandbox.cargo_home.join(".rgo-install.json").exists());
 
-    // Exercise the same activation transition with a recorded protocol-6
+    // Exercise the same activation transition with the previous recorded policy
     // daemon: current clients must reject it, but setup can request only its
     // unchanged Shutdown operation and wait for the singleton to release.
     let setup = sandbox
@@ -563,7 +563,8 @@ fn no_service_undo_stops_daemon_before_removing_activation() {
     let record_path = sandbox.cargo_home.join(".rgo-install.json");
     let mut record: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&record_path).unwrap()).unwrap();
-    record["protocol_version"] = 6.into();
+    let legacy_version = rgo_protocol::PROTOCOL_VERSION - 1;
+    record["protocol_version"] = legacy_version.into();
     std::fs::write(&record_path, serde_json::to_vec(&record).unwrap()).unwrap();
     let singleton = std::fs::OpenOptions::new()
         .read(true)
@@ -583,7 +584,7 @@ fn no_service_undo_stops_daemon_before_removing_activation() {
             &mut current,
             &Response::Error {
                 code: "protocol_mismatch".into(),
-                message: "server=6".into(),
+                message: format!("server={legacy_version}"),
             },
         )
         .unwrap();
@@ -592,9 +593,15 @@ fn no_service_undo_stops_daemon_before_removing_activation() {
         legacy.set_timeout(Duration::from_secs(5)).unwrap();
         assert!(matches!(
             ipc::read_message::<Request>(&mut legacy).unwrap(),
-            Request::Hello { version: 6, .. }
+            Request::Hello { version, .. } if version == legacy_version
         ));
-        ipc::write_message(&mut legacy, &Response::Hello { version: 6 }).unwrap();
+        ipc::write_message(
+            &mut legacy,
+            &Response::Hello {
+                version: legacy_version,
+            },
+        )
+        .unwrap();
         assert!(matches!(
             ipc::read_message::<Request>(&mut legacy).unwrap(),
             Request::Shutdown

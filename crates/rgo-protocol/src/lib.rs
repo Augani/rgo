@@ -6,7 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u32 = 7;
+pub const PROTOCOL_VERSION: u32 = 8;
 pub const MAX_FRAME_SIZE: usize = 1024 * 1024;
 pub const DEFAULT_LEASE_TTL_SECS: u32 = 30;
 pub const DEFAULT_HEARTBEAT_SECS: u32 = 10;
@@ -21,8 +21,8 @@ pub const SIDECAR_FILE: &str = ".rgo-context.json";
 pub const BYPASS_ENV: &str = "RGO_BYPASS";
 pub const HOME_ENV: &str = "RGO_HOME";
 pub const LEASE_ENV: &str = "RGO_LEASE_ID";
-/// Revision of the producer admission rules, independent of IPC compatibility.
-pub const SUPERVISED_CONTEXT_VERSION: u32 = 2;
+/// Revision of producer/lifecycle admission, independent of IPC compatibility.
+pub const SUPERVISED_CONTEXT_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContextSidecar {
@@ -35,7 +35,7 @@ pub struct ContextSidecar {
     /// launcher. Older/native contexts keep the conservative lock-time grace.
     #[serde(default)]
     pub supervised_origin: bool,
-    /// Older supervised contexts predate compiler-broker admission checks.
+    /// Older supervised contexts predate the current producer/lifecycle policy.
     #[serde(default)]
     pub supervision_version: u32,
     pub workspace_root: String,

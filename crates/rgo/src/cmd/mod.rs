@@ -6,6 +6,8 @@ pub mod daemon;
 pub mod doctor;
 pub mod gc;
 pub mod ls;
+#[cfg(target_os = "macos")]
+pub mod macos_cargo_job;
 pub mod passthrough;
 pub mod pin;
 pub mod setup;

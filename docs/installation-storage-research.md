@@ -565,3 +565,31 @@ covers launchd job ownership, original descriptor/argument handoff, signals,
 startup failure, crash recovery, job reaping, admission/IPC revision changes,
 and actual launcher/IDE validation. P2 and the install-and-forget release gate
 remain open.
+
+## macOS installed-launcher pilot — 2026-10-02
+
+The installed Cargo shim now has a private `RGO_MACOS_SUPERVISOR_PILOT=1` path
+that creates a unique owned launchd job. A bounded Unix-socket handshake checks
+the peer's user identity and invocation token, transfers the original standard
+descriptors with `SCM_RIGHTS`, and carries arguments/environment as native byte
+vectors. The job holds its context guard and syncs the kernel receipt before
+the caller's one-use start commit. Preparation failure uses checkout storage;
+failure after commit never launches Cargo a second time.
+[Apple's descriptor-message API](https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man2/recvmsg.2.html),
+[peer-identity API](https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man3/getpeereid.3.html).
+
+The existing coalition fixture now uses the actual installed launcher instead
+of a separate test-only job helper. It kills the guardian after Cargo exits,
+requires a closed-FD writer to remain protected from real GC, verifies its late
+write, and requires reclamation after exit. In the same fixture, healthy
+completion preserves stdin/EOF, stdout/stderr, non-UTF-8 argument and environment
+bytes, the application argument separator, and exit status 17; the job directory
+and receipt then retire. It passed locally on macOS 27.2 arm64. The existing
+setup recovery fixture also passed recorded protocol-7 Shutdown recovery.
+
+Admission revision 3 and protocol 8 fence the new policy from older daemons.
+The coalition path uses a distinct namespace so it cannot reuse descriptor-only
+histories. Normal activation is not changed yet: terminal signal/job-control
+proof, abandoned-job recovery, startup/cancellation boundaries, and the supported
+runtime matrix remain in the [macOS checklist](macos-cargo-supervision.md).
+Automatic GC stays off by default. The fixture count is unchanged.

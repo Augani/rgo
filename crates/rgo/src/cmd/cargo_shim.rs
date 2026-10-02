@@ -178,6 +178,28 @@ pub fn run(
         command_args.push(OsString::from(setting));
     }
     command_args.extend(cargo_args.iter().cloned());
+    // Private pilot: exercise the installed unchanged-command launcher
+    // before making launchd transport part of the supported activation mode.
+    #[cfg(target_os = "macos")]
+    if std::env::var_os("RGO_MACOS_SUPERVISOR_PILOT").as_deref() == Some(OsStr::new("1")) {
+        if let Some((context, root)) = &selection {
+            match super::macos_cargo_job::PreparedJob::prepare(
+                real_cargo,
+                &command_args,
+                &paths,
+                context,
+            ) {
+                Ok(job) => return job.run(session),
+                Err(error) => {
+                    eprintln!(
+                        "rgo: macOS Cargo guardian unavailable ({error:#}); using checkout storage"
+                    );
+                    drop(session);
+                    return exec_real_cargo_in_checkout(real_cargo, &args, root);
+                }
+            }
+        }
+    }
     #[cfg(unix)]
     {
         run_supervised(real_cargo, &command_args, session)

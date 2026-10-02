@@ -2,8 +2,9 @@
 
 Priority: macOS first, as requested on October 2, 2026. This is the next P2
 implementation batch in [the accepted plan](installation-storage-plan.md).
-Automatic GC stays off by default. This prototype does not activate kernel
-tracking in the ordinary Cargo launcher or close the cleanup safety gate.
+Automatic GC stays off by default. The private launcher pilot uses kernel
+tracking when `RGO_MACOS_SUPERVISOR_PILOT=1`; normal activation still uses the
+descriptor mechanism and the cleanup safety gate remains open.
 
 ## Problem and selected mechanism
 
@@ -74,8 +75,47 @@ break those workflows; it does not validate a shipping Cargo supervisor.
 The normal launcher still uses the earlier descriptor mechanism. Registering
 its existing process directly would bind a context to Terminal, an IDE, or
 another launching application's coalition and retain it until that application
-exits. The fixture deliberately creates a separate launchd job. Its temporary
-helper is test code; it is not a shipping activation option.
+exits. The installed launcher's private pilot now creates its own launchd job;
+the fixture no longer supplies a separate test-only helper.
+
+## Launcher pilot — October 2, 2026
+
+- [x] Create a private, uniquely named launchd job with no restart/demand
+  triggers, and a one-use local rendezvous. Check the exact owned definition
+  before cleanup and preserve edited definitions.
+- [x] Authenticate the local peer with its Unix user identity and a random
+  invocation token. Bound request frames and owner-record reads.
+- [x] Transfer the original three standard descriptors with `SCM_RIGHTS` and
+  encode argument/environment values as native bytes. The extended existing
+  fixture verifies stdin/EOF, stdout/stderr, non-UTF-8 bytes, the Cargo `--`
+  separator, and an application's exit code 17.
+- [x] Hold the original session through preparation; the job acquires its own
+  context guard and syncs the kernel receipt before the caller commits Cargo.
+  Preparation errors fall back before any managed Cargo write. Failure after
+  the commit does not retry Cargo.
+- [x] Return the primary Cargo result while the guardian retains exclusion for
+  surviving descendants. Release only the same-process guard so unrelated
+  contexts can still be reclaimed.
+- [x] Retire the kernel receipt under the held context guard when the guardian
+  is its coalition's only remaining task and will perform no further managed
+  work. Remove the rendezvous before bootout can reap the coalition. The
+  healthy fixture verifies job-directory cleanup and released exclusion.
+- [x] Extend the same fixture to kill the actual guardian after Cargo exits.
+  Its closed-FD writer remains kernel-counted and real GC preserves the folder;
+  the late write succeeds and idle GC reclaims it afterward.
+- [x] Move to admission revision 3 and protocol 8. A separate macOS coalition
+  discriminator prevents this pilot from reusing descriptor-only contexts.
+  The existing setup recovery fixture now exercises recorded protocol 7;
+  the unchanged Shutdown compatibility range still includes protocol 6.
+- [ ] Complete signal and terminal job-control evidence, abandoned-job recovery,
+  every startup/cancellation boundary, and the declared runtime/architecture
+  matrix before making this the normal installed launcher path.
+
+The private regression passed locally on macOS 27.2 arm64 with the new launcher.
+This is still a pilot, and the previously recorded `325b2e5` CI run only validates
+the earlier observation/receipt implementation. Updated platform evidence is
+required for this batch. The routine suite still contains one coalition test;
+the existing case was extended instead of creating duplicate fixtures.
 
 ## Integrate with unchanged Cargo commands
 

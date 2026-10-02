@@ -104,8 +104,8 @@ The Unix pilot has a reproduced cleanup gap: a detached build-script child
 that closes inherited descriptors can keep writing after Cargo exits, while
 manual or opted-in automatic GC deletes its context. `rgo doctor` warns about
 this. A kernel-tracked macOS supervisor is being implemented first; its
-[prototype and integration checklist](docs/macos-cargo-supervision.md) are not
-yet active in ordinary Cargo launches.
+[prototype and integration checklist](docs/macos-cargo-supervision.md) describe
+an opt-in private launcher pilot; normal activation does not use it yet.
 
 For a private Windows evaluation, run
 `rgo setup --supervised --real-cargo C:\absolute\path\to\cargo.exe --no-service`

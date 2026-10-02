@@ -2,9 +2,9 @@
 //!
 //! These private XNU interfaces are dynamically resolved and never substitute a
 //! PID scan or an empty count on error. Durable receipts extend an explicitly
-//! registered session's protection after its lock descriptors close. Ordinary
-//! launchers do not register yet: a shipping guardian still needs an exclusively
-//! owned launchd job, admission fencing, and supported-version evidence.
+//! registered session's protection after its lock descriptors close. The private
+//! Cargo launcher pilot registers isolated launchd jobs; normal activation still
+//! needs terminal compatibility, crash recovery, and supported-version evidence.
 
 #![allow(unsafe_code)] // Narrow FFI to dynamically resolved XNU observation APIs.
 
@@ -283,6 +283,10 @@ pub(crate) fn register_current(paths: &RgoPaths, context: Option<&Path>) -> Resu
         "macOS coalition receipt is full"
     );
     receipt.coalitions.push(coalition.id());
+    write_receipt(paths, &path, &receipt)
+}
+
+fn write_receipt(paths: &RgoPaths, path: &Path, receipt: &Receipt) -> Result<()> {
     let bytes = serde_json::to_vec(&receipt)?;
     ensure!(
         bytes.len() as u64 <= MAX_RECEIPT_BYTES,
@@ -303,9 +307,37 @@ pub(crate) fn register_current(paths: &RgoPaths, context: Option<&Path>) -> Resu
     file.write_all(&bytes)?;
     file.sync_all()?;
     drop(file);
-    std::fs::rename(&staging, &path)?;
+    std::fs::rename(&staging, path)?;
     std::fs::File::open(path.parent().context("coalition receipt has no parent")?)?.sync_all()?;
     Ok(())
+}
+
+/// A dedicated guardian is the last task in its own coalition and has fenced
+/// all future managed work. Retire before bootout can reap that coalition. Its
+/// caller holds the context's session guard through this durable completion.
+pub(crate) fn retire_current(paths: &RgoPaths, context: Option<&Path>) -> Result<()> {
+    let current = ResourceCoalition::for_pid(std::process::id().try_into()?)?;
+    ensure!(
+        current.active_tasks()? == 1,
+        "macOS guardian still has descendants"
+    );
+    let boot_session = boot_session()?;
+    let path = receipt_path(paths, context)?;
+    let _lock = receipt_lock(paths)?;
+    let mut receipt = read_receipt(&path, context)?.context("macOS guardian receipt is missing")?;
+    ensure!(
+        receipt.boot_session == boot_session && receipt.coalitions.contains(&current.id()),
+        "macOS guardian receipt does not contain its kernel identity"
+    );
+    receipt.coalitions.retain(|id| *id != current.id());
+    if receipt.coalitions.is_empty() {
+        std::fs::remove_file(&path)?;
+        std::fs::File::open(path.parent().context("coalition receipt has no parent")?)?
+            .sync_all()?;
+        Ok(())
+    } else {
+        write_receipt(paths, &path, &receipt)
+    }
 }
 
 /// Called only after GC has acquired its exclusive lifecycle guards, which
