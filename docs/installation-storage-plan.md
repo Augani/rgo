@@ -317,6 +317,10 @@ the application's handler with exit 74, one invocation and actual idle GC.
 Two local background terminal-stop failures remain unexplained after later
 passes. The [mask observations and remaining checklist](macos-cargo-supervision.md#unsupported-blocked-masks--october-2-2026)
 record this explicitly; normal activation and automatic GC stay disabled.
+All 19 existing jobs passed on attempt 1 at `20bea89` in the
+[platform run](https://github.com/Augani/rgo/actions/runs/37066707489), including
+both advisory nightly lanes and actual arm64/Intel guardian cases. The five
+unexplained failures and broader release gates remain open.
 
 **macOS priority (2026-10-02):** a private real-Cargo audit reproduced deletion
 while a detached child with closed inherited descriptors was still writing.

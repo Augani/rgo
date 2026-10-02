@@ -133,7 +133,11 @@ terminal-stop failures remain unexplained despite later passes. Process and
 event diagnostics now capture that path without changing assertions/deadlines.
 See the [recorded observations](docs/probes/2026-10-02-macos-native-masks.json)
 and [checklist](docs/macos-cargo-supervision.md#unsupported-blocked-masks--october-2-2026).
-Normal activation and automatic GC remain disabled.
+All 19 existing jobs passed on attempt 1 at `20bea89` in the
+[platform run](https://github.com/Augani/rgo/actions/runs/37066707489), including
+advisory nightly and actual arm64/Intel cases. These results verify the mask
+fallback without explaining the five open failures. Normal activation and
+automatic GC remain disabled.
 
 ## 0. What changed vs. `doc.md`, and why
 

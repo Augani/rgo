@@ -922,3 +922,11 @@ mask fallback, not complete native process-state equivalence. Two background
 terminal-stop failures remain unexplained despite later passes; the existing
 fixture now captures private process and event diagnostics on that path without
 relaxing its checks. Normal activation and automatic GC remain disabled.
+
+All 19 individual jobs passed on attempt 1 at `20bea89` in the
+[existing platform matrix](https://github.com/Augani/rgo/actions/runs/37066707489).
+The [job record](probes/2026-10-02-macos-native-masks-ci.json) verifies actual
+arm64 stable/beta/nightly and Intel coalition/interrupt cases; Intel retains
+all ten startup outcomes, including kernel-pending SIGALRM and exact checkout
+handler exit 74. This verifies the change across those runtimes without
+explaining the terminal failures or closing broader compatibility gates.

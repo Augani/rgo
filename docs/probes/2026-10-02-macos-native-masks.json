@@ -154,6 +154,17 @@
         "rgo": "5732014adf6e919f65020e6efcc30f16314dbd2c676c37f460e2d91f70cab45d",
         "rgo-rustc-wrapper": "88800eb94dbe104b2d10046e996d5cc1ca1ca0729d4b4b5fa90906b5cc6f5194"
       }
+    },
+    "post_daemon_shutdown": {
+      "owned_jobs": 0,
+      "coalition_receipts": 0,
+      "daemon_socket_present": false
+    },
+    "current_binary_scope": "Debug mask-guard build identified by its recorded binary hashes; final committed source is validated independently by the all-bin builds and existing CI matrix.",
+    "captured_output": {
+      "stdout.log": "native stdout pending alarm\n",
+      "stderr.log": "rgo: macOS Cargo guardian unavailable (Cargo guardian cannot admit the invocation: Cargo caller has blocked signals outside the guardian relay contract); using checkout storage\n   Compiling native-mask-upgrade v0.1.0 (/private/tmp/rgomask-0wzsikmx/project)\n    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.22s\n     Running `target/debug/native-mask-upgrade`\nnative stderr\n",
+      "gc.log": "target 0 B; planned estimate 4.0 KiB; unlinked approximately 4.0 KiB\nManaged after GC      560.0 KiB\n  build contexts            0 B\n  compiler cache            0 B\n  other rgo state     560.0 KiB\nTarget still unmet    560.0 KiB\nSome remaining data was protected, ineligible, or could not be removed.\nVolume free observed 120.7 GiB before, 120.7 GiB after (other disk activity can affect this)\n"
     }
   },
   "probe_correction": "The first private upgrade setup was refused because its temporary Cargo socket path exceeded the Unix limit; the probe used a shorter private /tmp root and then completed.",
@@ -161,7 +172,7 @@
     "Two local background terminal-stop failures (27.71s and 28.31s), followed by passes with process/event diagnostics. No cause established; later passes do not resolve these failures.",
     "Three earlier unexplained failures documented in the macOS checklist remain open."
   ],
-  "release_status": "Native supervisor remains a private pilot; normal activation and automatic GC disabled. Final platform checks pending.",
+  "release_status": "This source batch passed all 19 existing jobs on attempt 1. Native supervisor remains a private pilot; normal activation and automatic GC disabled. Unexplained failures and wider acceptance gates remain open.",
   "required_local_checks": {
     "all_bins_debug": "passed (7.88s)",
     "all_targets_clippy": "passed with -D warnings (9.14s)",
@@ -177,6 +188,16 @@
         "RGO_MACOS_SUPERVISOR_EVENT_AUDIT": false,
         "RGO_MACOS_SUPERVISOR_AUDIT": false
       }
-    }
+    },
+    "full_workspace_suite": "PASS in the existing remote platform matrix; no duplicate full local suite"
+  },
+  "temporary_probe_cleanup": "After captured output and binary hashes were saved and owned jobs, coalition receipts and daemon sockets were absent, both private probe directories and copied binary pairs were removed. Product GC deletion was verified before this temporary-file cleanup.",
+  "platform_verification": {
+    "record": "2026-10-02-macos-native-masks-ci.json",
+    "code_sha": "20bea89cc461161b416dad312e422e7b6757a8d2",
+    "run_url": "https://github.com/Augani/rgo/actions/runs/37066707489",
+    "individual_jobs_passed": 19,
+    "individual_jobs_total": 19,
+    "run_attempt": 1
   }
 }

@@ -1091,8 +1091,10 @@ they do not explain the three earlier failures or close the wider release gates.
   (27.71 s and 28.31 s). Later passes do not explain them. Failure diagnostics
   now include private descendant state, signal masks and caller/guardian events;
   deadlines and assertions are unchanged.
-- [ ] Validate this batch on the existing platform matrix and complete the
-  remaining native-state, timing, terminal and upgrade gates. The three earlier
+- [x] Validate this batch on all 19 existing platform jobs at `20bea89`, on
+  attempt 1, including advisory nightly and actual arm64/Intel guardian cases.
+- [ ] Complete the remaining native-state, timing, terminal and upgrade gates.
+  The three earlier
   unexplained failures remain open; normal activation and automatic GC stay off.
 
 The [observations](probes/2026-10-02-macos-native-masks.json) distinguish the
@@ -1102,3 +1104,16 @@ its private temporary root corrected probe setup without a production change.
 This does not expand the relay contract or change protocol 9, admission 4,
 owner 4 or receipt 2. A currently ignored blocked signal is also refused because
 the application can change its action before unblocking.
+
+The [full platform run](https://github.com/Augani/rgo/actions/runs/37066707489)
+passed all 19 individual jobs without a retry. On macOS 14.8.9 build 23J631
+arm64, coalition/interrupt durations were 15.06 s / 1.62 s with stable 1.99.0,
+16.74 s / 1.76 s with beta 1.100.0-beta.2, and 15.60 s / 1.48 s with advisory
+nightly 1.101.0. Each lane passed all 116 core cases, including strict CAS
+pressure reclamation. Intel macOS 15.7.9 build 24G830 with Cargo 1.99.0 passed
+in 22.16 s / 2.38 s and emitted all ten startup results, including the pending
+alarm, no managed commit and exact handler exit 74. The
+[individual job record](probes/2026-10-02-macos-native-masks-ci.json) includes
+the exact source, runtimes and conclusions. This validates the mask fallback
+batch; it does not explain the two local terminal failures or the three earlier
+failures, and does not close the broader activation and release gates.
