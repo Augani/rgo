@@ -216,7 +216,7 @@ implement or verify Cargo terminal behavior.
 - [x] Extend the existing fixture with a real interactive shell/PTY rather than
   add another equivalent Rust case. Verify stop/resume, resize, EOF, Ctrl-C,
   terminal restoration, and late descendant output.
-- [ ] Repeat the same paired latency probe after the combined transport change,
+- [x] Repeat the same paired latency probe after the combined transport change,
   then run the existing platform and Intel checks once for that batch.
 - [ ] Enable the normal installed macOS path only after terminal compatibility,
   startup/recovery boundaries, supported runtimes, and latency meet their gates.
@@ -238,7 +238,7 @@ Ctrl-C and status 130, application status 17, mixed pipes/redirection, normal
 terminal restoration, late detached output, and cleanup after caller SIGKILL.
 The existing coalition crash and interrupted-Cargo cases also passed. No new
 Rust test case was added; all-bin build and warning-free all-target Clippy passed.
-Platform validation of this combined batch is pending.
+The combined batch's platform results are recorded below.
 
 **Remaining terminal crash defect:** the same observation reproduces incomplete
 terminal restoration after the caller is killed with SIGKILL. Zsh partly
@@ -279,7 +279,39 @@ an asynchronously redrawn prompt, and waits for actual background suspension.
 The existing recovery check awaits launchd unload after metadata removal; those
 are distinct completion points. These corrections avoid requiring an arbitrary
 fixed pause or treating the first disappeared directory as completed bootout.
-Platform validation of the combined batch is pending.
+The [19-job matrix](https://github.com/Augani/rgo/actions/runs/37005085858)
+passed at `50a8405`, including the focused Intel macOS lane, full macOS
+stable/beta/nightly suites, and Rust 1.85 source builds on all three platforms.
+This validates this batch; the declared runtime range, broader interruption
+matrix, terminal crash defect, and activation gates remain open.
+
+The [optimized-pair samples](benchmarks/2026-10-02-macos-arm64-cargo-guardian-release.json)
+at `50a8405` used the complete `cargo build --release` output, the same private
+setup and paired 24 no-op/12 edit-build procedure, cache off, automatic GC off,
+and no accepted guardian fallback. Median no-op time was 24.9 ms plain versus
+134.3 ms guardian; edit time was 126.5 ms versus 236.2 ms. Added 109.4/109.7 ms
+remains above the proposed allowance. Debug and optimized observations are
+kept separately with their executable hashes; this single-crate nonterminal
+result does not close broader performance validation.
+
+The crash observation agrees with zsh 5.9's
+[job handling](https://github.com/zsh-users/zsh/blob/zsh-5.9/Src/jobs.c): an
+unfrozen shell can snapshot the terminal when its foreground job finishes,
+before reattaching its own group. Its
+[line editor](https://github.com/zsh-users/zsh/blob/zsh-5.9/Src/Zle/zle_main.c)
+repairs selected local flags, rather than every relay change. Inference: a late
+physical-terminal restore cannot establish that the shell's saved snapshot is
+correct. A faster exit observer alone is not a race proof. Do not relax the
+exact-mode restore into an unconditional overwrite or freeze a user's shell
+globally as a workaround.
+
+Moving a same-session child into the guardian's coalition is also not a general
+unprivileged substitute: XNU's
+[spawn path](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/kern/kern_exec.c)
+requires a privileged source coalition or the coalition-spawn entitlement for
+an explicitly selected coalition. Ordinary parent-session spawning must not
+assume that privilege. The PTY design therefore remains an opt-in prototype
+pending a reviewed terminal-mode ownership solution.
 
 ## Integrate with unchanged Cargo commands
 

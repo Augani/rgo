@@ -107,10 +107,17 @@ input/EOF, color, resizing, Ctrl-Z/fg/bg, TOSTOP, Ctrl-C, nonzero status,
 normal terminal restoration, and output after the caller exits. It also
 reproduces incomplete terminal restoration after caller SIGKILL; this remains
 an activation gate. Readiness-driven waiting and Interactive scheduling reduced
-the measured launch delay, but the first combined probe still exceeds the
+the measured launch delay, but optimized binaries still add about 109 ms,
+exceeding the
 proposed 100 ms allowance. Normal activation remains disabled while crash,
 latency, recovery, runtime, and IDE gates are open. Details and checkboxes are in
 the [macOS checklist](docs/macos-cargo-supervision.md).
+
+The terminal batch's [19-job matrix](https://github.com/Augani/rgo/actions/runs/37005085858)
+passed at `50a8405`, including Intel macOS and all existing platform suites.
+Its [optimized-pair samples](docs/benchmarks/2026-10-02-macos-arm64-cargo-guardian-release.json)
+record 109.4 ms median no-op overhead and 109.7 ms edit-build overhead. These
+results close the batch's validation step, while the activation gates stay open.
 
 The [19-job run](https://github.com/Augani/rgo/actions/runs/36998573830) passed
 at `5557f94`, including Intel macOS 15.7.9 and all existing platform suites.

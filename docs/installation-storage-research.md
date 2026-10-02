@@ -640,6 +640,13 @@ to 126.5/127.9 ms added median no-op/edit latency, which still fails the propose
 at `dd09d11` measured 113.7/120.6 ms added medians, still above that allowance.
 These debug-binary probes do not settle optimized installer performance.
 
+The subsequent [optimized-pair probe](benchmarks/2026-10-02-macos-arm64-cargo-guardian-release.json)
+at `50a8405` measured 109.4/109.7 ms added median no-op/edit time with the same
+sample counts and private activation. That still exceeds the proposed 100 ms
+allowance; it does not justify changing the target or enabling normal activation.
+The same source passed the [19-job matrix](https://github.com/Augani/rgo/actions/runs/37005085858),
+including Intel macOS, full platform suites, and the Rust 1.85 source builds.
+
 Caller SIGKILL exposed another activation defect: zsh can partly alter the
 original terminal before the guardian's exact-mode restore. Job retirement
 completes, but remaining relay flags affect the terminal. The observation prints
