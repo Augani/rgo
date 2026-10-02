@@ -186,6 +186,10 @@ process-level session guard.
   use checkout storage before pilot admission; controlling-terminal handoff,
   loaded-job replacement and every metadata interruption remain open. This
   does not close the normal launcher's descriptor gap.
+  The [19-job run](https://github.com/Augani/rgo/actions/runs/36998573830)
+  passed at `5557f94`, including those same cases on Intel macOS 15.7.9 and
+  all existing platform suites. The measured guardian startup overhead and
+  terminal handoff still block normal activation.
 
 - Unit and private-home fixtures verify context/global lock exclusion,
   missing-sidecar refusal, pin changes after planning, and an unrelated idle

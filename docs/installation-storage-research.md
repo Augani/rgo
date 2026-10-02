@@ -614,3 +614,15 @@ A focused `macos-15-intel` lane reuses the two existing cases to extend kernel
 interface and launcher evidence beyond arm64. All metadata interruption points,
 loaded-job replacement, terminal control, and the declared runtime range remain
 open; this follow-up adds no Rust test case.
+
+The [19-job platform run](https://github.com/Augani/rgo/actions/runs/36998573830)
+passed at `5557f94`. Its focused Intel lane identifies macOS 15.7.9 build
+24G830, x86_64, and Cargo/rustc 1.99.0; both real-launcher fixtures passed there.
+The local existing paired benchmark also ran the actual guardian with cache
+and automatic GC off, requiring no guardian fallback. Its
+[recorded samples](benchmarks/2026-10-02-macos-arm64-cargo-guardian.json) show
+241.1 ms median cached-build overhead and 154.2 ms edit-build overhead, exceeding
+the proposed 100 ms allowance for this tiny crate. Performance is therefore
+still an activation gate. The next [concrete implementation checklist](macos-cargo-supervision.md#next-batch-terminal-handoff-and-measured-launch-overhead)
+combines terminal handoff, latency attribution, and scheduling/notification
+improvements before normal activation.

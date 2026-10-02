@@ -101,6 +101,14 @@ checkout storage until controlling-terminal handoff is implemented. A focused
 Intel CI lane covers these same two cases; full interruption and runtime gates
 remain open.
 
+The [19-job run](https://github.com/Augani/rgo/actions/runs/36998573830) passed
+at `5557f94`, including Intel macOS 15.7.9 and all existing platform suites.
+The [guardian latency samples](docs/benchmarks/2026-10-02-macos-arm64-cargo-guardian.json)
+show 241.1 ms median no-op overhead and 154.2 ms edit-build overhead, both above
+the proposed allowance. The next [implementation checklist](docs/macos-cargo-supervision.md#next-batch-terminal-handoff-and-measured-launch-overhead)
+combines controlling-terminal handoff and measured launch/exit improvements;
+the pilot remains opt-in.
+
 `doc.md` treats the rustc-wrapper + CAS as the core and the managed build roots as a
 supporting piece. After checking what Cargo actually supports today (Cargo 1.98), the
 priorities invert:

@@ -206,6 +206,16 @@ checkout storage before pilot admission until controlling-terminal handoff is
 implemented. No additional Rust test case was added. Full startup/recovery
 interruption and runtime gates remain open.
 
+The [19-job follow-up](https://github.com/Augani/rgo/actions/runs/36998573830)
+passed at `5557f94`, including the complete existing suites and the Intel
+guardian lane on macOS 15.7.9 build 24G830 with Cargo/rustc 1.99.0. The local
+1.98 latency probe found median no-op overhead of 241.1 ms and edit-build
+overhead of 154.2 ms, both above the proposed 100 ms allowance for this tiny
+crate. These [raw samples](benchmarks/2026-10-02-macos-arm64-cargo-guardian.json)
+keep performance open. The next [implementation batch](macos-cargo-supervision.md#next-batch-terminal-handoff-and-measured-launch-overhead)
+combines terminal handoff and measured startup/exit scheduling improvements;
+normal activation stays off until its gates pass.
+
 - [ ] Document the exact lock/lifecycle protocol Cargo uses for each supported version and platform. Determine whether it covers build scripts, rustdoc, no-op commands, package/install operations, test execution, and waiting Cargo processes.
 - [ ] Build deterministic race fixtures that pause between liveness check, lock acquisition, rename, and removal. Require that GC actually deletes other eligible data while the target build remains protected.
 - [ ] Exercise long-running builds beyond the ten-minute recency window and wrapper lease TTL; use injected time only where it preserves the actual synchronization behavior being tested.

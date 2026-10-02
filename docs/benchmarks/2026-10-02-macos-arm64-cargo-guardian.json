@@ -1,0 +1,115 @@
+{
+  "platform": "macOS-27.2-arm64-arm-64bit-Mach-O",
+  "cargo": "cargo 1.98.0 (797e8a9bc 2026-08-05)",
+  "rustc": "rustc 1.98.0 (88d9e12ae 2026-08-18)",
+  "rgo": "rgo 0.1.0",
+  "source_commit": "5557f94f1c56536ea581d2cac82976176be336d4",
+  "rgo_binary_sha256": "06e12daa71398c41e28a21025a471ac0c93e567ee2ffa5207a372af50eb7b605",
+  "wrapper_binary_sha256": "0a9351035b9f7c7604612ce8e960e0047ada096c7cae7786c93ba2dbd2f0cf46",
+  "cache_enabled": false,
+  "automatic_gc_enabled": false,
+  "warm_noop": {
+    "plain": {
+      "median_ms": 23.0,
+      "p95_ms": 27.3,
+      "samples_ms": [
+        24.0,
+        24.7,
+        22.7,
+        26.8,
+        22.3,
+        22.8,
+        22.5,
+        23.9,
+        22.6,
+        23.6,
+        21.3,
+        21.9,
+        20.6,
+        23.2,
+        20.0,
+        22.1,
+        21.5,
+        26.8,
+        19.8,
+        24.9,
+        23.4,
+        30.4,
+        27.3,
+        32.7
+      ]
+    },
+    "supervised": {
+      "median_ms": 264.1,
+      "p95_ms": 304.3,
+      "samples_ms": [
+        225.9,
+        253.7,
+        200.8,
+        270.6,
+        278.7,
+        135.7,
+        263.2,
+        283.3,
+        264.9,
+        252.1,
+        251.5,
+        276.9,
+        274.8,
+        305.4,
+        304.3,
+        276.1,
+        263.3,
+        262.4,
+        204.3,
+        266.4,
+        217.0,
+        250.9,
+        287.4,
+        312.6
+      ]
+    }
+  },
+  "edit_build": {
+    "plain": {
+      "median_ms": 135.2,
+      "p95_ms": 141.8,
+      "samples_ms": [
+        139.8,
+        142.3,
+        126.2,
+        141.3,
+        108.4,
+        138.5,
+        113.2,
+        138.5,
+        107.8,
+        132.0,
+        112.5,
+        141.8
+      ]
+    },
+    "supervised": {
+      "median_ms": 289.4,
+      "p95_ms": 422.1,
+      "samples_ms": [
+        349.4,
+        436.5,
+        272.5,
+        293.5,
+        262.0,
+        294.5,
+        270.3,
+        285.2,
+        259.7,
+        422.1,
+        340.8,
+        275.8
+      ]
+    }
+  },
+  "macos_supervisor_pilot": true,
+  "admission_revision": 3,
+  "transport": "launchd guardian with native descriptors; no controlling terminal",
+  "fallback_samples": 0
+}

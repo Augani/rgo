@@ -65,7 +65,8 @@ storage before admission, or preserve an already admitted context.
   is macOS 27.2 build 26B5091g, arm64. The prototype also passed the macOS
   14.8.9 build 23J631 arm64 beta workspace suite at `325b2e5` in
   [platform CI](https://github.com/Augani/rgo/actions/runs/36992158237).
-  Intel and the full supported runtime range remain unverified.
+  The full supported runtime range remains unverified; Intel pilot evidence
+  is recorded below.
 
 The complete [18-job run](https://github.com/Augani/rgo/actions/runs/36992158237)
 passed at `325b2e5`, including macOS stable/beta/nightly suites and the existing
@@ -146,10 +147,79 @@ this batch; a focused `macos-15-intel` lane runs those same two cases because
 [GitHub identifies that runner as Intel](https://docs.github.com/en/actions/reference/runners/github-hosted-runners).
 No additional Rust test case was added in this follow-up.
 
+The [19-job run](https://github.com/Augani/rgo/actions/runs/36998573830) passed
+at `5557f94`, including the full existing platform suites and the focused Intel
+lane. Its recorded runtime is macOS 15.7.9 build 24G830, x86_64, Cargo/rustc
+1.99.0. Both guardian cases passed there; local evidence uses Cargo/rustc 1.98.0
+on macOS 27.2 arm64. This broadens the pilot's observation matrix without
+closing terminal, cancellation, or the full supported-runtime gate.
+
 Power loss or cancellation between individual metadata removals and bootout,
 loaded-job replacement, every preparation/commit boundary, and the complete
 signal-disposition and terminal matrix still require work. Older pilot owner
 records are preserved when their schema cannot establish the recovery scope.
+
+## Next batch: terminal handoff and measured launch overhead
+
+The existing 24 no-op/12 edit-build paired probe, with cache and automatic GC
+off, measured the actual nonterminal guardian at `5557f94`. Every captured
+result was checked for guardian fallback before acceptance. The
+[raw samples](benchmarks/2026-10-02-macos-arm64-cargo-guardian.json) contain
+binary hashes, toolchain versions, and the source commit.
+
+| Median | Plain Cargo | Guardian pilot | Added time |
+|---|---:|---:|---:|
+| Cached no-op | 23.0 ms | 264.1 ms | 241.1 ms |
+| Edit build | 135.2 ms | 289.4 ms | 154.2 ms |
+
+Both exceed the proposed 100 ms absolute allowance for this small crate. The
+pilot must remain opt-in until this is reduced. Apple's
+[launchd contract](https://github.com/apple-oss-distributions/launchd/blob/main/man/launchd.plist.5)
+says unspecified/Standard jobs receive CPU and I/O limits and describes
+Interactive as an application-like classification. Scheduling and timer
+coalescing are hypotheses to measure, not an established explanation of these
+samples.
+
+A [private session observation](probes/macos-terminal-session-observation.json)
+also found that a new launchd job was a process-group leader in session 1 and
+could not directly adopt a PTY. Moving only that job to its parent's existing
+group, then creating its own session, allowed PTY adoption. Apple's
+[setpgid](https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man2/setpgid.2.html)
+and [setsid](https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man2/setsid.2.html)
+contracts explain these preconditions. This primitive observation does not
+implement or verify Cargo terminal behavior.
+
+- [ ] Measure bootstrap, startup, Cargo runtime, and exit-notification costs;
+  evaluate an explicit Interactive job classification and readiness-driven
+  SIGCHLD/control-socket waiting instead of periodic primary-exit sleeps.
+  Preserve recognition of the exact historical owned job definition.
+- [ ] Preflight the caller's controlling terminal and descriptor identities
+  before admission. Pass pipes/files directly; unsupported terminal shapes
+  stay in checkout storage.
+- [ ] Give the guardian its own session and PTY before starting Cargo. Validate
+  the parent/session preconditions and fall back on errors. Keep Cargo in
+  that session so its group has a living parent and ordinary job-control
+  signals still work.
+- [ ] Pass the PTY master and original terminal descriptor over the existing
+  authenticated channel. Initialize the PTY with original terminal settings
+  and window size; use bounded buffers and descriptor readiness.
+- [ ] Establish Cargo's foreground group before exec can read the terminal.
+  Preserve redirected streams, native bytes, interactive input, `/dev/tty`,
+  EOF, output draining, resize events, and primary exit/signal results.
+- [ ] Restore the caller's terminal before stopping or exiting; reapply relay
+  mode only in the foreground. Handle `fg`, `bg`, TOSTOP, and nested terminal
+  consumers. The guardian must restore its own known relay settings after
+  caller failure without overwriting later shell edits.
+- [ ] Retain the master after the primary result while descendants survive;
+  hand off output draining so caller exit does not prematurely hang up their
+  PTY. Keep the existing kernel receipt through the final possible writer.
+- [ ] Extend the existing fixture with a real interactive shell/PTY rather than
+  add another equivalent Rust case. Verify stop/resume, resize, EOF, Ctrl-C,
+  terminal restoration, and late descendant output.
+- [ ] Repeat the same paired latency probe after the combined transport change,
+  then run the existing platform and Intel checks once for that batch.
+- [ ] Enable the normal installed macOS path only after terminal compatibility,
+  startup/recovery boundaries, supported runtimes, and latency meet their gates.
 
 ## Integrate with unchanged Cargo commands
 

@@ -1,0 +1,23 @@
+{
+  "date": "2026-10-02",
+  "platform": "macOS 27.2 build 26B5091g arm64",
+  "method": "Two uniquely named private launchd Python jobs; no Cargo setup or managed build writes. Owned jobs were booted out after observation.",
+  "direct_adoption": {
+    "pid": 61852,
+    "session": 1,
+    "group": 61852,
+    "controlling_terminal": "[Errno 1] Operation not permitted"
+  },
+  "session_setup_then_adoption": {
+    "pid": 62465,
+    "original_session": 1,
+    "original_group": 62465,
+    "parent_group": 1,
+    "operations": ["setpgid(0, parent_group)", "setsid()", "openpty()", "ioctl(slave, TIOCSCTTY, 0)"],
+    "new_session": 62465,
+    "new_group": 62465,
+    "controlling_terminal": true,
+    "foreground_group": 62465
+  },
+  "limits": "Local primitive observation only. Not an implemented Cargo terminal transport or proof for other runtimes, architectures, cancellation, raw-mode restoration, foreground/background jobs, or descendant I/O."
+}
