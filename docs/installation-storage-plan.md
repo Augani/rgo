@@ -163,6 +163,15 @@ The layout initializer now rejects a filesystem-root `RGO_HOME` and a pre-existi
 **Purpose:** deletion must be coordinated with the entire build, including paths that never invoke rgo's compiler wrapper.
 **Primary areas:** `context.rs`, `gc.rs`, `daemon.rs`, `db.rs`, `ipc.rs`, wrapper, real-Cargo concurrency tests.
 
+**macOS terminal metadata follow-up:** complete registered-shell records now
+have a separate daemon retirement path with a synced sibling journal, exact
+byte/file identity checks, and live-process exclusion. It never changes terminal
+modes or authorizes build-data deletion. The existing fixture exercises busy
+locks and continuation by a restarted daemon after the first removal. Incomplete
+registration, the remaining lifecycle/runtime matrix, and platform validation
+are still open in the
+[macOS checklist](macos-cargo-supervision.md#abandoned-terminal-host-retirement).
+
 **macOS priority (2026-10-02):** a private real-Cargo audit reproduced deletion
 while a detached child with closed inherited descriptors was still writing.
 The [macOS supervisor checklist](macos-cargo-supervision.md) records the selected

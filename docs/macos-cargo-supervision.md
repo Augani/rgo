@@ -478,6 +478,49 @@ Intel guardian lane and full macOS stable/beta/nightly suites, all three Rust
 it does not close the broader supported-shell, lifecycle, IDE, or performance
 release gates.
 
+## Abandoned terminal-host retirement
+
+The registered terminal's guardian can retire before its shell record is
+acknowledged. Daemon maintenance now handles that owned metadata separately
+from build-data GC, including when automatic destructive GC is disabled. This
+path never opens the terminal and never applies saved terminal modes.
+
+- [x] Share the existing bounded host/lease schemas and native process identity
+  observer between the caller and daemon, without changing the serialized
+  format or adding dependencies to the rustc wrapper.
+- [x] Preserve current-boot live shells or lease callers, uncertain process
+  queries, unsupported records, nonlocal volumes, unknown entries, and changed
+  bytes or file identities. Explicit undo instead requires the same current
+  shell, boot, and terminal and still refuses a live caller.
+- [x] Use nonblocking owned locks and check their boolean acquisition result.
+  The earlier `fs4` call ignored `Ok(false)` under contention; both host and
+  retirement locks now refuse to proceed when busy.
+- [x] Sync a sibling retirement journal before the first unlink. Bind its
+  authorization to the exact original bytes, directory identity, and every
+  known file's identity, length, and digest. Revalidate all remaining files
+  before each bounded step; preserve edits or additions.
+- [x] Resume after the original host header has been removed, then sync the
+  parent directory before removing the journal. Runtime helpers never recreate
+  a missing lock, and shell hooks disable recovery while retirement is pending.
+- [x] Reuse the existing fixture for a real surviving process in the exited
+  shell's session, actual lock contention, an added file, an edited remaining
+  counter, and restart of the real daemon after the first journaled unlink.
+- [ ] Complete interruption coverage while publishing registration/counters,
+  including temporary or incomplete records lacking enough ownership evidence.
+- [ ] Validate this batch in platform CI before counting its platform evidence.
+
+Maintenance retains its directory iterator, considers at most 16 entries per
+pass, and removes at most two metadata files per entry. A 50 ms elapsed budget
+is checked between entries; it is not a hard bound on filesystem syscall time.
+Unknown temporary or incomplete registration directories remain preserved.
+This addresses abandoned complete host records, not every startup interruption,
+the full terminal runtime matrix, or the performance activation gate.
+
+Local macOS 27.2 arm64 validation passed the all-bin build, the two existing
+focused macOS cases, all-target Clippy with warnings denied, format, and diff
+checks. The extended coalition case completed in 17.86 seconds; no equivalent
+Rust test case or redundant full local suite was added. Platform CI is pending.
+
 ## Integrate with unchanged Cargo commands
 
 - [ ] Add a private per-invocation launchd job with a unique owned label, no

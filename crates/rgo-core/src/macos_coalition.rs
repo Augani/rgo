@@ -158,7 +158,7 @@ pub fn boot_session() -> Result<String> {
     Ok(value.to_owned())
 }
 
-fn valid_boot_session(value: &str) -> bool {
+pub(crate) fn valid_boot_session(value: &str) -> bool {
     value.len() == 36
         && value.bytes().enumerate().all(|(index, byte)| {
             if [8, 13, 18, 23].contains(&index) {

@@ -3,106 +3,17 @@
 #![allow(unsafe_code)] // Confined termios, PTY, session, and descriptor operations.
 
 use anyhow::{Context, Result, ensure};
-use serde::{Deserialize, Serialize};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 
+pub(super) use rgo_core::macos_terminal_hosts::{Configuration, Settings};
+
 const BUFFER_LIMIT: usize = 64 * 1024;
 
 pub(super) mod recovery;
-
-#[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub(super) struct Settings {
-    input: u64,
-    output: u64,
-    control: u64,
-    local: u64,
-    characters: Vec<u8>,
-    input_speed: u64,
-    output_speed: u64,
-}
-
-impl Settings {
-    fn read(fd: i32) -> Result<Self> {
-        let mut value: libc::termios = unsafe { std::mem::zeroed() };
-        ensure!(
-            unsafe { libc::tcgetattr(fd, &mut value) } == 0,
-            "reading terminal settings failed"
-        );
-        Ok(Self::from_native(&value))
-    }
-
-    fn from_native(value: &libc::termios) -> Self {
-        Self {
-            input: value.c_iflag,
-            output: value.c_oflag,
-            control: value.c_cflag,
-            local: value.c_lflag,
-            characters: value.c_cc.to_vec(),
-            input_speed: value.c_ispeed,
-            output_speed: value.c_ospeed,
-        }
-    }
-
-    fn native(&self) -> Result<libc::termios> {
-        ensure!(
-            self.characters.len() == libc::NCCS,
-            "unsupported terminal character count"
-        );
-        let mut value: libc::termios = unsafe { std::mem::zeroed() };
-        value.c_iflag = self.input;
-        value.c_oflag = self.output;
-        value.c_cflag = self.control;
-        value.c_lflag = self.local;
-        value.c_cc.copy_from_slice(&self.characters);
-        value.c_ispeed = self.input_speed;
-        value.c_ospeed = self.output_speed;
-        Ok(value)
-    }
-
-    fn raw(&self) -> Result<Self> {
-        let mut value = self.native()?;
-        unsafe { libc::cfmakeraw(&mut value) };
-        Ok(Self::from_native(&value))
-    }
-
-    fn apply(&self, fd: i32) -> Result<()> {
-        ensure!(
-            unsafe { libc::tcsetattr(fd, libc::TCSANOW, &self.native()?) } == 0,
-            "setting terminal mode failed"
-        );
-        Ok(())
-    }
-
-    fn same_effective_mode(&self, other: &Self) -> bool {
-        let mut left = self.clone();
-        let mut right = other.clone();
-        // PENDIN is a kernel input-queue state, not a persistent mode setting.
-        left.local &= !libc::PENDIN;
-        right.local &= !libc::PENDIN;
-        left == right
-    }
-
-    fn zsh_resumed(&self) -> Self {
-        let mut settings = self.clone();
-        settings.local |= libc::ICANON | libc::ECHO;
-        settings.local &= !libc::FLUSHO;
-        settings
-    }
-}
-
-#[derive(Clone, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub(super) struct Configuration {
-    settings: Settings,
-    owner_group: i32,
-    shell_group: i32,
-    pub(super) foreground: bool,
-}
 
 fn window(fd: i32) -> Result<libc::winsize> {
     let mut size = unsafe { std::mem::zeroed() };

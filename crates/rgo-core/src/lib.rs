@@ -20,6 +20,8 @@ pub mod ipc;
 pub mod macos_coalition;
 #[cfg(target_os = "macos")]
 pub mod macos_jobs;
+#[cfg(target_os = "macos")]
+pub mod macos_terminal_hosts;
 pub mod paths;
 pub mod service;
 pub mod size;

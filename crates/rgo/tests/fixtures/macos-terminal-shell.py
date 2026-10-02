@@ -261,8 +261,27 @@ with open('/dev/tty', 'rb', buffering=0) as terminal:
     assert not host.exists(), "undo retained the owned terminal host"
     shell_command('eval "$("$RGO_TERMINAL_HELPER" macos-terminal-host init-zsh)"')
     assert int(next((pathlib.Path(os.environ["RGO_HOME"]) / "state/terminal-hosts").iterdir()).joinpath("generation").read_text()) == 0
+    # Leave a real process in this shell's session after its leader exits. It
+    # ignores HUP and closes every standard descriptor; Rust will release it.
+    pathlib.Path("shell-worker.py").write_text('''import os, pathlib, signal, time
+signal.signal(signal.SIGHUP, signal.SIG_IGN)
+for fd in (0, 1, 2): os.close(fd)
+pathlib.Path('shell-worker-pid').write_text(str(os.getpid()))
+deadline = time.monotonic() + 120
+while not pathlib.Path('release-shell-worker').exists() and time.monotonic() < deadline:
+    time.sleep(0.02)
+pathlib.Path('shell-worker-exited').write_text('finished')
+''')
+    shell_command("python3 shell-worker.py &")
+    wait_for(lambda: pathlib.Path("shell-worker-pid").is_file(), "shell worker did not start")
     command("cargo run --offline")
     expect(b"RGO_TERMINAL_READY")
+    host = next((pathlib.Path(os.environ["RGO_HOME"]) / "state/terminal-hosts").iterdir())
+    # Added user content prevents background retirement until Rust has checked
+    # ownership and a live caller, then interrupted an actual journaled removal.
+    (host / "keep-me").write_text("user content")
+    pathlib.Path("retiring-terminal-token").write_text(host.name)
+    pathlib.Path("retiring-terminal-lease.json").write_bytes((host / "lease.json").read_bytes())
     # Disconnect an active physical terminal, then await actual shell exit and
     # guardian retirement. There is no terminal left whose modes may be reset.
     os.close(master)

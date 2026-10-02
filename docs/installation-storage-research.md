@@ -662,3 +662,25 @@ the before/after settings explicitly and does not claim crash restoration
 passed. Mode ownership, prompt editing after failure, other shells, and the
 remaining interruption/runtime matrix stay open in the
 [implementation checklist](macos-cargo-supervision.md#terminal-handoff-and-measured-launch-overhead).
+
+## macOS abandoned terminal-host recovery — 2026-10-02
+
+The subsequent registered-zsh prototype stores its lease outside Cargo job
+data. Complete host records now have a separate maintenance retirement path:
+current-boot shells and lease callers must be confirmed no longer live;
+uncertain identities, nonlocal filesystems, unsupported records, added files,
+and changed bytes or inodes preserve the metadata. Background retirement never
+opens a terminal or applies saved settings. A synced sibling journal survives
+individual removals, so the daemon can resume without the original host header.
+Authorization is tied to the exact bytes included in that journal, and the
+directory removal is synced before the journal disappears.
+
+Inspection of the installed `fs4` API found that nonblocking lock acquisition
+returns `Ok(false)` for contention. The earlier terminal helper ignored that
+boolean. Host and retirement operations now require `true`. The existing
+macOS fixture checks contention with a distinct live descriptor, a surviving
+process in the exited shell's session, preservation of added/edited content,
+and continuation by a real daemon restarted after the first unlink. It adds
+no Rust test case. Incomplete registrations and all interruption points remain
+outside this completed-record design; the broader activation and performance
+gates remain open in the [checklist](macos-cargo-supervision.md#abandoned-terminal-host-retirement).

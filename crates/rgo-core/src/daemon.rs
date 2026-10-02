@@ -115,6 +115,8 @@ struct State {
     pin_pruner: Arc<Mutex<context::PinPruneScanner>>,
     #[cfg(target_os = "macos")]
     macos_job_scanner: Arc<Mutex<crate::macos_jobs::RecoveryScanner>>,
+    #[cfg(target_os = "macos")]
+    terminal_host_scanner: Arc<Mutex<crate::macos_terminal_hosts::RecoveryScanner>>,
     pending_scanner: Arc<Mutex<crate::supervision::PendingMaintenanceScanner>>,
     trigger_scan: Arc<Mutex<crate::size::TriggerScan>>,
     auto_gc_retry_at: Arc<Mutex<Option<Instant>>>,
@@ -261,6 +263,10 @@ pub fn run(paths: RgoPaths, cfg: Resolved) -> Result<()> {
         pin_pruner: Arc::new(Mutex::new(context::PinPruneScanner::default())),
         #[cfg(target_os = "macos")]
         macos_job_scanner: Arc::new(Mutex::new(crate::macos_jobs::RecoveryScanner::default())),
+        #[cfg(target_os = "macos")]
+        terminal_host_scanner: Arc::new(Mutex::new(
+            crate::macos_terminal_hosts::RecoveryScanner::default(),
+        )),
         pending_scanner: Arc::new(Mutex::new(
             crate::supervision::PendingMaintenanceScanner::default(),
         )),
@@ -2440,6 +2446,16 @@ fn recover_macos_cargo_jobs(state: &State) {
         Ok(recovered) => tracing::debug!(recovered, "recovered idle macOS Cargo jobs"),
         Err(error) => tracing::warn!(%error, "macOS Cargo job recovery deferred"),
     }
+    match state
+        .terminal_host_scanner
+        .lock()
+        .unwrap()
+        .scan(&state.paths, 16)
+    {
+        Ok(0) => {}
+        Ok(recovered) => tracing::debug!(recovered, "retired abandoned macOS terminal hosts"),
+        Err(error) => tracing::warn!(%error, "macOS terminal host recovery deferred"),
+    }
 }
 
 fn maintenance(state: &State) -> Result<()> {
@@ -3360,6 +3376,10 @@ mod tests {
             pin_pruner: Arc::new(Mutex::new(context::PinPruneScanner::default())),
             #[cfg(target_os = "macos")]
             macos_job_scanner: Arc::new(Mutex::new(crate::macos_jobs::RecoveryScanner::default())),
+            #[cfg(target_os = "macos")]
+            terminal_host_scanner: Arc::new(Mutex::new(
+                crate::macos_terminal_hosts::RecoveryScanner::default(),
+            )),
             pending_scanner: Arc::new(Mutex::new(
                 crate::supervision::PendingMaintenanceScanner::default(),
             )),

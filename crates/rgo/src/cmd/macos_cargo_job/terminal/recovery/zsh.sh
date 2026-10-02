@@ -20,6 +20,7 @@
     autoload -Uz add-zsh-hook
     __rgo_terminal_counter() {
         emulate -L zsh
+        [[ ! -e "${__rgo_terminal_directory:h}/.retiring-${__rgo_terminal_token}.json" ]] || return 1
         local counter="$__rgo_terminal_directory/generation.$$.${__rgo_terminal_generation}.$1.tmp" descriptor
         builtin sysopen -w -m 600 -o creat,excl,cloexec,nofollow -u descriptor "$counter" || return 1
         if ! builtin syswrite -o "$descriptor" "$1"; then
@@ -45,6 +46,11 @@
     __rgo_terminal_precmd() {
         emulate -L zsh
         [[ -z $__rgo_terminal_disabled ]] || return 0
+        if [[ -e "${__rgo_terminal_directory:h}/.retiring-${__rgo_terminal_token}.json" ]]; then
+            typeset -g __rgo_terminal_disabled=1
+            RGO_TERMINAL_HOST=disabled
+            return 0
+        fi
         if [[ -f "$__rgo_terminal_directory/lease.json" ]]; then
             if ! "$__rgo_terminal_executable" macos-terminal-host --home "$__rgo_terminal_root" finish --token "$__rgo_terminal_token" --generation "$__rgo_terminal_generation"; then
                 typeset -g __rgo_terminal_disabled=1

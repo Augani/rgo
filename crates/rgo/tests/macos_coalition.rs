@@ -4,10 +4,50 @@ use std::path::PathBuf;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use fs4::fs_std::FileExt;
 use rgo_core::macos_coalition::ResourceCoalition;
+use rgo_core::macos_terminal_hosts::{self as terminal_hosts, Host, Process, ProcessState, Saved};
 use rgo_core::paths::RgoPaths;
 use rgo_core::supervision;
+use rgo_protocol::{Request, Response};
 use rgo_testkit::Sandbox;
+
+struct ReleaseWorker(PathBuf);
+
+impl Drop for ReleaseWorker {
+    fn drop(&mut self) {
+        let _ = std::fs::write(&self.0, b"continue");
+        if self.0.with_file_name("shell-worker-pid").is_file() {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while !self.0.with_file_name("shell-worker-exited").is_file()
+                && Instant::now() < deadline
+            {
+                thread::sleep(Duration::from_millis(20));
+            }
+        }
+    }
+}
+
+struct PrivateDaemon(std::process::Child);
+
+impl Drop for PrivateDaemon {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+struct ShutdownDaemon(RgoPaths);
+
+impl Drop for ShutdownDaemon {
+    fn drop(&mut self) {
+        let _ = rgo_core::ipc::request_with_timeout(
+            &self.0.socket_path(),
+            Request::Shutdown,
+            Duration::from_secs(1),
+        );
+    }
+}
 
 struct ProbeJob<'a> {
     sandbox: &'a Sandbox,
@@ -126,6 +166,7 @@ while not pathlib.Path(os.environ['RGO_COALITION_READY']).exists():
     let paths = RgoPaths {
         root: sandbox.rgo_home.clone(),
     };
+    let _shutdown_daemon = ShutdownDaemon(paths.clone());
     let directory = std::fs::read_dir(paths.state_dir())
         .unwrap()
         .map(|entry| entry.unwrap().path())
@@ -397,6 +438,7 @@ fn main() {
         include_str!("fixtures/macos-terminal-child.py"),
     )
     .unwrap();
+    let worker_release = ReleaseWorker(project.join("release-shell-worker"));
     let terminal = sandbox
         .cmd("python3")
         .arg("-c")
@@ -418,4 +460,128 @@ fn main() {
         String::from_utf8_lossy(&terminal.stderr)
     );
     println!("{}", String::from_utf8_lossy(&terminal.stdout));
+
+    let token = std::fs::read_to_string(project.join("retiring-terminal-token")).unwrap();
+    let host_dir = paths.state_dir().join("terminal-hosts").join(&token);
+    let journal = host_dir
+        .parent()
+        .unwrap()
+        .join(format!(".retiring-{token}.json"));
+    let host: Host = terminal_hosts::read(&host_dir.join("host.json")).unwrap();
+    assert!(host.shell.state().unwrap() == ProcessState::Gone);
+    let unknown = terminal_hosts::retire(&paths, &token, None).unwrap_err();
+    assert!(
+        unknown.to_string().contains("unknown content"),
+        "{unknown:#}"
+    );
+    assert!(host_dir.join("host.json").is_file() && !journal.exists());
+
+    let worker_pid: i32 = std::fs::read_to_string(project.join("shell-worker-pid"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    let worker = Process::observe(worker_pid).unwrap().unwrap();
+    assert_eq!(worker.session, host.shell.session);
+    let mut lease: Saved = serde_json::from_slice(
+        &std::fs::read(project.join("retiring-terminal-lease.json")).unwrap(),
+    )
+    .unwrap();
+    lease.caller = worker.clone();
+    terminal_hosts::write(&host_dir, "lease.json", &lease, false).unwrap();
+    std::fs::remove_file(host_dir.join("keep-me")).unwrap();
+    let live = terminal_hosts::retire(&paths, &token, None).unwrap_err();
+    assert!(live.to_string().contains("live caller"), "{live:#}");
+    assert!(host_dir.join("host.json").is_file() && !journal.exists());
+
+    // fs4 try_lock returns Ok(false) for contention. A second descriptor must
+    // refuse recovery rather than continuing as though it held the lock.
+    let host_lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(host_dir.join("host.lock"))
+        .unwrap();
+    FileExt::lock_exclusive(&host_lock).unwrap();
+    assert!(
+        terminal_hosts::lock(&host_dir)
+            .unwrap_err()
+            .to_string()
+            .contains("busy")
+    );
+    drop(host_lock);
+    let retirement_lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(
+            paths
+                .state_dir()
+                .join("locks/macos-terminal-retirement.lock"),
+        )
+        .unwrap();
+    FileExt::lock_exclusive(&retirement_lock).unwrap();
+    assert!(
+        terminal_hosts::retire(&paths, &token, None)
+            .unwrap_err()
+            .to_string()
+            .contains("busy")
+    );
+    drop(retirement_lock);
+
+    // Stop the actual daemon before interrupting retirement. Acquiring its
+    // singleton lock proves exit; a stale socket is not evidence of liveness.
+    assert!(matches!(
+        rgo_core::ipc::request(&paths.socket_path(), Request::Shutdown).unwrap(),
+        Response::Ok
+    ));
+    let daemon_lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(paths.state_dir().join("daemon.lock"))
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !FileExt::try_lock_exclusive(&daemon_lock).unwrap() {
+        assert!(Instant::now() < deadline, "private daemon did not stop");
+        thread::sleep(Duration::from_millis(20));
+    }
+    drop(worker_release);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while worker.state().unwrap() == ProcessState::Live {
+        assert!(
+            Instant::now() < deadline,
+            "private shell worker did not exit"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert!(!terminal_hosts::retire_step(&paths, &token, None, 1).unwrap());
+    assert!(!host_dir.join("host.json").exists() && journal.is_file());
+    let generation = host_dir.join("generation");
+    let original = std::fs::read(&generation).unwrap();
+    std::fs::write(&generation, b"user edit").unwrap();
+    let remaining = std::fs::read_dir(&host_dir).unwrap().count();
+    let edited = terminal_hosts::retire(&paths, &token, None).unwrap_err();
+    assert!(edited.to_string().contains("content changed"), "{edited:#}");
+    assert_eq!(std::fs::read_dir(&host_dir).unwrap().count(), remaining);
+    assert!(journal.is_file());
+    std::fs::write(&generation, original).unwrap();
+    drop(daemon_lock);
+    let _daemon = PrivateDaemon(
+        sandbox
+            .cmd(rgo)
+            .args(["daemon", "--foreground"])
+            .env("RGO_DAEMON_POLL_SECS", "1")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while host_dir.exists() || journal.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "restarted daemon did not resume owned terminal retirement"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+    println!(
+        "terminal metadata: live caller, added/edited content, busy locks, and interrupted retirement across real daemon restart passed"
+    );
 }
