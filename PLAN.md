@@ -49,6 +49,14 @@ prompt unpin recovery. The [18-job matrix](https://github.com/Augani/rgo/actions
 passed, including the 100-project recovery probes. The total work of a single
 pass and the broader P2/P3 release gates remain open.
 
+**2026-10-02 Windows uninstall:** exact ownership snapshots now survive partial
+removal in a retained uninstall journal. Recovery covers activation undo, command
+removal, PATH restoration, and installer-state removal; pending removal blocks
+install, edited files are preserved, and repeated completed uninstall is harmless.
+The existing Windows installer probe and [18-job matrix](https://github.com/Augani/rgo/actions/runs/36976744030)
+passed, including its running-Cargo and raw PATH/type controls. Every internal
+undo/service write, safe data purge, and the wider P4 release gates remain open.
+
 ## 0. What changed vs. `doc.md`, and why
 
 `doc.md` treats the rustc-wrapper + CAS as the core and the managed build roots as a

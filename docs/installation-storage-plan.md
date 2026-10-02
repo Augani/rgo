@@ -541,8 +541,10 @@ no-op. Versioned binaries, old-shell Cargo fallbacks, and managed data are retai
 The existing private Windows installer probe now exercises those four boundaries,
 reinstall rejection, edited command/state preservation, and recovery alongside
 its running-Cargo and exact raw User PATH/type controls. Both scripts parse, and
-a local PowerShell helper probe with a mocked undo passed; actual Windows
-validation is pending. This does not close every core setup/undo write boundary,
+local PowerShell helper probes with mocked undo passed, including a command edit
+between preflight and removal. The [18-job matrix](https://github.com/Augani/rgo/actions/runs/36976744030)
+passed, including the live Windows installer probe, full workspace suites,
+zero-warning Clippy, and 100-project recovery. This does not close every core setup/undo write boundary,
 service-manager interruption, or the broader uninstall/purge release gates.
 
 The [build-only release run for `b4092e1`](https://github.com/Augani/rgo/actions/runs/36894054104) passed all four platform archive jobs and complete-bundle verification. Its public publish job was skipped; this proves that candidate assets can be assembled, not that a public installer endpoint or lifecycle gate is ready.

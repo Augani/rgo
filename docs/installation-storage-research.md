@@ -479,6 +479,9 @@ The existing private Windows installer probe adds controlled failures after
 undo, first command removal, PATH restoration, and state removal. It requires
 recovery, rejects an intervening install, preserves edited command/state files,
 and retains its running-Cargo and exact raw PATH/type controls. A local PowerShell
-helper probe passed with undo mocked; both installer/probe scripts parse. A live
-Windows run is still required. These boundaries do not prove every internal
+helper probe passed with undo mocked; both installer/probe scripts parse. A second
+local control edited the command during mocked undo and verified the later digest
+check preserved it. The [18-job matrix](https://github.com/Augani/rgo/actions/runs/36976744030)
+passed, including the live Windows installer recovery and running-Cargo/PATH
+controls, full workspace suites, and 100-project recovery. These boundaries do not prove every internal
 core undo or service-manager write, power-loss durability, or safe data purge.
